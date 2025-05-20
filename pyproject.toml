@@ -1,0 +1,145 @@
+```toml
+[project]
+name = "meshmerizer"
+
+# Dynamic version numbers from git
+dynamic = ["version"]
+
+# Tagline for Meshmerizer
+description = "Convert hydrodynamical simulation outputs (point clouds/voxels) into 3D-printable mesh STL files."
+
+# Long description
+readme = "README.md"
+
+# Minimum Python version
+requires-python = ">=3.8"
+
+# License
+license = { text = "MIT" }
+
+# Project keywords
+keywords = [
+  "3d-printing",
+  "hydrodynamics",
+  "voxels",
+  "marching-cubes",
+  "stl",
+  "mesh",
+  "point-cloud",
+]
+
+# Authors
+authors = [
+  { name = "Will Roper", email = "w.roper@sussex.ac.uk" },
+]
+
+# Maintainers
+maintainers = [
+  { name = "Will Roper", email = "w.roper@sussex.ac.uk" },
+]
+
+# Classifiers
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Physics",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+]
+
+# Dependencies
+dependencies = [
+  "numpy>=1.21",
+  "scipy>=1.7",
+  "scikit-image>=0.19",
+  "trimesh>=3.9",
+]
+
+[project.optional-dependencies]
+# Development
+dev = [
+  "pytest>=6.0",
+  "black>=22.1.0",
+  "flake8>=4.0.1",
+  "mypy>=0.971",
+]
+
+# Entry points
+[project.scripts]
+meshmerizer = "meshmerizer.cli:main"
+
+# Build system
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Dynamic version attr
+[tool.setuptools.dynamic]
+version = { attr = "meshmerizer._version:__version__" }
+
+# Ruff configuration
+[tool.ruff]
+# Exclude common directories and files from linting
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    ".DS_Store",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+    ".pre-commit-config.yaml",
+    "*__init__.py",
+]
+# Line length and indentation
+line-length = 79
+indent-width = 4
+# Target Python versions
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "D"]
+ignore = [
+    "E402",  # module level import not at top of file
+    "F811",  # redefinition of unused name
+]
+extend-select = ["I"]  # import order
+fixable = ["ALL"]
+unfixable = []
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"examples/**/*.py" = ["D"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+```
