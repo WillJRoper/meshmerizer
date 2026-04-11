@@ -374,13 +374,13 @@ def test_remove_islands_keeps_largest_component(method):
         meshes = voxels_to_stl(
             volume,
             threshold=0.5,
-            remove_islands=True,
+            remove_islands=0,
         )
     else:
         meshes = voxels_to_stl_via_sdf(
             volume,
             threshold=0.5,
-            remove_islands=True,
+            remove_islands=0,
         )
 
     assert len(meshes) == 1
@@ -390,6 +390,54 @@ def test_remove_islands_keeps_largest_component(method):
 
     assert np.all(bbox_min < 15.0)
     assert np.all(bbox_max < 16.0)
+
+
+@pytest.mark.parametrize("method", ["standard", "sdf"])
+def test_remove_islands_threshold_discards_only_small_components(method):
+    volume = np.zeros((24, 24, 24), dtype=float)
+    volume[2:12, 2:12, 2:12] = 1.0
+    volume[14:17, 14:17, 14:17] = 1.0
+    volume[20:22, 20:22, 20:22] = 1.0
+
+    if method == "standard":
+        meshes = voxels_to_stl(
+            volume,
+            threshold=0.5,
+            split_islands=True,
+            remove_islands=10,
+        )
+    else:
+        meshes = voxels_to_stl_via_sdf(
+            volume,
+            threshold=0.5,
+            split_islands=True,
+            remove_islands=10,
+        )
+
+    assert len(meshes) == 2
+
+    max_spans = sorted(
+        [np.ptp(mesh.vertices, axis=0).max() for mesh in meshes],
+        reverse=True,
+    )
+    assert max_spans[0] > 8.0
+    assert max_spans[1] > 2.0
+
+
+def test_cli_parses_remove_islands_flag_as_largest_only():
+    parser = _build_parser()
+    args = parser.parse_args(["stl", "snapshot.hdf5", "--remove-islands"])
+
+    assert args.remove_islands == 0
+
+
+def test_cli_parses_remove_islands_threshold():
+    parser = _build_parser()
+    args = parser.parse_args(
+        ["stl", "snapshot.hdf5", "--remove-islands", "10"]
+    )
+
+    assert args.remove_islands == 10
 
 
 def test_cli_parses_smooth_iters():
@@ -638,6 +686,142 @@ def test_run_stl_uses_unioned_chunk_output(monkeypatch, tmp_path):
 
     assert called["unioned"] is True
     assert out_path.exists()
+
+
+def test_run_stl_unioned_remove_islands_keeps_largest(monkeypatch, tmp_path):
+    parser = _build_parser()
+    out_path = tmp_path / "largest_only.stl"
+    args = parser.parse_args(
+        [
+            "stl",
+            "snapshot.hdf5",
+            "--nchunks",
+            "2",
+            "--chunk-output",
+            "unioned",
+            "--remove-islands",
+            "--output",
+            str(out_path),
+        ]
+    )
+
+    def fake_load_particles(**_kwargs):
+        return (
+            np.array([1.0]),
+            np.array([[0.1, 0.1, 0.1]]),
+            None,
+            1.0,
+            np.zeros(3),
+        )
+
+    def fake_generate_hard_chunk_meshes(*_args, **_kwargs):
+        mesh = Mesh(
+            vertices=np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ]
+            ),
+            faces=np.array([[0, 1, 2]]),
+        )
+        return [(object(), [mesh])]
+
+    large = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    small = trimesh.creation.box(extents=(0.5, 0.5, 0.5))
+    small.apply_translation([5.0, 0.0, 0.0])
+    union_mesh = Mesh(mesh=trimesh.util.concatenate([large, small]))
+
+    def fake_union_hard_chunk_meshes(*_args, **_kwargs):
+        return union_mesh
+
+    monkeypatch.setattr(
+        "meshmerizer.cli._load_swift_particles", fake_load_particles
+    )
+    monkeypatch.setattr(
+        "meshmerizer.cli.generate_hard_chunk_meshes",
+        fake_generate_hard_chunk_meshes,
+    )
+    monkeypatch.setattr(
+        "meshmerizer.cli.union_hard_chunk_meshes",
+        fake_union_hard_chunk_meshes,
+    )
+
+    _run_stl(args)
+
+    written = trimesh.load(out_path, force="mesh")
+    assert len(written.split(only_watertight=False)) == 1
+    assert written.bounds[1][0] < 2.0
+
+
+def test_run_stl_unioned_remove_islands_threshold(monkeypatch, tmp_path):
+    parser = _build_parser()
+    out_path = tmp_path / "thresholded.stl"
+    args = parser.parse_args(
+        [
+            "stl",
+            "snapshot.hdf5",
+            "--nchunks",
+            "2",
+            "--chunk-output",
+            "unioned",
+            "--remove-islands",
+            "200000",
+            "--output",
+            str(out_path),
+        ]
+    )
+
+    def fake_load_particles(**_kwargs):
+        return (
+            np.array([1.0]),
+            np.array([[0.1, 0.1, 0.1]]),
+            None,
+            1.0,
+            np.zeros(3),
+        )
+
+    def fake_generate_hard_chunk_meshes(*_args, **_kwargs):
+        mesh = Mesh(
+            vertices=np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ]
+            ),
+            faces=np.array([[0, 1, 2]]),
+        )
+        return [(object(), [mesh])]
+
+    large = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    medium = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    tiny = trimesh.creation.box(extents=(0.1, 0.1, 0.1))
+    medium.apply_translation([5.0, 0.0, 0.0])
+    tiny.apply_translation([8.0, 0.0, 0.0])
+    union_mesh = Mesh(mesh=trimesh.util.concatenate([large, medium, tiny]))
+
+    def fake_union_hard_chunk_meshes(*_args, **_kwargs):
+        return union_mesh
+
+    monkeypatch.setattr(
+        "meshmerizer.cli._load_swift_particles", fake_load_particles
+    )
+    monkeypatch.setattr(
+        "meshmerizer.cli.generate_hard_chunk_meshes",
+        fake_generate_hard_chunk_meshes,
+    )
+    monkeypatch.setattr(
+        "meshmerizer.cli.union_hard_chunk_meshes",
+        fake_union_hard_chunk_meshes,
+    )
+
+    _run_stl(args)
+
+    written = trimesh.load(out_path, force="mesh")
+    components = written.split(only_watertight=False)
+    assert len(components) == 2
+    assert max(c.bounds[1][0] for c in components) < 6.0
 
 
 def test_generate_voxel_grid_coords_range_zero():

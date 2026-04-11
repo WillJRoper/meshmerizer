@@ -20,6 +20,7 @@ import trimesh
 from meshmerizer.chunking import (
     VirtualGrid,
     generate_hard_chunk_meshes,
+    keep_largest_mesh_component,
     union_hard_chunk_meshes,
 )
 from meshmerizer.mesh import Mesh, voxels_to_stl_via_sdf
@@ -931,6 +932,42 @@ def _run_stl(args: argparse.Namespace) -> None:
         _print_elapsed("Overlapped hard chunk generation", union_start)
         final_mesh = union_hard_chunk_meshes(chunk_meshes)
 
+        if args.remove_islands is not None:
+            if args.remove_islands == 0:
+                # Match the dense-path meaning of the bare flag by keeping only
+                # the single largest connected mesh body.
+                final_mesh = keep_largest_mesh_component(final_mesh)
+            else:
+                # Convert the voxel-count threshold into a physical volume cut
+                # so the chunked path can filter assembled mesh bodies using
+                # the same user-facing semantics.
+                min_volume = args.remove_islands * (virtual_grid.voxel_size**3)
+                components = final_mesh.to_trimesh().split(
+                    only_watertight=False
+                )
+                kept = []
+                for component in components:
+                    # Prefer the mesh volume when trimesh recognises the body
+                    # as volumetric, but fall back to the bounding-box volume
+                    # so small closed components from mocked or imperfect
+                    # meshes can still be filtered sensibly.
+                    if component.is_volume:
+                        component_volume = abs(component.volume)
+                    else:
+                        component_volume = float(np.prod(component.extents))
+                    if component_volume >= min_volume:
+                        kept.append(component)
+                if not kept:
+                    print(
+                        "Error: Island removal removed all chunked mesh "
+                        "components."
+                    )
+                    sys.exit(1)
+                if len(kept) == 1:
+                    final_mesh = Mesh(mesh=kept[0].copy())
+                else:
+                    final_mesh = Mesh(mesh=trimesh.util.concatenate(kept))
+
         # Apply optional post-processing after union so it acts on the final
         # watertight surface rather than on individual chunk fragments.
         if args.target_size:
@@ -1149,10 +1186,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     stl.add_argument(
         "--remove-islands",
-        action="store_true",
+        nargs="?",
+        const=0,
+        default=None,
+        type=int,
         help=(
-            "Keep only the largest connected component and discard any "
-            "disconnected islands."
+            "Remove disconnected islands before meshing. Use the flag alone "
+            "to keep only the largest island, or pass an integer to discard "
+            "islands smaller than that many voxels."
         ),
     )
     stl.add_argument(

@@ -258,7 +258,7 @@ def _prepare_volume(
     threshold: float,
     closing_radius: int,
     split_islands: bool,
-    remove_islands: bool,
+    remove_islands: Optional[int],
     mesh_index: Optional[int],
     padding: int = 1,
 ) -> Tuple[np.ndarray, Iterable[int]]:
@@ -269,8 +269,9 @@ def _prepare_volume(
         threshold (float): Binarization threshold.
         closing_radius (int): Radius for binary closing.
         split_islands (bool): Whether to split connected components.
-        remove_islands (bool): Whether to keep only the largest connected
-            component.
+        remove_islands (Optional[int]): Island-removal mode. ``None`` keeps all
+            components, ``0`` keeps only the largest component, and positive
+            values remove components smaller than the given voxel count.
         mesh_index (Optional[int]): Specific island to extract.
         padding (int): Number of voxels to pad the volume with zeros.
 
@@ -307,9 +308,9 @@ def _prepare_volume(
         print(f"Binary closing took {close_end - close_start:.4f} seconds.")
 
     # Label islands only when the caller wants separate components or wants to
-    # keep just the largest one.
+    # remove some subset of them before meshing.
     label_struct = ndimage.generate_binary_structure(3, 1)
-    if split_islands or remove_islands:
+    if split_islands or remove_islands is not None:
         split_start = time.perf_counter()
         labeled, num = ndimage.label(bin_vol, structure=label_struct)
         island_ids = range(1, num + 1)
@@ -319,21 +320,38 @@ def _prepare_volume(
             f"Found {num} islands."
         )
 
-        if remove_islands and num > 0:
-            # Keep only the dominant component when requested so small floating
-            # islands do not survive into the final mesh.
+        if remove_islands is not None and num > 0:
+            # Count component sizes in voxels so island filtering is based on
+            # the binary field rather than on downstream mesh topology.
             component_sizes = np.bincount(labeled.ravel())
             component_sizes[0] = 0
-            largest_label = int(np.argmax(component_sizes))
-            largest_size = int(component_sizes[largest_label])
-            removed_count = num - 1
-            labeled = np.where(labeled == largest_label, largest_label, 0)
-            island_ids = [largest_label]
-            print(
-                "Removing disconnected islands. "
-                f"Keeping largest component with {largest_size} voxels "
-                f"and discarding {removed_count} island(s)."
-            )
+            if remove_islands == 0:
+                # Preserve the historical behavior of keeping only the single
+                # largest connected component.
+                largest_label = int(np.argmax(component_sizes))
+                largest_size = int(component_sizes[largest_label])
+                removed_count = num - 1
+                labeled = np.where(labeled == largest_label, largest_label, 0)
+                island_ids = [largest_label]
+                print(
+                    "Removing disconnected islands. "
+                    f"Keeping largest component with {largest_size} voxels "
+                    f"and discarding {removed_count} island(s)."
+                )
+            else:
+                # Remove only components below the requested voxel-count
+                # threshold and keep all larger components.
+                keep_labels = np.flatnonzero(component_sizes >= remove_islands)
+                keep_labels = keep_labels[keep_labels != 0]
+                keep_mask = np.isin(labeled, keep_labels)
+                labeled = np.where(keep_mask, labeled, 0)
+                island_ids = keep_labels.tolist()
+                removed_count = int(num - len(island_ids))
+                print(
+                    "Removing disconnected islands smaller than "
+                    f"{remove_islands} voxels. Keeping {len(island_ids)} "
+                    f"component(s) and discarding {removed_count} island(s)."
+                )
     else:
         # In the simple path we treat the whole mask as one component labelled
         # 1 if any voxels survive thresholding.
@@ -407,7 +425,7 @@ def voxels_to_stl(
     threshold: float,
     closing_radius: int = 1,
     split_islands: bool = False,
-    remove_islands: bool = False,
+    remove_islands: Optional[int] = None,
     mesh_index: Optional[int] = None,
     voxel_size: float = 1.0,
 ) -> List[Mesh]:
@@ -418,8 +436,9 @@ def voxels_to_stl(
         threshold (float): Threshold value for binarization.
         closing_radius (int): Radius for binary closing to fill small gaps.
         split_islands (bool): If True, split the volume into separate islands.
-        remove_islands (bool): If True, keep only the largest connected
-            component.
+        remove_islands (Optional[int]): Island-removal mode. ``None`` keeps all
+            components, ``0`` keeps only the largest component, and positive
+            values remove components smaller than the given voxel count.
         mesh_index (Optional[int]): Index of the mesh to extract. If None,
             all meshes are extracted.
         voxel_size (float): The physical size of a single voxel. Used for
@@ -493,7 +512,7 @@ def voxels_to_stl_via_sdf(
     threshold: float,
     closing_radius: int = 1,
     split_islands: bool = False,
-    remove_islands: bool = False,
+    remove_islands: Optional[int] = None,
     mesh_index: Optional[int] = None,
     voxel_size: float = 1.0,
 ) -> List[Mesh]:
@@ -507,8 +526,9 @@ def voxels_to_stl_via_sdf(
         threshold (float): Threshold value for binarization.
         closing_radius (int): Radius for binary closing to fill small gaps.
         split_islands (bool): If True, split the volume into separate islands.
-        remove_islands (bool): If True, keep only the largest connected
-            component.
+        remove_islands (Optional[int]): Island-removal mode. ``None`` keeps all
+            components, ``0`` keeps only the largest component, and positive
+            values remove components smaller than the given voxel count.
         mesh_index (Optional[int]): Index of the mesh to extract. If None,
             all meshes are extracted.
         voxel_size (float): The physical size of a single voxel. Used for
