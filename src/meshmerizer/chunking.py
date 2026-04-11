@@ -730,6 +730,7 @@ def generate_hard_chunk_meshes(
         List of ``(bounds, meshes)`` pairs for non-empty chunks.
     """
     total_start = time.perf_counter()
+    pass_label = "Chunk pass"
     # Normalize the particle arrays once so the per-chunk loop can stay focused
     # on chunk-specific work.
     coords_arr = np.asarray(coordinates, dtype=np.float64)
@@ -748,9 +749,13 @@ def generate_hard_chunk_meshes(
     voxelize_total = 0.0
     preprocess_total = 0.0
     meshing_total = 0.0
+    processed_chunks = 0
+    nonempty_chunks = 0
+    emitted_meshes = 0
     # Process chunks independently so the path stays low-memory and parallel
     # friendly.
     for chunk_bounds in iter_hard_chunk_bounds(grid):
+        processed_chunks += 1
         halo_voxels = (
             chunk_halo_voxels(gaussian_sigma) if gaussian_sigma > 0 else 0
         )
@@ -768,6 +773,10 @@ def generate_hard_chunk_meshes(
             smoothing_lengths=smoothing_arr,
         )
         if particle_indices.size == 0:
+            print(
+                f"{pass_label:>10} {chunk_bounds.index}: "
+                "0 particles -> skipped"
+            )
             continue
 
         voxelize_start = time.perf_counter()
@@ -824,18 +833,28 @@ def generate_hard_chunk_meshes(
         meshing_total += time.perf_counter() - meshing_start
         if meshes:
             chunk_meshes.append((chunk_bounds, meshes))
+            nonempty_chunks += 1
+            emitted_meshes += len(meshes)
             print(
-                f"Chunk {chunk_bounds.index} kept {len(meshes)} mesh(es) "
-                f"from {particle_indices.size} particle(s) in "
+                f"{pass_label:>10} {chunk_bounds.index}: "
+                f"{particle_indices.size} particles -> "
+                f"{len(meshes)} mesh(es) in "
                 f"{time.perf_counter() - chunk_start:.3f} s"
             )
+        else:
+            print(
+                f"{pass_label:>10} {chunk_bounds.index}: "
+                f"{particle_indices.size} particles -> no mesh"
+            )
 
-    print(f"Hard chunk voxelization took {voxelize_total:.3f} s total")
-    print(f"Hard chunk preprocessing took {preprocess_total:.3f} s total")
-    print(f"Hard chunk SDF meshing took {meshing_total:.3f} s total")
-    print(
-        f"Hard chunk pipeline took {time.perf_counter() - total_start:.3f} s"
-    )
+    print("Chunk summary:")
+    print(f"  processed chunks: {processed_chunks}")
+    print(f"  non-empty chunks: {nonempty_chunks}")
+    print(f"  emitted meshes:   {emitted_meshes}")
+    print(f"  voxelization:     {voxelize_total:.3f} s total")
+    print(f"  preprocessing:    {preprocess_total:.3f} s total")
+    print(f"  sdf meshing:      {meshing_total:.3f} s total")
+    print(f"  chunk pass total: {time.perf_counter() - total_start:.3f} s")
     return chunk_meshes
 
 

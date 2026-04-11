@@ -864,10 +864,13 @@ def _run_stl(args: argparse.Namespace) -> None:
         )
 
         print(
-            "Generating hard chunk watertight mesh(es) "
-            f"(threshold={final_threshold:.4e}, "
-            f"nchunks={args.nchunks})..."
+            "Chunked meshing setup:\n"
+            f"  threshold:    {final_threshold:.4e}\n"
+            f"  chunks/axis:  {args.nchunks}\n"
+            f"  resolution:   {args.resolution}\n"
+            f"  chunk output: {args.chunk_output}"
         )
+        print("\nChunk extraction pass:")
 
         try:
             mesh_start = time.perf_counter()
@@ -901,6 +904,7 @@ def _run_stl(args: argparse.Namespace) -> None:
             output_dir.mkdir(parents=True, exist_ok=True)
             stem = output_path.stem
             chunk_counter = 0
+            print(f"\nWriting separate chunks to {output_dir}/")
             # Number chunks monotonically in write order so the filenames are
             # stable and easy to inspect.
             for _bounds, meshes in chunk_meshes:
@@ -915,7 +919,8 @@ def _run_stl(args: argparse.Namespace) -> None:
 
         # Regenerate with overlap so the unioned path has enough seam
         # context to assign and stitch boundary triangles robustly.
-        print("Regenerating chunk meshes with overlap for watertight union...")
+        print("\nUnion assembly pass:")
+        print("  Regenerating overlapped chunk meshes for seam-safe union...")
         union_start = time.perf_counter()
         chunk_meshes = generate_hard_chunk_meshes(
             field_data,
@@ -929,18 +934,23 @@ def _run_stl(args: argparse.Namespace) -> None:
             nthreads=args.nthreads,
             overlap_voxels=1,
         )
-        _print_elapsed("Overlapped hard chunk generation", union_start)
+        _print_elapsed("Overlapped chunk generation", union_start)
         final_mesh = union_hard_chunk_meshes(chunk_meshes)
 
         if args.remove_islands is not None:
             if args.remove_islands == 0:
                 # Match the dense-path meaning of the bare flag by keeping only
                 # the single largest connected mesh body.
+                print("  Island filtering: keeping only the largest component")
                 final_mesh = keep_largest_mesh_component(final_mesh)
             else:
                 # Convert the voxel-count threshold into a physical volume cut
                 # so the chunked path can filter assembled mesh bodies using
                 # the same user-facing semantics.
+                print(
+                    "  Island filtering: removing components smaller than "
+                    f"{args.remove_islands} voxels"
+                )
                 min_volume = args.remove_islands * (virtual_grid.voxel_size**3)
                 components = final_mesh.to_trimesh().split(
                     only_watertight=False
@@ -1005,7 +1015,7 @@ def _run_stl(args: argparse.Namespace) -> None:
                 "⚠️ Warning: final mesh is not watertight. "
                 "The STL will still be written."
             )
-        print(f"Saving to {output_path}...")
+        print(f"\nSaving final chunked mesh to {output_path}...")
         save_start = time.perf_counter()
         final_mesh.save(str(output_path))
         _print_elapsed("Mesh save", save_start)
