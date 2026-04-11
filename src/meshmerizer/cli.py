@@ -14,7 +14,6 @@ import trimesh
 
 from meshmerizer.chunking import (
     VirtualGrid,
-    combine_chunk_meshes,
     generate_hard_chunk_meshes,
     union_hard_chunk_meshes,
 )
@@ -685,6 +684,8 @@ def _run_stl(args: argparse.Namespace) -> None:
                 clip_halos=args.clip_halos,
                 gaussian_sigma=args.gaussian_sigma,
                 nthreads=args.nthreads,
+                overlap_voxels=1,
+                clip_to_bounds=args.chunk_output != "unioned",
             )
             _print_elapsed("Hard chunk mesh generation", mesh_start)
         except ValueError as exc:
@@ -711,13 +712,22 @@ def _run_stl(args: argparse.Namespace) -> None:
             print("Done.")
             return
 
-        if args.chunk_output == "unioned":
-            final_mesh = union_hard_chunk_meshes(chunk_meshes)
-        else:
-            combined_meshes = [
-                mesh for _bounds, meshes in chunk_meshes for mesh in meshes
-            ]
-            final_mesh = combine_chunk_meshes(combined_meshes)
+        print("Regenerating chunk meshes with overlap for watertight union...")
+        union_start = time.perf_counter()
+        chunk_meshes = generate_hard_chunk_meshes(
+            field_data,
+            coords,
+            h,
+            virtual_grid,
+            threshold=final_threshold,
+            preprocess=args.preprocess,
+            clip_halos=args.clip_halos,
+            gaussian_sigma=args.gaussian_sigma,
+            nthreads=args.nthreads,
+            overlap_voxels=1,
+        )
+        _print_elapsed("Overlapped hard chunk generation", union_start)
+        final_mesh = union_hard_chunk_meshes(chunk_meshes)
 
         if args.target_size:
             print(f"Scaling mesh to target size: {args.target_size} cm...")
@@ -752,7 +762,7 @@ def _run_stl(args: argparse.Namespace) -> None:
         return
 
     try:
-        grid, voxel_size, _origin = _load_swift_volume(
+        grid, voxel_size, origin = _load_swift_volume(
             filename=args.filename,
             particle_type=args.particle_type,
             field=args.field,
@@ -813,6 +823,8 @@ def _run_stl(args: argparse.Namespace) -> None:
         print(f"Merging {len(meshes)} mesh components...")
         combined = trimesh.util.concatenate([m.to_trimesh() for m in meshes])
         final_mesh = Mesh(mesh=combined)
+
+    final_mesh.translate(origin)
 
     if args.target_size:
         print(f"Scaling mesh to target size: {args.target_size} cm...")
@@ -1022,11 +1034,11 @@ def _build_parser() -> argparse.ArgumentParser:
     stl.add_argument(
         "--chunk-output",
         type=str,
-        choices=["combined", "separate", "unioned"],
-        default="combined",
+        choices=["separate", "unioned"],
+        default="unioned",
         help=(
-            "When chunking is enabled, either write one combined STL or one "
-            "STL per chunk. Default: combined"
+            "When chunking is enabled, either write one STL per chunk or a "
+            "single watertight unioned STL. Default: unioned"
         ),
     )
     stl.add_argument(

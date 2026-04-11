@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -85,8 +86,11 @@ class HardChunkBounds:
     """Hard chunk bounds in voxel/sample and world coordinates."""
 
     index: tuple[int, int, int]
+    nchunks: int
     sample_start: np.ndarray
     sample_stop: np.ndarray
+    local_start: np.ndarray
+    local_stop: np.ndarray
     world_start: np.ndarray
     world_stop: np.ndarray
 
@@ -99,6 +103,31 @@ class HardChunkBounds:
     def extent(self) -> np.ndarray:
         """Chunk world-space side lengths."""
         return self.world_stop - self.world_start
+
+    @property
+    def sample_voxel_size(self) -> np.ndarray:
+        """Per-axis voxel size implied by the sample-grid span."""
+        return self.extent / np.asarray(self.shape, dtype=np.float64)
+
+    @property
+    def hard_local_start(self) -> np.ndarray:
+        """Owned hard-boundary start in local coordinates."""
+        return self.local_start
+
+    @property
+    def hard_local_stop(self) -> np.ndarray:
+        """Owned hard-boundary stop in local coordinates."""
+        return self.local_stop - self.sample_voxel_size
+
+    @property
+    def hard_world_start(self) -> np.ndarray:
+        """Owned hard-boundary start in world coordinates."""
+        return self.world_start
+
+    @property
+    def hard_world_stop(self) -> np.ndarray:
+        """Owned hard-boundary stop in world coordinates."""
+        return self.world_stop - self.sample_voxel_size
 
 
 @dataclass(frozen=True)
@@ -192,14 +221,17 @@ def chunk_world_bounds(grid: VirtualGrid, chunk: Chunk) -> HardChunkBounds:
         [chunk.x.sample_stop, chunk.y.sample_stop, chunk.z.sample_stop],
         dtype=np.int64,
     )
-    world_start = (
-        grid.origin + sample_start.astype(np.float64) * grid.voxel_size
-    )
+    local_start = sample_start.astype(np.float64) * grid.voxel_size
+    local_stop = sample_stop.astype(np.float64) * grid.voxel_size
+    world_start = grid.origin + local_start
     world_stop = grid.origin + sample_stop.astype(np.float64) * grid.voxel_size
     return HardChunkBounds(
         index=chunk.index,
+        nchunks=grid.nchunks,
         sample_start=sample_start,
         sample_stop=sample_stop,
+        local_start=local_start,
+        local_stop=local_stop,
         world_start=world_start,
         world_stop=world_stop,
     )
@@ -209,6 +241,61 @@ def iter_hard_chunk_bounds(grid: VirtualGrid) -> Iterator[HardChunkBounds]:
     """Yield all hard chunk bounds for the virtual grid."""
     for chunk in grid.iter_chunks():
         yield chunk_world_bounds(grid, chunk)
+
+
+def expand_hard_chunk_bounds(
+    grid: VirtualGrid,
+    chunk_bounds: HardChunkBounds,
+    *,
+    overlap_voxels: int,
+) -> HardChunkBounds:
+    """Expand a hard chunk by a small voxel overlap on interior faces only."""
+    if overlap_voxels < 0:
+        raise ValueError("overlap_voxels must be >= 0")
+    if overlap_voxels == 0:
+        return chunk_bounds
+
+    sample_start = chunk_bounds.sample_start.copy()
+    sample_stop = chunk_bounds.sample_stop.copy()
+
+    for axis in range(3):
+        if chunk_bounds.index[axis] > 0:
+            sample_start[axis] = max(0, sample_start[axis] - overlap_voxels)
+        if chunk_bounds.index[axis] < grid.nchunks - 1:
+            sample_stop[axis] = min(
+                grid.resolution,
+                sample_stop[axis] + overlap_voxels,
+            )
+
+    local_start = sample_start.astype(np.float64) * grid.voxel_size
+    local_stop = sample_stop.astype(np.float64) * grid.voxel_size
+    world_start = grid.origin + local_start
+    world_stop = grid.origin + local_stop
+    return HardChunkBounds(
+        index=chunk_bounds.index,
+        nchunks=grid.nchunks,
+        sample_start=sample_start,
+        sample_stop=sample_stop,
+        local_start=local_start,
+        local_stop=local_stop,
+        world_start=world_start,
+        world_stop=world_stop,
+    )
+
+
+def crop_grid_to_chunk_bounds(
+    expanded_grid: np.ndarray,
+    expanded_bounds: HardChunkBounds,
+    target_bounds: HardChunkBounds,
+) -> np.ndarray:
+    """Crop an expanded hard-chunk grid back to the target hard bounds."""
+    start = target_bounds.sample_start - expanded_bounds.sample_start
+    stop = start + (target_bounds.sample_stop - target_bounds.sample_start)
+    return expanded_grid[
+        start[0] : stop[0],
+        start[1] : stop[1],
+        start[2] : stop[2],
+    ]
 
 
 def select_particles_in_hard_chunk(
@@ -227,8 +314,8 @@ def select_particles_in_hard_chunk(
     if coords_arr.ndim != 2 or coords_arr.shape[1] != 3:
         raise ValueError("coordinates must have shape (N, 3)")
 
-    lower = chunk_bounds.world_start
-    upper = chunk_bounds.world_stop
+    lower = chunk_bounds.hard_local_start
+    upper = chunk_bounds.hard_local_stop
 
     if smoothing_lengths is None:
         mask = np.all(coords_arr >= lower, axis=1) & np.all(
@@ -272,19 +359,50 @@ def voxelize_hard_chunk(
     if resolution <= 0:
         raise ValueError("chunk resolution must be > 0")
 
-    local_coords = coords_arr - chunk_bounds.world_start
+    local_coords = coords_arr - chunk_bounds.local_start
     local_box_size = float(chunk_bounds.extent[0])
-
-    from .voxels import generate_voxel_grid
-
-    return generate_voxel_grid(
-        data=data_arr,
-        coordinates=local_coords,
-        resolution=resolution,
-        smoothing_lengths=smoothing_lengths,
-        box_size=local_box_size,
-        nthreads=nthreads,
+    voxel_size = local_box_size / resolution
+    local_grid = np.zeros(
+        (resolution, resolution, resolution), dtype=np.float64
     )
+
+    scaled = local_coords / local_box_size * resolution
+    vox_indices = np.floor(scaled).astype(np.int64)
+
+    if smoothing_lengths is None:
+        vox_indices = np.clip(vox_indices, 0, resolution - 1)
+        np.add.at(
+            local_grid,
+            (vox_indices[:, 0], vox_indices[:, 1], vox_indices[:, 2]),
+            data_arr,
+        )
+        return local_grid, voxel_size
+
+    if _voxelize is None:
+        raise RuntimeError(
+            "Chunk-local smoothing requires the _voxelize C extension."
+        )
+
+    smoothing_arr = np.asarray(smoothing_lengths, dtype=np.float64)
+    if smoothing_arr.shape != (coords_arr.shape[0],):
+        raise ValueError("smoothing_lengths must have shape (N,)")
+
+    if voxel_size > 0:
+        smoothing_lengths_vox = (smoothing_arr / voxel_size).astype(np.int64)
+    else:
+        smoothing_lengths_vox = np.zeros_like(smoothing_arr, dtype=np.int64)
+
+    _voxelize.box_deposition_local(
+        local_grid,
+        data_arr.astype(np.float64),
+        vox_indices.astype(np.int64),
+        smoothing_lengths_vox,
+        resolution,
+        resolution,
+        resolution,
+        int(nthreads),
+    )
+    return local_grid, voxel_size
 
 
 def mesh_hard_chunk_sdf(
@@ -300,18 +418,45 @@ def mesh_hard_chunk_sdf(
     origin.
     """
     voxel_size = float(chunk_bounds.extent[0] / chunk_bounds.shape[0])
-    meshes = voxels_to_stl_via_sdf(
-        chunk_grid,
-        threshold=threshold,
-        closing_radius=closing_radius,
-        split_islands=True,
-        voxel_size=voxel_size,
-    )
+    try:
+        meshes = voxels_to_stl_via_sdf(
+            chunk_grid,
+            threshold=threshold,
+            closing_radius=closing_radius,
+            split_islands=True,
+            voxel_size=voxel_size,
+        )
+    except ValueError as exc:
+        if "No meshes created via SDF" in str(exc):
+            return []
+        raise
 
     world_origin = chunk_bounds.world_start
     for mesh in meshes:
         mesh.vertices[:] = mesh.vertices + world_origin
     return meshes
+
+
+def clip_mesh_to_hard_chunk(mesh: Mesh, chunk_bounds: HardChunkBounds) -> Mesh:
+    """Clip a mesh to the exact hard chunk box and cap the cut faces."""
+    extents = chunk_bounds.hard_world_stop - chunk_bounds.hard_world_start
+    center = 0.5 * (
+        chunk_bounds.hard_world_start + chunk_bounds.hard_world_stop
+    )
+    box = trimesh.creation.box(extents=extents)
+    box.apply_translation(center)
+
+    clipped = trimesh.boolean.intersection(
+        [mesh.to_trimesh(), box],
+        engine="blender",
+        check_volume=True,
+    )
+    if clipped is None or len(clipped.faces) == 0:
+        raise ValueError("Chunk clipping removed all mesh geometry")
+
+    clipped.process()
+    clipped.fix_normals()
+    return Mesh(mesh=clipped)
 
 
 def generate_hard_chunk_meshes(
@@ -325,6 +470,8 @@ def generate_hard_chunk_meshes(
     clip_halos: float | None,
     gaussian_sigma: float,
     nthreads: int = 1,
+    overlap_voxels: int = 0,
+    clip_to_bounds: bool = False,
 ) -> list[tuple[HardChunkBounds, list[Mesh]]]:
     """Generate watertight meshes for each hard chunk independently."""
     total_start = time.perf_counter()
@@ -345,10 +492,18 @@ def generate_hard_chunk_meshes(
     preprocess_total = 0.0
     meshing_total = 0.0
     for chunk_bounds in iter_hard_chunk_bounds(grid):
+        halo_voxels = (
+            chunk_halo_voxels(gaussian_sigma) if gaussian_sigma > 0 else 0
+        )
+        effective_bounds = expand_hard_chunk_bounds(
+            grid,
+            chunk_bounds,
+            overlap_voxels=overlap_voxels + halo_voxels,
+        )
         chunk_start = time.perf_counter()
         particle_indices = select_particles_in_hard_chunk(
             coords_arr,
-            chunk_bounds,
+            effective_bounds,
             smoothing_lengths=smoothing_arr,
         )
         if particle_indices.size == 0:
@@ -358,7 +513,7 @@ def generate_hard_chunk_meshes(
         chunk_grid, _voxel_size = voxelize_hard_chunk(
             data_arr[particle_indices],
             coords_arr[particle_indices],
-            chunk_bounds,
+            effective_bounds,
             smoothing_lengths=(
                 None
                 if smoothing_arr is None
@@ -375,14 +530,33 @@ def generate_hard_chunk_meshes(
             clip_halos=clip_halos,
             gaussian_sigma=gaussian_sigma,
         )
+        if halo_voxels > 0:
+            chunk_grid = crop_grid_to_chunk_bounds(
+                chunk_grid,
+                effective_bounds,
+                expand_hard_chunk_bounds(
+                    grid,
+                    chunk_bounds,
+                    overlap_voxels=overlap_voxels,
+                ),
+            )
+            effective_bounds = expand_hard_chunk_bounds(
+                grid,
+                chunk_bounds,
+                overlap_voxels=overlap_voxels,
+            )
         preprocess_total += time.perf_counter() - preprocess_start
 
         meshing_start = time.perf_counter()
         meshes = mesh_hard_chunk_sdf(
             chunk_grid,
-            chunk_bounds,
+            effective_bounds,
             threshold=threshold,
         )
+        if clip_to_bounds:
+            meshes = [
+                clip_mesh_to_hard_chunk(mesh, chunk_bounds) for mesh in meshes
+            ]
         meshing_total += time.perf_counter() - meshing_start
         if meshes:
             chunk_meshes.append((chunk_bounds, meshes))
@@ -404,26 +578,206 @@ def generate_hard_chunk_meshes(
 def union_hard_chunk_meshes(
     chunk_meshes: list[tuple[HardChunkBounds, list[Mesh]]],
 ) -> Mesh:
-    """Boolean-union hard chunk meshes into a single solid mesh."""
+    """Assemble overlapped hard chunk meshes into one watertight solid."""
     if not chunk_meshes:
         raise ValueError("No chunk meshes to union")
 
-    trimesh_meshes = [
-        mesh.to_trimesh()
-        for _bounds, meshes in chunk_meshes
-        for mesh in meshes
-    ]
-    if len(trimesh_meshes) == 1:
-        return Mesh(mesh=trimesh_meshes[0].copy())
+    assembled_parts: list[trimesh.Trimesh] = []
+    for bounds, meshes in chunk_meshes:
+        for mesh in meshes:
+            trimesh_mesh = mesh.to_trimesh().copy()
+            centroids = trimesh_mesh.triangles_center
+            keep = np.ones(len(trimesh_mesh.faces), dtype=bool)
+            for axis in range(3):
+                lower = bounds.hard_world_start[axis]
+                upper = bounds.hard_world_stop[axis]
+                if bounds.index[axis] == bounds.nchunks - 1:
+                    axis_keep = (centroids[:, axis] >= lower - 1e-8) & (
+                        centroids[:, axis] <= upper + 1e-8
+                    )
+                else:
+                    axis_keep = (centroids[:, axis] >= lower - 1e-8) & (
+                        centroids[:, axis] < upper - 1e-8
+                    )
+                keep &= axis_keep
 
-    unioned = trimesh.boolean.union(
-        trimesh_meshes,
-        engine="blender",
-        check_volume=True,
-    )
-    unioned.process()
+            if not np.any(keep):
+                continue
+            trimesh_mesh.update_faces(keep)
+            trimesh_mesh.remove_unreferenced_vertices()
+            assembled_parts.append(trimesh_mesh)
+
+    if not assembled_parts:
+        raise ValueError("No chunk geometry remained after seam ownership")
+
+    unioned = trimesh.util.concatenate(assembled_parts)
+    unioned.merge_vertices()
+    unioned.update_faces(unioned.unique_faces())
+    unioned.update_faces(unioned.nondegenerate_faces())
+    unioned.remove_unreferenced_vertices()
+    unioned = _cap_planar_boundary_loops(unioned)
     unioned.fix_normals()
     return Mesh(mesh=unioned)
+
+
+def _mesh_boundary_loops(mesh: trimesh.Trimesh) -> list[list[int]]:
+    """Return boundary vertex loops for a mesh with open boundaries."""
+    edge_counts: Counter[tuple[int, int]] = Counter()
+    for tri in mesh.faces:
+        a, b, c = tri
+        edge_counts[tuple(sorted((a, b)))] += 1
+        edge_counts[tuple(sorted((b, c)))] += 1
+        edge_counts[tuple(sorted((a, c)))] += 1
+
+    boundary_edges = [
+        edge for edge, count in edge_counts.items() if count == 1
+    ]
+    if not boundary_edges:
+        return []
+
+    adjacency: defaultdict[int, list[int]] = defaultdict(list)
+    for a, b in boundary_edges:
+        adjacency[a].append(b)
+        adjacency[b].append(a)
+
+    loops: list[list[int]] = []
+    visited_vertices: set[int] = set()
+    for start in list(adjacency):
+        if start in visited_vertices:
+            continue
+
+        loop = [start]
+        visited_vertices.add(start)
+        prev = None
+        cur = start
+        while True:
+            next_vertices = [v for v in adjacency[cur] if v != prev]
+            if not next_vertices:
+                raise ValueError("Encountered open boundary chain")
+            nxt = next_vertices[0]
+            if nxt == start:
+                break
+            if nxt in visited_vertices:
+                raise ValueError("Boundary graph is not a simple loop")
+            loop.append(nxt)
+            visited_vertices.add(nxt)
+            prev, cur = cur, nxt
+        loops.append(loop)
+    return loops
+
+
+def _polygon_area_2d(points: np.ndarray) -> float:
+    """Return the signed area of a 2D polygon."""
+    x = points[:, 0]
+    y = points[:, 1]
+    return 0.5 * np.sum(x * np.roll(y, -1) - y * np.roll(x, -1))
+
+
+def _point_in_triangle_2d(
+    point: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+    c: np.ndarray,
+) -> bool:
+    """Return True if a 2D point lies inside or on a triangle."""
+
+    def _sign(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
+        return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (
+            p1[1] - p3[1]
+        )
+
+    d1 = _sign(point, a, b)
+    d2 = _sign(point, b, c)
+    d3 = _sign(point, c, a)
+    has_neg = (d1 < -1e-12) or (d2 < -1e-12) or (d3 < -1e-12)
+    has_pos = (d1 > 1e-12) or (d2 > 1e-12) or (d3 > 1e-12)
+    return not (has_neg and has_pos)
+
+
+def _triangulate_loop(
+    loop: list[int], vertices: np.ndarray
+) -> list[list[int]]:
+    """Triangulate one small planar boundary loop with ear clipping."""
+    points = vertices[loop]
+    spans = points.max(axis=0) - points.min(axis=0)
+    flat_axis = int(np.argmin(spans))
+    planar = points[:, [axis for axis in range(3) if axis != flat_axis]]
+
+    indices = list(range(len(loop)))
+    ccw = _polygon_area_2d(planar) > 0
+    faces: list[list[int]] = []
+    guard = 0
+    while len(indices) > 3 and guard < 1000:
+        guard += 1
+        clipped = False
+        n = len(indices)
+        for i in range(n):
+            ia = indices[(i - 1) % n]
+            ib = indices[i]
+            ic = indices[(i + 1) % n]
+            a = planar[ia]
+            b = planar[ib]
+            c = planar[ic]
+            cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (
+                c[0] - a[0]
+            )
+            if (ccw and cross <= 1e-12) or ((not ccw) and cross >= -1e-12):
+                continue
+            if any(
+                _point_in_triangle_2d(planar[j], a, b, c)
+                for j in indices
+                if j not in (ia, ib, ic)
+            ):
+                continue
+
+            if ccw:
+                faces.append([loop[ia], loop[ib], loop[ic]])
+            else:
+                faces.append([loop[ia], loop[ic], loop[ib]])
+            indices.pop(i)
+            clipped = True
+            break
+        if not clipped:
+            raise ValueError("Failed to triangulate seam loop")
+
+    if len(indices) == 3:
+        if ccw:
+            faces.append(
+                [loop[indices[0]], loop[indices[1]], loop[indices[2]]]
+            )
+        else:
+            faces.append(
+                [loop[indices[0]], loop[indices[2]], loop[indices[1]]]
+            )
+    return faces
+
+
+def _cap_planar_boundary_loops(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Cap small planar seam loops left after chunk assembly."""
+    loops = _mesh_boundary_loops(mesh)
+    if not loops:
+        return mesh
+
+    cap_faces: list[list[int]] = []
+    for loop in loops:
+        points = mesh.vertices[loop]
+        spans = points.max(axis=0) - points.min(axis=0)
+        # Only patch tiny seam holes introduced by chunk assembly. Leave other
+        # open boundaries untouched instead of guessing.
+        if np.min(spans) > 1e-8 or len(loop) > 32:
+            return mesh
+        cap_faces.extend(_triangulate_loop(loop, mesh.vertices))
+
+    capped = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=np.vstack([mesh.faces, np.asarray(cap_faces, dtype=np.int64)]),
+        process=False,
+    )
+    capped.merge_vertices()
+    capped.update_faces(capped.unique_faces())
+    capped.update_faces(capped.nondegenerate_faces())
+    capped.remove_unreferenced_vertices()
+    return capped
 
 
 def generate_chunk_grid(
@@ -731,18 +1085,14 @@ def chunk_sdf_to_mesh(
 
 
 def combine_chunk_meshes(meshes: list[Mesh]) -> Mesh:
-    """Combine chunk mesh fragments into one mesh."""
+    """Combine chunk mesh fragments into one assembled multi-body mesh."""
     if not meshes:
         raise ValueError("No chunk meshes to combine")
     if len(meshes) == 1:
         return meshes[0]
 
     combined = trimesh.util.concatenate([m.to_trimesh() for m in meshes])
-    merged = Mesh(mesh=combined)
-    merged.to_trimesh().merge_vertices()
-    merged.to_trimesh().process()
-    merged.to_trimesh().fix_normals()
-    return merged
+    return Mesh(mesh=combined)
 
 
 def keep_largest_mesh_component(mesh: Mesh) -> Mesh:

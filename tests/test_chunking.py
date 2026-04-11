@@ -10,7 +10,10 @@ from meshmerizer.chunking import (
     chunk_samples,
     chunk_sdf_to_mesh,
     chunk_world_bounds,
+    clip_mesh_to_hard_chunk,
     combine_chunk_meshes,
+    crop_grid_to_chunk_bounds,
+    expand_hard_chunk_bounds,
     generate_chunk_grid,
     generate_chunked_mesh,
     generate_hard_chunk_meshes,
@@ -138,6 +141,14 @@ def test_chunk_world_bounds_match_sample_ranges() -> None:
     np.testing.assert_array_equal(bounds.sample_start, np.array([4, 0, 0]))
     np.testing.assert_array_equal(bounds.sample_stop, np.array([9, 5, 5]))
     np.testing.assert_allclose(
+        bounds.local_start,
+        np.array([4, 0, 0]) * grid.voxel_size,
+    )
+    np.testing.assert_allclose(
+        bounds.local_stop,
+        np.array([9, 5, 5]) * grid.voxel_size,
+    )
+    np.testing.assert_allclose(
         bounds.world_start,
         np.array([5.0, 6.0, 7.0]) + np.array([4, 0, 0]) * grid.voxel_size,
     )
@@ -242,6 +253,24 @@ def test_voxelize_hard_chunk_uses_local_chunk_bounds() -> None:
     assert np.isclose(chunk_grid.sum(), data.sum())
 
 
+def test_crop_grid_to_chunk_bounds_restores_target_shape() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    target = next(
+        b for b in iter_hard_chunk_bounds(grid) if b.index == (0, 0, 0)
+    )
+    expanded = expand_hard_chunk_bounds(grid, target, overlap_voxels=1)
+    expanded_grid = np.zeros(expanded.shape, dtype=float)
+
+    cropped = crop_grid_to_chunk_bounds(expanded_grid, expanded, target)
+
+    assert cropped.shape == target.shape
+
+
 def test_mesh_hard_chunk_sdf_places_mesh_in_world_space() -> None:
     grid = VirtualGrid(
         origin=np.array([10.0, 20.0, 30.0]),
@@ -262,6 +291,82 @@ def test_mesh_hard_chunk_sdf_places_mesh_in_world_space() -> None:
     assert trimesh_mesh.is_watertight
     assert np.all(trimesh_mesh.bounds[0] >= bounds.world_start)
     assert np.all(trimesh_mesh.bounds[1] <= bounds.world_stop + 1e-8)
+
+
+def test_clip_mesh_to_hard_chunk_enforces_exact_bounds() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    bounds = next(
+        b for b in iter_hard_chunk_bounds(grid) if b.index == (0, 0, 0)
+    )
+    raw = Mesh(mesh=trimesh.creation.box(extents=(0.8, 0.8, 0.8)))
+    raw.vertices[:] = raw.vertices + np.array([0.4, 0.4, 0.4])
+
+    clipped = clip_mesh_to_hard_chunk(raw, bounds).to_trimesh()
+
+    assert clipped.is_watertight
+    assert np.all(clipped.bounds[0] >= bounds.hard_world_start - 1e-8)
+    assert np.all(clipped.bounds[1] <= bounds.hard_world_stop + 1e-8)
+
+
+def test_clipped_overlap_chunk_reaches_owned_boundary() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=16,
+        nchunks=2,
+    )
+    coords = np.array(
+        [
+            [(i + 0.5) / 16.0, (j + 0.5) / 16.0, (k + 0.5) / 16.0]
+            for i in range(4, 12)
+            for j in range(4, 12)
+            for k in range(4, 12)
+        ],
+        dtype=np.float64,
+    )
+    data = np.ones(coords.shape[0], dtype=np.float64)
+
+    chunk_meshes = generate_hard_chunk_meshes(
+        data,
+        coords,
+        None,
+        grid,
+        threshold=0.5,
+        preprocess="none",
+        clip_halos=None,
+        gaussian_sigma=0.0,
+        overlap_voxels=1,
+        clip_to_bounds=True,
+    )
+
+    bounds, meshes = next(
+        (b, meshes) for b, meshes in chunk_meshes if b.index == (1, 0, 0)
+    )
+    clipped = meshes[0].to_trimesh()
+
+    assert np.isclose(clipped.bounds[0, 0], bounds.hard_world_start[0])
+
+
+def test_mesh_hard_chunk_sdf_returns_empty_for_empty_chunk() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    bounds = next(
+        b for b in iter_hard_chunk_bounds(grid) if b.index == (0, 0, 0)
+    )
+    chunk_grid = np.zeros(bounds.shape, dtype=float)
+
+    meshes = mesh_hard_chunk_sdf(chunk_grid, bounds, threshold=0.5)
+
+    assert meshes == []
 
 
 def test_generate_hard_chunk_meshes_returns_chunk_mesh_pairs() -> None:
@@ -328,24 +433,99 @@ def test_union_hard_chunk_meshes_is_watertight_for_split_volume() -> None:
         resolution=16,
         nchunks=2,
     )
-    chunk_meshes = []
-    for bounds in iter_hard_chunk_bounds(grid):
-        chunk_grid = np.zeros(bounds.shape, dtype=float)
-        x0 = max(0, 4 - bounds.sample_start[0])
-        x1 = min(bounds.shape[0], 12 - bounds.sample_start[0])
-        y0 = max(0, 4 - bounds.sample_start[1])
-        y1 = min(bounds.shape[1], 12 - bounds.sample_start[1])
-        z0 = max(0, 4 - bounds.sample_start[2])
-        z1 = min(bounds.shape[2], 12 - bounds.sample_start[2])
-        if x0 < x1 and y0 < y1 and z0 < z1:
-            chunk_grid[x0:x1, y0:y1, z0:z1] = 1.0
-        meshes = mesh_hard_chunk_sdf(chunk_grid, bounds, threshold=0.5)
-        if meshes:
-            chunk_meshes.append((bounds, meshes))
+    coords = np.array(
+        [
+            [(i + 0.5) / 16.0, (j + 0.5) / 16.0, (k + 0.5) / 16.0]
+            for i in range(4, 12)
+            for j in range(4, 12)
+            for k in range(4, 12)
+        ],
+        dtype=np.float64,
+    )
+    data = np.ones(coords.shape[0], dtype=np.float64)
+    chunk_meshes = generate_hard_chunk_meshes(
+        data,
+        coords,
+        None,
+        grid,
+        threshold=0.5,
+        preprocess="none",
+        clip_halos=None,
+        gaussian_sigma=0.0,
+        overlap_voxels=1,
+    )
 
     combined = union_hard_chunk_meshes(chunk_meshes).to_trimesh()
 
     assert combined.is_watertight
+
+
+def test_union_hard_chunk_meshes_is_watertight_after_seam_ownership() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=16,
+        nchunks=2,
+    )
+    coords = np.array(
+        [
+            [(i + 0.5) / 16.0, (j + 0.5) / 16.0, (k + 0.5) / 16.0]
+            for i in range(4, 12)
+            for j in range(4, 12)
+            for k in range(4, 12)
+        ],
+        dtype=np.float64,
+    )
+    data = np.ones(coords.shape[0], dtype=np.float64)
+
+    chunk_meshes = generate_hard_chunk_meshes(
+        data,
+        coords,
+        None,
+        grid,
+        threshold=0.5,
+        preprocess="none",
+        clip_halos=None,
+        gaussian_sigma=0.0,
+        overlap_voxels=1,
+    )
+    combined = union_hard_chunk_meshes(chunk_meshes).to_trimesh()
+
+    assert combined.is_watertight
+    assert len(combined.split(only_watertight=False)) == 1
+
+
+def test_generate_hard_chunk_meshes_with_overlap_returns_meshes() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=16,
+        nchunks=2,
+    )
+    coords = np.array(
+        [
+            [(i + 0.5) / 16.0, (j + 0.5) / 16.0, (k + 0.5) / 16.0]
+            for i in range(4, 12)
+            for j in range(4, 12)
+            for k in range(4, 12)
+        ],
+        dtype=np.float64,
+    )
+    data = np.ones(coords.shape[0], dtype=np.float64)
+
+    chunk_meshes = generate_hard_chunk_meshes(
+        data,
+        coords,
+        None,
+        grid,
+        threshold=0.5,
+        preprocess="none",
+        clip_halos=None,
+        gaussian_sigma=0.0,
+        overlap_voxels=1,
+    )
+
+    assert chunk_meshes
 
 
 def test_generate_chunk_grid_matches_full_grid_owned_region() -> None:

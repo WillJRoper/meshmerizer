@@ -5,6 +5,7 @@ import pytest
 import trimesh
 
 from meshmerizer.cli import _build_parser, _run_stl
+from meshmerizer.chunking import HardChunkBounds
 from meshmerizer.mesh import Mesh, voxels_to_stl, voxels_to_stl_via_sdf
 from meshmerizer.voxels import generate_voxel_grid, process_gaussian_smoothing
 
@@ -428,6 +429,8 @@ def test_run_stl_uses_chunked_mesh_path(monkeypatch, tmp_path):
             "snapshot.hdf5",
             "--nchunks",
             "2",
+            "--chunk-output",
+            "unioned",
             "--output",
             str(out_path),
         ]
@@ -444,6 +447,17 @@ def test_run_stl_uses_chunked_mesh_path(monkeypatch, tmp_path):
             np.zeros(3),
         )
 
+    bounds = HardChunkBounds(
+        index=(0, 0, 0),
+        nchunks=1,
+        sample_start=np.array([0, 0, 0]),
+        sample_stop=np.array([2, 2, 2]),
+        local_start=np.array([0.0, 0.0, 0.0]),
+        local_stop=np.array([1.0, 1.0, 1.0]),
+        world_start=np.array([0.0, 0.0, 0.0]),
+        world_stop=np.array([1.0, 1.0, 1.0]),
+    )
+
     def fake_generate_hard_chunk_meshes(*_args, **_kwargs):
         called["chunked"] = True
         mesh = Mesh(
@@ -456,7 +470,7 @@ def test_run_stl_uses_chunked_mesh_path(monkeypatch, tmp_path):
             ),
             faces=np.array([[0, 1, 2]]),
         )
-        return [(object(), [mesh])]
+        return [(bounds, [mesh])]
 
     monkeypatch.setattr(
         "meshmerizer.cli._load_swift_particles", fake_load_particles
