@@ -495,6 +495,59 @@ def test_union_hard_chunk_meshes_is_watertight_after_seam_ownership() -> None:
     assert len(combined.split(only_watertight=False)) == 1
 
 
+def test_generate_hard_chunk_meshes_parallel_matches_serial() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=16,
+        nchunks=2,
+    )
+    coords = np.array(
+        [
+            [(i + 0.5) / 16.0, (j + 0.5) / 16.0, (k + 0.5) / 16.0]
+            for i in range(4, 12)
+            for j in range(4, 12)
+            for k in range(4, 12)
+        ],
+        dtype=np.float64,
+    )
+    data = np.ones(coords.shape[0], dtype=np.float64)
+
+    serial = generate_hard_chunk_meshes(
+        data,
+        coords,
+        None,
+        grid,
+        threshold=0.5,
+        preprocess="none",
+        clip_halos=None,
+        gaussian_sigma=0.0,
+        nthreads=1,
+        overlap_voxels=1,
+        clip_to_bounds=True,
+    )
+    parallel = generate_hard_chunk_meshes(
+        data,
+        coords,
+        None,
+        grid,
+        threshold=0.5,
+        preprocess="none",
+        clip_halos=None,
+        gaussian_sigma=0.0,
+        nthreads=2,
+        overlap_voxels=1,
+        clip_to_bounds=True,
+    )
+
+    assert [bounds.index for bounds, _ in serial] == [
+        bounds.index for bounds, _ in parallel
+    ]
+    assert [len(meshes) for _, meshes in serial] == [
+        len(meshes) for _, meshes in parallel
+    ]
+
+
 def test_generate_hard_chunk_meshes_with_overlap_returns_meshes() -> None:
     grid = VirtualGrid(
         origin=np.zeros(3),

@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -728,6 +729,9 @@ def generate_hard_chunk_meshes(
 
     Returns:
         List of ``(bounds, meshes)`` pairs for non-empty chunks.
+
+    Raises:
+        ValueError: If the input array shapes or thread count are invalid.
     """
     total_start = time.perf_counter()
     pass_label = "Chunk pass"
@@ -744,27 +748,32 @@ def generate_hard_chunk_meshes(
         smoothing_arr = np.asarray(smoothing_lengths, dtype=np.float64)
         if smoothing_arr.shape != (coords_arr.shape[0],):
             raise ValueError("smoothing_lengths must have shape (N,)")
+    if nthreads < 1:
+        raise ValueError("nthreads must be >= 1")
 
-    chunk_meshes: list[tuple[HardChunkBounds, list[Mesh]]] = []
-    voxelize_total = 0.0
-    preprocess_total = 0.0
-    meshing_total = 0.0
-    processed_chunks = 0
-    nonempty_chunks = 0
-    emitted_meshes = 0
-    # Process chunks independently so the path stays low-memory and parallel
-    # friendly.
-    for chunk_bounds in iter_hard_chunk_bounds(grid):
-        processed_chunks += 1
-        halo_voxels = (
-            chunk_halo_voxels(gaussian_sigma) if gaussian_sigma > 0 else 0
-        )
+    halo_voxels = (
+        chunk_halo_voxels(gaussian_sigma) if gaussian_sigma > 0 else 0
+    )
+
+    def _process_chunk(
+        chunk_bounds: HardChunkBounds,
+    ) -> dict[str, object] | None:
+        """Process one hard chunk and return its timing/result summary.
+
+        Args:
+            chunk_bounds: Chunk bounds to process.
+
+        Returns:
+            Summary dictionary for the processed chunk, or ``None`` if the
+            chunk has no contributing particles.
+        """
         effective_bounds = expand_hard_chunk_bounds(
             grid,
             chunk_bounds,
             overlap_voxels=overlap_voxels + halo_voxels,
         )
         chunk_start = time.perf_counter()
+
         # Select only the particles that influence this chunk's effective
         # support region before any local voxelization work.
         particle_indices = select_particles_in_hard_chunk(
@@ -773,11 +782,16 @@ def generate_hard_chunk_meshes(
             smoothing_lengths=smoothing_arr,
         )
         if particle_indices.size == 0:
-            print(
-                f"{pass_label:>10} {chunk_bounds.index}: "
-                "0 particles -> skipped"
-            )
-            continue
+            return {
+                "bounds": chunk_bounds,
+                "particles": 0,
+                "meshes": [],
+                "voxelize_time": 0.0,
+                "preprocess_time": 0.0,
+                "meshing_time": 0.0,
+                "elapsed": time.perf_counter() - chunk_start,
+                "status": "skipped",
+            }
 
         voxelize_start = time.perf_counter()
         chunk_grid, _voxel_size = voxelize_hard_chunk(
@@ -791,7 +805,7 @@ def generate_hard_chunk_meshes(
             ),
             nthreads=nthreads,
         )
-        voxelize_total += time.perf_counter() - voxelize_start
+        voxelize_time = time.perf_counter() - voxelize_start
 
         preprocess_start = time.perf_counter()
         chunk_grid = preprocess_chunk_grid(
@@ -817,7 +831,7 @@ def generate_hard_chunk_meshes(
                 chunk_bounds,
                 overlap_voxels=overlap_voxels,
             )
-        preprocess_total += time.perf_counter() - preprocess_start
+        preprocess_time = time.perf_counter() - preprocess_start
 
         meshing_start = time.perf_counter()
         # Extract meshes only after chunk-local preprocessing is complete.
@@ -830,21 +844,70 @@ def generate_hard_chunk_meshes(
             meshes = [
                 clip_mesh_to_hard_chunk(mesh, chunk_bounds) for mesh in meshes
             ]
-        meshing_total += time.perf_counter() - meshing_start
+        meshing_time = time.perf_counter() - meshing_start
+
+        status = "meshed" if meshes else "empty"
+        return {
+            "bounds": chunk_bounds,
+            "particles": int(particle_indices.size),
+            "meshes": meshes,
+            "voxelize_time": voxelize_time,
+            "preprocess_time": preprocess_time,
+            "meshing_time": meshing_time,
+            "elapsed": time.perf_counter() - chunk_start,
+            "status": status,
+        }
+
+    chunk_meshes: list[tuple[HardChunkBounds, list[Mesh]]] = []
+    voxelize_total = 0.0
+    preprocess_total = 0.0
+    meshing_total = 0.0
+    processed_chunks = 0
+    nonempty_chunks = 0
+    emitted_meshes = 0
+    all_bounds = list(iter_hard_chunk_bounds(grid))
+    processed_chunks = len(all_bounds)
+
+    # Preserve deterministic output ordering by collecting results in the same
+    # chunk order regardless of whether execution is serial or parallel.
+    if nthreads == 1:
+        results = [_process_chunk(chunk_bounds) for chunk_bounds in all_bounds]
+    else:
+        with ThreadPoolExecutor(max_workers=nthreads) as executor:
+            results = list(executor.map(_process_chunk, all_bounds))
+
+    for result in results:
+        if result is None:
+            continue
+        chunk_bounds = result["bounds"]
+        particle_count = int(result["particles"])
+        meshes = result["meshes"]
+        voxelize_total += float(result["voxelize_time"])
+        preprocess_total += float(result["preprocess_time"])
+        meshing_total += float(result["meshing_time"])
+        elapsed = float(result["elapsed"])
+        status = str(result["status"])
+
+        if status == "skipped":
+            print(
+                f"{pass_label:>10} {chunk_bounds.index}: "
+                "0 particles -> skipped"
+            )
+            continue
+
         if meshes:
             chunk_meshes.append((chunk_bounds, meshes))
             nonempty_chunks += 1
             emitted_meshes += len(meshes)
             print(
                 f"{pass_label:>10} {chunk_bounds.index}: "
-                f"{particle_indices.size} particles -> "
-                f"{len(meshes)} mesh(es) in "
-                f"{time.perf_counter() - chunk_start:.3f} s"
+                f"{particle_count} particles -> "
+                f"{len(meshes)} mesh(es) in {elapsed:.3f} s"
             )
         else:
             print(
                 f"{pass_label:>10} {chunk_bounds.index}: "
-                f"{particle_indices.size} particles -> no mesh"
+                f"{particle_count} particles -> no mesh"
             )
 
     print("Chunk summary:")
