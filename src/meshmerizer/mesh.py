@@ -226,6 +226,54 @@ class Mesh:
         self.mesh.process()
         self.mesh.fix_normals()
 
+    def simplify(self, factor: float = 1.0) -> None:
+        """Simplify the mesh by targeting a fraction of the current faces.
+
+        Args:
+            factor: Fraction of faces to keep. ``1.0`` disables
+                simplification.
+
+        Raises:
+            ValueError: If ``factor`` is outside ``(0, 1]``.
+            RuntimeError: If simplification fails or is unavailable.
+        """
+        # Treat a factor of one as an explicit no-op so the caller can pass the
+        # CLI option through without special branching.
+        if not (0.0 < factor <= 1.0):
+            raise ValueError("simplify factor must satisfy 0 < factor <= 1")
+        if factor == 1.0:
+            return
+
+        face_count = len(self.mesh.faces)
+        if face_count < 4:
+            return
+
+        # Convert the requested retention factor into a face budget and avoid
+        # requesting a degenerate mesh from the simplifier.
+        target_faces = max(4, int(round(face_count * factor)))
+        if target_faces >= face_count:
+            return
+
+        try:
+            simplified = self.mesh.simplify_quadric_decimation(
+                face_count=target_faces
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "mesh simplification failed. Install the "
+                "'fast-simplification' package and reinstall meshmerizer. "
+                f"Original error: {exc}"
+            ) from exc
+
+        # Replace the wrapped trimesh only if simplification succeeded and kept
+        # a usable triangle mesh.
+        if simplified is None or len(simplified.faces) == 0:
+            raise RuntimeError("mesh simplification produced no faces")
+        self.mesh = simplified
+        self.mesh.process()
+        _repair_local_broken_faces(self.mesh)
+        self.mesh.fix_normals()
+
     def to_trimesh(self) -> trimesh.Trimesh:
         """Return the underlying trimesh object.
 

@@ -9,6 +9,13 @@ from meshmerizer.cli import _build_parser, _run_stl
 from meshmerizer.mesh import Mesh, voxels_to_stl, voxels_to_stl_via_sdf
 from meshmerizer.voxels import generate_voxel_grid, process_gaussian_smoothing
 
+try:
+    import fast_simplification  # noqa: F401
+
+    HAS_FAST_SIMPLIFICATION = True
+except ImportError:
+    HAS_FAST_SIMPLIFICATION = False
+
 
 # --- Fixtures / Helper Functions ---
 @pytest.fixture
@@ -348,6 +355,20 @@ def test_mesh_subdivide_then_repair_preserves_watertightness():
     assert trimesh_mesh.is_watertight
 
 
+@pytest.mark.skipif(
+    not HAS_FAST_SIMPLIFICATION,
+    reason="fast-simplification is not installed",
+)
+def test_mesh_simplify_reduces_face_count_and_preserves_watertightness():
+    mesh = Mesh(mesh=trimesh.creation.icosphere(subdivisions=3, radius=1.0))
+    original_faces = len(mesh.faces)
+
+    mesh.simplify(0.5)
+
+    assert len(mesh.faces) < original_faces
+    assert mesh.to_trimesh().is_watertight
+
+
 # --- Edge Cases ---
 def test_empty_volume_handling():
     volume = np.zeros((5, 5, 5))
@@ -470,6 +491,33 @@ def test_cli_parses_subdivide_iters():
     )
 
     assert args.subdivide_iters == 1
+
+
+def test_cli_parses_simplify_factor():
+    parser = _build_parser()
+    args = parser.parse_args(
+        ["stl", "snapshot.hdf5", "--simplify-factor", "0.5"]
+    )
+
+    assert args.simplify_factor == 0.5
+
+
+def test_run_stl_rejects_invalid_simplify_factor(monkeypatch, tmp_path):
+    parser = _build_parser()
+    out_path = tmp_path / "invalid_simplify.stl"
+    args = parser.parse_args(
+        [
+            "stl",
+            "snapshot.hdf5",
+            "--simplify-factor",
+            "1.5",
+            "--output",
+            str(out_path),
+        ]
+    )
+
+    with pytest.raises(SystemExit):
+        _run_stl(args)
 
 
 def test_cli_parses_tight_bounds():

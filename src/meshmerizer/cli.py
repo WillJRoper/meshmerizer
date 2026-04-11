@@ -139,8 +139,9 @@ def _add_common_voxel_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=1,
         help=(
-            "Number of threads to use for C-accelerated smoothing "
-            "deposition. Default: 1"
+            "Number of worker threads to use. In chunked runs this controls "
+            "chunk-level parallelism; in unchunked runs it is passed to the "
+            "C-accelerated smoothing deposition. Default: 1"
         ),
     )
     parser.add_argument(
@@ -206,6 +207,15 @@ def _add_common_voxel_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Gaussian smoothing sigma in voxel units to apply to the voxel "
             "grid before thresholding. Default: 0"
+        ),
+    )
+    parser.add_argument(
+        "--simplify-factor",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of mesh faces to keep after extraction. Use 1.0 to "
+            "disable simplification. Default: 1.0"
         ),
     )
 
@@ -856,6 +866,12 @@ def _run_stl(args: argparse.Namespace) -> None:
     if args.nchunks < 1:
         log_status("Meshing", "Error: --nchunks must be >= 1")
         sys.exit(1)
+    if not (0.0 < args.simplify_factor <= 1.0):
+        log_status(
+            "Cleaning",
+            "Error: --simplify-factor must satisfy 0 < factor <= 1",
+        )
+        sys.exit(1)
     if args.nchunks > 1:
         # The chunked path prepares particles once, then either writes
         # per-chunk STLs or assembles a watertight union.
@@ -941,6 +957,13 @@ def _run_stl(args: argparse.Namespace) -> None:
                 for mesh in meshes:
                     chunk_counter += 1
                     chunk_path = output_dir / f"{stem}_{chunk_counter}.stl"
+                    if args.simplify_factor < 1.0:
+                        log_status(
+                            "Cleaning",
+                            "Simplifying chunk mesh "
+                            f"to factor {args.simplify_factor:.3f}...",
+                        )
+                        mesh.simplify(args.simplify_factor)
                     log_status("Saving", f"Saving chunk to {chunk_path}...")
                     mesh.save(str(chunk_path))
             _print_elapsed("Total STL pipeline", run_start)
@@ -998,6 +1021,13 @@ def _run_stl(args: argparse.Namespace) -> None:
 
         # Apply optional post-processing after union so it acts on the final
         # watertight surface rather than on individual chunk fragments.
+        if args.simplify_factor < 1.0:
+            log_status(
+                "Cleaning",
+                "Simplifying final mesh to factor "
+                f"{args.simplify_factor:.3f}...",
+            )
+            final_mesh.simplify(args.simplify_factor)
         if args.target_size:
             log_status(
                 "Cleaning",
@@ -1118,6 +1148,13 @@ def _run_stl(args: argparse.Namespace) -> None:
     # Dense extraction happens in local voxel coordinates, so translate the
     # mesh back into the original world-space frame before saving.
     final_mesh.translate(origin)
+
+    if args.simplify_factor < 1.0:
+        log_status(
+            "Cleaning",
+            f"Simplifying final mesh to factor {args.simplify_factor:.3f}...",
+        )
+        final_mesh.simplify(args.simplify_factor)
 
     if args.target_size:
         log_status(
