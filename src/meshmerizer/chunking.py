@@ -18,6 +18,7 @@ import numpy as np
 import trimesh
 from scipy import ndimage
 from skimage import measure
+from trimesh import repair
 
 try:
     from . import _voxelize
@@ -890,6 +891,9 @@ def union_hard_chunk_meshes(
     unioned.update_faces(unioned.unique_faces())
     unioned.update_faces(unioned.nondegenerate_faces())
     unioned.remove_unreferenced_vertices()
+    # Let trimesh close simple boundary cycles first. This handles more general
+    # seam graphs than the custom planar-loop fallback alone.
+    repair.fill_holes(unioned)
     unioned = _cap_planar_boundary_loops(unioned)
     unioned.fix_normals()
     return Mesh(mesh=unioned)
@@ -1084,7 +1088,16 @@ def _cap_planar_boundary_loops(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     Returns:
         Mesh with eligible seam loops capped.
     """
-    loops = _mesh_boundary_loops(mesh)
+    # If trimesh already managed to close the seam holes, keep the mesh as-is.
+    if mesh.is_watertight:
+        return mesh
+
+    # Only fall back to the custom planar capper for the remaining small seam
+    # holes that trimesh repair did not handle.
+    try:
+        loops = _mesh_boundary_loops(mesh)
+    except ValueError:
+        return mesh
     if not loops:
         return mesh
 
