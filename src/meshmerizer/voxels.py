@@ -1,4 +1,10 @@
-"""A module with functions for voxelization of input point clouds."""
+"""Voxelization and scalar-field preprocessing helpers.
+
+This module converts particle data into dense voxel grids and provides the
+preprocessing operations used before isosurface extraction. It supports both
+plain point deposition and C-accelerated smoothed deposition for SPH-like
+particle data.
+"""
 
 from typing import Optional, Tuple
 
@@ -12,6 +18,8 @@ from swiftsimio.visualisation.volume_render import render_gas
 try:
     from . import _voxelize
 except ImportError:
+    # Keep a soft failure here so non-smoothed workflows can still run even if
+    # the extension was not built.
     _voxelize = None
     print(
         "Warning: _voxelize C extension not found. "
@@ -22,13 +30,18 @@ except ImportError:
 def process_log_scale(grid: np.ndarray) -> np.ndarray:
     """Apply logarithmic scaling to the grid to compress dynamic range.
 
-    Useful for cosmic web visualization where density spans many orders of
-    magnitude.
+    Useful for scalar fields whose values span many orders of magnitude.
+
+    Args:
+        grid: Input scalar field.
+
+    Returns:
+        Log-scaled scalar field.
     """
-    # Avoid log(0) by adding a tiny epsilon relative to the max value
+    # Avoid log(0) by adding a tiny epsilon relative to the field maximum.
     epsilon = 1e-10 * np.max(grid)
     if epsilon == 0:
-        # Handle empty grid
+        # Fall back to an absolute epsilon when the grid is entirely zero.
         epsilon = 1e-10
     return np.log10(grid + epsilon)
 
@@ -46,6 +59,8 @@ def process_remove_halos(
     Returns:
         The grid with peaks clipped.
     """
+    # Clip only the extreme high tail so bright compact structures do not hide
+    # lower-contrast extended features.
     limit = np.percentile(grid, threshold_percentile)
     print(
         f"Clipping halos > {limit:.4e} ({threshold_percentile}th percentile)"
@@ -65,7 +80,12 @@ def process_gaussian_smoothing(
 
     Returns:
         Smoothed grid.
+
+    Raises:
+        ValueError: If ``sigma`` is negative.
     """
+    # Reject negative widths because scipy's Gaussian filter does not interpret
+    # them meaningfully for this workflow.
     if sigma < 0:
         raise ValueError(f"gaussian sigma must be >= 0, got {sigma}")
     if sigma == 0:
@@ -94,16 +114,14 @@ def process_filament_filter(
     -> Walls (Sheets) and Voids are suppressed.
 
     Args:
-        grid (np.ndarray): Input 3D voxel grid (usually density).
-        sigma (float): Smoothing scale for derivative calculation.
-                       Matches the width of filaments to detect (in voxels).
+        grid: Input 3D voxel grid, usually a density-like field.
+        sigma: Smoothing scale for derivative calculation in voxel units.
 
     Returns:
-        np.ndarray: A normalized (0-1) scalar field representing the web
-            skeleton.
+        Normalized scalar field representing the filament-and-halo response.
     """
     print(f"Computing Hessian features (sigma={sigma})...")
-    # Compute Hessian (returns list of gradients)
+    # Compute the Hessian tensor of the scalar field at the requested scale.
     hessian = hessian_matrix(
         grid,
         sigma=sigma,
@@ -111,17 +129,15 @@ def process_filament_filter(
         use_gaussian_derivatives=False,
     )
 
-    # Compute Eigenvalues
-    # Scikit-image sorts values: l1 <= l2 <= l3
-    # For density peaks, eigenvalues are negative.
-    # l1 is the most negative (largest magnitude curvature).
-    # l2 is the second most negative.
+    # Convert the tensor field into ordered eigenvalues. Scikit-image returns
+    # them sorted as l1 <= l2 <= l3.
     eigvals = hessian_matrix_eigvals(hessian)
 
-    # Use |l2| to target filaments + halos, ignoring sheets.
+    # Use |l2| to keep filamentary and halo-like structures while suppressing
+    # sheet-like features.
     response = np.abs(eigvals[1])
 
-    # Normalize to 0-1 for easier thresholding
+    # Normalize to 0-1 so downstream thresholding is easier to interpret.
     max_val = np.max(response)
     if max_val > 0:
         response /= max_val
@@ -153,7 +169,8 @@ def optimize_threshold_connectivity(
         steps: Number of threshold steps to test.
 
     Returns:
-        float: The optimal threshold value.
+        Threshold that maximizes the giant connected component score within the
+        requested filling-factor range.
     """
     print(
         "Optimizing threshold "
@@ -161,19 +178,19 @@ def optimize_threshold_connectivity(
         f"{max_filling_factor:.1%})..."
     )
 
-    # 1. Determine candidate thresholds based on percentiles
-    # We want to keep between min and max factor of the voxels.
-    # So we look at percentiles (1 - max) to (1 - min).
+    # Build candidate thresholds from percentiles that correspond to the target
+    # filling-factor range.
     p_start = (1.0 - max_filling_factor) * 100
     p_end = (1.0 - min_filling_factor) * 100
     percentiles = np.linspace(p_start, p_end, steps)
     thresholds = np.percentile(grid, percentiles)
 
+    # Initialize the best score so the first valid threshold always wins.
     best_score = -1.0
     best_threshold = thresholds[0]
 
-    # Structuring element for connectivity (26-connectivity is good for
-    # filaments).
+    # Use 26-connectivity so filamentary structures are treated as connected
+    # whenever they touch by faces, edges, or corners.
     structure = ndimage.generate_binary_structure(3, 3)
 
     print(
@@ -185,7 +202,8 @@ def optimize_threshold_connectivity(
         mask = grid > t
         total_voxels = np.sum(mask)
 
-        # Check volume constraints
+        # Skip thresholds whose occupied volume falls outside the requested
+        # range, even if percentile rounding put them here.
         filling_factor = total_voxels / grid.size
         if (
             filling_factor < min_filling_factor
@@ -194,14 +212,15 @@ def optimize_threshold_connectivity(
             # Should be handled by percentile choice, but precision varies.
             continue
 
-        # Label connected components
+        # Measure connected components to score how much of the structure sits
+        # in one dominant island.
         labeled, n_components = ndimage.label(mask, structure=structure)
 
         if n_components == 0:
             continue
 
-        # Get sizes of components
-        # 0 is background, so we skip it. But bincount includes it.
+        # Background occupies label 0, so ignore it when computing component
+        # sizes.
         component_sizes = np.bincount(labeled.ravel())
         if len(component_sizes) < 2:  # Only background found
             continue
@@ -209,8 +228,7 @@ def optimize_threshold_connectivity(
         largest_comp_size = component_sizes[1:].max()
         giant_fraction = largest_comp_size / total_voxels
 
-        # Score: Primarily Giant Fraction.
-        # We prefer higher connectivity.
+        # Prefer thresholds that maximize the giant component fraction.
         score = giant_fraction
 
         is_best = ""
@@ -258,10 +276,10 @@ def generate_voxel_grid_swift(
         periodic (bool): Account for periodic boundaries.
 
     Returns:
-        np.ndarray: 3D voxel grid of shape (resolution, resolution,
-            resolution).
+        Dense voxel grid with shape ``(resolution, resolution, resolution)``.
     """
-    # Perform the volume render, returns a cosmo_array
+    # Delegate rendering to SWIFTsimIO, which returns a cosmo_array-like
+    # object.
     grid = render_gas(
         data,
         resolution=resolution,
@@ -272,7 +290,7 @@ def generate_voxel_grid_swift(
         region=region,
         periodic=periodic,
     )
-    # Convert to a plain numpy array
+    # Convert the result to a plain NumPy array for downstream processing.
     try:
         return grid.to_value()
     except AttributeError:
@@ -288,39 +306,39 @@ def generate_voxel_grid(
     box_size: Optional[float] = None,
     nthreads: int = 1,
 ) -> Tuple[np.ndarray, float]:
-    """Generate a 3D voxel grid from a 2D array.
+    """Generate a dense voxel grid from particle samples.
 
     Args:
-        data (np.ndarray): Input data array to sort into voxels.
-        coordinates (np.ndarray): Coordinates of the data points.
-        smoothing_lengths (np.ndarray, optional): Smoothing lengths per data
-            point.
-            If provided, a box-deposition kernel is used.
-        resolution (int): Number of voxels along each axis.
-        parallel (bool): Whether to use parallel rendering. (Currently ignored;
-            parallelism is handled by underlying C code if available, or
-            implicitly by numpy operations.)
-        box_size (float, optional): The physical size of the cubic volume. If
-            provided, the returned `voxel_size` will be
-            `box_size / resolution`.
-            Otherwise, `box_size` is inferred from coordinate bounds and
-            `voxel_size` is set accordingly.
-        nthreads (int): Number of threads to request for the C smoothing
-            deposition kernel. Ignored for non-smoothed voxelization.
+        data: Scalar value attached to each particle.
+        coordinates: Particle coordinates with shape ``(N, 3)``.
+        resolution: Number of voxels along each axis.
+        smoothing_lengths: Optional per-particle smoothing lengths. When
+            provided, box deposition is used instead of point deposition.
+        parallel: Retained for compatibility. Currently unused by this helper.
+        box_size: Physical size of the cubic volume. When omitted, a cubic box
+            is inferred from the coordinate ranges.
+        nthreads: Number of threads requested for the C smoothing kernel.
 
     Returns:
-        tuple:
-            - np.ndarray: 3D voxel grid of shape (resolution, resolution,
-              resolution).
-            - float: The physical size of a single voxel in the grid.
+        Tuple containing the dense voxel grid and the physical voxel size.
+
+    Raises:
+        ValueError: If the requested resolution or input shapes are invalid.
+        RuntimeError: If smoothing lengths are supplied but the C extension is
+            unavailable.
     """
-    # Create a 3D grid of zeros, ensure it's float64 for C extension
+    # Allocate the dense grid in float64 so the C deposition kernel can write
+    # into it directly without dtype conversion.
     grid = np.zeros((resolution, resolution, resolution), dtype=np.float64)
 
+    # Validate threading early so both the C and NumPy paths see the same error
+    # behaviour.
     if nthreads < 1:
         raise ValueError(f"nthreads must be >= 1, got {nthreads}")
 
     coords = np.asarray(coordinates)
+    # Require explicit ``(N, 3)`` coordinates because the later voxel mapping
+    # assumes three spatial axes throughout.
     if coords.ndim != 2 or coords.shape[1] != 3:
         raise ValueError(
             f"coordinates must be an array of shape (N, 3), got {coords.shape}"
@@ -330,17 +348,17 @@ def generate_voxel_grid(
     maxs = coords.max(axis=0)
     ranges = maxs - mins
 
-    # Determine voxel size and map coordinates to voxel indices.
-    #
-    # - If box_size is provided, we assume coordinates are in [0, box_size]
-    #   (typical SWIFT) or [min, min + box_size] (translated subvolume).
-    # - If box_size is not provided, infer an approximate cubic box size from
-    #   the coordinate bounds and return a meaningful voxel_size.
+    # Map coordinates onto a cubic voxel lattice, either using the supplied box
+    # size or inferring one from the particle bounds.
     if box_size is not None:
+        # When a box size is supplied, preserve that physical scale exactly
+        # instead of inferring one from the occupied particle bounds.
         if box_size <= 0:
             raise ValueError(f"box_size must be > 0, got {box_size}")
         voxel_size = box_size / resolution
 
+        # If the coordinates already lie in the box, keep the origin at zero.
+        # Otherwise treat the minimum corner as the translated local origin.
         eps = 1e-6 * box_size
         origin = np.where(
             (mins >= -eps) & (maxs <= box_size + eps),
@@ -351,12 +369,16 @@ def generate_voxel_grid(
         scaled = (coords - origin) / box_size * resolution
         vox_indices = np.floor(scaled).astype(np.int64)
     else:
+        # Without an explicit box size, infer a cubic box from the occupied
+        # particle range so all three axes share the same voxel size.
         box_size_inferred = float(np.max(ranges))
         voxel_size = (
             box_size_inferred / resolution if box_size_inferred > 0 else 1.0
         )
 
         vox_indices = np.zeros_like(coords, dtype=np.int64)
+        # Rescale each axis independently into the inferred cubic lattice while
+        # handling degenerate single-valued axes safely.
         for axis in range(3):
             axis_range = ranges[axis]
             if axis_range > 0:
@@ -367,10 +389,12 @@ def generate_voxel_grid(
             else:
                 vox_indices[:, axis] = 0
 
-    # Clip to ensure valid indices before passing to C or np.add.at.
+    # Clip indices before deposition so particles on the upper boundary stay in
+    # range.
     vox_indices = np.clip(vox_indices, 0, resolution - 1)
 
-    # Convert smoothing lengths to voxel units (if provided)
+    # Use the C extension for smoothed deposition and NumPy accumulation for
+    # the simpler point-deposition path.
     if smoothing_lengths is not None:
         if _voxelize is None:
             raise RuntimeError(
@@ -379,7 +403,8 @@ def generate_voxel_grid(
                 "is built correctly."
             )
 
-        # Ensure smoothing lengths are int64 and convert to voxel units
+        # Convert smoothing lengths from physical units into voxel radii before
+        # passing them to the deposition kernel.
         if voxel_size > 0:
             smoothing_lengths_vox = (smoothing_lengths / voxel_size).astype(
                 np.int64
@@ -389,7 +414,8 @@ def generate_voxel_grid(
                 smoothing_lengths, dtype=np.int64
             )
 
-        # Call the C extension
+        # Delegate the smoothed deposition to the compiled kernel because a
+        # Python implementation is too slow for the intended data sizes.
         _voxelize.box_deposition(
             grid,
             # Ensure data is float64 for C
@@ -401,7 +427,7 @@ def generate_voxel_grid(
         )
 
     else:
-        # Use numpy.add.at for efficient non-smoothed deposition
+        # Use vectorised accumulation for the simpler point-deposition path.
         x_indices = vox_indices[:, 0]
         y_indices = vox_indices[:, 1]
         z_indices = vox_indices[:, 2]

@@ -1,4 +1,10 @@
-"""Utilities for preparing meshes for physical 3D printing."""
+"""Helpers for preparing generated meshes for physical printing.
+
+This module contains lightweight utilities that convert simulation-scale meshes
+into dimensions that are convenient for slicers and physical printers. The
+current branch uses this module to implement the CLI's ``--target-size``
+option.
+"""
 
 from typing import Any, Union
 
@@ -11,32 +17,34 @@ def scale_mesh_to_print(
     mesh: Mesh,
     target_size: Union[float, Any],
 ) -> Mesh:
-    """Scale the mesh to a specific real-world size.
+    """Scale a mesh so its longest dimension matches a print target.
 
     This assumes the output unit of the STL is millimeters (standard for
     slicers).
 
     Args:
-        mesh (Mesh): The mesh to scale.
-        target_size (float or unyt_quantity): The target size for the longest
-            dimension. If float, assumed to be centimeters. If unyt_quantity,
-            it will be converted to centimeters.
+        mesh: Mesh to scale in place.
+        target_size: Target size for the longest mesh dimension. Plain floats
+            are interpreted as centimetres. Quantity-like objects with a
+            ``units`` attribute are converted to centimetres when possible.
 
     Returns:
-        Mesh: The scaled mesh object (modified in-place, but returned for
-            convenience).
+        The same mesh instance after in-place scaling.
     """
-    # Current extents
+    # Measure the current longest dimension before computing the scale factor.
+    # Measure the current mesh extents so scaling is based on the longest side.
     extents = mesh.to_trimesh().extents
     max_dimension = np.max(extents)
 
+    # Refuse to scale degenerate geometry because the scale factor would be
+    # undefined.
     if max_dimension == 0:
         print("Warning: Mesh has zero extent. Cannot scale.")
         return mesh
 
-    # Handle unyt quantities
+    # Convert quantity-like inputs to centimetres so the CLI accepts both plain
+    # numbers and unit-aware values.
     if hasattr(target_size, "units"):
-        # Convert to cm then take value
         try:
             target_size_cm = target_size.to("cm").value
         except Exception as e:
@@ -45,17 +53,15 @@ def scale_mesh_to_print(
             )
             target_size_cm = target_size.value
     else:
-        # Assume cm
         target_size_cm = float(target_size)
 
-    # Target size in mm (standard for STL)
+    # Convert from centimetres to millimetres because that is what most slicers
+    # assume for STL geometry.
     target_size_mm = target_size_cm * 10.0
 
-    # Calculate scale factor
+    # Apply a uniform scale so the longest dimension lands exactly on the
+    # requested physical size.
     scale_factor = target_size_mm / max_dimension
-
-    # Apply scale
-    # Mesh wrapper doesn't have apply_scale, need to use underlying trimesh
     mesh.to_trimesh().apply_scale(scale_factor)
 
     print(

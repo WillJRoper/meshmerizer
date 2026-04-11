@@ -1,4 +1,10 @@
-"""A module containing the Mesh class and its methods."""
+"""Mesh wrappers and voxel-to-surface conversion helpers.
+
+This module provides the lightweight :class:`Mesh` wrapper used throughout the
+package, along with helpers that convert dense voxel grids into triangle meshes
+via standard marching cubes or signed-distance-field extraction. It also
+contains repair and subdivision helpers used by the CLI after mesh generation.
+"""
 
 import time
 from typing import Iterable, List, Optional, Tuple
@@ -12,10 +18,13 @@ from skimage import measure
 
 
 class Mesh:
-    """A wrapper around trimesh.Trimesh for 3D printing workflows.
+    """A lightweight wrapper around :class:`trimesh.Trimesh`.
+
+    The wrapper keeps mesh-specific utilities in one place and provides a small
+    package-local API used by the CLI and chunking code.
 
     Attributes:
-        mesh (trimesh.Trimesh): The underlying trimesh object.
+        mesh: Underlying ``trimesh.Trimesh`` instance.
     """
 
     def __init__(
@@ -24,21 +33,29 @@ class Mesh:
         faces: Optional[np.ndarray] = None,
         vertex_normals: Optional[np.ndarray] = None,
         mesh: Optional[trimesh.Trimesh] = None,
-    ):
+    ) -> None:
         """Initialize the Mesh object.
 
-        Can be initialized either with raw data (vertices, faces) or
-        an existing trimesh object.
+        The mesh can be created either from raw vertex/face arrays or by
+        wrapping an existing ``trimesh.Trimesh`` instance.
 
         Args:
-            vertices (np.ndarray, optional): The vertices of the mesh.
-            faces (np.ndarray, optional): The faces of the mesh.
-            vertex_normals (np.ndarray, optional): The normals of the vertices.
-            mesh (trimesh.Trimesh, optional): An existing trimesh object.
+            vertices: Optional ``(N, 3)`` vertex array.
+            faces: Optional ``(M, 3)`` triangle index array.
+            vertex_normals: Optional ``(N, 3)`` per-vertex normals.
+            mesh: Optional existing ``trimesh.Trimesh`` to wrap.
+
+        Raises:
+            ValueError: If neither a ``mesh`` nor raw vertex/face arrays are
+                provided.
         """
+        # Prefer wrapping an existing trimesh when one is already available so
+        # we do not rebuild geometry unnecessarily.
         if mesh is not None:
             self.mesh = mesh
         elif vertices is not None and faces is not None:
+            # Create the underlying trimesh without automatic processing so the
+            # package stays in control of cleanup and repair order.
             self.mesh = trimesh.Trimesh(
                 vertices=vertices,
                 faces=faces,
@@ -52,45 +69,74 @@ class Mesh:
 
     @property
     def vertices(self) -> np.ndarray:
-        """Vertex positions as an (N, 3) array."""
+        """Return vertex positions.
+
+        Returns:
+            Vertex positions as an ``(N, 3)`` array.
+        """
         return self.mesh.vertices
 
     @property
     def faces(self) -> np.ndarray:
-        """Triangle indices as an (M, 3) array."""
+        """Return triangle indices.
+
+        Returns:
+            Triangle indices as an ``(M, 3)`` array.
+        """
         return self.mesh.faces
 
     @property
     def vertex_normals(self) -> np.ndarray:
-        """Per-vertex normals as an (N, 3) array."""
+        """Return per-vertex normals.
+
+        Returns:
+            Per-vertex normals as an ``(N, 3)`` array.
+        """
         return self.mesh.vertex_normals
 
-    def __repr__(self):
-        """Return a string representation of the Mesh object."""
+    def __repr__(self) -> str:
+        """Return a developer-facing representation of the mesh.
+
+        Returns:
+            String representation with vertex and face array shapes.
+        """
         return (
             f"Mesh(vertices={self.vertices.shape}, faces={self.faces.shape})"
         )
 
-    def __str__(self):
-        """Return a string describing the Mesh object."""
+    def __str__(self) -> str:
+        """Return a human-readable description of the mesh.
+
+        Returns:
+            Short description of the vertex and face counts.
+        """
         return (
             f"Mesh with {self.vertices.shape[0]} "
             f"vertices and {self.faces.shape[0]} faces"
         )
 
-    def __len__(self):
-        """Return the number of vertices in the mesh."""
+    def __len__(self) -> int:
+        """Return the number of vertices in the mesh.
+
+        Returns:
+            Vertex count.
+        """
         return self.vertices.shape[0]
 
-    def __add__(self, other):
+    def __add__(self, other: "Mesh") -> "Mesh":
         """Add two Mesh objects together.
 
         Args:
-            other (Mesh): The other Mesh object to add.
+            other: Mesh to concatenate with this mesh.
 
         Returns:
-            Mesh: A new Mesh object containing the combined vertices and faces.
+            New mesh containing both triangle soups.
+
+        Raises:
+            TypeError: If ``other`` is not a :class:`Mesh` instance.
         """
+        # Restrict addition to package-local Mesh objects so the return type
+        # and downstream API remain predictable.
         if not isinstance(other, Mesh):
             raise TypeError("Can only add another Mesh object.")
 
@@ -98,10 +144,16 @@ class Mesh:
         return Mesh(mesh=combined)
 
     def translate(self, offset: np.ndarray) -> None:
-        """Translate the mesh in place by the given offset."""
+        """Translate the mesh in place.
+
+        Args:
+            offset: Translation vector with shape ``(3,)``.
+        """
+        # Update vertices in place so all other mesh properties remain attached
+        # to the same underlying trimesh object.
         self.mesh.vertices[:] = self.mesh.vertices + np.asarray(offset)
 
-    def repair(self, smoothing_iters: int = 0):
+    def repair(self, smoothing_iters: int = 0) -> None:
         """Repair the mesh for 3D printing.
 
         Operations:
@@ -110,11 +162,16 @@ class Mesh:
         3. Optional smoothing.
 
         Args:
-            smoothing_iters (int): Number of Taubin smoothing iterations.
+            smoothing_iters: Number of Taubin smoothing iterations to apply
+                after the initial cleanup pass.
         """
+        # Run trimesh cleanup before any optional smoothing so the surface
+        # starts from a sane topology.
         self.mesh.process()
 
         if smoothing_iters > 0:
+            # Smooth only when requested; the default path keeps the extracted
+            # geometry unchanged apart from topology cleanup.
             smoothing.filter_taubin(
                 self.mesh,
                 lamb=0.5,
@@ -122,23 +179,31 @@ class Mesh:
                 iterations=smoothing_iters,
             )
 
-        # Re-run cleanup after smoothing so topology and normals stay sane.
+        # Re-run cleanup after smoothing because smoothing can introduce small
+        # inconsistencies in normals and cached topology state.
         self.mesh.process()
         self.mesh.fix_normals()
         if not self.mesh.is_watertight:
             print("⚠️ Mesh still not watertight after repair.")
 
-    def subdivide(self, iterations: int = 1):
+    def subdivide(self, iterations: int = 1) -> None:
         """Subdivide the mesh surface using Loop subdivision.
 
         Args:
-            iterations (int): Number of subdivision iterations.
+            iterations: Number of subdivision iterations.
+
+        Raises:
+            ValueError: If ``iterations`` is negative.
         """
+        # Treat zero iterations as a no-op so the caller can pass through user
+        # input without special handling.
         if iterations < 0:
             raise ValueError("iterations must be >= 0")
         if iterations == 0:
             return
 
+        # Run Loop subdivision on the raw vertex/face arrays, then rebuild the
+        # trimesh so the wrapper continues to own a consistent object.
         vertices, faces = remesh.subdivide_loop(
             self.mesh.vertices,
             self.mesh.faces,
@@ -155,20 +220,27 @@ class Mesh:
     def to_trimesh(self) -> trimesh.Trimesh:
         """Return the underlying trimesh object.
 
-        Note: This no longer performs auto-repair. Use `.repair()` explicitly.
+        Returns:
+            Underlying ``trimesh.Trimesh`` instance.
+
+        Note:
+            This method does not perform auto-repair. Call :meth:`repair`
+            explicitly when cleanup is required.
         """
         return self.mesh
 
-    def save(self, filename: str):
+    def save(self, filename: str) -> None:
         """Save the mesh to a file.
 
-        Parameters:
-            filename (str): The name of the file to save the mesh to.
+        Args:
+            filename: Output mesh filename.
         """
+        # Delegate serialization to trimesh and keep the wrapper responsible
+        # for user-facing status output.
         self.mesh.export(filename)
         print(f"Mesh saved to {filename}")
 
-    def show(self):
+    def show(self) -> None:
         """Display the mesh using trimesh's built-in viewer."""
         self.mesh.show()
         print("Mesh displayed.")
@@ -196,11 +268,14 @@ def _prepare_volume(
         padding (int): Number of voxels to pad the volume with zeros.
 
     Returns:
-        labeled_volume (np.ndarray): Integer array where 0 is background and
-            values > 0 are object labels.
-        island_ids (iterable): A list or range of IDs to process.
+        Tuple containing:
+
+        - Integer volume where ``0`` is background and positive values are
+          component labels.
+        - Iterable of label IDs to extract.
     """
-    # Pad the volume to ensure watertightness
+    # Pad the field before thresholding so surfaces on the volume boundary can
+    # close cleanly during extraction.
     if padding > 0:
         volume = np.pad(
             volume,
@@ -209,13 +284,13 @@ def _prepare_volume(
             constant_values=0,
         )
 
-    # 1) Binarise
+    # Binarise the scalar field at the requested isovalue.
     bin_start = time.perf_counter()
     bin_vol = volume > threshold
     bin_end = time.perf_counter()
     print(f"Binarization took {bin_end - bin_start:.4f} seconds.")
 
-    # 2) Binary Closing
+    # Close small gaps in the binary mask before connected-component analysis.
     if closing_radius > 0:
         close_start = time.perf_counter()
         base_struct = ndimage.generate_binary_structure(3, 1)
@@ -224,10 +299,9 @@ def _prepare_volume(
         close_end = time.perf_counter()
         print(f"Binary closing took {close_end - close_start:.4f} seconds.")
 
-    # 3) Label islands
+    # Label islands only when the caller wants separate components or wants to
+    # keep just the largest one.
     label_struct = ndimage.generate_binary_structure(3, 1)
-    # If we are splitting islands, we label connected components.
-    # If not, we treat the whole thing as one big island (label=1).
     if split_islands or remove_islands:
         split_start = time.perf_counter()
         labeled, num = ndimage.label(bin_vol, structure=label_struct)
@@ -239,6 +313,8 @@ def _prepare_volume(
         )
 
         if remove_islands and num > 0:
+            # Keep only the dominant component when requested so small floating
+            # islands do not survive into the final mesh.
             component_sizes = np.bincount(labeled.ravel())
             component_sizes[0] = 0
             largest_label = int(np.argmax(component_sizes))
@@ -252,23 +328,19 @@ def _prepare_volume(
                 f"and discarding {removed_count} island(s)."
             )
     else:
+        # In the simple path we treat the whole mask as one component labelled
+        # 1 if any voxels survive thresholding.
         labeled = bin_vol.astype(np.int32)
-        # If there are no voxels, island_ids should be empty
         if not np.any(labeled):
             island_ids = []
         else:
             island_ids = [1]
 
-    # Filter for specific mesh index if requested
+    # Restrict extraction to a specific connected-component label when the
+    # caller requests a single island.
     if mesh_index is not None:
-        # Check availability
-        # Note: island_ids might be a range, so we convert to list to check
         all_ids = list(island_ids)
         if mesh_index not in all_ids:
-            # For backwards compatibility with the original logic which allowed
-            # mesh_index to be 1-based or 0-based, we assume the user passes
-            # the specific integer label they want.
-            # The original code did `island_ids = [mesh_index]`.
             raise ValueError(
                 f"Mesh index {mesh_index} not found in the volume."
             )
@@ -286,7 +358,7 @@ def voxels_to_stl(
     mesh_index: Optional[int] = None,
     voxel_size: float = 1.0,
 ) -> List[Mesh]:
-    """Convert a 3D voxel array to one or more STL meshes using standard MC.
+    """Convert a voxel volume to meshes with standard marching cubes.
 
     Args:
         volume (np.ndarray): 3D voxel array representing the volume.
@@ -301,9 +373,10 @@ def voxels_to_stl(
             scaling the output mesh.
 
     Returns:
-        meshes : list of Mesh
-            List of Mesh objects representing the solid regions.
+        List of extracted meshes.
     """
+    # Keep an end-to-end timer so the caller can see the full extraction cost,
+    # not just the marching-cubes kernel time.
     start_time = time.perf_counter()
 
     labeled, island_ids = _prepare_volume(
@@ -318,17 +391,19 @@ def voxels_to_stl(
     mesh_start = time.perf_counter()
     meshes: List[Mesh] = []
 
+    # Extract each requested connected component independently so callers can
+    # keep islands split if they want to post-process them separately.
     for idx in island_ids:
         mask = labeled == idx
         if not mask.any():
             continue
 
-        # Remove small objects (heuristic from original code)
+        # Skip tiny components that are almost always numerical debris.
         if np.sum(mask) < 10:
             continue
 
-        # Marching cubes on the mask directly
-        # level=0.5 works because mask is 0 or 1
+        # Run marching cubes directly on the binary mask. ``level=0.5`` places
+        # the surface midway between empty and filled voxels.
         verts, faces, normals, _ = measure.marching_cubes(
             mask, level=0.5, spacing=(voxel_size, voxel_size, voxel_size)
         )
@@ -344,8 +419,8 @@ def voxels_to_stl(
     )
 
     if not meshes:
-        # Check if the volume was actually empty or if filtering removed
-        # everything.
+        # Distinguish between an empty field and a field whose candidate meshes
+        # were filtered out so callers get a more useful error.
         if volume.max() <= threshold:
             msg = "Volume max value below threshold."
         else:
@@ -369,7 +444,7 @@ def voxels_to_stl_via_sdf(
     mesh_index: Optional[int] = None,
     voxel_size: float = 1.0,
 ) -> List[Mesh]:
-    """Convert voxels to mesh using Signed Distance Fields (SDF).
+    """Convert voxels to meshes using a signed distance field.
 
     This method often produces more watertight meshes than standard
     binary mask marching cubes.
@@ -387,14 +462,10 @@ def voxels_to_stl_via_sdf(
             scaling the output mesh.
 
     Returns:
-        meshes : list of Mesh
-            List of Mesh objects representing the solid regions.
+        List of extracted meshes.
     """
+    # As with the standard path, keep a total timer for the full SDF workflow.
     start_time = time.perf_counter()
-
-    # Note: original code expected mesh_index to be 0-based for the list of
-    # islands in this function, but the island labels are 1-based.
-    # We will adhere to the new standard: mesh_index refers to the LABEL ID.
 
     labeled, island_ids = _prepare_volume(
         volume,
@@ -406,17 +477,20 @@ def voxels_to_stl_via_sdf(
     )
 
     meshes: List[Mesh] = []
+    # Convert each connected component independently so the caller can still
+    # get separate meshes when island splitting is enabled.
     for idx in island_ids:
         mask = labeled == idx
         if not mask.any():
             continue
 
-        # Compute SDF
+        # Build a signed distance field from the binary component mask.
         d_in = ndimage.distance_transform_edt(mask)
         d_out = ndimage.distance_transform_edt(~mask)
         sdf = d_in.astype(float) - d_out.astype(float)
 
-        # Marching cubes on the zero level set of the SDF
+        # Extract the zero level-set, which usually gives a smoother and more
+        # watertight surface than marching cubes on the raw mask.
         verts, faces, normals, _ = measure.marching_cubes(
             volume=sdf,
             level=0.0,

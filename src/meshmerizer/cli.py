@@ -1,4 +1,10 @@
-"""Command Line Interface for Meshmerizer."""
+"""Command-line entry points for STL generation from simulation data.
+
+This module implements the package CLI, including SWIFT particle loading,
+optional spatial cropping and preprocessing, dense meshing, and chunked
+watertight meshing. The current branch intentionally focuses on STL generation
+and does not expose the experimental Blender/VDB workflow.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +34,17 @@ from meshmerizer.voxels import (
 
 
 def _boxsize_to_float(boxsize: object) -> float:
+    """Convert a SWIFT box-size object into a plain float.
+
+    Args:
+        boxsize: Snapshot metadata box-size value, which may be scalar, array,
+            or quantity-like.
+
+    Returns:
+        Maximum box extent as a plain float.
+    """
+    # SWIFT metadata may expose box size as a scalar, a vector, or a quantity-
+    # like object, so normalise it before extracting a float.
     box = boxsize
     if hasattr(box, "value"):
         box = box.value
@@ -38,11 +55,23 @@ def _boxsize_to_float(boxsize: object) -> float:
 
 
 def _print_elapsed(label: str, start: float) -> None:
-    """Print a simple stage timing line."""
+    """Print a simple stage timing line.
+
+    Args:
+        label: Human-readable label for the timed stage.
+        start: ``time.perf_counter()`` timestamp captured before the stage.
+    """
     print(f"{label} took {time.perf_counter() - start:.3f} s")
 
 
 def _add_common_voxel_args(parser: argparse.ArgumentParser) -> None:
+    """Register CLI arguments shared by voxelization-based commands.
+
+    Args:
+        parser: Parser or subparser to extend in place.
+    """
+    # Coordinate transforms and periodic handling are applied before any
+    # crop or voxelization so dense and chunked paths share the same setup.
     parser.add_argument(
         "--shift",
         type=float,
@@ -55,6 +84,8 @@ def _add_common_voxel_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
+    # The wrap/no-wrap pair is mutually exclusive because the shift policy must
+    # be unambiguous once the coordinates have been translated.
     wrap_shift_group = parser.add_mutually_exclusive_group()
     wrap_shift_group.add_argument(
         "--wrap-shift",
@@ -76,6 +107,8 @@ def _add_common_voxel_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.set_defaults(wrap_shift=True)
 
+    # Grid geometry and preprocessing arguments are shared by the dense and
+    # chunked STL paths.
     parser.add_argument(
         "--resolution",
         "-r",
@@ -205,7 +238,24 @@ def _apply_coordinate_shift(
     wrap_shift: bool,
     box_size: Optional[float],
 ) -> np.ndarray:
-    """Apply a translation (and optional periodic wrap) to coordinates."""
+    """Apply a translation and optional periodic wrap to coordinates.
+
+    Args:
+        coords: Coordinate array with shape ``(N, 3)``.
+        shift: Translation vector with shape ``(3,)``.
+        wrap_shift: Whether to wrap translated coordinates back into the
+            domain.
+        box_size: Domain size used for wrapping.
+
+    Returns:
+        Shifted coordinate array.
+
+    Raises:
+        ValueError: If the coordinate shape or shift vector are invalid, or if
+            wrapping is requested without a valid ``box_size``.
+    """
+    # Normalize inputs first so all later arithmetic and validation operate on
+    # predictable NumPy arrays.
     coords_arr = np.asarray(coords, dtype=np.float64)
     if coords_arr.ndim != 2 or coords_arr.shape[1] != 3:
         raise ValueError("coords must have shape (N, 3)")
@@ -214,6 +264,7 @@ def _apply_coordinate_shift(
     if shift_arr.shape != (3,):
         raise ValueError("shift must have shape (3,)")
 
+    # Apply the requested translation before any optional periodic wrap.
     shifted = coords_arr + shift_arr
     if not wrap_shift:
         return shifted
@@ -224,6 +275,7 @@ def _apply_coordinate_shift(
             "Pass --box-size (or ensure snapshot metadata includes boxsize), "
             "or use --no-wrap-shift."
         )
+    # Wrap into the periodic domain once the translation is applied.
     box = float(box_size)
     if box <= 0.0:
         raise ValueError("box_size must be > 0 when using --wrap-shift")
@@ -243,14 +295,29 @@ def _crop_particles_to_region(
 ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]:
     """Crop particle arrays to an axis-aligned cubic region.
 
-    Returns region-local coordinates in [0, extent) and the world-space origin
-    (min corner) used for the translation.
+    Args:
+        coords: Particle coordinates with shape ``(N, 3)``.
+        values: Scalar values associated with each particle.
+        smoothing_lengths: Optional per-particle smoothing lengths.
+        center: Region centre in world coordinates.
+        extent: Cubic region side length.
+        box_size: Full periodic box size.
+        periodic: Whether to use periodic selection around the region centre.
+
+    Returns:
+        Tuple containing cropped local coordinates, cropped values, cropped
+        smoothing lengths, and the world-space origin of the selected region.
+
+    Raises:
+        ValueError: If the region specification or array shapes are invalid.
     """
     if extent <= 0:
         raise ValueError("extent must be > 0")
     if box_size <= 0:
         raise ValueError("box_size must be > 0")
 
+    # Work in a center/extent representation so both periodic and non-periodic
+    # crops can share the same outer-region definition.
     c = np.asarray(center, dtype=np.float64)
     if c.shape != (3,):
         raise ValueError("center must have shape (3,)")
@@ -267,9 +334,8 @@ def _crop_particles_to_region(
     maxs = c + half
 
     if periodic:
-        # Center-wrapped selection using the minimum image convention.
-        # This avoids missing particles when the structure straddles periodic
-        # boundaries (e.g. appears in multiple corners in projection).
+        # Use the minimum-image convention so a region that crosses the
+        # periodic boundary still selects the intended contiguous structure.
         delta = coords_arr - c
         delta = (delta + 0.5 * box_size) % box_size - 0.5 * box_size
         mask = np.all(np.abs(delta) <= half, axis=1)
@@ -277,6 +343,8 @@ def _crop_particles_to_region(
         local = delta + half
         origin = np.mod(mins, box_size)
     else:
+        # For non-periodic crops, require the requested cube to lie fully
+        # inside the simulation domain.
         if np.any(mins < 0.0) or np.any(maxs > box_size):
             raise ValueError(
                 "Non-periodic region must lie within [0, box_size]"
@@ -285,6 +353,8 @@ def _crop_particles_to_region(
         mask = np.all((coords_arr >= mins) & (coords_arr < maxs), axis=1)
         local = coords_arr - origin
 
+    # Apply the same mask to coordinates, projected values, and smoothing
+    # lengths so the particle arrays stay aligned.
     cropped_coords = local[mask]
     cropped_values = values_arr[mask]
     if smoothing_lengths is None:
@@ -307,6 +377,18 @@ def _tighten_voxelization_bounds(
     The returned coordinates are shifted so the tightened min corner becomes
     the new local origin. The new cube side length is the maximum occupied span
     across x/y/z so the downstream voxel grid remains cubic.
+
+    Args:
+        coords: Particle coordinates with shape ``(N, 3)``.
+        smoothing_lengths: Optional per-particle smoothing lengths.
+        box_size: Current cubic box size.
+
+    Returns:
+        Tuple containing shifted coordinates, shifted smoothing lengths, the
+        origin offset, and the tightened cubic box size.
+
+    Raises:
+        ValueError: If the inputs are empty or malformed.
     """
     if box_size <= 0:
         raise ValueError("box_size must be > 0")
@@ -317,23 +399,31 @@ def _tighten_voxelization_bounds(
     if coords_arr.shape[0] == 0:
         raise ValueError("coords must not be empty")
 
+    # Start from the occupied particle bounds and expand by smoothing support
+    # if the mesh is built from smoothed particle deposition.
     mins = np.min(coords_arr, axis=0)
     maxs = np.max(coords_arr, axis=0)
 
     if smoothing_lengths is None:
         h_arr = None
     else:
+        # Expand the occupied bounds by the support radii so smoothed
+        # deposition still fits inside the tightened box.
         h_arr = np.asarray(smoothing_lengths, dtype=np.float64)
         if h_arr.shape != (coords_arr.shape[0],):
             raise ValueError("smoothing_lengths must have shape (N,)")
         mins = np.min(coords_arr - h_arr[:, None], axis=0)
         maxs = np.max(coords_arr + h_arr[:, None], axis=0)
 
+    # Clamp the tightened cube to the current box before computing the final
+    # cubic side length.
     mins = np.clip(mins, 0.0, box_size)
     maxs = np.clip(maxs, 0.0, box_size)
     spans = maxs - mins
     tight_box_size = float(np.max(spans))
 
+    # If all particles collapse to one point, keep the original box rather than
+    # creating a zero-sized voxelization cube.
     if tight_box_size <= 0.0:
         return coords_arr, h_arr, np.zeros(3, dtype=np.float64), box_size
 
@@ -349,10 +439,24 @@ def _raise_if_empty_subregion_selection(
     extent: float,
     periodic: bool,
 ) -> None:
-    """Raise a helpful error if a subregion selection is empty."""
+    """Raise a helpful error if a subregion selection is empty.
+
+    Args:
+        n_selected: Number of particles selected by the crop.
+        particle_type: Selected particle family.
+        field: Requested particle field.
+        center: Crop centre.
+        extent: Crop extent.
+        periodic: Whether the selection used periodic wrapping.
+
+    Raises:
+        RuntimeError: If no particles were selected.
+    """
     if n_selected != 0:
         return
 
+    # Build a message that includes the full selection context so users can see
+    # exactly why the crop failed.
     c = np.asarray(center, dtype=np.float64)
     msg = (
         "Subregion selection contains no particles: "
@@ -373,16 +477,35 @@ def _apply_preprocess(
     clip_halos: Optional[float],
     gaussian_sigma: float,
 ) -> np.ndarray:
+    """Apply scalar-field preprocessing requested by the CLI.
+
+    Args:
+        grid: Dense voxel grid.
+        preprocess: Preprocessing mode.
+        clip_halos: Optional clipping percentile.
+        gaussian_sigma: Gaussian smoothing width in voxel units.
+
+    Returns:
+        Preprocessed grid.
+
+    Raises:
+        ValueError: If ``gaussian_sigma`` is negative.
+    """
+    # Apply clipping before nonlinear transforms so bright peaks do not
+    # dominate the later preprocessing stages.
     if clip_halos is not None:
         grid = process_remove_halos(grid, threshold_percentile=clip_halos)
 
     if preprocess != "none":
+        # The preprocess choice controls the scalar field that the final
+        # mesh is extracted from, but all modes still end with Gaussian blur.
         print(f"Applying preprocessing: {preprocess}")
         if preprocess == "log":
             grid = process_log_scale(grid)
         elif preprocess == "filaments":
             grid = process_filament_filter(grid)
 
+    # Validate the final Gaussian stage after any earlier preprocessing choice.
     if gaussian_sigma < 0:
         raise ValueError("--gaussian-sigma must be >= 0")
     grid = process_gaussian_smoothing(grid, sigma=gaussian_sigma)
@@ -406,6 +529,28 @@ def _load_swift_volume(
     periodic: bool,
     tight_bounds: bool,
 ) -> tuple[np.ndarray, float, np.ndarray]:
+    """Load particles from a SWIFT snapshot and voxelize them.
+
+    Args:
+        filename: Snapshot filename.
+        particle_type: Particle family to load.
+        field: Particle field to project.
+        resolution: Output grid resolution per axis.
+        nthreads: Thread count for smoothed deposition.
+        smoothing_factor: Factor applied to smoothing lengths.
+        box_size: Optional box size override.
+        shift: Coordinate shift applied before crop/voxelization.
+        wrap_shift: Whether to wrap the shifted coordinates periodically.
+        center: Optional crop centre.
+        extent: Optional crop extent.
+        periodic: Whether region selection is periodic.
+        tight_bounds: Whether to shrink the voxelization domain to occupancy.
+
+    Returns:
+        Tuple containing the voxel grid, voxel size, and world-space origin.
+    """
+    # Reuse the particle-loading helper so dense and chunked code paths stay in
+    # sync on coordinate preparation and cropping semantics.
     voxelize_start = time.perf_counter()
     field_data, coords, h, effective_box_size, origin = _load_swift_particles(
         filename=filename,
@@ -421,6 +566,8 @@ def _load_swift_volume(
         tight_bounds=tight_bounds,
     )
 
+    # Voxelize after all coordinate transforms and cropping so the dense and
+    # chunked paths use the same particle preparation rules.
     print(f"Voxelizing to {resolution}^3 grid...")
     grid, voxel_size = generate_voxel_grid(
         data=field_data,
@@ -454,6 +601,31 @@ def _load_swift_particles(
     float,
     np.ndarray,
 ]:
+    """Load and preprocess particle arrays from a SWIFT snapshot.
+
+    Args:
+        filename: Snapshot filename.
+        particle_type: Particle family to extract.
+        field: Field to project into the voxel grid.
+        smoothing_factor: Multiplier applied to smoothing lengths.
+        box_size: Optional box size override.
+        shift: Coordinate shift applied before cropping.
+        wrap_shift: Whether to wrap shifted coordinates periodically.
+        center: Optional crop centre.
+        extent: Optional crop extent.
+        periodic: Whether crop selection is periodic.
+        tight_bounds: Whether to tighten the voxelization cube to occupancy.
+
+    Returns:
+        Tuple containing field values, prepared coordinates, smoothing lengths,
+        effective box size, and the world-space origin.
+
+    Raises:
+        RuntimeError: If the snapshot cannot be loaded or has no usable box.
+        ValueError: If argument combinations are inconsistent.
+    """
+    # Import SWIFT-specific dependencies lazily so non-SWIFT imports stay as
+    # lightweight as possible.
     import swiftsimio as sw
     from swiftsimio.visualisation import generate_smoothing_lengths
 
@@ -470,10 +642,14 @@ def _load_swift_particles(
     if (center is None) != (extent is None):
         raise ValueError("--center and --extent must be provided together")
 
+    # Determine the physical box size once up front because every later spatial
+    # transform depends on it.
     full_box_size_source: str
     if box_size is not None:
         box_size_source = "--box-size"
     else:
+        # Fall back to snapshot metadata when the user does not override the
+        # box size explicitly.
         meta_box = None
         if hasattr(data, "metadata"):
             meta_box = getattr(data.metadata, "boxsize", None)
@@ -490,6 +666,8 @@ def _load_swift_particles(
     full_box_size = float(box_size)
     full_box_size_source = box_size_source
 
+    # Select the requested particle family once so the later field access and
+    # smoothing-length logic share the same object.
     if particle_type == "gas":
         part_data = data.gas
     elif particle_type == "dark_matter":
@@ -518,6 +696,8 @@ def _load_swift_particles(
     field_data = getattr(part_data, field).value
     _print_elapsed("Particle field extraction", extract_start)
 
+    # Shift coordinates before any crop so region selection sees the final
+    # coordinate system.
     shift_arr = np.asarray(shift, dtype=np.float64)
     if shift_arr.shape != (3,):
         raise ValueError("--shift must provide exactly 3 values: dx dy dz")
@@ -541,6 +721,8 @@ def _load_swift_particles(
         _print_elapsed("Smoothing-length extraction", smoothing_start)
     else:
         print("Smoothing lengths not found. Generating...")
+        # Generate smoothing lengths only when the snapshot does not already
+        # provide them, and fall back to point deposition if generation fails.
         boxsize = data.metadata.boxsize
         smoothing_start = time.perf_counter()
         try:
@@ -563,10 +745,14 @@ def _load_swift_particles(
         f"(sim units; from {full_box_size_source})"
     )
 
+    # Track the world-space origin of the voxelization cube separately from the
+    # local particle coordinates used during deposition.
     origin = np.zeros(3, dtype=np.float64)
     effective_box_size = full_box_size
 
     if center is not None:
+        # Crop first so later tightening works on the selected physical region
+        # instead of the full simulation box.
         crop_start = time.perf_counter()
         assert extent is not None
         center_arr = np.asarray(center, dtype=np.float64)
@@ -607,6 +793,8 @@ def _load_swift_particles(
         _print_elapsed("Subregion crop", crop_start)
 
     if tight_bounds:
+        # Tight bounds reduce wasted resolution by shrinking the voxelization
+        # cube to the occupied support of the selected particles.
         tighten_start = time.perf_counter()
         coords, h, origin_offset, effective_box_size = (
             _tighten_voxelization_bounds(
@@ -630,11 +818,22 @@ def _load_swift_particles(
 
 
 def _run_stl(args: argparse.Namespace) -> None:
+    """Execute the ``meshmerizer stl`` command.
+
+    Args:
+        args: Parsed CLI arguments for the STL subcommand.
+    """
+    # The STL command orchestrates particle preparation, meshing, optional mesh
+    # post-processing, and final export.
     run_start = time.perf_counter()
     if args.nchunks < 1:
         print("Error: --nchunks must be >= 1")
         sys.exit(1)
     if args.nchunks > 1:
+        # The chunked path prepares particles once, then either writes
+        # per-chunk STLs or assembles a watertight union.
+        # Load prepared particle arrays once so the initial clipped-chunk pass
+        # and the later union pass operate on the exact same inputs.
         try:
             field_data, coords, h, effective_box_size, origin = (
                 _load_swift_particles(
@@ -695,10 +894,14 @@ def _run_stl(args: argparse.Namespace) -> None:
 
         output_path = args.output or args.filename.with_suffix(".stl")
         if args.chunk_output == "separate":
+            # Write each clipped chunk mesh independently for workflows that
+            # prefer separate printable tiles.
             output_dir = output_path.with_suffix("")
             output_dir.mkdir(parents=True, exist_ok=True)
             stem = output_path.stem
             chunk_counter = 0
+            # Number chunks monotonically in write order so the filenames are
+            # stable and easy to inspect.
             for _bounds, meshes in chunk_meshes:
                 for mesh in meshes:
                     chunk_counter += 1
@@ -709,6 +912,8 @@ def _run_stl(args: argparse.Namespace) -> None:
             print("Done.")
             return
 
+        # Regenerate with overlap so the unioned path has enough seam
+        # context to assign and stitch boundary triangles robustly.
         print("Regenerating chunk meshes with overlap for watertight union...")
         union_start = time.perf_counter()
         chunk_meshes = generate_hard_chunk_meshes(
@@ -726,6 +931,8 @@ def _run_stl(args: argparse.Namespace) -> None:
         _print_elapsed("Overlapped hard chunk generation", union_start)
         final_mesh = union_hard_chunk_meshes(chunk_meshes)
 
+        # Apply optional post-processing after union so it acts on the final
+        # watertight surface rather than on individual chunk fragments.
         if args.target_size:
             print(f"Scaling mesh to target size: {args.target_size} cm...")
             scale_mesh_to_print(final_mesh, args.target_size)
@@ -758,6 +965,8 @@ def _run_stl(args: argparse.Namespace) -> None:
         print("Done.")
         return
 
+    # The dense path voxelizes once, preprocesses once, and extracts the final
+    # mesh from the full selected region.
     try:
         grid, voxel_size, origin = _load_swift_volume(
             filename=args.filename,
@@ -817,10 +1026,14 @@ def _run_stl(args: argparse.Namespace) -> None:
 
     final_mesh: Mesh = meshes[0]
     if len(meshes) > 1:
+        # Preserve all islands unless the user explicitly requested island
+        # removal before meshing.
         print(f"Merging {len(meshes)} mesh components...")
         combined = trimesh.util.concatenate([m.to_trimesh() for m in meshes])
         final_mesh = Mesh(mesh=combined)
 
+    # Dense extraction happens in local voxel coordinates, so translate the
+    # mesh back into the original world-space frame before saving.
     final_mesh.translate(origin)
 
     if args.target_size:
@@ -857,12 +1070,19 @@ def _run_stl(args: argparse.Namespace) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """Build the top-level argument parser for the package CLI.
+
+    Returns:
+        Configured top-level parser.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Convert SWIFT simulation snapshots to 3D-printable STL meshes."
         )
     )
 
+    # The current branch exposes only STL generation, but it keeps a subcommand
+    # structure so future command groups can be added without breaking parsing.
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     stl = subparsers.add_parser(
@@ -947,11 +1167,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list[str]] = None) -> None:
-    """Entry point for the `meshmerizer` CLI."""
+    """Entry point for the ``meshmerizer`` CLI.
+
+    Args:
+        argv: Optional argument vector. When omitted, ``sys.argv[1:]`` is used.
+    """
     if argv is None:
         argv = sys.argv[1:]
 
-    # Backwards-compatible mode: `meshmerizer snapshot.hdf5 ...`.
+    # Preserve the historical one-command invocation style by treating a bare
+    # snapshot path as ``meshmerizer stl <snapshot> ...``.
     if argv and argv[0] != "stl":
         argv = ["stl", *argv]
 

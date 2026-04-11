@@ -1,177 +1,145 @@
 # Meshmerizer
 
-**Meshmerizer** is a high-performance Python package for converting hydrodynamical simulation outputs (point clouds and SPH data) into watertight, 3D-printable STL meshes. 
+Meshmerizer converts particle-based simulation outputs into watertight STL
+meshes. It is built around dense voxelization, signed-distance-field surface
+extraction, and a chunked union path for cases that are too large to mesh in
+one pass.
 
-It specializes in processing data from **SWIFT** simulations but is generic enough to handle any 3D point cloud data.
+The current package focuses on STL generation from SWIFT snapshots and generic
+particle data.
 
-## Key Features
+## Features
 
-*   **Fast Voxelization**: 
-    *   **C-Accelerated Smoothing**: Uses a custom C extension for high-performance SPH kernel deposition (smoothing).
-    *   **Vectorized Point Cloud Deposition**: Efficient numpy-based accumulation for raw point clouds.
-*   **Watertight Mesh Generation**: 
-    *   **SDF (Signed Distance Field)**: Generates naturally smooth and watertight surfaces ideal for fluids.
-    *   **Automatic Padding**: Ensures meshes are closed at boundaries.
-*   **Physical Scaling**: 
-    *   Supports `box_size` inputs to ensure the final STL mesh respects physical dimensions (e.g., parsecs, cm).
-*   **Robust Repair**: 
-    *   Built-in mesh cleaning to remove degenerate faces, duplicates, and unreferenced vertices.
-    *   Optional Taubin smoothing for surface refinement.
+- C-accelerated smoothed voxelization for SPH-style particle data
+- signed-distance-field meshing for watertight surfaces
+- chunked meshing with a watertight `unioned` output mode
+- optional preprocessing with log scaling, filament filtering, halo clipping,
+  and Gaussian smoothing
+- optional print scaling via `--target-size`
 
 ## Installation
 
-Meshmerizer requires a C compiler for the acceleration extension.
-
-### From Source
-
 ```bash
-git clone https://github.com/yourusername/meshmerizer.git
-cd meshmerizer
 pip install -e .
 ```
 
-*Note: This will automatically compile the `_voxelize` C extension.*
+For development tools and tests:
 
-### Dependencies
-
-*   `numpy`
-*   `scipy`
-*   `scikit-image` (Marching Cubes)
-*   `trimesh` (Mesh handling)
-*   `swiftsimio` (SWIFT data loading)
-
-## Usage
-
-### Command Line Interface (CLI)
-
-Meshmerizer provides a dedicated CLI for processing SWIFT simulation snapshots directly from the terminal.
-
-**Basic Usage:**
 ```bash
-meshmerizer snapshot_0000.hdf5
+pip install -e ".[dev]"
 ```
 
-**Advanced Usage:**
-Generate a high-resolution mesh (256^3) using SDF, project the "densities" field, and scale the final model to 15cm for printing:
+## CLI
+
+The package currently exposes one command group:
 
 ```bash
-meshmerizer snapshot_0000.hdf5 \
-  --resolution 256 \
-  --method sdf \
+meshmerizer stl snapshot.hdf5
+```
+
+The historical shorthand still works:
+
+```bash
+meshmerizer snapshot.hdf5
+```
+
+### Common examples
+
+Dense STL generation:
+
+```bash
+meshmerizer stl snapshot.hdf5 \
+  --particle-type gas \
   --field densities \
-  --target-size 15 \
-  --output my_model.stl
+  --resolution 256 \
+  --output dense.stl
 ```
 
-**Options:**
-*   `filename`: Path to the input HDF5 file.
-*   `--output, -o`: Output filename (default: input + .stl).
-*   `--resolution, -r`: Voxel grid resolution (default: 128).
-*   `--optimize`: Automatically find the optimal threshold to maximize structure connectivity (e.g. for cosmic web). Ignores `--threshold` if set.
-*   `--max-filling-factor`: When using `--optimize`, the maximum allowed volume fraction of the box (default 0.2).
-*   `--preprocess`: Preprocessing step for the voxel grid: `none`, `log` (log10 scaling), `filaments` (Hessian-based structure enhancement). Recommended `log` or `filaments` for cosmic web.
-*   `--particle-type, -p`: Particle type to extract: `gas`, `dark_matter`, `stars`, `black_holes` (default: `gas`).
-*   `--method, -m`: Mesh generation method: `sdf` (smoother, watertight) or `standard` (default: `sdf`).
-*   `--target-size, -s`: Target print size in cm.
-*   `--box-size, -b`: Physical box size (overrides data bounds).
-*   `--smoothing-factor`: Multiplier for SPH smoothing lengths.
-
-### Cosmic Web Extraction Example
-
-To extract filamentary structures from dark matter, use logarithmic scaling or the filament filter. Adding `--optimize` will automatically find the threshold that keeps the web connected while discarding noise.
+Chunked watertight union:
 
 ```bash
-meshmerizer snapshot_0000.hdf5 \
-  --particle-type dark_matter \
-  --preprocess log \
-  --optimize \
-  --max-filling-factor 0.15 \
-  --resolution 256 \
-  --output cosmic_web_optimized.stl
+meshmerizer stl snapshot.hdf5 \
+  --particle-type gas \
+  --field densities \
+  --resolution 128 \
+  --nchunks 2 \
+  --chunk-output unioned \
+  --output chunked.stl
 ```
 
-### Basic Example
+Separate chunk files:
 
-Here is how to generate a mesh from a set of particles programmatically:
+```bash
+meshmerizer stl snapshot.hdf5 \
+  --resolution 128 \
+  --nchunks 2 \
+  --chunk-output separate \
+  --output chunked.stl
+```
+
+Subregion extraction with tighter bounds:
+
+```bash
+meshmerizer stl snapshot.hdf5 \
+  --particle-type gas \
+  --field densities \
+  --center 60 60 60 \
+  --extent 15 \
+  --tight-bounds \
+  --output region.stl
+```
+
+## Important options
+
+- `--resolution`: voxel grid resolution per axis
+- `--nchunks`: number of chunks per axis for chunked meshing
+- `--chunk-output`: `unioned` or `separate`
+- `--threshold`: isosurface threshold
+- `--preprocess`: `none`, `log`, or `filaments`
+- `--clip-halos`: percentile clip before preprocessing
+- `--gaussian-sigma`: Gaussian smoothing width in voxel units
+- `--target-size`: scale the longest mesh dimension to the given centimetres
+- `--remove-islands`: keep only the largest connected component
+
+## Python usage
 
 ```python
 import numpy as np
-from meshmerizer.voxels import generate_voxel_grid
+
 from meshmerizer.mesh import voxels_to_stl_via_sdf
+from meshmerizer.voxels import generate_voxel_grid
 
-# 1. Prepare your data (N, 3 coordinates)
-coordinates = np.random.rand(1000, 3) 
-data = np.ones(1000) # Mass or density
-smoothing_lengths = np.ones(1000) * 0.05 # Optional SPH smoothing
+coordinates = np.random.rand(1000, 3)
+data = np.ones(1000)
+smoothing_lengths = np.full(1000, 0.05)
 
-# 2. Voxelize (C-accelerated if smoothing_lengths provided)
-# box_size defines the physical scale of the grid (e.g. 1.0 kpc)
 grid, voxel_size = generate_voxel_grid(
     data=data,
     coordinates=coordinates,
     resolution=128,
     smoothing_lengths=smoothing_lengths,
-    box_size=1.0 
+    box_size=1.0,
 )
 
-# 3. Generate Mesh using Signed Distance Fields (recommended for fluids)
 meshes = voxels_to_stl_via_sdf(
-    grid, 
-    threshold=0.5, 
-    voxel_size=voxel_size
+    grid,
+    threshold=0.5,
+    voxel_size=voxel_size,
 )
 
-# 4. Save
-if meshes:
-    meshes[0].save("output.stl")
+meshes[0].save("output.stl")
 ```
 
-### 3D Printing & Real-World Scaling
+## Package layout
 
-Meshmerizer includes tools to prepare your mesh for physical 3D printing by scaling it to a target real-world size.
+- `src/meshmerizer/cli.py`: CLI entry point
+- `src/meshmerizer/voxels.py`: voxelization and preprocessing helpers
+- `src/meshmerizer/chunking.py`: chunk geometry and chunked meshing helpers
+- `src/meshmerizer/mesh.py`: mesh wrapper and voxel-to-surface conversion
+- `src/meshmerizer/printing.py`: print-scaling helper used by `--target-size`
 
-```python
-from meshmerizer.printing import scale_mesh_to_print
-import unyt
-
-# ... generate your mesh ...
-
-# Option 1: Scale to 10 cm using a simple float
-scale_mesh_to_print(meshes[0], target_size=10.0)
-
-# Option 2: Scale using unyt quantities (e.g., 5 inches)
-target_size = 5.0 * unyt.inch
-scale_mesh_to_print(meshes[0], target_size=target_size)
-
-# Save the print-ready file (units will be millimeters for slicers)
-meshes[0].save("print_ready.stl")
-```
-
-### Advanced Usage
-
-Check the `examples/` directory for a complete script generating a helical structure:
+## Testing
 
 ```bash
-python examples/generate_example.py
-```
-
-## Development
-
-### Running Tests
-
-The project includes a comprehensive test suite using `pytest`.
-
-```bash
-# Install test dependencies
-pip install -e .[dev]
-
-# Run tests
 pytest
 ```
-
-### Project Structure
-
-*   `src/meshmerizer/voxels.py`: Voxelization logic.
-*   `src/meshmerizer/_voxelize.c`: C extension for performance.
-*   `src/meshmerizer/mesh.py`: Marching cubes and mesh repair logic.
-*   `tests/`: Unit tests for ensuring watertightness and scaling.
