@@ -17,7 +17,7 @@ try:
 except ImportError:
     _voxelize = None
 
-from .mesh import Mesh
+from .mesh import Mesh, voxels_to_stl_via_sdf
 from .voxels import (
     process_filament_filter,
     process_gaussian_smoothing,
@@ -285,6 +285,33 @@ def voxelize_hard_chunk(
         box_size=local_box_size,
         nthreads=nthreads,
     )
+
+
+def mesh_hard_chunk_sdf(
+    chunk_grid: np.ndarray,
+    chunk_bounds: HardChunkBounds,
+    *,
+    threshold: float,
+    closing_radius: int = 1,
+) -> list[Mesh]:
+    """Generate watertight mesh(es) for one hard chunk via local SDF.
+
+    Returned meshes are placed in global coordinates using the chunk's world
+    origin.
+    """
+    voxel_size = float(chunk_bounds.extent[0] / chunk_bounds.shape[0])
+    meshes = voxels_to_stl_via_sdf(
+        chunk_grid,
+        threshold=threshold,
+        closing_radius=closing_radius,
+        split_islands=True,
+        voxel_size=voxel_size,
+    )
+
+    world_origin = chunk_bounds.world_start
+    for mesh in meshes:
+        mesh.vertices[:] = mesh.vertices + world_origin
+    return meshes
 
 
 def generate_chunk_grid(
