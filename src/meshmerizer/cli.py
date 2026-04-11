@@ -23,6 +23,7 @@ from meshmerizer.chunking import (
     keep_largest_mesh_component,
     union_hard_chunk_meshes,
 )
+from meshmerizer.logging_utils import log_status
 from meshmerizer.mesh import Mesh, voxels_to_stl_via_sdf
 from meshmerizer.printing import scale_mesh_to_print
 from meshmerizer.voxels import (
@@ -62,7 +63,7 @@ def _print_elapsed(label: str, start: float) -> None:
         label: Human-readable label for the timed stage.
         start: ``time.perf_counter()`` timestamp captured before the stage.
     """
-    print(f"{label} took {time.perf_counter() - start:.3f} s")
+    log_status("Timing", f"{label} took {time.perf_counter() - start:.3f} s")
 
 
 def _add_common_voxel_args(parser: argparse.ArgumentParser) -> None:
@@ -500,7 +501,7 @@ def _apply_preprocess(
     if preprocess != "none":
         # The preprocess choice controls the scalar field that the final
         # mesh is extracted from, but all modes still end with Gaussian blur.
-        print(f"Applying preprocessing: {preprocess}")
+        log_status("Cleaning", f"Applying preprocessing: {preprocess}")
         if preprocess == "log":
             grid = process_log_scale(grid)
         elif preprocess == "filaments":
@@ -511,7 +512,10 @@ def _apply_preprocess(
         raise ValueError("--gaussian-sigma must be >= 0")
     grid = process_gaussian_smoothing(grid, sigma=gaussian_sigma)
 
-    print(f"Processed grid range: [{grid.min():.4e}, {grid.max():.4e}]")
+    log_status(
+        "Cleaning",
+        f"Processed grid range: [{grid.min():.4e}, {grid.max():.4e}]",
+    )
     return grid
 
 
@@ -569,7 +573,7 @@ def _load_swift_volume(
 
     # Voxelize after all coordinate transforms and cropping so the dense and
     # chunked paths use the same particle preparation rules.
-    print(f"Voxelizing to {resolution}^3 grid...")
+    log_status("Voxelising", f"Voxelizing to {resolution}^3 grid...")
     grid, voxel_size = generate_voxel_grid(
         data=field_data,
         coordinates=coords,
@@ -578,7 +582,7 @@ def _load_swift_volume(
         box_size=effective_box_size,
         nthreads=nthreads,
     )
-    print(f"Voxel size: {voxel_size:.4e} (sim units)")
+    log_status("Voxelising", f"Voxel size: {voxel_size:.4e} (sim units)")
     _print_elapsed("Voxelization", voxelize_start)
     return grid, voxel_size, origin
 
@@ -632,7 +636,7 @@ def _load_swift_particles(
 
     total_start = time.perf_counter()
 
-    print(f"Loading SWIFT data from {filename}...")
+    log_status("Loading", f"Loading SWIFT data from {filename}...")
     load_start = time.perf_counter()
     try:
         data = sw.load(str(filename))
@@ -680,7 +684,7 @@ def _load_swift_particles(
     else:
         raise ValueError(f"Unknown particle type '{particle_type}'")
 
-    print(f"Extracting {particle_type} particles...")
+    log_status("Loading", f"Extracting {particle_type} particles...")
     extract_start = time.perf_counter()
     coords_cosmo = part_data.coordinates
     coords = coords_cosmo.value
@@ -702,10 +706,11 @@ def _load_swift_particles(
     shift_arr = np.asarray(shift, dtype=np.float64)
     if shift_arr.shape != (3,):
         raise ValueError("--shift must provide exactly 3 values: dx dy dz")
-    print(
+    log_status(
+        "Loading",
         "Coordinate shift: "
         f"({shift_arr[0]:.6g},{shift_arr[1]:.6g},{shift_arr[2]:.6g}) "
-        f"wrap_shift={wrap_shift}"
+        f"wrap_shift={wrap_shift}",
     )
     shift_start = time.perf_counter()
     coords = _apply_coordinate_shift(
@@ -721,7 +726,7 @@ def _load_swift_particles(
         h = part_data.smoothing_lengths.value * smoothing_factor
         _print_elapsed("Smoothing-length extraction", smoothing_start)
     else:
-        print("Smoothing lengths not found. Generating...")
+        log_status("Loading", "Smoothing lengths not found. Generating...")
         # Generate smoothing lengths only when the snapshot does not already
         # provide them, and fall back to point deposition if generation fails.
         boxsize = data.metadata.boxsize
@@ -733,17 +738,18 @@ def _load_swift_particles(
                 kernel_gamma=1.8,
             )
             h = h_cosmo.value * smoothing_factor
-            print("Smoothing lengths generated.")
+            log_status("Loading", "Smoothing lengths generated.")
             _print_elapsed("Smoothing-length generation", smoothing_start)
         except Exception as exc:
-            print(f"Error generating smoothing lengths: {exc}")
-            print("Falling back to point deposition.")
+            log_status("Loading", f"Error generating smoothing lengths: {exc}")
+            log_status("Loading", "Falling back to point deposition.")
             h = None
             _print_elapsed("Smoothing-length generation", smoothing_start)
 
-    print(
+    log_status(
+        "Loading",
         f"Snapshot box size: {full_box_size:.6g} "
-        f"(sim units; from {full_box_size_source})"
+        f"(sim units; from {full_box_size_source})",
     )
 
     # Track the world-space origin of the voxelization cube separately from the
@@ -768,15 +774,17 @@ def _load_swift_particles(
             periodic=periodic,
         )
         effective_box_size = extent_f
-        print(
+        log_status(
+            "Cleaning",
             "Subregion: "
             f"center=({center_arr[0]:.6g},{center_arr[1]:.6g},"
             f"{center_arr[2]:.6g}) "
-            f"extent={extent_f:.6g} periodic={periodic}"
+            f"extent={extent_f:.6g} periodic={periodic}",
         )
-        print(
+        log_status(
+            "Cleaning",
             "Subregion origin (world-space min corner): "
-            f"({origin[0]:.6g},{origin[1]:.6g},{origin[2]:.6g})"
+            f"({origin[0]:.6g},{origin[1]:.6g},{origin[2]:.6g})",
         )
         n_selected = int(np.asarray(coords).shape[0])
         _raise_if_empty_subregion_selection(
@@ -787,9 +795,10 @@ def _load_swift_particles(
             extent=extent_f,
             periodic=periodic,
         )
-        print(
+        log_status(
+            "Cleaning",
             f"Selected {n_selected} {particle_type} particles "
-            f"for field '{field}'."
+            f"for field '{field}'.",
         )
         _print_elapsed("Subregion crop", crop_start)
 
@@ -807,10 +816,11 @@ def _load_swift_particles(
         origin = origin + origin_offset
         if center is not None and periodic:
             origin = np.mod(origin, full_box_size)
-        print(
+        log_status(
+            "Cleaning",
             "Tightened voxelization bounds: "
             f"origin=({origin[0]:.6g},{origin[1]:.6g},{origin[2]:.6g}) "
-            f"box_size={effective_box_size:.6g}"
+            f"box_size={effective_box_size:.6g}",
         )
         _print_elapsed("Tight bounds", tighten_start)
 
@@ -828,7 +838,7 @@ def _run_stl(args: argparse.Namespace) -> None:
     # post-processing, and final export.
     run_start = time.perf_counter()
     if args.nchunks < 1:
-        print("Error: --nchunks must be >= 1")
+        log_status("Meshing", "Error: --nchunks must be >= 1")
         sys.exit(1)
     if args.nchunks > 1:
         # The chunked path prepares particles once, then either writes
@@ -852,7 +862,7 @@ def _run_stl(args: argparse.Namespace) -> None:
                 )
             )
         except (RuntimeError, ValueError) as exc:
-            print(str(exc))
+            log_status("Loading", str(exc))
             sys.exit(1)
 
         final_threshold = args.threshold
@@ -863,14 +873,18 @@ def _run_stl(args: argparse.Namespace) -> None:
             nchunks=args.nchunks,
         )
 
-        print(
+        log_status(
+            "Meshing",
             "Chunked meshing setup:\n"
             f"  threshold:    {final_threshold:.4e}\n"
             f"  chunks/axis:  {args.nchunks}\n"
             f"  resolution:   {args.resolution}\n"
-            f"  chunk output: {args.chunk_output}"
+            f"  chunk output: {args.chunk_output}",
         )
-        print("\nChunk extraction pass:")
+        if args.chunk_output == "separate":
+            log_status("Meshing", "Chunk extraction pass:")
+        else:
+            log_status("Meshing", "Chunk union pass:")
 
         try:
             mesh_start = time.perf_counter()
@@ -889,11 +903,11 @@ def _run_stl(args: argparse.Namespace) -> None:
             )
             _print_elapsed("Hard chunk mesh generation", mesh_start)
         except ValueError as exc:
-            print(f"Error generating chunked mesh: {exc}")
+            log_status("Meshing", f"Error generating chunked mesh: {exc}")
             sys.exit(1)
 
         if not chunk_meshes:
-            print("Error: No chunk meshes generated (result was empty).")
+            log_status("Meshing", "Error: No chunk meshes generated.")
             sys.exit(1)
 
         output_path = args.output or args.filename.with_suffix(".stl")
@@ -904,52 +918,39 @@ def _run_stl(args: argparse.Namespace) -> None:
             output_dir.mkdir(parents=True, exist_ok=True)
             stem = output_path.stem
             chunk_counter = 0
-            print(f"\nWriting separate chunks to {output_dir}/")
+            log_status("Saving", f"Writing separate chunks to {output_dir}/")
             # Number chunks monotonically in write order so the filenames are
             # stable and easy to inspect.
             for _bounds, meshes in chunk_meshes:
                 for mesh in meshes:
                     chunk_counter += 1
                     chunk_path = output_dir / f"{stem}_{chunk_counter}.stl"
-                    print(f"Saving chunk to {chunk_path}...")
+                    log_status("Saving", f"Saving chunk to {chunk_path}...")
                     mesh.save(str(chunk_path))
             _print_elapsed("Total STL pipeline", run_start)
-            print("Done.")
+            log_status("Saving", "Done.")
             return
 
-        # Regenerate with overlap so the unioned path has enough seam
-        # context to assign and stitch boundary triangles robustly.
-        print("\nUnion assembly pass:")
-        print("  Regenerating overlapped chunk meshes for seam-safe union...")
-        union_start = time.perf_counter()
-        chunk_meshes = generate_hard_chunk_meshes(
-            field_data,
-            coords,
-            h,
-            virtual_grid,
-            threshold=final_threshold,
-            preprocess=args.preprocess,
-            clip_halos=args.clip_halos,
-            gaussian_sigma=args.gaussian_sigma,
-            nthreads=args.nthreads,
-            overlap_voxels=1,
-        )
-        _print_elapsed("Overlapped chunk generation", union_start)
+        log_status("Meshing", "Union assembly pass:")
         final_mesh = union_hard_chunk_meshes(chunk_meshes)
 
         if args.remove_islands is not None:
             if args.remove_islands == 0:
                 # Match the dense-path meaning of the bare flag by keeping only
                 # the single largest connected mesh body.
-                print("  Island filtering: keeping only the largest component")
+                log_status(
+                    "Cleaning",
+                    "Island filtering: keeping only the largest component",
+                )
                 final_mesh = keep_largest_mesh_component(final_mesh)
             else:
                 # Convert the voxel-count threshold into a physical volume cut
                 # so the chunked path can filter assembled mesh bodies using
                 # the same user-facing semantics.
-                print(
-                    "  Island filtering: removing components smaller than "
-                    f"{args.remove_islands} voxels"
+                log_status(
+                    "Cleaning",
+                    "Island filtering: removing components smaller than "
+                    f"{args.remove_islands} voxels",
                 )
                 min_volume = args.remove_islands * (virtual_grid.voxel_size**3)
                 components = final_mesh.to_trimesh().split(
@@ -968,9 +969,10 @@ def _run_stl(args: argparse.Namespace) -> None:
                     if component_volume >= min_volume:
                         kept.append(component)
                 if not kept:
-                    print(
+                    log_status(
+                        "Cleaning",
                         "Error: Island removal removed all chunked mesh "
-                        "components."
+                        "components.",
                     )
                     sys.exit(1)
                 if len(kept) == 1:
@@ -981,26 +983,31 @@ def _run_stl(args: argparse.Namespace) -> None:
         # Apply optional post-processing after union so it acts on the final
         # watertight surface rather than on individual chunk fragments.
         if args.target_size:
-            print(f"Scaling mesh to target size: {args.target_size} cm...")
+            log_status(
+                "Cleaning",
+                f"Scaling mesh to target size: {args.target_size} cm...",
+            )
             scale_mesh_to_print(final_mesh, args.target_size)
 
         if args.subdivide_iters < 0:
-            print("Error: --subdivide-iters must be >= 0")
+            log_status("Cleaning", "Error: --subdivide-iters must be >= 0")
             sys.exit(1)
         if args.subdivide_iters > 0:
-            print(
+            log_status(
+                "Cleaning",
                 "Applying Loop subdivision to final mesh "
-                f"({args.subdivide_iters} iterations)..."
+                f"({args.subdivide_iters} iterations)...",
             )
             final_mesh.subdivide(iterations=args.subdivide_iters)
 
         if args.smooth_iters < 0:
-            print("Error: --smooth-iters must be >= 0")
+            log_status("Cleaning", "Error: --smooth-iters must be >= 0")
             sys.exit(1)
         if args.smooth_iters > 0:
-            print(
+            log_status(
+                "Cleaning",
                 "Applying Taubin smoothing to final mesh "
-                f"({args.smooth_iters} iterations)..."
+                f"({args.smooth_iters} iterations)...",
             )
             final_mesh.repair(smoothing_iters=args.smooth_iters)
         else:
@@ -1011,16 +1018,17 @@ def _run_stl(args: argparse.Namespace) -> None:
         # Call out topology problems explicitly before writing the final STL so
         # users do not miss a non-watertight export in a long run.
         if not final_mesh.to_trimesh().is_watertight:
-            print(
+            log_status(
+                "Saving",
                 "⚠️ Warning: final mesh is not watertight. "
-                "The STL will still be written."
+                "The STL will still be written.",
             )
-        print(f"\nSaving final chunked mesh to {output_path}...")
+        log_status("Saving", f"Saving final chunked mesh to {output_path}...")
         save_start = time.perf_counter()
         final_mesh.save(str(output_path))
         _print_elapsed("Mesh save", save_start)
         _print_elapsed("Total STL pipeline", run_start)
-        print("Done.")
+        log_status("Saving", "Done.")
         return
 
     # The dense path voxelizes once, preprocesses once, and extracts the final
@@ -1042,7 +1050,7 @@ def _run_stl(args: argparse.Namespace) -> None:
             tight_bounds=args.tight_bounds,
         )
     except (RuntimeError, ValueError) as exc:
-        print(str(exc))
+        log_status("Loading", str(exc))
         sys.exit(1)
 
     try:
@@ -1054,15 +1062,16 @@ def _run_stl(args: argparse.Namespace) -> None:
             args.gaussian_sigma,
         )
     except ValueError as exc:
-        print(str(exc))
+        log_status("Cleaning", str(exc))
         sys.exit(1)
     _print_elapsed("Grid preprocessing", preprocess_start)
 
     final_threshold = args.threshold
 
-    print(
+    log_status(
+        "Meshing",
         "Generating watertight mesh using SDF "
-        f"(threshold={final_threshold:.4e})..."
+        f"(threshold={final_threshold:.4e})...",
     )
 
     try:
@@ -1075,18 +1084,18 @@ def _run_stl(args: argparse.Namespace) -> None:
         )
         _print_elapsed("Dense mesh generation", mesh_start)
     except ValueError as exc:
-        print(f"Error generating mesh: {exc}")
+        log_status("Meshing", f"Error generating mesh: {exc}")
         sys.exit(1)
 
     if not meshes:
-        print("Error: No mesh generated (result was empty).")
+        log_status("Meshing", "Error: No mesh generated.")
         sys.exit(1)
 
     final_mesh: Mesh = meshes[0]
     if len(meshes) > 1:
         # Preserve all islands unless the user explicitly requested island
         # removal before meshing.
-        print(f"Merging {len(meshes)} mesh components...")
+        log_status("Meshing", f"Merging {len(meshes)} mesh components...")
         combined = trimesh.util.concatenate([m.to_trimesh() for m in meshes])
         final_mesh = Mesh(mesh=combined)
 
@@ -1095,26 +1104,31 @@ def _run_stl(args: argparse.Namespace) -> None:
     final_mesh.translate(origin)
 
     if args.target_size:
-        print(f"Scaling mesh to target size: {args.target_size} cm...")
+        log_status(
+            "Cleaning",
+            f"Scaling mesh to target size: {args.target_size} cm...",
+        )
         scale_mesh_to_print(final_mesh, args.target_size)
 
     if args.subdivide_iters < 0:
-        print("Error: --subdivide-iters must be >= 0")
+        log_status("Cleaning", "Error: --subdivide-iters must be >= 0")
         sys.exit(1)
     if args.subdivide_iters > 0:
-        print(
+        log_status(
+            "Cleaning",
             "Applying Loop subdivision to final mesh "
-            f"({args.subdivide_iters} iterations)..."
+            f"({args.subdivide_iters} iterations)...",
         )
         final_mesh.subdivide(iterations=args.subdivide_iters)
 
     if args.smooth_iters < 0:
-        print("Error: --smooth-iters must be >= 0")
+        log_status("Cleaning", "Error: --smooth-iters must be >= 0")
         sys.exit(1)
     if args.smooth_iters > 0:
-        print(
+        log_status(
+            "Cleaning",
             "Applying Taubin smoothing to final mesh "
-            f"({args.smooth_iters} iterations)..."
+            f"({args.smooth_iters} iterations)...",
         )
         final_mesh.repair(smoothing_iters=args.smooth_iters)
     else:
@@ -1126,16 +1140,17 @@ def _run_stl(args: argparse.Namespace) -> None:
     # Dense exports should also warn loudly when the extracted surface is not
     # watertight so the issue is visible in the final terminal output.
     if not final_mesh.to_trimesh().is_watertight:
-        print(
+        log_status(
+            "Saving",
             "⚠️ Warning: final mesh is not watertight. "
-            "The STL will still be written."
+            "The STL will still be written.",
         )
-    print(f"Saving to {output_path}...")
+    log_status("Saving", f"Saving to {output_path}...")
     save_start = time.perf_counter()
     final_mesh.save(str(output_path))
     _print_elapsed("Mesh save", save_start)
     _print_elapsed("Total STL pipeline", run_start)
-    print("Done.")
+    log_status("Saving", "Done.")
 
 
 def _build_parser() -> argparse.ArgumentParser:

@@ -10,6 +10,7 @@ from typing import Any, Union
 
 import numpy as np
 
+from .logging_utils import log_status
 from .mesh import Mesh
 
 
@@ -39,7 +40,7 @@ def scale_mesh_to_print(
     # Refuse to scale degenerate geometry because the scale factor would be
     # undefined.
     if max_dimension == 0:
-        print("Warning: Mesh has zero extent. Cannot scale.")
+        log_status("Cleaning", "Warning: Mesh has zero extent. Cannot scale.")
         return mesh
 
     # Convert quantity-like inputs to centimetres so the CLI accepts both plain
@@ -48,8 +49,9 @@ def scale_mesh_to_print(
         try:
             target_size_cm = target_size.to("cm").value
         except Exception as e:
-            print(
-                f"Error converting unyt quantity: {e}. Assuming value is cm."
+            log_status(
+                "Cleaning",
+                f"Error converting unyt quantity: {e}. Assuming value is cm.",
             )
             target_size_cm = target_size.value
     else:
@@ -64,10 +66,11 @@ def scale_mesh_to_print(
     scale_factor = target_size_mm / max_dimension
     mesh.to_trimesh().apply_scale(scale_factor)
 
-    print(
+    log_status(
+        "Cleaning",
         f"Scaled mesh to {target_size_cm} cm "
-        f"(max dimension: {target_size_mm} mm)."
+        f"(max dimension: {target_size_mm} mm).",
     )
-    print(f"Scale factor applied: {scale_factor:.4f}")
+    log_status("Cleaning", f"Scale factor applied: {scale_factor:.4f}")
 
     return mesh

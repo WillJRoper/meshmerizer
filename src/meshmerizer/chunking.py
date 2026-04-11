@@ -28,6 +28,7 @@ except ImportError:
     # smoothed chunk deposition will raise when invoked.
     _voxelize = None
 
+from .logging_utils import current_thread_number, log_status
 from .mesh import Mesh, voxels_to_stl_via_sdf
 from .voxels import (
     process_filament_filter,
@@ -734,7 +735,6 @@ def generate_hard_chunk_meshes(
         ValueError: If the input array shapes or thread count are invalid.
     """
     total_start = time.perf_counter()
-    pass_label = "Chunk pass"
     # Normalize the particle arrays once so the per-chunk loop can stay focused
     # on chunk-specific work.
     coords_arr = np.asarray(coordinates, dtype=np.float64)
@@ -792,6 +792,7 @@ def generate_hard_chunk_meshes(
                 "meshing_time": 0.0,
                 "elapsed": time.perf_counter() - chunk_start,
                 "status": "skipped",
+                "thread": current_thread_number() if nthreads > 1 else None,
             }
 
         voxelize_start = time.perf_counter()
@@ -857,6 +858,7 @@ def generate_hard_chunk_meshes(
             "meshing_time": meshing_time,
             "elapsed": time.perf_counter() - chunk_start,
             "status": status,
+            "thread": current_thread_number() if nthreads > 1 else None,
         }
 
     chunk_meshes: list[tuple[HardChunkBounds, list[Mesh]]] = []
@@ -888,11 +890,13 @@ def generate_hard_chunk_meshes(
         meshing_total += float(result["meshing_time"])
         elapsed = float(result["elapsed"])
         status = str(result["status"])
+        thread = result["thread"]
 
         if status == "skipped":
-            print(
-                f"{pass_label:>10} {chunk_bounds.index}: "
-                "0 particles -> skipped"
+            log_status(
+                "Meshing",
+                f"{chunk_bounds.index}: 0 particles -> skipped",
+                thread=thread,
             )
             continue
 
@@ -900,25 +904,30 @@ def generate_hard_chunk_meshes(
             chunk_meshes.append((chunk_bounds, meshes))
             nonempty_chunks += 1
             emitted_meshes += len(meshes)
-            print(
-                f"{pass_label:>10} {chunk_bounds.index}: "
-                f"{particle_count} particles -> "
-                f"{len(meshes)} mesh(es) in {elapsed:.3f} s"
+            log_status(
+                "Meshing",
+                f"{chunk_bounds.index}: {particle_count} particles -> "
+                f"{len(meshes)} mesh(es) in {elapsed:.3f} s",
+                thread=thread,
             )
         else:
-            print(
-                f"{pass_label:>10} {chunk_bounds.index}: "
-                f"{particle_count} particles -> no mesh"
+            log_status(
+                "Meshing",
+                f"{chunk_bounds.index}: {particle_count} particles -> no mesh",
+                thread=thread,
             )
 
-    print("Chunk summary:")
-    print(f"  processed chunks: {processed_chunks}")
-    print(f"  non-empty chunks: {nonempty_chunks}")
-    print(f"  emitted meshes:   {emitted_meshes}")
-    print(f"  voxelization:     {voxelize_total:.3f} s total")
-    print(f"  preprocessing:    {preprocess_total:.3f} s total")
-    print(f"  sdf meshing:      {meshing_total:.3f} s total")
-    print(f"  chunk pass total: {time.perf_counter() - total_start:.3f} s")
+    log_status(
+        "Meshing",
+        "Chunk summary:\n"
+        f"  processed chunks: {processed_chunks}\n"
+        f"  non-empty chunks: {nonempty_chunks}\n"
+        f"  emitted meshes:   {emitted_meshes}\n"
+        f"  voxelization:     {voxelize_total:.3f} s total\n"
+        f"  preprocessing:    {preprocess_total:.3f} s total\n"
+        f"  sdf meshing:      {meshing_total:.3f} s total\n"
+        f"  chunk pass total: {time.perf_counter() - total_start:.3f} s",
+    )
     return chunk_meshes
 
 
@@ -1738,10 +1747,11 @@ def generate_chunked_mesh(
         halo=halo,
         smoothing_lengths_vox=smoothing_lengths_vox,
     )
-    print(
+    log_status(
+        "Meshing",
         "Chunk assignment took "
         f"{time.perf_counter() - assign_start:.3f} s "
-        f"for {grid.nchunks**3} chunk(s)"
+        f"for {grid.nchunks**3} chunk(s)",
     )
 
     meshes: list[Mesh] = []
@@ -1793,22 +1803,35 @@ def generate_chunked_mesh(
     if not meshes:
         raise ValueError("No chunk meshes created. Check threshold and input.")
 
-    print(f"Chunk deposition took {deposition_total:.3f} s total")
-    print(f"Chunk preprocessing took {preprocess_total:.3f} s total")
-    print(f"Chunk SDF meshing took {meshing_total:.3f} s total")
+    log_status(
+        "Meshing", f"Chunk deposition took {deposition_total:.3f} s total"
+    )
+    log_status(
+        "Cleaning",
+        f"Chunk preprocessing took {preprocess_total:.3f} s total",
+    )
+    log_status(
+        "Meshing", f"Chunk SDF meshing took {meshing_total:.3f} s total"
+    )
 
     stitch_start = time.perf_counter()
     combined = combine_chunk_meshes(meshes)
-    print(f"Chunk stitch took {time.perf_counter() - stitch_start:.3f} s")
+    log_status(
+        "Meshing",
+        f"Chunk stitch took {time.perf_counter() - stitch_start:.3f} s",
+    )
     if remove_islands:
         island_start = time.perf_counter()
         combined = keep_largest_mesh_component(combined)
-        print(
+        log_status(
+            "Cleaning",
             "Post-stitch island removal took "
-            f"{time.perf_counter() - island_start:.3f} s"
+            f"{time.perf_counter() - island_start:.3f} s",
         )
-    print(
-        f"Chunked mesh pipeline took {time.perf_counter() - total_start:.3f} s"
+    log_status(
+        "Meshing",
+        "Chunked mesh pipeline took "
+        f"{time.perf_counter() - total_start:.3f} s",
     )
     return combined
 

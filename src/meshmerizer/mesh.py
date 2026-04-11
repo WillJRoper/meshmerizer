@@ -17,6 +17,8 @@ from scipy import ndimage
 from skimage import measure
 from trimesh import repair as trimesh_repair
 
+from .logging_utils import log_status
+
 
 class Mesh:
     """A lightweight wrapper around :class:`trimesh.Trimesh`.
@@ -191,7 +193,7 @@ class Mesh:
         _repair_local_broken_faces(self.mesh)
         self.mesh.fix_normals()
         if not self.mesh.is_watertight:
-            print("⚠️ Mesh still not watertight after repair.")
+            log_status("Cleaning", "⚠️ Mesh still not watertight after repair.")
 
     def subdivide(self, iterations: int = 1) -> None:
         """Subdivide the mesh surface using Loop subdivision.
@@ -245,12 +247,12 @@ class Mesh:
         # Delegate serialization to trimesh and keep the wrapper responsible
         # for user-facing status output.
         self.mesh.export(filename)
-        print(f"Mesh saved to {filename}")
+        log_status("Saving", f"Mesh saved to {filename}")
 
     def show(self) -> None:
         """Display the mesh using trimesh's built-in viewer."""
         self.mesh.show()
-        print("Mesh displayed.")
+        log_status("Meshing", "Mesh displayed.")
 
 
 def _prepare_volume(
@@ -296,7 +298,10 @@ def _prepare_volume(
     bin_start = time.perf_counter()
     bin_vol = volume > threshold
     bin_end = time.perf_counter()
-    print(f"Binarization took {bin_end - bin_start:.4f} seconds.")
+    log_status(
+        "Cleaning",
+        f"Binarization took {bin_end - bin_start:.4f} seconds.",
+    )
 
     # Close small gaps in the binary mask before connected-component analysis.
     if closing_radius > 0:
@@ -305,7 +310,10 @@ def _prepare_volume(
         closing_struct = ndimage.iterate_structure(base_struct, closing_radius)
         bin_vol = ndimage.binary_closing(bin_vol, structure=closing_struct)
         close_end = time.perf_counter()
-        print(f"Binary closing took {close_end - close_start:.4f} seconds.")
+        log_status(
+            "Cleaning",
+            f"Binary closing took {close_end - close_start:.4f} seconds.",
+        )
 
     # Label islands only when the caller wants separate components or wants to
     # remove some subset of them before meshing.
@@ -315,9 +323,10 @@ def _prepare_volume(
         labeled, num = ndimage.label(bin_vol, structure=label_struct)
         island_ids = range(1, num + 1)
         split_end = time.perf_counter()
-        print(
+        log_status(
+            "Cleaning",
             f"Labeling took {split_end - split_start:.4f} seconds. "
-            f"Found {num} islands."
+            f"Found {num} islands.",
         )
 
         if remove_islands is not None and num > 0:
@@ -333,10 +342,11 @@ def _prepare_volume(
                 removed_count = num - 1
                 labeled = np.where(labeled == largest_label, largest_label, 0)
                 island_ids = [largest_label]
-                print(
+                log_status(
+                    "Cleaning",
                     "Removing disconnected islands. "
                     f"Keeping largest component with {largest_size} voxels "
-                    f"and discarding {removed_count} island(s)."
+                    f"and discarding {removed_count} island(s).",
                 )
             else:
                 # Remove only components below the requested voxel-count
@@ -347,10 +357,11 @@ def _prepare_volume(
                 labeled = np.where(keep_mask, labeled, 0)
                 island_ids = keep_labels.tolist()
                 removed_count = int(num - len(island_ids))
-                print(
+                log_status(
+                    "Cleaning",
                     "Removing disconnected islands smaller than "
                     f"{remove_islands} voxels. Keeping {len(island_ids)} "
-                    f"component(s) and discarding {removed_count} island(s)."
+                    f"component(s) and discarding {removed_count} island(s).",
                 )
     else:
         # In the simple path we treat the whole mask as one component labelled
@@ -485,9 +496,10 @@ def voxels_to_stl(
         )
 
     mesh_end = time.perf_counter()
-    print(
+    log_status(
+        "Meshing",
         f"Marching cubes took {mesh_end - mesh_start:.4f} seconds. "
-        f"Created {len(meshes)} meshes."
+        f"Created {len(meshes)} meshes.",
     )
 
     if not meshes:
@@ -500,9 +512,10 @@ def voxels_to_stl(
         raise ValueError(f"No meshes created. {msg}")
 
     end_time = time.perf_counter()
-    print(
+    log_status(
+        "Meshing",
         f"Converted volume to {len(meshes)} meshes in "
-        f"{end_time - start_time:.4f} seconds."
+        f"{end_time - start_time:.4f} seconds.",
     )
     return meshes
 
@@ -581,6 +594,9 @@ def voxels_to_stl_via_sdf(
         )
 
     end_time = time.perf_counter()
-    print(f"SDF Conversion finished in {end_time - start_time:.4f} seconds.")
+    log_status(
+        "Meshing",
+        f"SDF conversion finished in {end_time - start_time:.4f} seconds.",
+    )
 
     return meshes

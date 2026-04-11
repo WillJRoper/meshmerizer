@@ -14,6 +14,8 @@ from skimage.feature import hessian_matrix, hessian_matrix_eigvals
 from swiftsimio import SWIFTDataset, cosmo_array
 from swiftsimio.visualisation.volume_render import render_gas
 
+from .logging_utils import log_status
+
 # Import the C extension for accelerated voxelization
 try:
     from . import _voxelize
@@ -21,9 +23,10 @@ except ImportError:
     # Keep a soft failure here so non-smoothed workflows can still run even if
     # the extension was not built.
     _voxelize = None
-    print(
+    log_status(
+        "Voxelising",
         "Warning: _voxelize C extension not found. "
-        "Box deposition with smoothing_lengths will be slow."
+        "Box deposition with smoothing_lengths will be slow.",
     )
 
 
@@ -62,8 +65,9 @@ def process_remove_halos(
     # Clip only the extreme high tail so bright compact structures do not hide
     # lower-contrast extended features.
     limit = np.percentile(grid, threshold_percentile)
-    print(
-        f"Clipping halos > {limit:.4e} ({threshold_percentile}th percentile)"
+    log_status(
+        "Cleaning",
+        f"Clipping halos > {limit:.4e} ({threshold_percentile}th percentile)",
     )
     return np.clip(grid, a_min=None, a_max=limit)
 
@@ -91,7 +95,10 @@ def process_gaussian_smoothing(
     if sigma == 0:
         return grid
 
-    print(f"Applying Gaussian smoothing (sigma={sigma:.3g} voxels)")
+    log_status(
+        "Cleaning",
+        f"Applying Gaussian smoothing (sigma={sigma:.3g} voxels)",
+    )
     return ndimage.gaussian_filter(grid, sigma=sigma)
 
 
@@ -120,7 +127,7 @@ def process_filament_filter(
     Returns:
         Normalized scalar field representing the filament-and-halo response.
     """
-    print(f"Computing Hessian features (sigma={sigma})...")
+    log_status("Cleaning", f"Computing Hessian features (sigma={sigma})...")
     # Compute the Hessian tensor of the scalar field at the requested scale.
     hessian = hessian_matrix(
         grid,
@@ -172,10 +179,11 @@ def optimize_threshold_connectivity(
         Threshold that maximizes the giant connected component score within the
         requested filling-factor range.
     """
-    print(
+    log_status(
+        "Cleaning",
         "Optimizing threshold "
         f"(Target Volume: {min_filling_factor:.1%} - "
-        f"{max_filling_factor:.1%})..."
+        f"{max_filling_factor:.1%})...",
     )
 
     # Build candidate thresholds from percentiles that correspond to the target
@@ -193,10 +201,11 @@ def optimize_threshold_connectivity(
     # whenever they touch by faces, edges, or corners.
     structure = ndimage.generate_binary_structure(3, 3)
 
-    print(
-        f"{'Threshold':>12} | {'Vol%':>7} | {'Giant Comp%':>10} | {'Status'}"
+    log_status(
+        "Cleaning",
+        f"{'Threshold':>12} | {'Vol%':>7} | {'Giant Comp%':>10} | {'Status'}",
     )
-    print("-" * 50)
+    log_status("Cleaning", "-" * 50)
 
     for t in thresholds:
         mask = grid > t
@@ -237,15 +246,17 @@ def optimize_threshold_connectivity(
             best_threshold = t
             is_best = "*"
 
-        print(
+        log_status(
+            "Cleaning",
             f"{t:12.4e} | {filling_factor:7.2%} | "
-            f"{giant_fraction:10.1%} | {is_best}"
+            f"{giant_fraction:10.1%} | {is_best}",
         )
 
-    print(
+    log_status(
+        "Cleaning",
         "Optimization Complete. "
         f"Best Threshold: {best_threshold:.4e} "
-        f"(Connectivity: {best_score:.1%})"
+        f"(Connectivity: {best_score:.1%})",
     )
     return best_threshold
 
