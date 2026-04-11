@@ -63,7 +63,23 @@ def _print_elapsed(label: str, start: float) -> None:
         label: Human-readable label for the timed stage.
         start: ``time.perf_counter()`` timestamp captured before the stage.
     """
-    log_status("Timing", f"{label} took {time.perf_counter() - start:.3f} s")
+    operation = "Timing"
+    label_lower = label.lower()
+    if any(token in label_lower for token in ["load", "extract"]):
+        operation = "Loading"
+    elif any(token in label_lower for token in ["crop", "bound", "clean"]):
+        operation = "Cleaning"
+    elif any(token in label_lower for token in ["voxel", "deposit"]):
+        operation = "Voxelising"
+    elif any(
+        token in label_lower
+        for token in ["mesh", "sdf", "stitch", "chunk", "pipeline"]
+    ):
+        operation = "Meshing"
+    elif "save" in label_lower:
+        operation = "Saving"
+
+    log_status(operation, f"{label} took {time.perf_counter() - start:.3f} s")
 
 
 def _add_common_voxel_args(parser: argparse.ArgumentParser) -> None:
