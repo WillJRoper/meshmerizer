@@ -178,3 +178,6 @@ cython_debug/
 *.stl
 out/
 parameter_tests/
+
+# Local agent instructions
+AGENTS.md

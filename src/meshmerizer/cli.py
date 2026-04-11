@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -17,10 +16,8 @@ from meshmerizer.chunking import (
     generate_hard_chunk_meshes,
     union_hard_chunk_meshes,
 )
-from meshmerizer.debug_plots import save_histogram_png, save_z_projection_png
 from meshmerizer.mesh import Mesh, voxels_to_stl_via_sdf
 from meshmerizer.printing import scale_mesh_to_print
-from meshmerizer.volume_io import compute_grid_stats, write_volume_h5
 from meshmerizer.voxels import (
     generate_voxel_grid,
     process_filament_filter,
@@ -859,150 +856,10 @@ def _run_stl(args: argparse.Namespace) -> None:
     print("Done.")
 
 
-def _synthetic_volume(name: str, resolution: int) -> np.ndarray:
-    if name != "sphere":
-        raise ValueError(f"Unknown synthetic volume '{name}'")
-
-    c = (resolution - 1) / 2.0
-    x, y, z = np.ogrid[:resolution, :resolution, :resolution]
-    r = 0.35 * resolution
-    vol = ((x - c) ** 2 + (y - c) ** 2 + (z - c) ** 2) <= r**2
-    return vol.astype(np.float32)
-
-
-def _run_export_vdb(args: argparse.Namespace) -> None:
-    if args.synthetic is None and args.filename is None:
-        print("Error: provide a snapshot filename or --synthetic")
-        sys.exit(1)
-
-    if args.synthetic is not None:
-        if args.center is not None or args.extent is not None:
-            print(
-                "Error: --center/--extent are only supported for snapshot "
-                "inputs"
-            )
-            sys.exit(1)
-        grid = _synthetic_volume(args.synthetic, args.resolution)
-        voxel_size = args.box_size / args.resolution if args.box_size else 1.0
-        origin = np.zeros(3, dtype=np.float64)
-        if args.box_size is not None:
-            print(f"Box size: {args.box_size:.6g} (sim units)")
-        print(f"Voxel size: {voxel_size:.4e} (sim units)")
-    else:
-        try:
-            grid, voxel_size, origin = _load_swift_volume(
-                filename=args.filename,
-                particle_type=args.particle_type,
-                field=args.field,
-                resolution=args.resolution,
-                nthreads=args.nthreads,
-                smoothing_factor=args.smoothing_factor,
-                box_size=args.box_size,
-                shift=args.shift,
-                wrap_shift=args.wrap_shift,
-                center=args.center,
-                extent=args.extent,
-                periodic=args.periodic,
-                tight_bounds=args.tight_bounds,
-            )
-        except (RuntimeError, ValueError) as exc:
-            print(str(exc))
-            sys.exit(1)
-
-    try:
-        grid = _apply_preprocess(
-            grid,
-            args.preprocess,
-            args.clip_halos,
-            args.gaussian_sigma,
-        )
-    except ValueError as exc:
-        print(str(exc))
-        sys.exit(1)
-
-    stats = compute_grid_stats(grid)
-    print(
-        "Preprocessed grid stats: "
-        f"min={stats['min']:.6e} max={stats['max']:.6e} "
-        f"p50={stats['p50']:.6e} p90={stats['p90']:.6e} "
-        f"p99={stats['p99']:.6e} p99.9={stats['p999']:.6e}"
-    )
-    if stats["p99"] > 0.0 and np.isfinite(stats["p99"]):
-        print(
-            "Recommended Blender density multiply (so p99~1): "
-            f"{(1.0 / stats['p99']):.6g}"
-        )
-
-    if args.save_projection is not None:
-        try:
-            out = save_z_projection_png(
-                args.save_projection, grid, method="sum"
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"Error saving projection: {exc}")
-            sys.exit(1)
-        print(f"Wrote projection PNG: {out}")
-
-    if args.save_histogram is not None:
-        try:
-            out = save_histogram_png(args.save_histogram, grid)
-        except Exception as exc:  # noqa: BLE001
-            print(f"Error saving histogram: {exc}")
-            sys.exit(1)
-        print(f"Wrote histogram PNG: {out}")
-
-    out_base: Path
-    if args.filename is not None:
-        out_base = args.filename.with_suffix("")
-    else:
-        out_base = Path("synthetic")
-
-    out_h5 = args.out_h5 or out_base.with_suffix(".h5")
-    out_vdb = args.out_vdb or out_base.with_suffix(".vdb")
-
-    write_volume_h5(
-        out_h5,
-        grid,
-        voxel_size=voxel_size,
-        origin=origin,
-        grid_name=args.grid_name,
-    )
-    print(f"Wrote HDF5 intermediate: {out_h5}")
-
-    dataset_path = f"/grids/{args.grid_name}"
-    cmd = [
-        args.vdb_writer,
-        "--in",
-        str(out_h5),
-        "--dataset",
-        dataset_path,
-        "--out",
-        str(out_vdb),
-        "--grid-name",
-        args.grid_name,
-    ]
-    print("Running VDB writer:")
-    print("  " + " ".join(cmd))
-    try:
-        subprocess.run(cmd, check=True)
-    except FileNotFoundError as exc:
-        print(
-            f"Error: VDB writer not found: '{args.vdb_writer}'. "
-            "Build tools/vdb_writer and/or put meshmerizer-vdb-writer on PATH."
-        )
-        raise SystemExit(1) from exc
-    except subprocess.CalledProcessError as exc:
-        print(f"Error: VDB writer failed with exit code {exc.returncode}")
-        raise SystemExit(1) from exc
-
-    print(f"Wrote VDB: {out_vdb}")
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert SWIFT simulation snapshots to 3D-printable STL meshes "
-            "and volume formats."
+            "Convert SWIFT simulation snapshots to 3D-printable STL meshes."
         )
     )
 
@@ -1086,72 +943,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     stl.set_defaults(func=_run_stl)
 
-    export_vdb = subparsers.add_parser(
-        "export-vdb",
-        help="Export a dense volume to HDF5 then write OpenVDB",
-    )
-    export_vdb.add_argument(
-        "filename",
-        type=Path,
-        nargs="?",
-        default=None,
-        help="Path to the SWIFT snapshot file (HDF5).",
-    )
-    export_vdb.add_argument(
-        "--synthetic",
-        type=str,
-        default=None,
-        choices=["sphere"],
-        help="Generate a synthetic test volume instead of reading a snapshot.",
-    )
-    _add_common_voxel_args(export_vdb)
-    export_vdb.add_argument(
-        "--save-projection",
-        type=Path,
-        default=None,
-        help=(
-            "Save a z-axis projection PNG (sum over z) of the preprocessed "
-            "grid. Useful to verify non-uniformity in Blender."
-        ),
-    )
-    export_vdb.add_argument(
-        "--save-histogram",
-        type=Path,
-        default=None,
-        help=(
-            "Save a histogram PNG of preprocessed grid values (log10 x-axis "
-            "when values>0)."
-        ),
-    )
-    export_vdb.add_argument(
-        "--grid-name",
-        type=str,
-        default="density",
-        help="Grid/dataset name to write (stored at /grids/<grid-name>).",
-    )
-    export_vdb.add_argument(
-        "--out-h5",
-        type=Path,
-        default=None,
-        help="Output HDF5 intermediate path. Defaults to <base>.h5",
-    )
-    export_vdb.add_argument(
-        "--out-vdb",
-        type=Path,
-        default=None,
-        help="Output VDB path. Defaults to <base>.vdb",
-    )
-    export_vdb.add_argument(
-        "--vdb-writer",
-        type=str,
-        default="meshmerizer-vdb-writer",
-        help=(
-            "Path to the VDB writer helper. Default: meshmerizer-vdb-writer "
-            "(found on PATH)."
-        ),
-    )
-    export_vdb.set_defaults(func=_run_export_vdb)
-
     return parser
 
 
@@ -1161,7 +952,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         argv = sys.argv[1:]
 
     # Backwards-compatible mode: `meshmerizer snapshot.hdf5 ...`.
-    if argv and argv[0] not in {"stl", "export-vdb"}:
+    if argv and argv[0] != "stl":
         argv = ["stl", *argv]
 
     parser = _build_parser()
