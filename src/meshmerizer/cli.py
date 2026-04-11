@@ -956,7 +956,18 @@ def _run_stl(args: argparse.Namespace) -> None:
                 f"({args.smooth_iters} iterations)..."
             )
             final_mesh.repair(smoothing_iters=args.smooth_iters)
+        else:
+            # Even without user-requested smoothing, run the lightweight repair
+            # pass so small non-manifold extraction artefacts are corrected.
+            final_mesh.repair(smoothing_iters=0)
 
+        # Call out topology problems explicitly before writing the final STL so
+        # users do not miss a non-watertight export in a long run.
+        if not final_mesh.to_trimesh().is_watertight:
+            print(
+                "⚠️ Warning: final mesh is not watertight. "
+                "The STL will still be written."
+            )
         print(f"Saving to {output_path}...")
         save_start = time.perf_counter()
         final_mesh.save(str(output_path))
@@ -1059,8 +1070,19 @@ def _run_stl(args: argparse.Namespace) -> None:
             f"({args.smooth_iters} iterations)..."
         )
         final_mesh.repair(smoothing_iters=args.smooth_iters)
+    else:
+        # Run the base repair pass even when smoothing is disabled so tiny
+        # extraction artefacts are still cleaned up before export.
+        final_mesh.repair(smoothing_iters=0)
 
     output_path = args.output or args.filename.with_suffix(".stl")
+    # Dense exports should also warn loudly when the extracted surface is not
+    # watertight so the issue is visible in the final terminal output.
+    if not final_mesh.to_trimesh().is_watertight:
+        print(
+            "⚠️ Warning: final mesh is not watertight. "
+            "The STL will still be written."
+        )
     print(f"Saving to {output_path}...")
     save_start = time.perf_counter()
     final_mesh.save(str(output_path))

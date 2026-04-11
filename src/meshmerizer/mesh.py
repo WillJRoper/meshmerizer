@@ -15,6 +15,7 @@ import trimesh.remesh as remesh
 import trimesh.smoothing as smoothing
 from scipy import ndimage
 from skimage import measure
+from trimesh import repair as trimesh_repair
 
 
 class Mesh:
@@ -169,6 +170,11 @@ class Mesh:
         # starts from a sane topology.
         self.mesh.process()
 
+        # Repair small local broken regions before any optional smoothing. This
+        # specifically targets tiny non-manifold patches that can appear after
+        # marching-cubes extraction on otherwise valid surfaces.
+        _repair_local_broken_faces(self.mesh)
+
         if smoothing_iters > 0:
             # Smooth only when requested; the default path keeps the extracted
             # geometry unchanged apart from topology cleanup.
@@ -182,6 +188,7 @@ class Mesh:
         # Re-run cleanup after smoothing because smoothing can introduce small
         # inconsistencies in normals and cached topology state.
         self.mesh.process()
+        _repair_local_broken_faces(self.mesh)
         self.mesh.fix_normals()
         if not self.mesh.is_watertight:
             print("⚠️ Mesh still not watertight after repair.")
@@ -347,6 +354,52 @@ def _prepare_volume(
         island_ids = [mesh_index]
 
     return labeled, island_ids
+
+
+def _repair_local_broken_faces(mesh: trimesh.Trimesh) -> None:
+    """Repair tiny local broken-face regions in place.
+
+    Args:
+        mesh: Mesh to repair in place.
+    """
+    # Ask trimesh for faces adjacent to non-manifold or otherwise broken local
+    # topology. Empty results mean there is nothing to repair here.
+    broken = trimesh_repair.broken_faces(mesh)
+    if len(broken) == 0:
+        return
+
+    broken = np.asarray(broken, dtype=np.int64)
+    if broken.size > 128:
+        return
+
+    keep = np.ones(len(mesh.faces), dtype=bool)
+    keep[broken] = False
+
+    # Remove the local broken patch first so trimesh can triangulate its
+    # boundary cleanly as a small stitch fan.
+    repaired = mesh.copy()
+    repaired.update_faces(keep)
+    repaired.remove_unreferenced_vertices()
+
+    try:
+        stitch_faces = trimesh_repair.stitch(repaired, insert_vertices=False)
+    except ValueError:
+        return
+    if len(stitch_faces) == 0:
+        return
+
+    repaired = trimesh.Trimesh(
+        vertices=repaired.vertices.copy(),
+        faces=np.vstack([repaired.faces, stitch_faces]),
+        process=False,
+    )
+    repaired.merge_vertices()
+    repaired.update_faces(repaired.unique_faces())
+    repaired.update_faces(repaired.nondegenerate_faces())
+    repaired.remove_unreferenced_vertices()
+
+    mesh.vertices = repaired.vertices.copy()
+    mesh.faces = repaired.faces.copy()
 
 
 def voxels_to_stl(

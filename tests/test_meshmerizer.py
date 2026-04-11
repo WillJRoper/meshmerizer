@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 import trimesh
 
-from meshmerizer.cli import _build_parser, _run_stl
 from meshmerizer.chunking import HardChunkBounds
+from meshmerizer.cli import _build_parser, _run_stl
 from meshmerizer.mesh import Mesh, voxels_to_stl, voxels_to_stl_via_sdf
 from meshmerizer.voxels import generate_voxel_grid, process_gaussian_smoothing
 
@@ -221,6 +221,42 @@ def test_generate_voxel_grid_with_smoothing_respects_nthreads():
     )
 
     assert np.allclose(grid_single, grid_multi)
+
+
+def test_mesh_repair_handles_small_broken_patch() -> None:
+    vertices = np.array(
+        [
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, 1.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 0.0, -1.0],
+            [2.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    faces = np.array(
+        [
+            [0, 2, 1],
+            [1, 2, 3],
+            [1, 3, 5],
+            [5, 3, 4],
+            [0, 2, 3],
+            [0, 3, 1],
+            [1, 3, 4],
+            [1, 4, 5],
+        ],
+        dtype=np.int64,
+    )
+    mesh = Mesh(vertices=vertices, faces=faces)
+
+    assert not mesh.to_trimesh().is_watertight
+
+    mesh.repair(smoothing_iters=0)
+
+    repaired = mesh.to_trimesh()
+    assert repaired.is_winding_consistent
+    assert repaired.faces.shape[0] > 0
 
 
 def test_process_gaussian_smoothing_reduces_peak_and_preserves_mass():
