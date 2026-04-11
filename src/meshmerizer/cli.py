@@ -16,6 +16,7 @@ from meshmerizer.chunking import (
     VirtualGrid,
     combine_chunk_meshes,
     generate_hard_chunk_meshes,
+    union_hard_chunk_meshes,
 )
 from meshmerizer.debug_plots import save_histogram_png, save_z_projection_png
 from meshmerizer.mesh import Mesh, voxels_to_stl_via_sdf
@@ -710,10 +711,13 @@ def _run_stl(args: argparse.Namespace) -> None:
             print("Done.")
             return
 
-        combined_meshes = [
-            mesh for _bounds, meshes in chunk_meshes for mesh in meshes
-        ]
-        final_mesh = combine_chunk_meshes(combined_meshes)
+        if args.chunk_output == "unioned":
+            final_mesh = union_hard_chunk_meshes(chunk_meshes, virtual_grid)
+        else:
+            combined_meshes = [
+                mesh for _bounds, meshes in chunk_meshes for mesh in meshes
+            ]
+            final_mesh = combine_chunk_meshes(combined_meshes)
 
         if args.target_size:
             print(f"Scaling mesh to target size: {args.target_size} cm...")
@@ -1018,7 +1022,7 @@ def _build_parser() -> argparse.ArgumentParser:
     stl.add_argument(
         "--chunk-output",
         type=str,
-        choices=["combined", "separate"],
+        choices=["combined", "separate", "unioned"],
         default="combined",
         help=(
             "When chunking is enabled, either write one combined STL or one "

@@ -21,6 +21,7 @@ from meshmerizer.chunking import (
     particle_voxel_indices,
     preprocess_chunk_grid,
     select_particles_in_hard_chunk,
+    union_hard_chunk_meshes,
     voxelize_hard_chunk,
 )
 from meshmerizer.mesh import Mesh
@@ -293,6 +294,31 @@ def test_generate_hard_chunk_meshes_returns_chunk_mesh_pairs() -> None:
 
     assert chunk_meshes
     assert all(meshes for _bounds, meshes in chunk_meshes)
+
+
+def test_union_hard_chunk_meshes_returns_combined_mesh() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    bounds = list(iter_hard_chunk_bounds(grid))[:2]
+    mesh1 = Mesh(
+        vertices=np.array([[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.0, 0.4, 0.0]]),
+        faces=np.array([[0, 1, 2]]),
+    )
+    mesh2 = Mesh(
+        vertices=np.array([[0.6, 0.0, 0.0], [1.0, 0.0, 0.0], [0.6, 0.4, 0.0]]),
+        faces=np.array([[0, 1, 2]]),
+    )
+
+    combined = union_hard_chunk_meshes(
+        [(bounds[0], [mesh1]), (bounds[1], [mesh2])],
+        grid,
+    ).to_trimesh()
+
+    assert combined.vertices.shape[0] > 0
 
 
 def test_generate_chunk_grid_matches_full_grid_owned_region() -> None:
