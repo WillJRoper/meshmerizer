@@ -548,6 +548,64 @@ def test_generate_hard_chunk_meshes_parallel_matches_serial() -> None:
     ]
 
 
+def test_generate_hard_chunk_meshes_uses_single_deposition_thread_per_chunk(
+    monkeypatch,
+) -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=16,
+        nchunks=2,
+    )
+    coords = np.array(
+        [[0.25, 0.25, 0.25], [0.75, 0.75, 0.75]],
+        dtype=np.float64,
+    )
+    data = np.ones(coords.shape[0], dtype=np.float64)
+    seen_nthreads = []
+
+    def fake_voxelize_hard_chunk(
+        data,
+        coordinates,
+        chunk_bounds,
+        *,
+        smoothing_lengths=None,
+        nthreads=1,
+    ):
+        seen_nthreads.append(nthreads)
+        return np.ones(chunk_bounds.shape, dtype=np.float64), 1.0 / 16.0
+
+    def fake_mesh_hard_chunk_sdf(chunk_grid, chunk_bounds, *, threshold):
+        mesh = trimesh.creation.box(extents=(0.1, 0.1, 0.1))
+        return [Mesh(mesh=mesh)]
+
+    monkeypatch.setattr(
+        "meshmerizer.chunking.voxelize_hard_chunk",
+        fake_voxelize_hard_chunk,
+    )
+    monkeypatch.setattr(
+        "meshmerizer.chunking.mesh_hard_chunk_sdf",
+        fake_mesh_hard_chunk_sdf,
+    )
+
+    generate_hard_chunk_meshes(
+        data,
+        coords,
+        None,
+        grid,
+        threshold=0.5,
+        preprocess="none",
+        clip_halos=None,
+        gaussian_sigma=0.0,
+        nthreads=4,
+        overlap_voxels=1,
+        clip_to_bounds=False,
+    )
+
+    assert seen_nthreads
+    assert all(thread_count == 1 for thread_count in seen_nthreads)
+
+
 def test_generate_hard_chunk_meshes_with_overlap_returns_meshes() -> None:
     grid = VirtualGrid(
         origin=np.zeros(3),

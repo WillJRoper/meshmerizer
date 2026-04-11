@@ -722,7 +722,7 @@ def generate_hard_chunk_meshes(
         preprocess: Preprocessing mode applied to each chunk field.
         clip_halos: Optional clipping percentile.
         gaussian_sigma: Gaussian smoothing width in voxel units.
-        nthreads: Number of threads requested for deposition.
+        nthreads: Number of worker threads to use across chunks.
         overlap_voxels: Additional overlap retained around chunk boundaries.
         clip_to_bounds: Whether to clip the extracted mesh back to the hard
             chunk box.
@@ -750,6 +750,7 @@ def generate_hard_chunk_meshes(
             raise ValueError("smoothing_lengths must have shape (N,)")
     if nthreads < 1:
         raise ValueError("nthreads must be >= 1")
+    deposition_threads = 1
 
     halo_voxels = (
         chunk_halo_voxels(gaussian_sigma) if gaussian_sigma > 0 else 0
@@ -803,7 +804,7 @@ def generate_hard_chunk_meshes(
                 if smoothing_arr is None
                 else smoothing_arr[particle_indices]
             ),
-            nthreads=nthreads,
+            nthreads=deposition_threads,
         )
         voxelize_time = time.perf_counter() - voxelize_start
 
