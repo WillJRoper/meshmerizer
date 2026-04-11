@@ -211,6 +211,42 @@ def iter_hard_chunk_bounds(grid: VirtualGrid) -> Iterator[HardChunkBounds]:
         yield chunk_world_bounds(grid, chunk)
 
 
+def select_particles_in_hard_chunk(
+    coordinates: np.ndarray,
+    chunk_bounds: HardChunkBounds,
+    *,
+    smoothing_lengths: np.ndarray | None = None,
+) -> np.ndarray:
+    """Select particles that intersect a hard chunk boundary box.
+
+    When smoothing lengths are supplied, the chunk bounds are padded by the
+    per-particle support radius so particles whose support overlaps the chunk
+    are included.
+    """
+    coords_arr = np.asarray(coordinates, dtype=np.float64)
+    if coords_arr.ndim != 2 or coords_arr.shape[1] != 3:
+        raise ValueError("coordinates must have shape (N, 3)")
+
+    lower = chunk_bounds.world_start
+    upper = chunk_bounds.world_stop
+
+    if smoothing_lengths is None:
+        mask = np.all(coords_arr >= lower, axis=1) & np.all(
+            coords_arr < upper,
+            axis=1,
+        )
+        return np.nonzero(mask)[0].astype(np.int64)
+
+    h = np.asarray(smoothing_lengths, dtype=np.float64)
+    if h.shape != (coords_arr.shape[0],):
+        raise ValueError("smoothing_lengths must have shape (N,)")
+
+    mins = coords_arr - h[:, None]
+    maxs = coords_arr + h[:, None]
+    mask = np.all(maxs >= lower, axis=1) & np.all(mins < upper, axis=1)
+    return np.nonzero(mask)[0].astype(np.int64)
+
+
 def generate_chunk_grid(
     data: np.ndarray,
     coordinates: np.ndarray,

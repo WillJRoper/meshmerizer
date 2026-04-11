@@ -18,6 +18,7 @@ from meshmerizer.chunking import (
     particle_support_bounds,
     particle_voxel_indices,
     preprocess_chunk_grid,
+    select_particles_in_hard_chunk,
 )
 from meshmerizer.mesh import Mesh
 from meshmerizer.voxels import generate_voxel_grid
@@ -157,6 +158,58 @@ def test_iter_hard_chunk_bounds_cover_domain() -> None:
     maxs = np.max(np.array([b.world_stop for b in bounds]), axis=0)
     np.testing.assert_allclose(mins, grid.origin)
     np.testing.assert_allclose(maxs, grid.origin + grid.box_size)
+
+
+def test_select_particles_in_hard_chunk_without_smoothing() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    bounds = next(
+        b for b in iter_hard_chunk_bounds(grid) if b.index == (0, 0, 0)
+    )
+    coords = np.array(
+        [
+            [0.10, 0.10, 0.10],
+            [0.49, 0.49, 0.49],
+            [0.70, 0.10, 0.10],
+        ],
+        dtype=np.float64,
+    )
+
+    indices = select_particles_in_hard_chunk(coords, bounds)
+
+    np.testing.assert_array_equal(indices, np.array([0, 1]))
+
+
+def test_select_particles_in_hard_chunk_with_smoothing_overlap() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    bounds = next(
+        b for b in iter_hard_chunk_bounds(grid) if b.index == (0, 0, 0)
+    )
+    coords = np.array(
+        [
+            [0.60, 0.10, 0.10],
+            [0.80, 0.80, 0.80],
+        ],
+        dtype=np.float64,
+    )
+    smoothing = np.array([0.15, 0.05], dtype=np.float64)
+
+    indices = select_particles_in_hard_chunk(
+        coords,
+        bounds,
+        smoothing_lengths=smoothing,
+    )
+
+    np.testing.assert_array_equal(indices, np.array([0]))
 
 
 def test_generate_chunk_grid_matches_full_grid_owned_region() -> None:
