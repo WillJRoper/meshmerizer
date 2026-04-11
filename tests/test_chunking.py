@@ -294,6 +294,9 @@ def test_generate_hard_chunk_meshes_returns_chunk_mesh_pairs() -> None:
 
     assert chunk_meshes
     assert all(meshes for _bounds, meshes in chunk_meshes)
+    for _bounds, meshes in chunk_meshes:
+        for mesh in meshes:
+            assert mesh.to_trimesh().is_watertight
 
 
 def test_union_hard_chunk_meshes_returns_combined_mesh() -> None:
@@ -304,21 +307,45 @@ def test_union_hard_chunk_meshes_returns_combined_mesh() -> None:
         nchunks=2,
     )
     bounds = list(iter_hard_chunk_bounds(grid))[:2]
-    mesh1 = Mesh(
-        vertices=np.array([[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.0, 0.4, 0.0]]),
-        faces=np.array([[0, 1, 2]]),
-    )
-    mesh2 = Mesh(
-        vertices=np.array([[0.6, 0.0, 0.0], [1.0, 0.0, 0.0], [0.6, 0.4, 0.0]]),
-        faces=np.array([[0, 1, 2]]),
-    )
+    chunk_grid_1 = np.zeros(bounds[0].shape, dtype=float)
+    chunk_grid_1[1:4, 1:4, 1:4] = 1.0
+    chunk_grid_2 = np.zeros(bounds[1].shape, dtype=float)
+    chunk_grid_2[1:4, 1:4, 1:4] = 1.0
+    mesh1 = mesh_hard_chunk_sdf(chunk_grid_1, bounds[0], threshold=0.5)[0]
+    mesh2 = mesh_hard_chunk_sdf(chunk_grid_2, bounds[1], threshold=0.5)[0]
 
     combined = union_hard_chunk_meshes(
-        [(bounds[0], [mesh1]), (bounds[1], [mesh2])],
-        grid,
+        [(bounds[0], [mesh1]), (bounds[1], [mesh2])]
     ).to_trimesh()
 
     assert combined.vertices.shape[0] > 0
+
+
+def test_union_hard_chunk_meshes_is_watertight_for_split_volume() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=16,
+        nchunks=2,
+    )
+    chunk_meshes = []
+    for bounds in iter_hard_chunk_bounds(grid):
+        chunk_grid = np.zeros(bounds.shape, dtype=float)
+        x0 = max(0, 4 - bounds.sample_start[0])
+        x1 = min(bounds.shape[0], 12 - bounds.sample_start[0])
+        y0 = max(0, 4 - bounds.sample_start[1])
+        y1 = min(bounds.shape[1], 12 - bounds.sample_start[1])
+        z0 = max(0, 4 - bounds.sample_start[2])
+        z1 = min(bounds.shape[2], 12 - bounds.sample_start[2])
+        if x0 < x1 and y0 < y1 and z0 < z1:
+            chunk_grid[x0:x1, y0:y1, z0:z1] = 1.0
+        meshes = mesh_hard_chunk_sdf(chunk_grid, bounds, threshold=0.5)
+        if meshes:
+            chunk_meshes.append((bounds, meshes))
+
+    combined = union_hard_chunk_meshes(chunk_meshes).to_trimesh()
+
+    assert combined.is_watertight
 
 
 def test_generate_chunk_grid_matches_full_grid_owned_region() -> None:

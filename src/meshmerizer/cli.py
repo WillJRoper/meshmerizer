@@ -712,7 +712,7 @@ def _run_stl(args: argparse.Namespace) -> None:
             return
 
         if args.chunk_output == "unioned":
-            final_mesh = union_hard_chunk_meshes(chunk_meshes, virtual_grid)
+            final_mesh = union_hard_chunk_meshes(chunk_meshes)
         else:
             combined_meshes = [
                 mesh for _bounds, meshes in chunk_meshes for mesh in meshes

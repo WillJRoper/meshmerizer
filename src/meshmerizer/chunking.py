@@ -314,55 +314,6 @@ def mesh_hard_chunk_sdf(
     return meshes
 
 
-def _drop_internal_plane_faces(
-    mesh: Mesh,
-    chunk_bounds: HardChunkBounds,
-    interior_planes: np.ndarray,
-    *,
-    tol: float,
-) -> Mesh:
-    """Remove faces that lie exactly on interior chunk boundary planes."""
-    trimesh_mesh = mesh.to_trimesh().copy()
-    if len(trimesh_mesh.faces) == 0 or interior_planes.size == 0:
-        return Mesh(mesh=trimesh_mesh)
-
-    vertices = trimesh_mesh.vertices
-    faces = trimesh_mesh.faces
-    face_keep = np.ones(len(faces), dtype=bool)
-
-    for axis in range(3):
-        axis_planes = interior_planes[axis]
-        if axis_planes.size == 0:
-            continue
-
-        face_axis = vertices[faces][:, :, axis]
-        on_chunk_plane = np.isclose(
-            face_axis,
-            chunk_bounds.world_start[axis],
-            atol=tol,
-        ) | np.isclose(
-            face_axis,
-            chunk_bounds.world_stop[axis],
-            atol=tol,
-        )
-        if not np.any(on_chunk_plane):
-            continue
-
-        for plane in axis_planes:
-            on_plane = np.isclose(face_axis, plane, atol=tol)
-            face_keep &= ~np.all(on_plane & on_chunk_plane, axis=1)
-
-    filtered = trimesh.Trimesh(
-        vertices=vertices.copy(),
-        faces=faces[face_keep].copy(),
-        process=False,
-    )
-    filtered.remove_unreferenced_vertices()
-    filtered.process()
-    filtered.fix_normals()
-    return Mesh(mesh=filtered)
-
-
 def generate_hard_chunk_meshes(
     data: np.ndarray,
     coordinates: np.ndarray,
@@ -452,35 +403,27 @@ def generate_hard_chunk_meshes(
 
 def union_hard_chunk_meshes(
     chunk_meshes: list[tuple[HardChunkBounds, list[Mesh]]],
-    grid: VirtualGrid,
 ) -> Mesh:
-    """Combine hard chunk meshes after stripping internal interface faces."""
+    """Boolean-union hard chunk meshes into a single solid mesh."""
     if not chunk_meshes:
         raise ValueError("No chunk meshes to union")
 
-    all_bounds = list(iter_hard_chunk_bounds(grid))
-    interior_coords_x = np.unique([b.world_stop[0] for b in all_bounds])[:-1]
-    interior_coords_y = np.unique([b.world_stop[1] for b in all_bounds])[:-1]
-    interior_coords_z = np.unique([b.world_stop[2] for b in all_bounds])[:-1]
-    interior_planes = np.array(
-        [interior_coords_x, interior_coords_y, interior_coords_z],
-        dtype=object,
+    trimesh_meshes = [
+        mesh.to_trimesh()
+        for _bounds, meshes in chunk_meshes
+        for mesh in meshes
+    ]
+    if len(trimesh_meshes) == 1:
+        return Mesh(mesh=trimesh_meshes[0].copy())
+
+    unioned = trimesh.boolean.union(
+        trimesh_meshes,
+        engine="blender",
+        check_volume=True,
     )
-    tol = grid.voxel_size * 1e-3
-
-    cleaned_meshes: list[Mesh] = []
-    for bounds, meshes in chunk_meshes:
-        for mesh in meshes:
-            cleaned_meshes.append(
-                _drop_internal_plane_faces(
-                    mesh,
-                    bounds,
-                    interior_planes,
-                    tol=tol,
-                )
-            )
-
-    return combine_chunk_meshes(cleaned_meshes)
+    unioned.process()
+    unioned.fix_normals()
+    return Mesh(mesh=unioned)
 
 
 def generate_chunk_grid(
