@@ -172,3 +172,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Local macOS / generated artifacts
+.DS_Store
+*.stl
+out/
+parameter_tests/

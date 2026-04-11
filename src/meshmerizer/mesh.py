@@ -97,6 +97,10 @@ class Mesh:
         combined = trimesh.util.concatenate([self.mesh, other.mesh])
         return Mesh(mesh=combined)
 
+    def translate(self, offset: np.ndarray) -> None:
+        """Translate the mesh in place by the given offset."""
+        self.mesh.vertices[:] = self.mesh.vertices + np.asarray(offset)
+
     def repair(self, smoothing_iters: int = 0):
         """Repair the mesh for 3D printing.
 
