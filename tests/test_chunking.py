@@ -19,6 +19,7 @@ from meshmerizer.chunking import (
     particle_voxel_indices,
     preprocess_chunk_grid,
     select_particles_in_hard_chunk,
+    voxelize_hard_chunk,
 )
 from meshmerizer.mesh import Mesh
 from meshmerizer.voxels import generate_voxel_grid
@@ -210,6 +211,32 @@ def test_select_particles_in_hard_chunk_with_smoothing_overlap() -> None:
     )
 
     np.testing.assert_array_equal(indices, np.array([0]))
+
+
+def test_voxelize_hard_chunk_uses_local_chunk_bounds() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    bounds = next(
+        b for b in iter_hard_chunk_bounds(grid) if b.index == (0, 0, 0)
+    )
+    coords = np.array(
+        [
+            [0.10, 0.10, 0.10],
+            [0.20, 0.20, 0.20],
+        ],
+        dtype=np.float64,
+    )
+    data = np.array([1.0, 2.0], dtype=np.float64)
+
+    chunk_grid, voxel_size = voxelize_hard_chunk(data, coords, bounds)
+
+    assert chunk_grid.shape == bounds.shape
+    assert np.isclose(voxel_size, bounds.extent[0] / bounds.shape[0])
+    assert np.isclose(chunk_grid.sum(), data.sum())
 
 
 def test_generate_chunk_grid_matches_full_grid_owned_region() -> None:

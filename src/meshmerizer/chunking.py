@@ -247,6 +247,46 @@ def select_particles_in_hard_chunk(
     return np.nonzero(mask)[0].astype(np.int64)
 
 
+def voxelize_hard_chunk(
+    data: np.ndarray,
+    coordinates: np.ndarray,
+    chunk_bounds: HardChunkBounds,
+    *,
+    smoothing_lengths: np.ndarray | None = None,
+    nthreads: int = 1,
+) -> tuple[np.ndarray, float]:
+    """Voxelize particles into a hard chunk-local grid.
+
+    The chunk's own world-space bounds define the voxelization cube.
+    """
+    data_arr = np.asarray(data)
+    coords_arr = np.asarray(coordinates, dtype=np.float64)
+    if coords_arr.ndim != 2 or coords_arr.shape[1] != 3:
+        raise ValueError("coordinates must have shape (N, 3)")
+    if data_arr.shape[0] != coords_arr.shape[0]:
+        raise ValueError("data must have shape (N,)")
+
+    resolution = int(
+        chunk_bounds.sample_stop[0] - chunk_bounds.sample_start[0]
+    )
+    if resolution <= 0:
+        raise ValueError("chunk resolution must be > 0")
+
+    local_coords = coords_arr - chunk_bounds.world_start
+    local_box_size = float(chunk_bounds.extent[0])
+
+    from .voxels import generate_voxel_grid
+
+    return generate_voxel_grid(
+        data=data_arr,
+        coordinates=local_coords,
+        resolution=resolution,
+        smoothing_lengths=smoothing_lengths,
+        box_size=local_box_size,
+        nthreads=nthreads,
+    )
+
+
 def generate_chunk_grid(
     data: np.ndarray,
     coordinates: np.ndarray,
