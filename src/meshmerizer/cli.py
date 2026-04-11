@@ -14,7 +14,8 @@ import trimesh
 
 from meshmerizer.chunking import (
     VirtualGrid,
-    generate_chunked_mesh,
+    combine_chunk_meshes,
+    generate_hard_chunk_meshes,
 )
 from meshmerizer.debug_plots import save_histogram_png, save_z_projection_png
 from meshmerizer.mesh import Mesh, voxels_to_stl_via_sdf
@@ -666,14 +667,14 @@ def _run_stl(args: argparse.Namespace) -> None:
         )
 
         print(
-            "Generating chunked watertight mesh "
+            "Generating hard chunk watertight mesh(es) "
             f"(threshold={final_threshold:.4e}, "
             f"nchunks={args.nchunks})..."
         )
 
         try:
             mesh_start = time.perf_counter()
-            final_mesh = generate_chunked_mesh(
+            chunk_meshes = generate_hard_chunk_meshes(
                 field_data,
                 coords,
                 h,
@@ -682,12 +683,37 @@ def _run_stl(args: argparse.Namespace) -> None:
                 preprocess=args.preprocess,
                 clip_halos=args.clip_halos,
                 gaussian_sigma=args.gaussian_sigma,
-                remove_islands=args.remove_islands,
+                nthreads=args.nthreads,
             )
-            _print_elapsed("Chunked mesh generation", mesh_start)
+            _print_elapsed("Hard chunk mesh generation", mesh_start)
         except ValueError as exc:
             print(f"Error generating chunked mesh: {exc}")
             sys.exit(1)
+
+        if not chunk_meshes:
+            print("Error: No chunk meshes generated (result was empty).")
+            sys.exit(1)
+
+        output_path = args.output or args.filename.with_suffix(".stl")
+        if args.chunk_output == "separate":
+            output_dir = output_path.with_suffix("")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            stem = output_path.stem
+            chunk_counter = 0
+            for _bounds, meshes in chunk_meshes:
+                for mesh in meshes:
+                    chunk_counter += 1
+                    chunk_path = output_dir / f"{stem}_{chunk_counter}.stl"
+                    print(f"Saving chunk to {chunk_path}...")
+                    mesh.save(str(chunk_path))
+            _print_elapsed("Total STL pipeline", run_start)
+            print("Done.")
+            return
+
+        combined_meshes = [
+            mesh for _bounds, meshes in chunk_meshes for mesh in meshes
+        ]
+        final_mesh = combine_chunk_meshes(combined_meshes)
 
         if args.target_size:
             print(f"Scaling mesh to target size: {args.target_size} cm...")
@@ -713,7 +739,6 @@ def _run_stl(args: argparse.Namespace) -> None:
             )
             final_mesh.repair(smoothing_iters=args.smooth_iters)
 
-        output_path = args.output or args.filename.with_suffix(".stl")
         print(f"Saving to {output_path}...")
         save_start = time.perf_counter()
         final_mesh.save(str(output_path))

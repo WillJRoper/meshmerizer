@@ -13,6 +13,7 @@ from meshmerizer.chunking import (
     combine_chunk_meshes,
     generate_chunk_grid,
     generate_chunked_mesh,
+    generate_hard_chunk_meshes,
     iter_hard_chunk_bounds,
     keep_largest_mesh_component,
     mesh_hard_chunk_sdf,
@@ -260,6 +261,38 @@ def test_mesh_hard_chunk_sdf_places_mesh_in_world_space() -> None:
     assert trimesh_mesh.is_watertight
     assert np.all(trimesh_mesh.bounds[0] >= bounds.world_start)
     assert np.all(trimesh_mesh.bounds[1] <= bounds.world_stop + 1e-8)
+
+
+def test_generate_hard_chunk_meshes_returns_chunk_mesh_pairs() -> None:
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    coords = np.array(
+        [
+            [0.10, 0.10, 0.10],
+            [0.20, 0.20, 0.20],
+            [0.80, 0.80, 0.80],
+        ],
+        dtype=np.float64,
+    )
+    data = np.ones(coords.shape[0], dtype=np.float64)
+
+    chunk_meshes = generate_hard_chunk_meshes(
+        data,
+        coords,
+        None,
+        grid,
+        threshold=0.5,
+        preprocess="none",
+        clip_halos=None,
+        gaussian_sigma=0.0,
+    )
+
+    assert chunk_meshes
+    assert all(meshes for _bounds, meshes in chunk_meshes)
 
 
 def test_generate_chunk_grid_matches_full_grid_owned_region() -> None:

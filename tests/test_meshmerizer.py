@@ -435,9 +435,9 @@ def test_run_stl_uses_chunked_mesh_path(monkeypatch, tmp_path):
             np.zeros(3),
         )
 
-    def fake_generate_chunked_mesh(*_args, **_kwargs):
+    def fake_generate_hard_chunk_meshes(*_args, **_kwargs):
         called["chunked"] = True
-        return Mesh(
+        mesh = Mesh(
             vertices=np.array(
                 [
                     [0.0, 0.0, 0.0],
@@ -447,19 +447,75 @@ def test_run_stl_uses_chunked_mesh_path(monkeypatch, tmp_path):
             ),
             faces=np.array([[0, 1, 2]]),
         )
+        return [(object(), [mesh])]
 
     monkeypatch.setattr(
         "meshmerizer.cli._load_swift_particles", fake_load_particles
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.generate_chunked_mesh",
-        fake_generate_chunked_mesh,
+        "meshmerizer.cli.generate_hard_chunk_meshes",
+        fake_generate_hard_chunk_meshes,
     )
 
     _run_stl(args)
 
     assert called["chunked"] is True
     assert out_path.exists()
+
+
+def test_run_stl_writes_separate_chunk_directory(monkeypatch, tmp_path):
+    parser = _build_parser()
+    out_path = tmp_path / "chunked.stl"
+    args = parser.parse_args(
+        [
+            "stl",
+            "snapshot.hdf5",
+            "--nchunks",
+            "2",
+            "--chunk-output",
+            "separate",
+            "--output",
+            str(out_path),
+        ]
+    )
+
+    def fake_load_particles(**_kwargs):
+        return (
+            np.array([1.0]),
+            np.array([[0.1, 0.1, 0.1]]),
+            None,
+            1.0,
+            np.zeros(3),
+        )
+
+    mesh = Mesh(
+        vertices=np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ]
+        ),
+        faces=np.array([[0, 1, 2]]),
+    )
+
+    def fake_generate_hard_chunk_meshes(*_args, **_kwargs):
+        return [(object(), [mesh]), (object(), [mesh])]
+
+    monkeypatch.setattr(
+        "meshmerizer.cli._load_swift_particles", fake_load_particles
+    )
+    monkeypatch.setattr(
+        "meshmerizer.cli.generate_hard_chunk_meshes",
+        fake_generate_hard_chunk_meshes,
+    )
+
+    _run_stl(args)
+
+    output_dir = tmp_path / "chunked"
+    assert output_dir.is_dir()
+    assert (output_dir / "chunked_1.stl").exists()
+    assert (output_dir / "chunked_2.stl").exists()
 
 
 def test_generate_voxel_grid_coords_range_zero():

@@ -314,6 +314,69 @@ def mesh_hard_chunk_sdf(
     return meshes
 
 
+def generate_hard_chunk_meshes(
+    data: np.ndarray,
+    coordinates: np.ndarray,
+    smoothing_lengths: np.ndarray | None,
+    grid: VirtualGrid,
+    *,
+    threshold: float,
+    preprocess: str,
+    clip_halos: float | None,
+    gaussian_sigma: float,
+    nthreads: int = 1,
+) -> list[tuple[HardChunkBounds, list[Mesh]]]:
+    """Generate watertight meshes for each hard chunk independently."""
+    coords_arr = np.asarray(coordinates, dtype=np.float64)
+    data_arr = np.asarray(data)
+    if data_arr.shape[0] != coords_arr.shape[0]:
+        raise ValueError("data must have shape (N,)")
+
+    if smoothing_lengths is None:
+        smoothing_arr = None
+    else:
+        smoothing_arr = np.asarray(smoothing_lengths, dtype=np.float64)
+        if smoothing_arr.shape != (coords_arr.shape[0],):
+            raise ValueError("smoothing_lengths must have shape (N,)")
+
+    chunk_meshes: list[tuple[HardChunkBounds, list[Mesh]]] = []
+    for chunk_bounds in iter_hard_chunk_bounds(grid):
+        particle_indices = select_particles_in_hard_chunk(
+            coords_arr,
+            chunk_bounds,
+            smoothing_lengths=smoothing_arr,
+        )
+        if particle_indices.size == 0:
+            continue
+
+        chunk_grid, _voxel_size = voxelize_hard_chunk(
+            data_arr[particle_indices],
+            coords_arr[particle_indices],
+            chunk_bounds,
+            smoothing_lengths=(
+                None
+                if smoothing_arr is None
+                else smoothing_arr[particle_indices]
+            ),
+            nthreads=nthreads,
+        )
+        chunk_grid = preprocess_chunk_grid(
+            chunk_grid,
+            preprocess=preprocess,
+            clip_halos=clip_halos,
+            gaussian_sigma=gaussian_sigma,
+        )
+        meshes = mesh_hard_chunk_sdf(
+            chunk_grid,
+            chunk_bounds,
+            threshold=threshold,
+        )
+        if meshes:
+            chunk_meshes.append((chunk_bounds, meshes))
+
+    return chunk_meshes
+
+
 def generate_chunk_grid(
     data: np.ndarray,
     coordinates: np.ndarray,
