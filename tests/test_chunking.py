@@ -9,9 +9,11 @@ from meshmerizer.chunking import (
     chunk_origin,
     chunk_samples,
     chunk_sdf_to_mesh,
+    chunk_world_bounds,
     combine_chunk_meshes,
     generate_chunk_grid,
     generate_chunked_mesh,
+    iter_hard_chunk_bounds,
     keep_largest_mesh_component,
     particle_support_bounds,
     particle_voxel_indices,
@@ -115,6 +117,46 @@ def test_chunk_samples_expand_with_halo() -> None:
         chunk_origin(grid, samples),
         [10.0 + 2.0 * grid.voxel_size, 20.0, 30.0],
     )
+
+
+def test_chunk_world_bounds_match_sample_ranges() -> None:
+    grid = VirtualGrid(
+        origin=np.array([5.0, 6.0, 7.0]),
+        box_size=8.0,
+        resolution=9,
+        nchunks=2,
+    )
+    chunk = next(c for c in grid.iter_chunks() if c.index == (1, 0, 0))
+
+    bounds = chunk_world_bounds(grid, chunk)
+
+    np.testing.assert_array_equal(bounds.sample_start, np.array([4, 0, 0]))
+    np.testing.assert_array_equal(bounds.sample_stop, np.array([9, 5, 5]))
+    np.testing.assert_allclose(
+        bounds.world_start,
+        np.array([5.0, 6.0, 7.0]) + np.array([4, 0, 0]) * grid.voxel_size,
+    )
+    np.testing.assert_allclose(
+        bounds.world_stop,
+        np.array([5.0, 6.0, 7.0]) + np.array([9, 5, 5]) * grid.voxel_size,
+    )
+
+
+def test_iter_hard_chunk_bounds_cover_domain() -> None:
+    grid = VirtualGrid(
+        origin=np.array([1.0, 2.0, 3.0]),
+        box_size=9.0,
+        resolution=10,
+        nchunks=3,
+    )
+
+    bounds = list(iter_hard_chunk_bounds(grid))
+
+    assert len(bounds) == 27
+    mins = np.min(np.array([b.world_start for b in bounds]), axis=0)
+    maxs = np.max(np.array([b.world_stop for b in bounds]), axis=0)
+    np.testing.assert_allclose(mins, grid.origin)
+    np.testing.assert_allclose(maxs, grid.origin + grid.box_size)
 
 
 def test_generate_chunk_grid_matches_full_grid_owned_region() -> None:

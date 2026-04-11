@@ -81,6 +81,27 @@ class ChunkSamples:
 
 
 @dataclass(frozen=True)
+class HardChunkBounds:
+    """Hard chunk bounds in voxel/sample and world coordinates."""
+
+    index: tuple[int, int, int]
+    sample_start: np.ndarray
+    sample_stop: np.ndarray
+    world_start: np.ndarray
+    world_stop: np.ndarray
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        """Chunk sample-grid shape."""
+        return tuple((self.sample_stop - self.sample_start).astype(int))
+
+    @property
+    def extent(self) -> np.ndarray:
+        """Chunk world-space side lengths."""
+        return self.world_stop - self.world_start
+
+
+@dataclass(frozen=True)
 class VirtualGrid:
     """Global voxel geometry without allocating the full grid."""
 
@@ -159,6 +180,35 @@ def chunk_samples(
 def chunk_origin(grid: VirtualGrid, samples: ChunkSamples) -> np.ndarray:
     """Return the world-space origin of a chunk sample block."""
     return grid.origin + samples.start.astype(np.float64) * grid.voxel_size
+
+
+def chunk_world_bounds(grid: VirtualGrid, chunk: Chunk) -> HardChunkBounds:
+    """Return the hard bounds of a chunk with no halo expansion."""
+    sample_start = np.array(
+        [chunk.x.sample_start, chunk.y.sample_start, chunk.z.sample_start],
+        dtype=np.int64,
+    )
+    sample_stop = np.array(
+        [chunk.x.sample_stop, chunk.y.sample_stop, chunk.z.sample_stop],
+        dtype=np.int64,
+    )
+    world_start = (
+        grid.origin + sample_start.astype(np.float64) * grid.voxel_size
+    )
+    world_stop = grid.origin + sample_stop.astype(np.float64) * grid.voxel_size
+    return HardChunkBounds(
+        index=chunk.index,
+        sample_start=sample_start,
+        sample_stop=sample_stop,
+        world_start=world_start,
+        world_stop=world_stop,
+    )
+
+
+def iter_hard_chunk_bounds(grid: VirtualGrid) -> Iterator[HardChunkBounds]:
+    """Yield all hard chunk bounds for the virtual grid."""
+    for chunk in grid.iter_chunks():
+        yield chunk_world_bounds(grid, chunk)
 
 
 def generate_chunk_grid(
