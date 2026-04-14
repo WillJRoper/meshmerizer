@@ -863,20 +863,75 @@ def test_occupied_chunk_mask_marks_only_touched_chunks() -> None:
     assert not occupied[1, 0, 0]
 
 
-def test_generate_hard_chunk_meshes_uses_occupancy_prepass(
+def test_build_chunk_particle_index_matches_exact_selection() -> None:
+    """Ensure the one-pass chunk index matches exact per-chunk selection.
+
+    Returns:
+        ``None``. Assertions verify the precomputed lists match the exact
+        geometric selector.
+    """
+    # Compare the new one-pass chunk association against the historical exact
+    # per-chunk selector for a smoothed-overlap configuration.
+    from meshmerizer.chunks.hard import _build_chunk_particle_index
+
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    coords = np.array(
+        [
+            [0.10, 0.10, 0.10],
+            [0.49, 0.49, 0.49],
+            [0.60, 0.10, 0.10],
+            [0.80, 0.80, 0.80],
+        ],
+        dtype=np.float64,
+    )
+    smoothing = np.array([0.01, 0.06, 0.15, 0.05], dtype=np.float64)
+    overlap_voxels = 1
+
+    chunk_index = _build_chunk_particle_index(
+        coords,
+        grid,
+        smoothing_lengths=smoothing,
+        overlap_voxels=overlap_voxels,
+    )
+
+    expected = {}
+    for bounds in iter_hard_chunk_bounds(grid):
+        expanded = expand_hard_chunk_bounds(
+            grid,
+            bounds,
+            overlap_voxels=overlap_voxels,
+        )
+        indices = select_particles_in_hard_chunk(
+            coords,
+            expanded,
+            smoothing_lengths=smoothing,
+        )
+        if indices.size > 0:
+            expected[bounds.index] = indices
+
+    assert chunk_index.keys() == expected.keys()
+    for chunk_key, indices in expected.items():
+        assert np.array_equal(chunk_index[chunk_key], indices)
+
+
+def test_generate_hard_chunk_meshes_avoids_exact_selector_scan(
     monkeypatch,
 ) -> None:
-    """Ensure empty chunks can be skipped before exact particle selection.
+    """Ensure chunk meshing no longer calls the exact global selector.
 
     Args:
         monkeypatch: Pytest monkeypatch fixture.
 
     Returns:
-        ``None``. Assertions verify the expensive selector is only called for
-        occupied chunks.
+        ``None``. Assertions verify the old exact selector path is bypassed.
     """
-    # Force a scenario where only one chunk is marked occupied by the prepass,
-    # then verify the exact selector only runs for that chunk.
+    # The chunk pipeline should now rely on the precomputed chunk index rather
+    # than re-running the exact global selector for each chunk.
     grid = VirtualGrid(
         origin=np.zeros(3),
         box_size=1.0,
@@ -885,29 +940,25 @@ def test_generate_hard_chunk_meshes_uses_occupancy_prepass(
     )
     coords = np.array([[0.10, 0.10, 0.10]], dtype=np.float64)
     data = np.ones(coords.shape[0], dtype=np.float64)
-    selected_chunks = []
 
-    def fake_select_particles_in_hard_chunk(
+    def fail_select_particles_in_hard_chunk(
         coordinates,
         chunk_bounds,
         *,
         smoothing_lengths=None,
     ):
-        """Record chunks reaching the exact selection path.
+        """Fail if the historical exact selector is reached.
 
         Args:
             coordinates: Particle coordinates.
             chunk_bounds: Chunk being processed.
             smoothing_lengths: Optional smoothing lengths.
 
-        Returns:
-            One particle index for the occupied chunk, otherwise empty.
+        Raises:
+            AssertionError: Always, because this path should not be used.
         """
-        del coordinates, smoothing_lengths
-        selected_chunks.append(chunk_bounds.index)
-        if chunk_bounds.index == (0, 0, 0):
-            return np.array([0], dtype=np.int64)
-        return np.empty(0, dtype=np.int64)
+        del coordinates, chunk_bounds, smoothing_lengths
+        raise AssertionError("select_particles_in_hard_chunk should not run")
 
     def fake_voxelize_hard_chunk(
         data,
@@ -948,7 +999,7 @@ def test_generate_hard_chunk_meshes_uses_occupancy_prepass(
 
     monkeypatch.setattr(
         "meshmerizer.chunks.hard.select_particles_in_hard_chunk",
-        fake_select_particles_in_hard_chunk,
+        fail_select_particles_in_hard_chunk,
     )
     monkeypatch.setattr(
         "meshmerizer.chunks.hard.voxelize_hard_chunk",
@@ -972,8 +1023,6 @@ def test_generate_hard_chunk_meshes_uses_occupancy_prepass(
         overlap_voxels=0,
         clip_to_bounds=False,
     )
-
-    assert selected_chunks == [(0, 0, 0)]
 
 
 def test_generate_hard_chunk_meshes_with_overlap_returns_meshes() -> None:

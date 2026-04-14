@@ -258,6 +258,120 @@ def _occupied_chunk_mask(
     return occupancy > 0
 
 
+def _build_chunk_particle_index(
+    coordinates: np.ndarray,
+    grid: VirtualGrid,
+    *,
+    smoothing_lengths: np.ndarray | None,
+    overlap_voxels: int,
+    batch_size: int = 1_000_000,
+) -> dict[tuple[int, int, int], np.ndarray]:
+    """Build exact per-chunk particle lists in one pass.
+
+    Args:
+        coordinates: Particle coordinates in the chunk-local coordinate system.
+        grid: Virtual grid describing the chunk partition.
+        smoothing_lengths: Optional per-particle smoothing lengths in world
+            units.
+        overlap_voxels: Effective overlap applied during chunk processing.
+        batch_size: Number of particles to process per vectorized batch.
+
+    Returns:
+        Mapping from chunk index to the exact particle indices that intersect
+        that chunk's expanded bounds.
+
+    Raises:
+        ValueError: If the input arrays have invalid shapes.
+    """
+    # Compute the exact chunk-index ranges touched by each particle support
+    # once up front so later chunk workers never scan the full particle set.
+    coords_arr = np.asarray(coordinates, dtype=np.float64)
+    if coords_arr.ndim != 2 or coords_arr.shape[1] != 3:
+        raise ValueError("coordinates must have shape (N, 3)")
+    if coords_arr.shape[0] == 0:
+        return {}
+
+    if smoothing_lengths is None:
+        support_radius = np.zeros(coords_arr.shape[0], dtype=np.float64)
+    else:
+        support_radius = np.asarray(smoothing_lengths, dtype=np.float64)
+        if support_radius.shape != (coords_arr.shape[0],):
+            raise ValueError("smoothing_lengths must have shape (N,)")
+
+    lower_bounds, upper_bounds = _expanded_chunk_axis_bounds(
+        grid,
+        overlap_voxels=overlap_voxels,
+    )
+    chunk_particles: dict[tuple[int, int, int], list[np.ndarray]] = {}
+
+    # Group particles by identical touched chunk ranges so Python only loops
+    # over unique range boxes rather than over every particle individually.
+    for start in range(0, coords_arr.shape[0], batch_size):
+        stop = min(start + batch_size, coords_arr.shape[0])
+        batch_coords = coords_arr[start:stop]
+        batch_radius = support_radius[start:stop]
+
+        mins = batch_coords - batch_radius[:, None]
+        maxs = batch_coords + batch_radius[:, None]
+
+        start_x = np.searchsorted(upper_bounds, mins[:, 0], side="right")
+        start_y = np.searchsorted(upper_bounds, mins[:, 1], side="right")
+        start_z = np.searchsorted(upper_bounds, mins[:, 2], side="right")
+        stop_x = np.searchsorted(lower_bounds, maxs[:, 0], side="right")
+        stop_y = np.searchsorted(lower_bounds, maxs[:, 1], side="right")
+        stop_z = np.searchsorted(lower_bounds, maxs[:, 2], side="right")
+
+        valid = (
+            (start_x < stop_x)
+            & (start_y < stop_y)
+            & (start_z < stop_z)
+            & (start_x < grid.nchunks)
+            & (start_y < grid.nchunks)
+            & (start_z < grid.nchunks)
+            & (stop_x > 0)
+            & (stop_y > 0)
+            & (stop_z > 0)
+        )
+        if not np.any(valid):
+            continue
+
+        particle_indices = np.arange(start, stop, dtype=np.int64)[valid]
+        ranges = np.column_stack(
+            (
+                np.clip(start_x[valid], 0, grid.nchunks),
+                np.clip(start_y[valid], 0, grid.nchunks),
+                np.clip(start_z[valid], 0, grid.nchunks),
+                np.clip(stop_x[valid], 0, grid.nchunks),
+                np.clip(stop_y[valid], 0, grid.nchunks),
+                np.clip(stop_z[valid], 0, grid.nchunks),
+            )
+        )
+        unique_ranges, inverse = np.unique(
+            ranges,
+            axis=0,
+            return_inverse=True,
+        )
+
+        for range_index, range_row in enumerate(unique_ranges):
+            touched_particles = particle_indices[inverse == range_index]
+            start_ix, start_iy, start_iz, stop_ix, stop_iy, stop_iz = (
+                int(value) for value in range_row
+            )
+            for ix in range(start_ix, stop_ix):
+                for iy in range(start_iy, stop_iy):
+                    for iz in range(start_iz, stop_iz):
+                        chunk_particles.setdefault((ix, iy, iz), []).append(
+                            touched_particles
+                        )
+
+    return {
+        chunk_index: np.sort(
+            np.concatenate(particle_groups).astype(np.int64, copy=False)
+        )
+        for chunk_index, particle_groups in chunk_particles.items()
+    }
+
+
 def select_particles_in_hard_chunk(
     coordinates: np.ndarray,
     chunk_bounds: HardChunkBounds,
@@ -578,18 +692,17 @@ def generate_hard_chunk_meshes(
         record_timing("Chunk pass total", 0.0, operation="Meshing")
         return []
     if smoothing_arr is None and overlap_voxels == 0 and halo_voxels == 0:
-        point_particle_buckets = _bucket_point_particles_into_hard_chunks(
+        chunk_particle_index = _bucket_point_particles_into_hard_chunks(
             coords_arr,
             grid,
         )
     else:
-        point_particle_buckets = None
-    occupied_chunk_mask = _occupied_chunk_mask(
-        coords_arr,
-        grid,
-        smoothing_lengths=smoothing_arr,
-        overlap_voxels=overlap_voxels + halo_voxels,
-    )
+        chunk_particle_index = _build_chunk_particle_index(
+            coords_arr,
+            grid,
+            smoothing_lengths=smoothing_arr,
+            overlap_voxels=overlap_voxels + halo_voxels,
+        )
 
     def process_chunk(
         chunk_bounds: HardChunkBounds,
@@ -612,34 +725,12 @@ def generate_hard_chunk_meshes(
         )
         chunk_start = time.perf_counter()
 
-        # Skip chunks proven empty by the conservative occupancy prepass before
-        # doing the expensive exact particle-selection scan.
-        if not occupied_chunk_mask[chunk_bounds.index]:
-            return {
-                "bounds": chunk_bounds,
-                "particles": 0,
-                "meshes": [],
-                "voxelize_time": 0.0,
-                "preprocess_time": 0.0,
-                "meshing_time": 0.0,
-                "elapsed": time.perf_counter() - chunk_start,
-                "status": "skipped",
-                "thread": current_thread_number() if nthreads > 1 else None,
-            }
-
-        # Skip chunks with no contributing particles before doing any voxel
-        # work.
-        if point_particle_buckets is not None:
-            particle_indices = point_particle_buckets.get(
-                chunk_bounds.index,
-                np.empty(0, dtype=np.int64),
-            )
-        else:
-            particle_indices = select_particles_in_hard_chunk(
-                coords_arr,
-                effective_bounds,
-                smoothing_lengths=smoothing_arr,
-            )
+        # Reuse the precomputed per-chunk particle list rather than scanning
+        # the full particle set in every worker.
+        particle_indices = chunk_particle_index.get(
+            chunk_bounds.index,
+            np.empty(0, dtype=np.int64),
+        )
         if particle_indices.size == 0:
             return {
                 "bounds": chunk_bounds,
