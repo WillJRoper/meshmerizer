@@ -825,6 +825,157 @@ def test_generate_hard_chunk_meshes_empty_input_returns_empty_list(
     assert called["voxelize"] is False
 
 
+def test_occupied_chunk_mask_marks_only_touched_chunks() -> None:
+    """Ensure the occupancy prepass excludes obviously untouched chunks.
+
+    Returns:
+        ``None``. Assertions verify occupied chunks are conservatively marked.
+    """
+    # The conservative occupancy prepass should mark chunks touched by particle
+    # support while leaving distant chunks unmarked.
+    from meshmerizer.chunks.hard import _occupied_chunk_mask
+
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    coords = np.array(
+        [
+            [0.10, 0.10, 0.10],
+            [0.80, 0.80, 0.80],
+        ],
+        dtype=np.float64,
+    )
+    smoothing_lengths = np.array([0.01, 0.01], dtype=np.float64)
+
+    occupied = _occupied_chunk_mask(
+        coords,
+        grid,
+        smoothing_lengths=smoothing_lengths,
+        overlap_voxels=0,
+    )
+
+    assert occupied[0, 0, 0]
+    assert occupied[1, 1, 1]
+    assert not occupied[0, 0, 1]
+    assert not occupied[1, 0, 0]
+
+
+def test_generate_hard_chunk_meshes_uses_occupancy_prepass(
+    monkeypatch,
+) -> None:
+    """Ensure empty chunks can be skipped before exact particle selection.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        ``None``. Assertions verify the expensive selector is only called for
+        occupied chunks.
+    """
+    # Force a scenario where only one chunk is marked occupied by the prepass,
+    # then verify the exact selector only runs for that chunk.
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    coords = np.array([[0.10, 0.10, 0.10]], dtype=np.float64)
+    data = np.ones(coords.shape[0], dtype=np.float64)
+    selected_chunks = []
+
+    def fake_select_particles_in_hard_chunk(
+        coordinates,
+        chunk_bounds,
+        *,
+        smoothing_lengths=None,
+    ):
+        """Record chunks reaching the exact selection path.
+
+        Args:
+            coordinates: Particle coordinates.
+            chunk_bounds: Chunk being processed.
+            smoothing_lengths: Optional smoothing lengths.
+
+        Returns:
+            One particle index for the occupied chunk, otherwise empty.
+        """
+        del coordinates, smoothing_lengths
+        selected_chunks.append(chunk_bounds.index)
+        if chunk_bounds.index == (0, 0, 0):
+            return np.array([0], dtype=np.int64)
+        return np.empty(0, dtype=np.int64)
+
+    def fake_voxelize_hard_chunk(
+        data,
+        coordinates,
+        chunk_bounds,
+        *,
+        smoothing_lengths=None,
+        nthreads=1,
+    ):
+        """Return one trivial occupied chunk grid.
+
+        Args:
+            data: Chunk-local particle data.
+            coordinates: Chunk-local particle coordinates.
+            chunk_bounds: Bounds for the requested chunk.
+            smoothing_lengths: Optional chunk-local smoothing lengths.
+            nthreads: Number of local deposition threads.
+
+        Returns:
+            Tuple containing the trivial chunk grid and voxel size.
+        """
+        del data, coordinates, smoothing_lengths, nthreads
+        return np.ones(chunk_bounds.shape, dtype=np.float64), 0.25
+
+    def fake_mesh_hard_chunk_sdf(chunk_grid, chunk_bounds, *, threshold):
+        """Return no mesh so the test stays lightweight.
+
+        Args:
+            chunk_grid: Chunk voxel grid.
+            chunk_bounds: Bounds for the processed chunk.
+            threshold: Extraction threshold.
+
+        Returns:
+            Empty list.
+        """
+        del chunk_grid, chunk_bounds, threshold
+        return []
+
+    monkeypatch.setattr(
+        "meshmerizer.chunks.hard.select_particles_in_hard_chunk",
+        fake_select_particles_in_hard_chunk,
+    )
+    monkeypatch.setattr(
+        "meshmerizer.chunks.hard.voxelize_hard_chunk",
+        fake_voxelize_hard_chunk,
+    )
+    monkeypatch.setattr(
+        "meshmerizer.chunks.hard.mesh_hard_chunk_sdf",
+        fake_mesh_hard_chunk_sdf,
+    )
+
+    generate_hard_chunk_meshes(
+        data,
+        coords,
+        np.array([0.01], dtype=np.float64),
+        grid,
+        threshold=0.5,
+        preprocess="none",
+        clip_halos=None,
+        gaussian_sigma=0.0,
+        nthreads=1,
+        overlap_voxels=0,
+        clip_to_bounds=False,
+    )
+
+    assert selected_chunks == [(0, 0, 0)]
+
+
 def test_generate_hard_chunk_meshes_with_overlap_returns_meshes() -> None:
     grid = VirtualGrid(
         origin=np.zeros(3),

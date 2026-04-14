@@ -122,6 +122,142 @@ def _bucket_point_particles_into_hard_chunks(
     }
 
 
+def _expanded_chunk_axis_bounds(
+    grid: VirtualGrid,
+    *,
+    overlap_voxels: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return monotonic per-axis expanded chunk bounds in local coordinates.
+
+    Args:
+        grid: Virtual grid describing the chunk partition.
+        overlap_voxels: Interior overlap applied to each chunk on both sides.
+
+    Returns:
+        Tuple of arrays containing the inclusive lower and exclusive upper
+        local coordinate bounds for each chunk index along one axis.
+    """
+    # The axis partition is identical for x, y, and z, so one set of bounds can
+    # be reused on all three axes.
+    voxel_size = grid.voxel_size
+    lower_bounds = np.empty(grid.nchunks, dtype=np.float64)
+    upper_bounds = np.empty(grid.nchunks, dtype=np.float64)
+    for chunk_index, axis_chunk in enumerate(
+        partition_axis(grid.cell_resolution, grid.nchunks)
+    ):
+        sample_start = axis_chunk.sample_start
+        sample_stop = axis_chunk.sample_stop
+        if chunk_index > 0:
+            sample_start = max(0, sample_start - overlap_voxels)
+        if chunk_index < grid.nchunks - 1:
+            sample_stop = min(grid.resolution, sample_stop + overlap_voxels)
+        lower_bounds[chunk_index] = sample_start * voxel_size
+        upper_bounds[chunk_index] = sample_stop * voxel_size
+    return lower_bounds, upper_bounds
+
+
+def _occupied_chunk_mask(
+    coordinates: np.ndarray,
+    grid: VirtualGrid,
+    *,
+    smoothing_lengths: np.ndarray | None,
+    overlap_voxels: int,
+    batch_size: int = 1_000_000,
+) -> np.ndarray:
+    """Return a conservative mask of chunks touched by any particle support.
+
+    Args:
+        coordinates: Particle coordinates in the chunk-local coordinate system.
+        grid: Virtual grid describing the chunk partition.
+        smoothing_lengths: Optional per-particle smoothing lengths in world
+            units.
+        overlap_voxels: Effective overlap applied during chunk processing.
+        batch_size: Number of particles to process per vectorized batch.
+
+    Returns:
+        Boolean mask with shape ``(nchunks, nchunks, nchunks)`` indicating
+        which chunks may receive contributions.
+
+    Raises:
+        ValueError: If the input arrays have invalid shapes.
+    """
+    # Build a conservative chunk occupancy map once so obviously empty chunks
+    # do not pay the full particle-selection scan later.
+    coords_arr = np.asarray(coordinates, dtype=np.float64)
+    if coords_arr.ndim != 2 or coords_arr.shape[1] != 3:
+        raise ValueError("coordinates must have shape (N, 3)")
+    if coords_arr.shape[0] == 0:
+        return np.zeros((grid.nchunks, grid.nchunks, grid.nchunks), dtype=bool)
+
+    if smoothing_lengths is None:
+        support_radius = np.zeros(coords_arr.shape[0], dtype=np.float64)
+    else:
+        support_radius = np.asarray(smoothing_lengths, dtype=np.float64)
+        if support_radius.shape != (coords_arr.shape[0],):
+            raise ValueError("smoothing_lengths must have shape (N,)")
+
+    lower_bounds, upper_bounds = _expanded_chunk_axis_bounds(
+        grid,
+        overlap_voxels=overlap_voxels,
+    )
+    diff = np.zeros(
+        (grid.nchunks + 1, grid.nchunks + 1, grid.nchunks + 1),
+        dtype=np.int64,
+    )
+
+    # Process the particle supports in large vectorized batches so the prepass
+    # scales linearly in particle count without allocating giant temporary
+    # arrays for the full snapshot.
+    for start in range(0, coords_arr.shape[0], batch_size):
+        stop = min(start + batch_size, coords_arr.shape[0])
+        batch_coords = coords_arr[start:stop]
+        batch_radius = support_radius[start:stop]
+
+        mins = batch_coords - batch_radius[:, None]
+        maxs = batch_coords + batch_radius[:, None]
+
+        start_x = np.searchsorted(upper_bounds, mins[:, 0], side="right")
+        start_y = np.searchsorted(upper_bounds, mins[:, 1], side="right")
+        start_z = np.searchsorted(upper_bounds, mins[:, 2], side="right")
+        stop_x = np.searchsorted(lower_bounds, maxs[:, 0], side="right")
+        stop_y = np.searchsorted(lower_bounds, maxs[:, 1], side="right")
+        stop_z = np.searchsorted(lower_bounds, maxs[:, 2], side="right")
+
+        valid = (
+            (start_x < stop_x)
+            & (start_y < stop_y)
+            & (start_z < stop_z)
+            & (start_x < grid.nchunks)
+            & (start_y < grid.nchunks)
+            & (start_z < grid.nchunks)
+            & (stop_x > 0)
+            & (stop_y > 0)
+            & (stop_z > 0)
+        )
+        if not np.any(valid):
+            continue
+
+        start_x = np.clip(start_x[valid], 0, grid.nchunks)
+        start_y = np.clip(start_y[valid], 0, grid.nchunks)
+        start_z = np.clip(start_z[valid], 0, grid.nchunks)
+        stop_x = np.clip(stop_x[valid], 0, grid.nchunks)
+        stop_y = np.clip(stop_y[valid], 0, grid.nchunks)
+        stop_z = np.clip(stop_z[valid], 0, grid.nchunks)
+
+        np.add.at(diff, (start_x, start_y, start_z), 1)
+        np.add.at(diff, (stop_x, start_y, start_z), -1)
+        np.add.at(diff, (start_x, stop_y, start_z), -1)
+        np.add.at(diff, (start_x, start_y, stop_z), -1)
+        np.add.at(diff, (stop_x, stop_y, start_z), 1)
+        np.add.at(diff, (stop_x, start_y, stop_z), 1)
+        np.add.at(diff, (start_x, stop_y, stop_z), 1)
+        np.add.at(diff, (stop_x, stop_y, stop_z), -1)
+
+    occupancy = diff[:-1, :-1, :-1]
+    occupancy = occupancy.cumsum(axis=0).cumsum(axis=1).cumsum(axis=2)
+    return occupancy > 0
+
+
 def select_particles_in_hard_chunk(
     coordinates: np.ndarray,
     chunk_bounds: HardChunkBounds,
@@ -448,6 +584,12 @@ def generate_hard_chunk_meshes(
         )
     else:
         point_particle_buckets = None
+    occupied_chunk_mask = _occupied_chunk_mask(
+        coords_arr,
+        grid,
+        smoothing_lengths=smoothing_arr,
+        overlap_voxels=overlap_voxels + halo_voxels,
+    )
 
     def process_chunk(
         chunk_bounds: HardChunkBounds,
@@ -469,6 +611,21 @@ def generate_hard_chunk_meshes(
             overlap_voxels=overlap_voxels + halo_voxels,
         )
         chunk_start = time.perf_counter()
+
+        # Skip chunks proven empty by the conservative occupancy prepass before
+        # doing the expensive exact particle-selection scan.
+        if not occupied_chunk_mask[chunk_bounds.index]:
+            return {
+                "bounds": chunk_bounds,
+                "particles": 0,
+                "meshes": [],
+                "voxelize_time": 0.0,
+                "preprocess_time": 0.0,
+                "meshing_time": 0.0,
+                "elapsed": time.perf_counter() - chunk_start,
+                "status": "skipped",
+                "thread": current_thread_number() if nthreads > 1 else None,
+            }
 
         # Skip chunks with no contributing particles before doing any voxel
         # work.
