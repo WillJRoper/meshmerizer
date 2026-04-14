@@ -129,6 +129,22 @@ def run_stl(args: argparse.Namespace) -> None:
             resolution=args.resolution,
             nchunks=args.nchunks,
         )
+        if args.chunk_overlap_percent < 0:
+            log_status(
+                "Meshing",
+                "Error: --chunk-overlap-percent must be >= 0",
+            )
+            sys.exit(1)
+
+        approx_chunk_width = virtual_grid.cell_resolution / args.nchunks
+        overlap_voxels = int(
+            round(approx_chunk_width * args.chunk_overlap_percent / 100.0)
+        )
+        if args.nchunks > 1:
+            max_overlap = max(0, int(np.floor(approx_chunk_width)) - 1)
+            overlap_voxels = min(max_overlap, max(1, overlap_voxels))
+        else:
+            overlap_voxels = 0
 
         log_status(
             "Meshing",
@@ -136,6 +152,8 @@ def run_stl(args: argparse.Namespace) -> None:
             f"  threshold:    {final_threshold:.4e}\n"
             f"  chunks/axis:  {args.nchunks}\n"
             f"  resolution:   {args.resolution}\n"
+            f"  overlap:      {args.chunk_overlap_percent:.1f}% "
+            f"({overlap_voxels} voxels)\n"
             f"  chunk output: {args.chunk_output}",
         )
         if args.chunk_output == "separate":
@@ -157,7 +175,7 @@ def run_stl(args: argparse.Namespace) -> None:
                 clip_halos=args.clip_halos,
                 gaussian_sigma=args.gaussian_sigma,
                 nthreads=args.nthreads,
-                overlap_voxels=1,
+                overlap_voxels=overlap_voxels,
                 clip_to_bounds=args.chunk_output != "unioned",
             )
             record_elapsed(
@@ -203,8 +221,8 @@ def run_stl(args: argparse.Namespace) -> None:
             log_status("Saving", "Done.")
             return
 
-        # The ``unioned`` mode assigns seam ownership and assembles the chunk
-        # meshes into one final watertight surface.
+        # The ``unioned`` mode combines the chunk meshes into one final mesh
+        # using the robust chunk-union backend.
         log_status("Meshing", "Union assembly pass:")
         final_mesh = union_hard_chunk_meshes(chunk_meshes)
 

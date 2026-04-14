@@ -236,6 +236,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     stl.add_argument(
+        "--chunk-overlap-percent",
+        type=float,
+        default=10.0,
+        help=(
+            "Percent of each chunk width to overlap on interior faces during "
+            "chunked meshing. Rounded to the nearest whole voxel and applied "
+            "on both sides of interior chunk boundaries. Default: 10.0"
+        ),
+    )
+    stl.add_argument(
         "--threshold",
         "-t",
         type=float,

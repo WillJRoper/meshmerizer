@@ -553,6 +553,15 @@ def test_cli_parses_chunk_output_unioned():
     assert args.chunk_output == "unioned"
 
 
+def test_cli_parses_chunk_overlap_percent():
+    parser = build_parser()
+    args = parser.parse_args(
+        ["stl", "snapshot.hdf5", "--chunk-overlap-percent", "12.5"]
+    )
+
+    assert args.chunk_overlap_percent == 12.5
+
+
 def test_run_stl_uses_chunked_mesh_path(monkeypatch, tmp_path):
     parser = build_parser()
     out_path = tmp_path / "chunked.stl"

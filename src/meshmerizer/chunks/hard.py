@@ -2,7 +2,7 @@
 
 This module contains the low-memory chunked meshing workflow. It handles
 particle selection for individual hard chunks, chunk-local voxelization,
-chunk-local SDF extraction, optional clipping back to exact hard bounds, and
+chunk-local mesh extraction, optional clipping back to exact hard bounds, and
 parallel execution across chunks.
 """
 
@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import trimesh
+from skimage import measure
 
 try:
     from meshmerizer import _voxelize
@@ -26,7 +27,7 @@ from meshmerizer.logging import (
     progress_bar,
     record_timing,
 )
-from meshmerizer.mesh import Mesh, voxels_to_stl_via_sdf
+from meshmerizer.mesh import Mesh
 
 from .geometry import (
     HardChunkBounds,
@@ -37,6 +38,59 @@ from .geometry import (
     partition_axis,
 )
 from .processing import chunk_halo_voxels, preprocess_chunk_grid
+
+
+def _voxels_to_chunk_meshes(
+    volume: np.ndarray,
+    *,
+    threshold: float,
+    closing_radius: int,
+    voxel_size: float,
+) -> list[Mesh]:
+    """Extract chunk-local meshes without filtering tiny components.
+
+    Args:
+        volume: Chunk-local scalar field.
+        threshold: Threshold used to binarize the field.
+        closing_radius: Binary closing radius.
+        voxel_size: Physical size of one voxel.
+
+    Returns:
+        Extracted chunk-local meshes.
+
+    Raises:
+        ValueError: If no meshes are produced.
+    """
+    from meshmerizer.mesh.volume import prepare_volume
+
+    labeled, island_ids = prepare_volume(
+        volume,
+        threshold,
+        closing_radius,
+        True,
+        None,
+        None,
+    )
+
+    meshes: list[Mesh] = []
+    for idx in island_ids:
+        mask = labeled == idx
+        if not mask.any():
+            continue
+        verts, faces, normals, _ = measure.marching_cubes(
+            mask,
+            level=0.5,
+            spacing=(voxel_size, voxel_size, voxel_size),
+        )
+        meshes.append(
+            Mesh(vertices=verts, faces=faces, vertex_normals=normals)
+        )
+
+    if not meshes:
+        raise ValueError(
+            "No meshes created. Volume max value below threshold."
+        )
+    return meshes
 
 
 def _axis_chunk_lookup(
@@ -632,20 +686,20 @@ def voxelize_hard_chunk(
     return local_grid, voxel_size
 
 
-def mesh_hard_chunk_sdf(
+def mesh_hard_chunk(
     chunk_grid: np.ndarray,
     chunk_bounds: HardChunkBounds,
     *,
     threshold: float,
     closing_radius: int = 1,
 ) -> list[Mesh]:
-    """Generate watertight mesh(es) for one hard chunk via local SDF.
+    """Generate mesh(es) for one hard chunk via marching cubes.
 
     Args:
         chunk_grid: Dense scalar field for one chunk.
         chunk_bounds: World and local geometry for the chunk.
         threshold: Isovalue used for surface extraction.
-        closing_radius: Binary closing radius passed to the SDF extractor.
+        closing_radius: Binary closing radius passed to marching-cubes prep.
 
     Returns:
         List of meshes emitted for the connected components found in the chunk.
@@ -662,15 +716,14 @@ def mesh_hard_chunk_sdf(
         raise ValueError("chunk bounds imply anisotropic voxel sizes")
     voxel_size = float(voxel_sizes[0])
     try:
-        meshes = voxels_to_stl_via_sdf(
+        meshes = _voxels_to_chunk_meshes(
             chunk_grid,
             threshold=threshold,
             closing_radius=closing_radius,
-            split_islands=True,
             voxel_size=voxel_size,
         )
     except ValueError as exc:
-        if "No meshes created via SDF" in str(exc):
+        if "No meshes created" in str(exc):
             return []
         raise
 
@@ -679,7 +732,18 @@ def mesh_hard_chunk_sdf(
     world_origin = chunk_bounds.world_start
     for mesh in meshes:
         mesh.vertices[:] = mesh.vertices + world_origin
+        mesh.to_trimesh().metadata["meshmerizer_chunk_bounds"] = {
+            "sample_start": chunk_bounds.sample_start.copy(),
+            "sample_stop": chunk_bounds.sample_stop.copy(),
+            "world_start": chunk_bounds.world_start.copy(),
+            "world_stop": chunk_bounds.world_stop.copy(),
+        }
+        if not mesh.to_trimesh().is_watertight:
+            mesh.repair(smoothing_iters=0)
     return meshes
+
+
+mesh_hard_chunk_sdf = mesh_hard_chunk
 
 
 def clip_mesh_to_hard_chunk(mesh: Mesh, chunk_bounds: HardChunkBounds) -> Mesh:
@@ -797,7 +861,7 @@ def generate_hard_chunk_meshes(
             "  emitted meshes:   0\n"
             "  voxelization:     0.000 s total\n"
             "  preprocessing:    0.000 s total\n"
-            "  sdf meshing:      0.000 s total\n"
+            "  mesh extraction:  0.000 s total\n"
             "  chunk pass total: 0.000 s",
         )
         record_timing("Chunk pass total", 0.0, operation="Meshing")
@@ -913,7 +977,7 @@ def generate_hard_chunk_meshes(
         # Extract meshes from the processed chunk field.
         # Optionally clip the result back to the exact hard chunk bounds.
         meshing_start = time.perf_counter()
-        meshes = mesh_hard_chunk_sdf(
+        meshes = mesh_hard_chunk(
             chunk_grid,
             effective_bounds,
             threshold=threshold,
@@ -923,12 +987,16 @@ def generate_hard_chunk_meshes(
                 clip_mesh_to_hard_chunk(mesh, chunk_bounds) for mesh in meshes
             ]
         meshing_time = time.perf_counter() - meshing_start
+        watertight_meshes = sum(
+            1 for mesh in meshes if mesh.to_trimesh().is_watertight
+        )
 
         status = "meshed" if meshes else "empty"
         return {
             "bounds": chunk_bounds,
             "particles": int(particle_indices.size),
             "meshes": meshes,
+            "watertight_meshes": watertight_meshes,
             "voxelize_time": voxelize_time,
             "preprocess_time": preprocess_time,
             "meshing_time": meshing_time,
@@ -969,6 +1037,7 @@ def generate_hard_chunk_meshes(
         chunk_bounds = result["bounds"]
         particle_count = int(result["particles"])
         meshes = result["meshes"]
+        watertight_meshes = int(result.get("watertight_meshes", 0))
         voxelize_total += float(result["voxelize_time"])
         preprocess_total += float(result["preprocess_time"])
         meshing_total += float(result["meshing_time"])
@@ -985,6 +1054,7 @@ def generate_hard_chunk_meshes(
                 "particles": particle_count,
                 "status": status,
                 "meshes": len(meshes),
+                "watertight": watertight_meshes,
                 "voxelize": float(result["voxelize_time"]),
                 "preprocess": float(result["preprocess_time"]),
                 "meshing": float(result["meshing_time"]),
@@ -1010,7 +1080,9 @@ def generate_hard_chunk_meshes(
             log_debug_status(
                 "Meshing",
                 f"{chunk_bounds.index}: {particle_count} particles -> "
-                f"{len(meshes)} mesh(es) in {elapsed:.3f} s",
+                f"{len(meshes)} mesh(es), "
+                f"{watertight_meshes}/{len(meshes)} watertight in "
+                f"{elapsed:.3f} s",
                 thread=thread,
             )
             return
@@ -1066,7 +1138,7 @@ def generate_hard_chunk_meshes(
         preprocess_total,
         operation="Cleaning",
     )
-    record_timing("Chunk SDF meshing", meshing_total, operation="Meshing")
+    record_timing("Chunk mesh extraction", meshing_total, operation="Meshing")
     record_timing(
         "Chunk pass total",
         time.perf_counter() - total_start,
@@ -1074,16 +1146,22 @@ def generate_hard_chunk_meshes(
     )
     if chunk_rows:
         table_lines = [
-            "index      particles  status   meshes  voxelize  preprocess"
-            "  meshing  elapsed  thread"
+            "index      particles  status   meshes  wtight  voxelize"
+            "  preprocess  meshing  elapsed  thread"
         ]
         for row in chunk_rows:
             thread_text = "-" if row["thread"] is None else str(row["thread"])
+            watertight_text = (
+                "-"
+                if int(row["meshes"]) == 0
+                else f"{int(row['watertight'])}/{int(row['meshes'])}"
+            )
             table_lines.append(
                 f"{str(row['index']):<10} "
                 f"{int(row['particles']):>9} "
                 f"{str(row['status']):<8} "
                 f"{int(row['meshes']):>6} "
+                f"{watertight_text:>7} "
                 f"{float(row['voxelize']):>9.3f} "
                 f"{float(row['preprocess']):>11.3f} "
                 f"{float(row['meshing']):>8.3f} "
@@ -1100,7 +1178,7 @@ def generate_hard_chunk_meshes(
         f"  association:      {association_time:.3f} s total\n"
         f"  voxelization:     {voxelize_total:.3f} s total\n"
         f"  preprocessing:    {preprocess_total:.3f} s total\n"
-        f"  sdf meshing:      {meshing_total:.3f} s total\n"
+        f"  mesh extraction:  {meshing_total:.3f} s total\n"
         f"  chunk pass total: {time.perf_counter() - total_start:.3f} s",
     )
     chunk_meshes = [

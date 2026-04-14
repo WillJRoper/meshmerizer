@@ -292,6 +292,50 @@ def test_mesh_hard_chunk_sdf_places_mesh_in_world_space() -> None:
     assert np.all(trimesh_mesh.bounds[1] <= bounds.world_stop + 1e-8)
 
 
+def test_mesh_hard_chunk_sdf_repairs_non_watertight_meshes(
+    monkeypatch,
+) -> None:
+    """Repair chunk meshes locally before returning them.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        ``None``. Assertions verify the chunk-local repair path runs.
+    """
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    bounds = next(
+        b for b in iter_hard_chunk_bounds(grid) if b.index == (0, 0, 0)
+    )
+    chunk_grid = np.zeros(bounds.shape, dtype=float)
+    chunk_grid[1:4, 1:4, 1:4] = 1.0
+
+    broken = trimesh.creation.box(extents=(0.2, 0.2, 0.2))
+    keep = np.ones(len(broken.faces), dtype=bool)
+    keep[0] = False
+    broken.update_faces(keep)
+    broken.remove_unreferenced_vertices()
+
+    def fake_extract(*args, **kwargs):
+        del args, kwargs
+        return [Mesh(mesh=broken.copy())]
+
+    monkeypatch.setattr(
+        "meshmerizer.chunks.hard._voxels_to_chunk_meshes",
+        fake_extract,
+    )
+
+    meshes = mesh_hard_chunk_sdf(chunk_grid, bounds, threshold=0.5)
+
+    assert meshes
+    assert meshes[0].to_trimesh().is_watertight
+
+
 def test_clip_mesh_to_hard_chunk_enforces_exact_bounds() -> None:
     grid = VirtualGrid(
         origin=np.zeros(3),
@@ -459,7 +503,7 @@ def test_union_hard_chunk_meshes_is_watertight_for_split_volume() -> None:
     assert combined.is_watertight
 
 
-def test_union_hard_chunk_meshes_is_watertight_after_seam_ownership() -> None:
+def test_union_hard_chunk_meshes_owned_cells_are_watertight() -> None:
     grid = VirtualGrid(
         origin=np.zeros(3),
         box_size=1.0,
@@ -492,6 +536,51 @@ def test_union_hard_chunk_meshes_is_watertight_after_seam_ownership() -> None:
 
     assert combined.is_watertight
     assert len(combined.split(only_watertight=False)) == 1
+
+
+def test_union_hard_chunk_meshes_uses_robust_union_backend() -> None:
+    """Boolean-union overlapping chunk meshes into one watertight mesh."""
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    bounds = next(
+        b for b in iter_hard_chunk_bounds(grid) if b.index == (0, 0, 0)
+    )
+    other_bounds = next(
+        b for b in iter_hard_chunk_bounds(grid) if b.index == (1, 0, 0)
+    )
+    left = Mesh(mesh=trimesh.creation.box(extents=(0.6, 0.6, 0.6)))
+    left.translate(np.array([0.35, 0.25, 0.25]))
+    right = Mesh(mesh=trimesh.creation.box(extents=(0.6, 0.6, 0.6)))
+    right.translate(np.array([0.65, 0.25, 0.25]))
+
+    combined = union_hard_chunk_meshes(
+        [(bounds, [left]), (other_bounds, [right])]
+    ).to_trimesh()
+
+    assert combined.is_watertight
+    assert len(combined.faces) > 0
+
+
+def test_union_cleanup_preserves_multiple_watertight_components() -> None:
+    """Keep multibody watertightness when components remain disconnected."""
+    from meshmerizer.chunks.assembly import _cleanup_union_components
+
+    left = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    right = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    right.vertices[:] = right.vertices + np.array([3.0, 0.0, 0.0])
+    merged = trimesh.util.concatenate([left, right])
+
+    cleaned, diagnostics = _cleanup_union_components(merged)
+
+    assert diagnostics["watertight_components"] == 2
+    assert diagnostics["open_components"] == 0
+    parts = cleaned.split(only_watertight=False)
+    assert len(parts) == 2
+    assert all(part.is_watertight for part in parts)
 
 
 def test_generate_hard_chunk_meshes_parallel_matches_serial() -> None:
