@@ -6,7 +6,7 @@ from typing import Iterable, Optional, Tuple
 import numpy as np
 from scipy import ndimage
 
-from meshmerizer.logging import log_status, record_elapsed
+from meshmerizer.logging import log_debug_status, log_status, record_elapsed
 
 
 def prepare_volume(
@@ -72,7 +72,7 @@ def prepare_volume(
         record_elapsed(
             "Connected-component labeling", split_start, operation="Cleaning"
         )
-        log_status("Cleaning", f"Found {num} islands after labeling.")
+        log_debug_status("Cleaning", f"Found {num} islands after labeling.")
 
         # Apply island filtering on the labeled voxel components before any
         # mesh extraction happens.

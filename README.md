@@ -165,5 +165,5 @@ To do list:
 
 - [ ] Further smoothing to remove voxelixed surface? (This must be done at the final mesh stage, after unioning, to avoid breaking watertightness.)
 - [x] Progress indicators with tqdm.
-- [ ] Faster skipping of empty chunks.
+- [x] Faster skipping of empty chunks.
 - [ ] Make python API more flexible and user-friendly, introducing clear function entry points for the main functionality.

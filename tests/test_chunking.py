@@ -628,19 +628,18 @@ def test_generate_hard_chunk_meshes_parallel_uses_completion_order(
     data = np.ones(coords.shape[0], dtype=np.float64)
     handled_indices = []
 
-    def fake_log_status(operation, message, *, thread=None, level=None):
-        """Capture chunk-level status messages.
+    def fake_log_debug_status(operation, message, *, thread=None):
+        """Capture chunk-level debug messages.
 
         Args:
             operation: Operation name passed by the implementation.
             message: Status message text.
             thread: Optional worker identifier.
-            level: Logging level.
 
         Returns:
             ``None``. Per-chunk indices are recorded for later assertions.
         """
-        del thread, level
+        del thread
         if operation != "Meshing" or not message.startswith("("):
             return
         handled_indices.append(message.split(":", 1)[0])
@@ -697,7 +696,10 @@ def test_generate_hard_chunk_meshes_parallel_uses_completion_order(
         "meshmerizer.chunks.hard.mesh_hard_chunk_sdf",
         fake_mesh_hard_chunk_sdf,
     )
-    monkeypatch.setattr("meshmerizer.chunks.hard.log_status", fake_log_status)
+    monkeypatch.setattr(
+        "meshmerizer.chunks.hard.log_debug_status",
+        fake_log_debug_status,
+    )
 
     with cli_logging_context():
         generate_hard_chunk_meshes(
@@ -716,6 +718,111 @@ def test_generate_hard_chunk_meshes_parallel_uses_completion_order(
 
     assert handled_indices
     assert handled_indices[0] != "(0, 0, 0)"
+
+
+def test_bucket_point_particles_into_hard_chunks_matches_chunk_selection() -> (
+    None
+):
+    """Ensure direct point bucketing matches per-chunk hard selection.
+
+    Returns:
+        ``None``. Assertions verify the fast path matches the existing logic.
+    """
+    # Compare the direct ownership bucketing against the slower chunk-by-chunk
+    # selector in the simple point-particle case where the optimization
+    # applies.
+    from meshmerizer.chunks.hard import (
+        _bucket_point_particles_into_hard_chunks,
+    )
+
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    coords = np.array(
+        [
+            [0.10, 0.10, 0.10],
+            [0.20, 0.20, 0.20],
+            [0.74, 0.10, 0.10],
+            [0.80, 0.80, 0.80],
+            [0.999, 0.999, 0.999],
+        ],
+        dtype=np.float64,
+    )
+
+    buckets = _bucket_point_particles_into_hard_chunks(coords, grid)
+    expected = {}
+    for bounds in iter_hard_chunk_bounds(grid):
+        indices = select_particles_in_hard_chunk(coords, bounds)
+        if indices.size > 0:
+            expected[bounds.index] = indices
+
+    assert buckets.keys() == expected.keys()
+    for chunk_index, indices in expected.items():
+        assert np.array_equal(buckets[chunk_index], indices)
+
+
+def test_generate_hard_chunk_meshes_empty_input_returns_empty_list(
+    monkeypatch,
+) -> None:
+    """Ensure completely empty particle input short-circuits chunk processing.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        ``None``. Assertions verify no chunk work is attempted.
+    """
+    # The global empty-input fast path should return before any chunk-level
+    # voxelization or meshing helpers are called.
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    called = {"voxelize": False}
+
+    def fake_voxelize_hard_chunk(*args, **kwargs):
+        """Fail if chunk voxelization is reached unexpectedly.
+
+        Args:
+            *args: Positional arguments.
+            **kwargs: Keyword arguments.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            AssertionError: Always, because this path should not run.
+        """
+        del args, kwargs
+        called["voxelize"] = True
+        raise AssertionError("voxelize_hard_chunk should not be called")
+
+    monkeypatch.setattr(
+        "meshmerizer.chunks.hard.voxelize_hard_chunk",
+        fake_voxelize_hard_chunk,
+    )
+
+    chunk_meshes = generate_hard_chunk_meshes(
+        np.array([], dtype=np.float64),
+        np.empty((0, 3), dtype=np.float64),
+        None,
+        grid,
+        threshold=0.5,
+        preprocess="none",
+        clip_halos=None,
+        gaussian_sigma=0.0,
+        nthreads=2,
+        overlap_voxels=0,
+        clip_to_bounds=False,
+    )
+
+    assert chunk_meshes == []
+    assert called["voxelize"] is False
 
 
 def test_generate_hard_chunk_meshes_with_overlap_returns_meshes() -> None:

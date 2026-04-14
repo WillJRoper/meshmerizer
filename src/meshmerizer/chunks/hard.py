@@ -21,6 +21,7 @@ except ImportError:
 
 from meshmerizer.logging import (
     current_thread_number,
+    log_debug_status,
     log_status,
     progress_bar,
     record_timing,
@@ -33,8 +34,92 @@ from .geometry import (
     crop_grid_to_chunk_bounds,
     expand_hard_chunk_bounds,
     iter_hard_chunk_bounds,
+    partition_axis,
 )
 from .processing import chunk_halo_voxels, preprocess_chunk_grid
+
+
+def _axis_chunk_lookup(
+    grid: VirtualGrid,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build per-axis lookup tables from cell index to chunk index.
+
+    Args:
+        grid: Virtual grid whose chunk partition should be encoded.
+
+    Returns:
+        Tuple of three arrays mapping x, y, and z marching-cubes cell indices
+        to the owning chunk index along that axis.
+    """
+    # Encode the chunk partition once so point particles can be mapped into
+    # owned hard chunks without scanning every particle against every chunk.
+    base_lookup = np.empty(grid.cell_resolution, dtype=np.int64)
+    for chunk_index, axis_chunk in enumerate(
+        partition_axis(grid.cell_resolution, grid.nchunks)
+    ):
+        base_lookup[axis_chunk.cell_start : axis_chunk.cell_stop] = chunk_index
+
+    # The grid uses the same axis partition along x, y, and z, so one lookup
+    # array can be copied for each axis.
+    return base_lookup.copy(), base_lookup.copy(), base_lookup.copy()
+
+
+def _bucket_point_particles_into_hard_chunks(
+    coordinates: np.ndarray,
+    grid: VirtualGrid,
+) -> dict[tuple[int, int, int], np.ndarray]:
+    """Bucket point particles into owned hard chunks without per-chunk scans.
+
+    Args:
+        coordinates: Particle coordinates in the chunk-local coordinate system.
+        grid: Virtual grid describing the global chunk partition.
+
+    Returns:
+        Mapping from chunk index to the particle indices owned by that chunk.
+
+    Raises:
+        ValueError: If ``coordinates`` does not have shape ``(N, 3)``.
+    """
+    # Convert particle positions to owning cell indices. Particles outside the
+    # owned marching-cubes cell range are ignored because the current
+    # hard-chunk ownership rule also excludes them.
+    coords_arr = np.asarray(coordinates, dtype=np.float64)
+    if coords_arr.ndim != 2 or coords_arr.shape[1] != 3:
+        raise ValueError("coordinates must have shape (N, 3)")
+    if coords_arr.shape[0] == 0:
+        return {}
+
+    voxel_size = grid.voxel_size
+    cell_indices = np.floor(coords_arr / voxel_size).astype(np.int64)
+    valid_mask = np.all(cell_indices >= 0, axis=1) & np.all(
+        cell_indices < grid.cell_resolution,
+        axis=1,
+    )
+    if not np.any(valid_mask):
+        return {}
+
+    # Map each valid cell to its owning chunk on each axis, then group the
+    # original particle indices by the resulting chunk triplet.
+    x_lookup, y_lookup, z_lookup = _axis_chunk_lookup(grid)
+    valid_particle_indices = np.nonzero(valid_mask)[0]
+    valid_cells = cell_indices[valid_mask]
+    chunk_ids = np.column_stack(
+        (
+            x_lookup[valid_cells[:, 0]],
+            y_lookup[valid_cells[:, 1]],
+            z_lookup[valid_cells[:, 2]],
+        )
+    )
+
+    buckets: dict[tuple[int, int, int], list[int]] = {}
+    for particle_index, chunk_id in zip(valid_particle_indices, chunk_ids):
+        chunk_key = tuple(int(value) for value in chunk_id)
+        buckets.setdefault(chunk_key, []).append(int(particle_index))
+
+    return {
+        chunk_key: np.asarray(particle_indices, dtype=np.int64)
+        for chunk_key, particle_indices in buckets.items()
+    }
 
 
 def select_particles_in_hard_chunk(
@@ -337,6 +422,33 @@ def generate_hard_chunk_meshes(
         chunk_halo_voxels(gaussian_sigma) if gaussian_sigma > 0 else 0
     )
 
+    # Fast-path the common sparse point-particle case by assigning each
+    # particle to its owned hard chunk once up front. Overlap or smoothing
+    # disables this optimization because chunk influence then extends beyond
+    # hard ownership.
+    if coords_arr.shape[0] == 0:
+        processed_chunks = grid.nchunks**3
+        log_status(
+            "Meshing",
+            "Chunk summary:\n"
+            f"  processed chunks: {processed_chunks}\n"
+            "  non-empty chunks: 0\n"
+            "  emitted meshes:   0\n"
+            "  voxelization:     0.000 s total\n"
+            "  preprocessing:    0.000 s total\n"
+            "  sdf meshing:      0.000 s total\n"
+            "  chunk pass total: 0.000 s",
+        )
+        record_timing("Chunk pass total", 0.0, operation="Meshing")
+        return []
+    if smoothing_arr is None and overlap_voxels == 0 and halo_voxels == 0:
+        point_particle_buckets = _bucket_point_particles_into_hard_chunks(
+            coords_arr,
+            grid,
+        )
+    else:
+        point_particle_buckets = None
+
     def process_chunk(
         chunk_bounds: HardChunkBounds,
     ) -> dict[str, object] | None:
@@ -360,11 +472,17 @@ def generate_hard_chunk_meshes(
 
         # Skip chunks with no contributing particles before doing any voxel
         # work.
-        particle_indices = select_particles_in_hard_chunk(
-            coords_arr,
-            effective_bounds,
-            smoothing_lengths=smoothing_arr,
-        )
+        if point_particle_buckets is not None:
+            particle_indices = point_particle_buckets.get(
+                chunk_bounds.index,
+                np.empty(0, dtype=np.int64),
+            )
+        else:
+            particle_indices = select_particles_in_hard_chunk(
+                coords_arr,
+                effective_bounds,
+                smoothing_lengths=smoothing_arr,
+            )
         if particle_indices.size == 0:
             return {
                 "bounds": chunk_bounds,
@@ -451,6 +569,7 @@ def generate_hard_chunk_meshes(
     chunk_mesh_map: dict[
         tuple[int, int, int], tuple[HardChunkBounds, list[Mesh]]
     ] = {}
+    chunk_rows: list[dict[str, object]] = []
     voxelize_total = 0.0
     preprocess_total = 0.0
     meshing_total = 0.0
@@ -484,10 +603,27 @@ def generate_hard_chunk_meshes(
         status = str(result["status"])
         thread = result["thread"]
 
+        # Record a compact per-chunk row for the detailed log so long runs can
+        # still be audited after the fact without printing each completion
+        # live.
+        chunk_rows.append(
+            {
+                "index": chunk_bounds.index,
+                "particles": particle_count,
+                "status": status,
+                "meshes": len(meshes),
+                "voxelize": float(result["voxelize_time"]),
+                "preprocess": float(result["preprocess_time"]),
+                "meshing": float(result["meshing_time"]),
+                "elapsed": elapsed,
+                "thread": thread,
+            }
+        )
+
         # Keep per-chunk completion output concise so the progress bar remains
         # the primary interactive signal during long runs.
         if status == "skipped":
-            log_status(
+            log_debug_status(
                 "Meshing",
                 f"{chunk_bounds.index}: skipped (0 particles)",
                 thread=thread,
@@ -498,7 +634,7 @@ def generate_hard_chunk_meshes(
             chunk_mesh_map[chunk_bounds.index] = (chunk_bounds, meshes)
             nonempty_chunks += 1
             emitted_meshes += len(meshes)
-            log_status(
+            log_debug_status(
                 "Meshing",
                 f"{chunk_bounds.index}: {particle_count} particles -> "
                 f"{len(meshes)} mesh(es) in {elapsed:.3f} s",
@@ -506,7 +642,7 @@ def generate_hard_chunk_meshes(
             )
             return
 
-        log_status(
+        log_debug_status(
             "Meshing",
             f"{chunk_bounds.index}: {particle_count} particles -> no mesh",
             thread=thread,
@@ -556,6 +692,28 @@ def generate_hard_chunk_meshes(
         time.perf_counter() - total_start,
         operation="Meshing",
     )
+    if chunk_rows:
+        table_lines = [
+            "index      particles  status   meshes  voxelize  preprocess"
+            "  meshing  elapsed  thread"
+        ]
+        for row in chunk_rows:
+            thread_text = "-" if row["thread"] is None else str(row["thread"])
+            table_lines.append(
+                f"{str(row['index']):<10} "
+                f"{int(row['particles']):>9} "
+                f"{str(row['status']):<8} "
+                f"{int(row['meshes']):>6} "
+                f"{float(row['voxelize']):>9.3f} "
+                f"{float(row['preprocess']):>11.3f} "
+                f"{float(row['meshing']):>8.3f} "
+                f"{float(row['elapsed']):>8.3f} "
+                f"{thread_text:>6}"
+            )
+        log_debug_status(
+            "Meshing",
+            "Chunk details:\n" + "\n".join(table_lines),
+        )
     log_status(
         "Meshing",
         "Chunk summary:\n"

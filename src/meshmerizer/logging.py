@@ -319,7 +319,7 @@ def _configure_cli_logging() -> None:
     _STATE.log_path = log_path
     _STATE.timings.clear()
 
-    log_status("Logging", f"Detailed log: {log_path}")
+    log_debug_status("Logging", f"Detailed log: {log_path}")
 
 
 def _teardown_cli_logging() -> None:
