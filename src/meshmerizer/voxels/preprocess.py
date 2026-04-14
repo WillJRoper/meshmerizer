@@ -6,11 +6,15 @@ based filament enhancement, and a threshold search helper based on connected-
 component dominance.
 """
 
+from __future__ import annotations
+
+import logging
+
 import numpy as np
 from scipy import ndimage
 from skimage.feature import hessian_matrix, hessian_matrix_eigvals
 
-from meshmerizer.logging_utils import log_status
+from meshmerizer.logging import log_status
 
 
 def process_log_scale(grid: np.ndarray) -> np.ndarray:
@@ -48,6 +52,7 @@ def process_remove_halos(
     log_status(
         "Cleaning",
         f"Clipping halos > {limit:.4e} ({threshold_percentile}th percentile)",
+        level=logging.DEBUG,
     )
     return np.clip(grid, a_min=None, a_max=limit)
 
@@ -78,6 +83,7 @@ def process_gaussian_smoothing(
     log_status(
         "Cleaning",
         f"Applying Gaussian smoothing (sigma={sigma:.3g} voxels)",
+        level=logging.DEBUG,
     )
     return ndimage.gaussian_filter(grid, sigma=sigma)
 
@@ -95,7 +101,11 @@ def process_filament_filter(
         Normalized filament-and-halo response field.
     """
     # Compute the Hessian tensor of the field at the requested scale.
-    log_status("Cleaning", f"Computing Hessian features (sigma={sigma})...")
+    log_status(
+        "Cleaning",
+        f"Computing Hessian features (sigma={sigma})...",
+        level=logging.DEBUG,
+    )
     hessian = hessian_matrix(
         grid,
         sigma=sigma,

@@ -18,6 +18,7 @@ from meshmerizer.chunks import (
     union_hard_chunk_meshes,
     voxelize_hard_chunk,
 )
+from meshmerizer.logging import cli_logging_context
 from meshmerizer.mesh import Mesh
 
 
@@ -602,6 +603,119 @@ def test_generate_hard_chunk_meshes_uses_single_deposition_thread_per_chunk(
 
     assert seen_nthreads
     assert all(thread_count == 1 for thread_count in seen_nthreads)
+
+
+def test_generate_hard_chunk_meshes_parallel_uses_completion_order(
+    monkeypatch,
+) -> None:
+    """Ensure threaded chunk progress follows completion order.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        ``None``. Assertions verify completion-order result handling.
+    """
+    # Use deterministic per-chunk delays so the test can observe whether the
+    # threaded path handles finished work or submission order.
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=4,
+        nchunks=2,
+    )
+    coords = np.array([[0.25, 0.25, 0.25], [0.75, 0.75, 0.75]])
+    data = np.ones(coords.shape[0], dtype=np.float64)
+    handled_indices = []
+
+    def fake_log_status(operation, message, *, thread=None, level=None):
+        """Capture chunk-level status messages.
+
+        Args:
+            operation: Operation name passed by the implementation.
+            message: Status message text.
+            thread: Optional worker identifier.
+            level: Logging level.
+
+        Returns:
+            ``None``. Per-chunk indices are recorded for later assertions.
+        """
+        del thread, level
+        if operation != "Meshing" or not message.startswith("("):
+            return
+        handled_indices.append(message.split(":", 1)[0])
+
+    def fake_voxelize_hard_chunk(
+        data,
+        coordinates,
+        chunk_bounds,
+        *,
+        smoothing_lengths=None,
+        nthreads=1,
+    ):
+        """Return a trivial occupied chunk grid after a staged delay.
+
+        Args:
+            data: Chunk-local particle data.
+            coordinates: Chunk-local particle coordinates.
+            chunk_bounds: Bounds for the requested chunk.
+            smoothing_lengths: Optional chunk-local smoothing lengths.
+            nthreads: Number of local deposition threads.
+
+        Returns:
+            Tuple containing the trivial chunk grid and voxel size.
+        """
+        import time
+
+        del data, coordinates, smoothing_lengths, nthreads
+        if chunk_bounds.index == (0, 0, 0):
+            time.sleep(0.05)
+        else:
+            time.sleep(0.0)
+        return np.ones(chunk_bounds.shape, dtype=np.float64), 0.25
+
+    def fake_mesh_hard_chunk_sdf(chunk_grid, chunk_bounds, *, threshold):
+        """Return one trivial mesh for every processed chunk.
+
+        Args:
+            chunk_grid: Chunk voxel grid.
+            chunk_bounds: Bounds for the processed chunk.
+            threshold: Extraction threshold.
+
+        Returns:
+            List containing one trivial mesh.
+        """
+        del chunk_grid, chunk_bounds, threshold
+        mesh = trimesh.creation.box(extents=(0.1, 0.1, 0.1))
+        return [Mesh(mesh=mesh)]
+
+    monkeypatch.setattr(
+        "meshmerizer.chunks.hard.voxelize_hard_chunk",
+        fake_voxelize_hard_chunk,
+    )
+    monkeypatch.setattr(
+        "meshmerizer.chunks.hard.mesh_hard_chunk_sdf",
+        fake_mesh_hard_chunk_sdf,
+    )
+    monkeypatch.setattr("meshmerizer.chunks.hard.log_status", fake_log_status)
+
+    with cli_logging_context():
+        generate_hard_chunk_meshes(
+            data,
+            coords,
+            None,
+            grid,
+            threshold=0.5,
+            preprocess="none",
+            clip_halos=None,
+            gaussian_sigma=0.0,
+            nthreads=2,
+            overlap_voxels=0,
+            clip_to_bounds=False,
+        )
+
+    assert handled_indices
+    assert handled_indices[0] != "(0, 0, 0)"
 
 
 def test_generate_hard_chunk_meshes_with_overlap_returns_meshes() -> None:

@@ -6,7 +6,7 @@ from typing import Iterable, Optional, Tuple
 import numpy as np
 from scipy import ndimage
 
-from meshmerizer.logging_utils import log_status
+from meshmerizer.logging import log_status, record_elapsed
 
 
 def prepare_volume(
@@ -52,11 +52,7 @@ def prepare_volume(
     # isovalue.
     bin_start = time.perf_counter()
     bin_vol = volume > threshold
-    bin_end = time.perf_counter()
-    log_status(
-        "Cleaning",
-        f"Binarization took {bin_end - bin_start:.4f} seconds.",
-    )
+    record_elapsed("Binarization", bin_start, operation="Cleaning")
 
     # Close small holes and gaps before connected-component analysis.
     if closing_radius > 0:
@@ -64,11 +60,7 @@ def prepare_volume(
         base_struct = ndimage.generate_binary_structure(3, 1)
         closing_struct = ndimage.iterate_structure(base_struct, closing_radius)
         bin_vol = ndimage.binary_closing(bin_vol, structure=closing_struct)
-        close_end = time.perf_counter()
-        log_status(
-            "Cleaning",
-            f"Binary closing took {close_end - close_start:.4f} seconds.",
-        )
+        record_elapsed("Binary closing", close_start, operation="Cleaning")
 
     # Label connected components only when the caller needs island splitting or
     # island filtering. Otherwise the whole mask is treated as one component.
@@ -77,12 +69,10 @@ def prepare_volume(
         split_start = time.perf_counter()
         labeled, num = ndimage.label(bin_vol, structure=label_struct)
         island_ids = range(1, num + 1)
-        split_end = time.perf_counter()
-        log_status(
-            "Cleaning",
-            f"Labeling took {split_end - split_start:.4f} seconds. "
-            f"Found {num} islands.",
+        record_elapsed(
+            "Connected-component labeling", split_start, operation="Cleaning"
         )
+        log_status("Cleaning", f"Found {num} islands after labeling.")
 
         # Apply island filtering on the labeled voxel components before any
         # mesh extraction happens.

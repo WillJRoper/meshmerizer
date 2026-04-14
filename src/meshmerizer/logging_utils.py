@@ -8,7 +8,13 @@ handling.
 from meshmerizer.logging import (
     current_thread_number,
     format_status_prefix,
+    log_debug_status,
     log_status,
 )
 
-__all__ = ["current_thread_number", "format_status_prefix", "log_status"]
+__all__ = [
+    "current_thread_number",
+    "format_status_prefix",
+    "log_debug_status",
+    "log_status",
+]

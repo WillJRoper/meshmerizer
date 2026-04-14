@@ -7,7 +7,7 @@ import numpy as np
 from scipy import ndimage
 from skimage import measure
 
-from meshmerizer.logging_utils import log_status
+from meshmerizer.logging import record_elapsed
 
 from .core import Mesh
 from .volume import prepare_volume
@@ -73,12 +73,7 @@ def voxels_to_stl(
             Mesh(vertices=verts, faces=faces, vertex_normals=normals)
         )
 
-    mesh_end = time.perf_counter()
-    log_status(
-        "Meshing",
-        f"Marching cubes took {mesh_end - mesh_start:.4f} seconds. "
-        f"Created {len(meshes)} meshes.",
-    )
+    record_elapsed("Marching cubes", mesh_start, operation="Meshing")
 
     # Distinguish between an actually empty field and a field whose candidate
     # components were filtered out.
@@ -89,11 +84,8 @@ def voxels_to_stl(
             msg = "Meshes removed by size filtering or invalid index."
         raise ValueError(f"No meshes created. {msg}")
 
-    end_time = time.perf_counter()
-    log_status(
-        "Meshing",
-        f"Converted volume to {len(meshes)} meshes in "
-        f"{end_time - start_time:.4f} seconds.",
+    record_elapsed(
+        "Marching-cubes extraction", start_time, operation="Meshing"
     )
     return meshes
 
@@ -166,9 +158,5 @@ def voxels_to_stl_via_sdf(
             "No meshes created via SDF. Check threshold and input."
         )
 
-    end_time = time.perf_counter()
-    log_status(
-        "Meshing",
-        f"SDF conversion finished in {end_time - start_time:.4f} seconds.",
-    )
+    record_elapsed("SDF extraction", start_time, operation="Meshing")
     return meshes

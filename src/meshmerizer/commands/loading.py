@@ -8,7 +8,7 @@ from typing import Optional
 
 import numpy as np
 
-from meshmerizer.logging_utils import log_status
+from meshmerizer.logging import log_debug_status, log_status, record_elapsed
 from meshmerizer.voxels import (
     generate_voxel_grid,
     process_filament_filter,
@@ -38,37 +38,6 @@ def boxsize_to_float(boxsize: object) -> float:
     if arr.ndim == 0:
         return float(arr)
     return float(np.max(arr))
-
-
-def print_elapsed(label: str, start: float) -> None:
-    """Print a simple stage timing line.
-
-    Args:
-        label: Human-readable label for the timed stage.
-        start: ``time.perf_counter()`` timestamp captured before the stage.
-
-    Returns:
-        ``None``. A timing line is emitted to the structured logger.
-    """
-    # Infer the status prefix from the label so timing messages align with the
-    # same operation categories used elsewhere in the CLI output.
-    operation = "Timing"
-    label_lower = label.lower()
-    if any(token in label_lower for token in ["load", "extract"]):
-        operation = "Loading"
-    elif any(token in label_lower for token in ["crop", "bound", "clean"]):
-        operation = "Cleaning"
-    elif any(token in label_lower for token in ["voxel", "deposit"]):
-        operation = "Voxelising"
-    elif any(
-        token in label_lower
-        for token in ["mesh", "sdf", "stitch", "chunk", "pipeline"]
-    ):
-        operation = "Meshing"
-    elif "save" in label_lower:
-        operation = "Saving"
-
-    log_status(operation, f"{label} took {time.perf_counter() - start:.3f} s")
 
 
 def apply_coordinate_shift(
@@ -331,7 +300,7 @@ def apply_preprocess(
     # Keep the preprocessing dispatch explicit so invalid mode names fail close
     # to the CLI boundary.
     if preprocess != "none":
-        log_status("Cleaning", f"Applying preprocessing: {preprocess}")
+        log_debug_status("Cleaning", f"Applying preprocessing: {preprocess}")
         if preprocess == "log":
             grid = process_log_scale(grid)
         elif preprocess == "filaments":
@@ -343,7 +312,7 @@ def apply_preprocess(
         raise ValueError("--gaussian-sigma must be >= 0")
     grid = process_gaussian_smoothing(grid, sigma=gaussian_sigma)
 
-    log_status(
+    log_debug_status(
         "Cleaning",
         f"Processed grid range: [{grid.min():.4e}, {grid.max():.4e}]",
     )
@@ -413,8 +382,11 @@ def load_swift_volume(
         box_size=effective_box_size,
         nthreads=nthreads,
     )
-    log_status("Voxelising", f"Voxel size: {voxel_size:.4e} (sim units)")
-    print_elapsed("Voxelization", voxelize_start)
+    log_debug_status(
+        "Voxelising",
+        f"Voxel size: {voxel_size:.4e} (sim units)",
+    )
+    record_elapsed("Voxelization", voxelize_start, operation="Voxelising")
     return grid, voxel_size, origin
 
 
@@ -473,7 +445,7 @@ def load_swift_particles(
         data = sw.load(str(filename))
     except Exception as exc:
         raise RuntimeError(f"Error loading file: {exc}") from exc
-    print_elapsed("Snapshot load", load_start)
+    record_elapsed("Snapshot load", load_start, operation="Loading")
 
     if (center is None) != (extent is None):
         raise ValueError("--center and --extent must be provided together")
@@ -529,14 +501,18 @@ def load_swift_particles(
         )
 
     field_data = getattr(part_data, field).value
-    print_elapsed("Particle field extraction", extract_start)
+    record_elapsed(
+        "Particle field extraction",
+        extract_start,
+        operation="Loading",
+    )
 
     # Apply the requested coordinate shift before any subregion crop so the
     # crop is interpreted in the shifted coordinate system.
     shift_arr = np.asarray(shift, dtype=np.float64)
     if shift_arr.shape != (3,):
         raise ValueError("--shift must provide exactly 3 values: dx dy dz")
-    log_status(
+    log_debug_status(
         "Loading",
         "Coordinate shift: "
         f"({shift_arr[0]:.6g},{shift_arr[1]:.6g},{shift_arr[2]:.6g}) "
@@ -549,14 +525,18 @@ def load_swift_particles(
         wrap_shift=wrap_shift,
         box_size=full_box_size,
     )
-    print_elapsed("Coordinate shifting", shift_start)
+    record_elapsed("Coordinate shifting", shift_start, operation="Loading")
 
     # Prefer snapshot smoothing lengths when available. Only fall back to
     # regeneration when the particle family does not store them explicitly.
     if hasattr(part_data, "smoothing_lengths"):
         smoothing_start = time.perf_counter()
         h = part_data.smoothing_lengths.value * smoothing_factor
-        print_elapsed("Smoothing-length extraction", smoothing_start)
+        record_elapsed(
+            "Smoothing-length extraction",
+            smoothing_start,
+            operation="Loading",
+        )
     else:
         log_status("Loading", "Smoothing lengths not found. Generating...")
         boxsize = data.metadata.boxsize
@@ -569,14 +549,22 @@ def load_swift_particles(
             )
             h = h_cosmo.value * smoothing_factor
             log_status("Loading", "Smoothing lengths generated.")
-            print_elapsed("Smoothing-length generation", smoothing_start)
+            record_elapsed(
+                "Smoothing-length generation",
+                smoothing_start,
+                operation="Loading",
+            )
         except Exception as exc:
             log_status("Loading", f"Error generating smoothing lengths: {exc}")
             log_status("Loading", "Falling back to point deposition.")
             h = None
-            print_elapsed("Smoothing-length generation", smoothing_start)
+            record_elapsed(
+                "Smoothing-length generation",
+                smoothing_start,
+                operation="Loading",
+            )
 
-    log_status(
+    log_debug_status(
         "Loading",
         f"Snapshot box size: {full_box_size:.6g} "
         f"(sim units; from {full_box_size_source})",
@@ -604,14 +592,14 @@ def load_swift_particles(
             periodic=periodic,
         )
         effective_box_size = extent_f
-        log_status(
+        log_debug_status(
             "Cleaning",
             "Subregion: "
             f"center=({center_arr[0]:.6g},{center_arr[1]:.6g},"
             f"{center_arr[2]:.6g}) "
             f"extent={extent_f:.6g} periodic={periodic}",
         )
-        log_status(
+        log_debug_status(
             "Cleaning",
             "Subregion origin (world-space min corner): "
             f"({origin[0]:.6g},{origin[1]:.6g},{origin[2]:.6g})",
@@ -625,12 +613,12 @@ def load_swift_particles(
             extent=extent_f,
             periodic=periodic,
         )
-        log_status(
+        log_debug_status(
             "Cleaning",
             f"Selected {n_selected} {particle_type} particles "
             f"for field '{field}'.",
         )
-        print_elapsed("Subregion crop", crop_start)
+        record_elapsed("Subregion crop", crop_start, operation="Cleaning")
 
     # Tight bounds are applied after any explicit crop so the optimization acts
     # on the actual region that will be voxelized.
@@ -646,13 +634,13 @@ def load_swift_particles(
         origin = origin + origin_offset
         if center is not None and periodic:
             origin = np.mod(origin, full_box_size)
-        log_status(
+        log_debug_status(
             "Cleaning",
             "Tightened voxelization bounds: "
             f"origin=({origin[0]:.6g},{origin[1]:.6g},{origin[2]:.6g}) "
             f"box_size={effective_box_size:.6g}",
         )
-        print_elapsed("Tight bounds", tighten_start)
+        record_elapsed("Tight bounds", tighten_start, operation="Cleaning")
 
-    print_elapsed("Particle preparation", total_start)
+    record_elapsed("Particle preparation", total_start, operation="Loading")
     return field_data, coords, h, effective_box_size, origin

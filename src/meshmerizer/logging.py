@@ -405,3 +405,27 @@ def progress_bar(
         yield bar
     finally:
         bar.close()
+
+
+def log_debug_status(
+    operation: str,
+    message: str,
+    *,
+    thread: int | None = None,
+) -> None:
+    """Log a detailed status line to the file log without console noise.
+
+    Args:
+        operation: Short operation label.
+        message: Human-readable diagnostic message.
+        thread: Optional 1-based worker identifier.
+
+    Returns:
+        ``None``. The message is emitted at debug level.
+    """
+    log_status(
+        operation,
+        message,
+        thread=thread,
+        level=std_logging.DEBUG,
+    )

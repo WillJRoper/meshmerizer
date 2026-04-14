@@ -20,7 +20,7 @@ from meshmerizer.chunks import (
     keep_largest_mesh_component,
     union_hard_chunk_meshes,
 )
-from meshmerizer.logging_utils import log_status
+from meshmerizer.logging import log_status, record_elapsed
 from meshmerizer.mesh import Mesh, voxels_to_stl_via_sdf
 from meshmerizer.printing import scale_mesh_to_print
 
@@ -28,7 +28,6 @@ from .loading import (
     apply_preprocess,
     load_swift_particles,
     load_swift_volume,
-    print_elapsed,
 )
 
 
@@ -161,7 +160,11 @@ def run_stl(args: argparse.Namespace) -> None:
                 overlap_voxels=1,
                 clip_to_bounds=args.chunk_output != "unioned",
             )
-            print_elapsed("Hard chunk mesh generation", mesh_start)
+            record_elapsed(
+                "Hard chunk mesh generation",
+                mesh_start,
+                operation="Meshing",
+            )
         except (ValueError, RuntimeError) as exc:
             log_status("Meshing", f"Error generating chunked mesh: {exc}")
             sys.exit(1)
@@ -192,7 +195,11 @@ def run_stl(args: argparse.Namespace) -> None:
                         mesh.simplify(args.simplify_factor)
                     log_status("Saving", f"Saving chunk to {chunk_path}...")
                     mesh.save(str(chunk_path))
-            print_elapsed("Total STL pipeline", run_start)
+            record_elapsed(
+                "Total STL pipeline",
+                run_start,
+                operation="Meshing",
+            )
             log_status("Saving", "Done.")
             return
 
@@ -295,8 +302,8 @@ def run_stl(args: argparse.Namespace) -> None:
         log_status("Saving", f"Saving final chunked mesh to {output_path}...")
         save_start = time.perf_counter()
         final_mesh.save(str(output_path))
-        print_elapsed("Mesh save", save_start)
-        print_elapsed("Total STL pipeline", run_start)
+        record_elapsed("Mesh save", save_start, operation="Saving")
+        record_elapsed("Total STL pipeline", run_start, operation="Meshing")
         log_status("Saving", "Done.")
         return
 
@@ -334,7 +341,9 @@ def run_stl(args: argparse.Namespace) -> None:
     except ValueError as exc:
         log_status("Cleaning", str(exc))
         sys.exit(1)
-    print_elapsed("Grid preprocessing", preprocess_start)
+    record_elapsed(
+        "Grid preprocessing", preprocess_start, operation="Cleaning"
+    )
 
     final_threshold = args.threshold
 
@@ -354,7 +363,11 @@ def run_stl(args: argparse.Namespace) -> None:
             remove_islands=args.remove_islands,
             voxel_size=voxel_size,
         )
-        print_elapsed("Dense mesh generation", mesh_start)
+        record_elapsed(
+            "Dense mesh generation",
+            mesh_start,
+            operation="Meshing",
+        )
     except ValueError as exc:
         log_status("Meshing", f"Error generating mesh: {exc}")
         sys.exit(1)
@@ -421,6 +434,6 @@ def run_stl(args: argparse.Namespace) -> None:
     log_status("Saving", f"Saving to {output_path}...")
     save_start = time.perf_counter()
     final_mesh.save(str(output_path))
-    print_elapsed("Mesh save", save_start)
-    print_elapsed("Total STL pipeline", run_start)
+    record_elapsed("Mesh save", save_start, operation="Saving")
+    record_elapsed("Total STL pipeline", run_start, operation="Meshing")
     log_status("Saving", "Done.")

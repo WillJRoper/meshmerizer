@@ -9,7 +9,7 @@ parallel execution across chunks.
 from __future__ import annotations
 
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import trimesh
@@ -19,7 +19,12 @@ try:
 except ImportError:
     _voxelize = None
 
-from meshmerizer.logging_utils import current_thread_number, log_status
+from meshmerizer.logging import (
+    current_thread_number,
+    log_status,
+    progress_bar,
+    record_timing,
+)
 from meshmerizer.mesh import Mesh, voxels_to_stl_via_sdf
 
 from .geometry import (
@@ -443,7 +448,9 @@ def generate_hard_chunk_meshes(
 
     # Compute the chunk list up front so serial and parallel execution see the
     # same processing order.
-    chunk_meshes: list[tuple[HardChunkBounds, list[Mesh]]] = []
+    chunk_mesh_map: dict[
+        tuple[int, int, int], tuple[HardChunkBounds, list[Mesh]]
+    ] = {}
     voxelize_total = 0.0
     preprocess_total = 0.0
     meshing_total = 0.0
@@ -452,19 +459,21 @@ def generate_hard_chunk_meshes(
     all_bounds = list(iter_hard_chunk_bounds(grid))
     processed_chunks = len(all_bounds)
 
-    # Run either serially or with a thread pool depending on the requested
-    # chunk worker count.
-    if nthreads == 1:
-        results = [process_chunk(chunk_bounds) for chunk_bounds in all_bounds]
-    else:
-        with ThreadPoolExecutor(max_workers=nthreads) as executor:
-            results = list(executor.map(process_chunk, all_bounds))
+    def handle_result(result: dict[str, object]) -> None:
+        """Accumulate timings and emit chunk-level status output.
 
-    # Accumulate timings and emit one structured status line per processed
-    # chunk so long chunked runs remain understandable.
-    for result in results:
-        if result is None:
-            continue
+        Args:
+            result: Result dictionary returned by ``process_chunk``.
+
+        Returns:
+            ``None``. Shared accumulators and status output are updated.
+        """
+        nonlocal emitted_meshes
+        nonlocal meshing_total
+        nonlocal nonempty_chunks
+        nonlocal preprocess_total
+        nonlocal voxelize_total
+
         chunk_bounds = result["bounds"]
         particle_count = int(result["particles"])
         meshes = result["meshes"]
@@ -475,16 +484,18 @@ def generate_hard_chunk_meshes(
         status = str(result["status"])
         thread = result["thread"]
 
+        # Keep per-chunk completion output concise so the progress bar remains
+        # the primary interactive signal during long runs.
         if status == "skipped":
             log_status(
                 "Meshing",
-                f"{chunk_bounds.index}: 0 particles -> skipped",
+                f"{chunk_bounds.index}: skipped (0 particles)",
                 thread=thread,
             )
-            continue
+            return
 
         if meshes:
-            chunk_meshes.append((chunk_bounds, meshes))
+            chunk_mesh_map[chunk_bounds.index] = (chunk_bounds, meshes)
             nonempty_chunks += 1
             emitted_meshes += len(meshes)
             log_status(
@@ -493,13 +504,58 @@ def generate_hard_chunk_meshes(
                 f"{len(meshes)} mesh(es) in {elapsed:.3f} s",
                 thread=thread,
             )
-        else:
-            log_status(
-                "Meshing",
-                f"{chunk_bounds.index}: {particle_count} particles -> no mesh",
-                thread=thread,
-            )
+            return
 
+        log_status(
+            "Meshing",
+            f"{chunk_bounds.index}: {particle_count} particles -> no mesh",
+            thread=thread,
+        )
+
+    # Run either serially or with a thread pool depending on the requested
+    # chunk worker count.
+    with progress_bar(
+        processed_chunks,
+        desc="Chunk meshing",
+        unit="chunk",
+        enabled=True,
+    ) as bar:
+        if nthreads == 1:
+            for chunk_bounds in all_bounds:
+                result = process_chunk(chunk_bounds)
+                if result is None:
+                    continue
+                handle_result(result)
+                bar.update(1)
+        else:
+            with ThreadPoolExecutor(max_workers=nthreads) as executor:
+                future_map = {
+                    executor.submit(process_chunk, chunk_bounds): chunk_bounds
+                    for chunk_bounds in all_bounds
+                }
+                for future in as_completed(future_map):
+                    result = future.result()
+                    if result is None:
+                        continue
+                    handle_result(result)
+                    bar.update(1)
+
+    record_timing(
+        "Chunk voxelization",
+        voxelize_total,
+        operation="Voxelising",
+    )
+    record_timing(
+        "Chunk preprocessing",
+        preprocess_total,
+        operation="Cleaning",
+    )
+    record_timing("Chunk SDF meshing", meshing_total, operation="Meshing")
+    record_timing(
+        "Chunk pass total",
+        time.perf_counter() - total_start,
+        operation="Meshing",
+    )
     log_status(
         "Meshing",
         "Chunk summary:\n"
@@ -511,4 +567,9 @@ def generate_hard_chunk_meshes(
         f"  sdf meshing:      {meshing_total:.3f} s total\n"
         f"  chunk pass total: {time.perf_counter() - total_start:.3f} s",
     )
+    chunk_meshes = [
+        chunk_mesh_map[chunk_bounds.index]
+        for chunk_bounds in all_bounds
+        if chunk_bounds.index in chunk_mesh_map
+    ]
     return chunk_meshes

@@ -10,7 +10,7 @@ from typing import Any, Union
 
 import numpy as np
 
-from .logging_utils import log_status
+from .logging import log_debug_status, log_status
 from .mesh import Mesh
 
 
@@ -66,11 +66,14 @@ def scale_mesh_to_print(
     scale_factor = target_size_mm / max_dimension
     mesh.to_trimesh().apply_scale(scale_factor)
 
-    log_status(
+    log_debug_status(
         "Cleaning",
         f"Scaled mesh to {target_size_cm} cm "
         f"(max dimension: {target_size_mm} mm).",
     )
-    log_status("Cleaning", f"Scale factor applied: {scale_factor:.4f}")
+    log_debug_status(
+        "Cleaning",
+        f"Scale factor applied: {scale_factor:.4f}",
+    )
 
     return mesh
