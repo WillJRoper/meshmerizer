@@ -54,6 +54,7 @@ dependencies = [
   "numpy>=1.21",
   "scipy>=1.7",
   "scikit-image>=0.19",
+  "tqdm>=4.66",
   "fast-simplification>=0.1",
   "trimesh>=3.9",
   "swiftsimio>=10.2.0",

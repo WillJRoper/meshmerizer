@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 from typing import Optional
 
+from meshmerizer.logging import cli_logging_context
+
 from .args import build_parser
 
 
@@ -31,4 +33,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     # always sees the canonical command layout.
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.func(args)
+
+    # Run the dispatched CLI command inside the shared logging context so
+    # progress bars, terminal messages, and the per-run log file stay aligned.
+    with cli_logging_context():
+        args.func(args)
