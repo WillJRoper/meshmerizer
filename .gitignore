@@ -178,6 +178,7 @@ cython_debug/
 *.stl
 out/
 parameter_tests/
+src/meshmerizer/_version.py
 
 # Local agent instructions
 AGENTS.md
