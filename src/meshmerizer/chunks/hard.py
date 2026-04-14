@@ -710,10 +710,7 @@ def generate_hard_chunk_meshes(
                 f"{float(row['elapsed']):>8.3f} "
                 f"{thread_text:>6}"
             )
-        log_debug_status(
-            "Meshing",
-            "Chunk details:\n" + "\n".join(table_lines),
-        )
+        log_status("Meshing", "Chunk details:\n" + "\n".join(table_lines))
     log_status(
         "Meshing",
         "Chunk summary:\n"
