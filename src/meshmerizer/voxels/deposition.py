@@ -131,7 +131,6 @@ def generate_voxel_grid(
             vox_indices,
             smoothing_lengths_vox,
             resolution,
-            int(nthreads),
         )
     else:
         # Point deposition is just indexed accumulation on the voxel lattice.

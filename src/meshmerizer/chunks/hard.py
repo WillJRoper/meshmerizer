@@ -628,7 +628,6 @@ def voxelize_hard_chunk(
         int(grid_shape[0]),
         int(grid_shape[1]),
         int(grid_shape[2]),
-        int(nthreads),
     )
     return local_grid, voxel_size
 

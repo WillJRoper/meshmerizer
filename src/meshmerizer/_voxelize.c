@@ -4,15 +4,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-static int get_effective_nthreads(int requested_nthreads) {
-    // Chunk-level parallelism is handled by the Python pipeline, so the local
-    // deposition helper always runs with a single effective worker.
-    if (requested_nthreads < 1) {
-        requested_nthreads = 1;
-    }
-    return requested_nthreads > 1 ? 1 : requested_nthreads;
-}
-
 static npy_int64 flatten_chunk_index(
     npy_int64 ix,
     npy_int64 iy,
@@ -31,19 +22,14 @@ static int deposit_box_kernel(
     npy_int64 *smoothing,
     npy_int64 nx,
     npy_int64 ny,
-    npy_int64 nz,
-    int requested_nthreads
+    npy_int64 nz
 ) {
-    int nthreads = get_effective_nthreads(requested_nthreads);
-
     for (npy_intp idx = 0; idx < grid_size; idx++) {
         grid[idx] = 0.0;
     }
 
-    // The deposition helper is intentionally serial now. This keeps the local
-    // kernel simple because the chunk pipeline already parallelizes across
-    // chunks at a higher level.
-    (void)nthreads;
+    // The deposition helper is intentionally serial. The chunk pipeline
+    // parallelizes at a higher level, so this helper only needs one code path.
     for (npy_intp i = 0; i < n_points; i++) {
         npy_int64 cx = coords[i * 3 + 0];
         npy_int64 cy = coords[i * 3 + 1];
@@ -80,16 +66,14 @@ static PyObject* voxelize_box_deposition(PyObject* self, PyObject* args) {
     PyArrayObject *grid_arr_in = NULL, *data_arr_in = NULL, *coords_arr_in = NULL, *smoothing_arr_in = NULL;
     PyArrayObject *grid_arr = NULL, *data_arr = NULL, *coords_arr = NULL, *smoothing_arr = NULL;
     int resolution;
-    int requested_nthreads;
 
     // Parse arguments as Python Objects first
-    if (!PyArg_ParseTuple(args, "O!O!O!O!ii",
+    if (!PyArg_ParseTuple(args, "O!O!O!O!i",
         &PyArray_Type, &grid_arr_in,
         &PyArray_Type, &data_arr_in,
         &PyArray_Type, &coords_arr_in,
         &PyArray_Type, &smoothing_arr_in,
-        &resolution,
-        &requested_nthreads)) {
+        &resolution)) {
         return NULL;
     }
 
@@ -150,8 +134,7 @@ static PyObject* voxelize_box_deposition(PyObject* self, PyObject* args) {
         smoothing,
         resolution,
         resolution,
-        resolution,
-        requested_nthreads
+        resolution
     ) != 0) {
         Py_DECREF(grid_arr);
         Py_DECREF(data_arr);
@@ -174,17 +157,15 @@ static PyObject* voxelize_box_deposition_local(PyObject* self, PyObject* args) {
     PyArrayObject *grid_arr_in = NULL, *data_arr_in = NULL, *coords_arr_in = NULL, *smoothing_arr_in = NULL;
     PyArrayObject *grid_arr = NULL, *data_arr = NULL, *coords_arr = NULL, *smoothing_arr = NULL;
     int nx, ny, nz;
-    int requested_nthreads;
 
-    if (!PyArg_ParseTuple(args, "O!O!O!O!iiii",
+    if (!PyArg_ParseTuple(args, "O!O!O!O!iii",
         &PyArray_Type, &grid_arr_in,
         &PyArray_Type, &data_arr_in,
         &PyArray_Type, &coords_arr_in,
         &PyArray_Type, &smoothing_arr_in,
         &nx,
         &ny,
-        &nz,
-        &requested_nthreads)) {
+        &nz)) {
         return NULL;
     }
 
@@ -238,8 +219,7 @@ static PyObject* voxelize_box_deposition_local(PyObject* self, PyObject* args) {
         smoothing,
         (npy_int64)nx,
         (npy_int64)ny,
-        (npy_int64)nz,
-        requested_nthreads
+        (npy_int64)nz
     ) != 0) {
         Py_DECREF(grid_arr);
         Py_DECREF(data_arr);
