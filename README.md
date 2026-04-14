@@ -132,14 +132,38 @@ meshes[0].save("output.stl")
 
 ## Package layout
 
-- `src/meshmerizer/cli.py`: CLI entry point
-- `src/meshmerizer/voxels.py`: voxelization and preprocessing helpers
-- `src/meshmerizer/chunking.py`: chunk geometry and chunked meshing helpers
-- `src/meshmerizer/mesh.py`: mesh wrapper and voxel-to-surface conversion
+- `src/meshmerizer/commands/`: CLI parsing, SWIFT loading, and STL command execution
+- `src/meshmerizer/chunks/`: chunk geometry, hard-chunk meshing, union assembly, and chunk preprocessing
+- `src/meshmerizer/mesh/`: mesh wrapper plus voxel-to-surface extraction helpers
+- `src/meshmerizer/voxels/`: particle deposition, scalar-field preprocessing, and SWIFT voxel rendering
 - `src/meshmerizer/printing.py`: print-scaling helper used by `--target-size`
+
+More specifically:
+
+- `src/meshmerizer/commands/args.py`: CLI argument definitions
+- `src/meshmerizer/commands/loading.py`: SWIFT particle loading, subregion extraction, and voxel-preparation helpers
+- `src/meshmerizer/commands/stl.py`: STL command orchestration
+- `src/meshmerizer/commands/main.py`: package CLI entry point
+- `src/meshmerizer/chunks/geometry.py`: virtual-grid and hard-chunk geometry types
+- `src/meshmerizer/chunks/hard.py`: hard-boundary chunk voxelization and meshing
+- `src/meshmerizer/chunks/assembly.py`: union assembly and connected-component helpers
+- `src/meshmerizer/chunks/processing.py`: shared chunk-field preprocessing helpers
+- `src/meshmerizer/mesh/core.py`: `Mesh` wrapper, repair, subdivision, and simplification
+- `src/meshmerizer/mesh/volume.py`: connected-component preparation for voxel volumes
+- `src/meshmerizer/mesh/extract.py`: marching-cubes and SDF extraction routines
+- `src/meshmerizer/voxels/deposition.py`: dense voxel-grid generation from particles
+- `src/meshmerizer/voxels/preprocess.py`: log scaling, filament filtering, halo clipping, and smoothing
+- `src/meshmerizer/voxels/swift.py`: SWIFTsimIO-backed voxel rendering
 
 ## Testing
 
 ```bash
 pytest
 ```
+
+To do list:
+
+- [ ] Further smoothing to remove voxelixed surface? (This must be done at the final mesh stage, after unioning, to avoid breaking watertightness.)
+- [ ] Progress indicators with tqdm.
+- [ ] Faster skipping of empty chunks.
+- [ ] Make python API more flexible and user-friendly, introducing clear function entry points for the main functionality.

@@ -73,7 +73,7 @@ dev = [
 
 # Entry points
 [project.scripts]
-meshmerizer = "meshmerizer.cli:main"
+meshmerizer = "meshmerizer.commands.main:main"
 
 # Set up the build system
 [build-system]

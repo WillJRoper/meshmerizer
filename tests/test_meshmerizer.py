@@ -4,8 +4,9 @@ import numpy as np
 import pytest
 import trimesh
 
-from meshmerizer.chunking import HardChunkBounds
-from meshmerizer.cli import _build_parser, _run_stl
+from meshmerizer.chunks import HardChunkBounds
+from meshmerizer.commands.args import build_parser
+from meshmerizer.commands.stl import run_stl
 from meshmerizer.mesh import Mesh, voxels_to_stl, voxels_to_stl_via_sdf
 from meshmerizer.voxels import generate_voxel_grid, process_gaussian_smoothing
 
@@ -446,14 +447,14 @@ def test_remove_islands_threshold_discards_only_small_components(method):
 
 
 def test_cli_parses_remove_islands_flag_as_largest_only():
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(["stl", "snapshot.hdf5", "--remove-islands"])
 
     assert args.remove_islands == 0
 
 
 def test_cli_parses_remove_islands_threshold():
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(
         ["stl", "snapshot.hdf5", "--remove-islands", "10"]
     )
@@ -462,21 +463,21 @@ def test_cli_parses_remove_islands_threshold():
 
 
 def test_cli_parses_smooth_iters():
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(["stl", "snapshot.hdf5", "--smooth-iters", "8"])
 
     assert args.smooth_iters == 8
 
 
 def test_cli_parses_nthreads():
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(["stl", "snapshot.hdf5", "--nthreads", "4"])
 
     assert args.nthreads == 4
 
 
 def test_cli_parses_gaussian_sigma():
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(
         ["stl", "snapshot.hdf5", "--gaussian-sigma", "1.5"]
     )
@@ -485,7 +486,7 @@ def test_cli_parses_gaussian_sigma():
 
 
 def test_cli_parses_subdivide_iters():
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(
         ["stl", "snapshot.hdf5", "--subdivide-iters", "1"]
     )
@@ -494,7 +495,7 @@ def test_cli_parses_subdivide_iters():
 
 
 def test_cli_parses_simplify_factor():
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(
         ["stl", "snapshot.hdf5", "--simplify-factor", "0.5"]
     )
@@ -503,7 +504,7 @@ def test_cli_parses_simplify_factor():
 
 
 def test_run_stl_rejects_invalid_simplify_factor(monkeypatch, tmp_path):
-    parser = _build_parser()
+    parser = build_parser()
     out_path = tmp_path / "invalid_simplify.stl"
     args = parser.parse_args(
         [
@@ -517,25 +518,25 @@ def test_run_stl_rejects_invalid_simplify_factor(monkeypatch, tmp_path):
     )
 
     with pytest.raises(SystemExit):
-        _run_stl(args)
+        run_stl(args)
 
 
 def test_cli_parses_tight_bounds():
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(["stl", "snapshot.hdf5", "--tight-bounds"])
 
     assert args.tight_bounds is True
 
 
 def test_cli_parses_nchunks():
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(["stl", "snapshot.hdf5", "--nchunks", "3"])
 
     assert args.nchunks == 3
 
 
 def test_cli_parses_chunk_output():
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(
         ["stl", "snapshot.hdf5", "--chunk-output", "separate"]
     )
@@ -544,7 +545,7 @@ def test_cli_parses_chunk_output():
 
 
 def test_cli_parses_chunk_output_unioned():
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(
         ["stl", "snapshot.hdf5", "--chunk-output", "unioned"]
     )
@@ -553,7 +554,7 @@ def test_cli_parses_chunk_output_unioned():
 
 
 def test_run_stl_uses_chunked_mesh_path(monkeypatch, tmp_path):
-    parser = _build_parser()
+    parser = build_parser()
     out_path = tmp_path / "chunked.stl"
     args = parser.parse_args(
         [
@@ -605,21 +606,21 @@ def test_run_stl_uses_chunked_mesh_path(monkeypatch, tmp_path):
         return [(bounds, [mesh])]
 
     monkeypatch.setattr(
-        "meshmerizer.cli._load_swift_particles", fake_load_particles
+        "meshmerizer.commands.stl.load_swift_particles", fake_load_particles
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.generate_hard_chunk_meshes",
+        "meshmerizer.commands.stl.generate_hard_chunk_meshes",
         fake_generate_hard_chunk_meshes,
     )
 
-    _run_stl(args)
+    run_stl(args)
 
     assert called["chunked"] is True
     assert out_path.exists()
 
 
 def test_run_stl_writes_separate_chunk_directory(monkeypatch, tmp_path):
-    parser = _build_parser()
+    parser = build_parser()
     out_path = tmp_path / "chunked.stl"
     args = parser.parse_args(
         [
@@ -658,14 +659,14 @@ def test_run_stl_writes_separate_chunk_directory(monkeypatch, tmp_path):
         return [(object(), [mesh]), (object(), [mesh])]
 
     monkeypatch.setattr(
-        "meshmerizer.cli._load_swift_particles", fake_load_particles
+        "meshmerizer.commands.stl.load_swift_particles", fake_load_particles
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.generate_hard_chunk_meshes",
+        "meshmerizer.commands.stl.generate_hard_chunk_meshes",
         fake_generate_hard_chunk_meshes,
     )
 
-    _run_stl(args)
+    run_stl(args)
 
     output_dir = tmp_path / "chunked"
     assert output_dir.is_dir()
@@ -673,8 +674,148 @@ def test_run_stl_writes_separate_chunk_directory(monkeypatch, tmp_path):
     assert (output_dir / "chunked_2.stl").exists()
 
 
+def test_run_stl_separate_rejects_target_size(monkeypatch, tmp_path):
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "stl",
+            "snapshot.hdf5",
+            "--nchunks",
+            "2",
+            "--chunk-output",
+            "separate",
+            "--target-size",
+            "12",
+            "--output",
+            str(tmp_path / "chunked.stl"),
+        ]
+    )
+
+    def fake_load_particles(**_kwargs):
+        return (
+            np.array([1.0]),
+            np.array([[0.1, 0.1, 0.1]]),
+            None,
+            1.0,
+            np.zeros(3),
+        )
+
+    def fake_generate_hard_chunk_meshes(*_args, **_kwargs):
+        mesh = Mesh(
+            vertices=np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ]
+            ),
+            faces=np.array([[0, 1, 2]]),
+        )
+        return [(object(), [mesh])]
+
+    monkeypatch.setattr(
+        "meshmerizer.commands.stl.load_swift_particles", fake_load_particles
+    )
+    monkeypatch.setattr(
+        "meshmerizer.commands.stl.generate_hard_chunk_meshes",
+        fake_generate_hard_chunk_meshes,
+    )
+
+    with pytest.raises(SystemExit):
+        run_stl(args)
+
+
+def test_run_stl_separate_rejects_remove_islands(monkeypatch, tmp_path):
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "stl",
+            "snapshot.hdf5",
+            "--nchunks",
+            "2",
+            "--chunk-output",
+            "separate",
+            "--remove-islands",
+            "--output",
+            str(tmp_path / "chunked.stl"),
+        ]
+    )
+
+    def fake_load_particles(**_kwargs):
+        return (
+            np.array([1.0]),
+            np.array([[0.1, 0.1, 0.1]]),
+            None,
+            1.0,
+            np.zeros(3),
+        )
+
+    def fake_generate_hard_chunk_meshes(*_args, **_kwargs):
+        mesh = Mesh(
+            vertices=np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ]
+            ),
+            faces=np.array([[0, 1, 2]]),
+        )
+        return [(object(), [mesh])]
+
+    monkeypatch.setattr(
+        "meshmerizer.commands.stl.load_swift_particles", fake_load_particles
+    )
+    monkeypatch.setattr(
+        "meshmerizer.commands.stl.generate_hard_chunk_meshes",
+        fake_generate_hard_chunk_meshes,
+    )
+
+    with pytest.raises(SystemExit):
+        run_stl(args)
+
+
+def test_run_stl_chunked_handles_runtime_error(monkeypatch, tmp_path):
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "stl",
+            "snapshot.hdf5",
+            "--nchunks",
+            "2",
+            "--chunk-output",
+            "unioned",
+            "--output",
+            str(tmp_path / "chunked.stl"),
+        ]
+    )
+
+    def fake_load_particles(**_kwargs):
+        return (
+            np.array([1.0]),
+            np.array([[0.1, 0.1, 0.1]]),
+            np.array([0.05]),
+            1.0,
+            np.zeros(3),
+        )
+
+    def fake_generate_hard_chunk_meshes(*_args, **_kwargs):
+        raise RuntimeError("chunk-local smoothing requires _voxelize")
+
+    monkeypatch.setattr(
+        "meshmerizer.commands.stl.load_swift_particles", fake_load_particles
+    )
+    monkeypatch.setattr(
+        "meshmerizer.commands.stl.generate_hard_chunk_meshes",
+        fake_generate_hard_chunk_meshes,
+    )
+
+    with pytest.raises(SystemExit):
+        run_stl(args)
+
+
 def test_run_stl_uses_unioned_chunk_output(monkeypatch, tmp_path):
-    parser = _build_parser()
+    parser = build_parser()
     out_path = tmp_path / "chunked.stl"
     args = parser.parse_args(
         [
@@ -719,25 +860,25 @@ def test_run_stl_uses_unioned_chunk_output(monkeypatch, tmp_path):
         return mesh
 
     monkeypatch.setattr(
-        "meshmerizer.cli._load_swift_particles", fake_load_particles
+        "meshmerizer.commands.stl.load_swift_particles", fake_load_particles
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.generate_hard_chunk_meshes",
+        "meshmerizer.commands.stl.generate_hard_chunk_meshes",
         fake_generate_hard_chunk_meshes,
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.union_hard_chunk_meshes",
+        "meshmerizer.commands.stl.union_hard_chunk_meshes",
         fake_union_hard_chunk_meshes,
     )
 
-    _run_stl(args)
+    run_stl(args)
 
     assert called["unioned"] is True
     assert out_path.exists()
 
 
 def test_run_stl_unioned_remove_islands_keeps_largest(monkeypatch, tmp_path):
-    parser = _build_parser()
+    parser = build_parser()
     out_path = tmp_path / "largest_only.stl"
     args = parser.parse_args(
         [
@@ -784,18 +925,18 @@ def test_run_stl_unioned_remove_islands_keeps_largest(monkeypatch, tmp_path):
         return union_mesh
 
     monkeypatch.setattr(
-        "meshmerizer.cli._load_swift_particles", fake_load_particles
+        "meshmerizer.commands.stl.load_swift_particles", fake_load_particles
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.generate_hard_chunk_meshes",
+        "meshmerizer.commands.stl.generate_hard_chunk_meshes",
         fake_generate_hard_chunk_meshes,
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.union_hard_chunk_meshes",
+        "meshmerizer.commands.stl.union_hard_chunk_meshes",
         fake_union_hard_chunk_meshes,
     )
 
-    _run_stl(args)
+    run_stl(args)
 
     written = trimesh.load(out_path, force="mesh")
     assert len(written.split(only_watertight=False)) == 1
@@ -803,7 +944,7 @@ def test_run_stl_unioned_remove_islands_keeps_largest(monkeypatch, tmp_path):
 
 
 def test_run_stl_unioned_remove_islands_threshold(monkeypatch, tmp_path):
-    parser = _build_parser()
+    parser = build_parser()
     out_path = tmp_path / "thresholded.stl"
     args = parser.parse_args(
         [
@@ -853,18 +994,18 @@ def test_run_stl_unioned_remove_islands_threshold(monkeypatch, tmp_path):
         return union_mesh
 
     monkeypatch.setattr(
-        "meshmerizer.cli._load_swift_particles", fake_load_particles
+        "meshmerizer.commands.stl.load_swift_particles", fake_load_particles
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.generate_hard_chunk_meshes",
+        "meshmerizer.commands.stl.generate_hard_chunk_meshes",
         fake_generate_hard_chunk_meshes,
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.union_hard_chunk_meshes",
+        "meshmerizer.commands.stl.union_hard_chunk_meshes",
         fake_union_hard_chunk_meshes,
     )
 
-    _run_stl(args)
+    run_stl(args)
 
     written = trimesh.load(out_path, force="mesh")
     components = written.split(only_watertight=False)
