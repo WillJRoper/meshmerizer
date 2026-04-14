@@ -122,6 +122,92 @@ def _bucket_point_particles_into_hard_chunks(
     }
 
 
+def _flatten_chunk_index(
+    index: tuple[int, int, int],
+    nchunks: int,
+) -> int:
+    """Flatten a 3D chunk index into one row-major integer index.
+
+    Args:
+        index: Chunk index in ``(x, y, z)`` order.
+        nchunks: Number of chunks per axis.
+
+    Returns:
+        Flattened chunk index.
+    """
+    return ((index[0] * nchunks) + index[1]) * nchunks + index[2]
+
+
+def _chunk_particle_dict_to_csr(
+    chunk_particles: dict[tuple[int, int, int], np.ndarray],
+    *,
+    nchunks: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert a chunk-to-particle mapping into CSR-style arrays.
+
+    Args:
+        chunk_particles: Mapping from chunk index to sorted particle indices.
+        nchunks: Number of chunks per axis.
+
+    Returns:
+        Tuple of ``(offsets, particle_indices)`` arrays.
+    """
+    # Lay the chunk payloads out in row-major chunk order so chunk workers can
+    # recover one chunk slice with two offset lookups and no Python dict work.
+    chunk_count = nchunks**3
+    offsets = np.zeros(chunk_count + 1, dtype=np.int64)
+    ordered_groups = []
+    for flat_index in range(chunk_count):
+        ix = flat_index // (nchunks * nchunks)
+        iy = (flat_index // nchunks) % nchunks
+        iz = flat_index % nchunks
+        chunk_index = (ix, iy, iz)
+        particle_indices = chunk_particles.get(chunk_index)
+        if particle_indices is None:
+            offsets[flat_index + 1] = offsets[flat_index]
+            continue
+        particle_indices = np.sort(
+            np.asarray(particle_indices, dtype=np.int64),
+        )
+        ordered_groups.append(particle_indices)
+        offsets[flat_index + 1] = offsets[flat_index] + particle_indices.size
+
+    if ordered_groups:
+        flattened_particles = np.concatenate(ordered_groups).astype(
+            np.int64,
+            copy=False,
+        )
+    else:
+        flattened_particles = np.empty(0, dtype=np.int64)
+    return offsets, flattened_particles
+
+
+def _chunk_particles_from_csr(
+    offsets: np.ndarray,
+    particle_indices: np.ndarray,
+    *,
+    chunk_index: tuple[int, int, int],
+    nchunks: int,
+) -> np.ndarray:
+    """Return one chunk's particle slice from CSR-style arrays.
+
+    Args:
+        offsets: CSR offset array with length ``nchunks**3 + 1``.
+        particle_indices: Flattened particle-index payload array.
+        chunk_index: Requested chunk index in ``(x, y, z)`` order.
+        nchunks: Number of chunks per axis.
+
+    Returns:
+        View of the particle indices that belong to the requested chunk.
+    """
+    # Treat the CSR arrays as one flat concatenation of per-chunk particle
+    # lists. The offset pair gives the exact half-open slice for this chunk.
+    flat_index = _flatten_chunk_index(chunk_index, nchunks)
+    start = int(offsets[flat_index])
+    stop = int(offsets[flat_index + 1])
+    return particle_indices[start:stop]
+
+
 def _expanded_chunk_axis_bounds(
     grid: VirtualGrid,
     *,
@@ -265,7 +351,7 @@ def _build_chunk_particle_index(
     smoothing_lengths: np.ndarray | None,
     overlap_voxels: int,
     batch_size: int = 1_000_000,
-) -> dict[tuple[int, int, int], np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Build exact per-chunk particle lists in one pass.
 
     Args:
@@ -277,8 +363,8 @@ def _build_chunk_particle_index(
         batch_size: Number of particles to process per vectorized batch.
 
     Returns:
-        Mapping from chunk index to the exact particle indices that intersect
-        that chunk's expanded bounds.
+        Tuple of CSR-style ``(offsets, particle_indices)`` arrays describing
+        the exact particle indices that intersect each chunk's expanded bounds.
 
     Raises:
         ValueError: If the input arrays have invalid shapes.
@@ -289,7 +375,10 @@ def _build_chunk_particle_index(
     if coords_arr.ndim != 2 or coords_arr.shape[1] != 3:
         raise ValueError("coordinates must have shape (N, 3)")
     if coords_arr.shape[0] == 0:
-        return {}
+        return np.zeros(grid.nchunks**3 + 1, dtype=np.int64), np.empty(
+            0,
+            dtype=np.int64,
+        )
 
     if smoothing_lengths is None:
         support_radius = np.zeros(coords_arr.shape[0], dtype=np.float64)
@@ -302,6 +391,19 @@ def _build_chunk_particle_index(
         grid,
         overlap_voxels=overlap_voxels,
     )
+
+    # Prefer the compiled builder when it is available because it computes the
+    # same CSR layout without repeated Python-level grouping work.
+    if hasattr(_voxelize, "build_chunk_particle_index"):
+        support_radius_arr = support_radius.astype(np.float64, copy=False)
+        return _voxelize.build_chunk_particle_index(
+            coords_arr,
+            support_radius_arr,
+            lower_bounds,
+            upper_bounds,
+            int(grid.nchunks),
+        )
+
     chunk_particles: dict[tuple[int, int, int], list[np.ndarray]] = {}
 
     # Group particles by identical touched chunk ranges so Python only loops
@@ -335,6 +437,8 @@ def _build_chunk_particle_index(
         if not np.any(valid):
             continue
 
+        # Keep original particle ordering inside each batch so the final per-
+        # chunk lists stay deterministic and match the historical selector.
         particle_indices = np.arange(start, stop, dtype=np.int64)[valid]
         ranges = np.column_stack(
             (
@@ -352,6 +456,8 @@ def _build_chunk_particle_index(
             return_inverse=True,
         )
 
+        # Append one particle sub-array to every chunk touched by the shared
+        # range box. The final CSR conversion flattens these grouped payloads.
         for range_index, range_row in enumerate(unique_ranges):
             touched_particles = particle_indices[inverse == range_index]
             start_ix, start_iy, start_iz, stop_ix, stop_iy, stop_iz = (
@@ -364,12 +470,18 @@ def _build_chunk_particle_index(
                             touched_particles
                         )
 
-    return {
+    # Normalize the grouped payloads into sorted arrays before converting to
+    # CSR so downstream chunk lookup sees stable, monotonic particle indices.
+    chunk_particle_dict = {
         chunk_index: np.sort(
             np.concatenate(particle_groups).astype(np.int64, copy=False)
         )
         for chunk_index, particle_groups in chunk_particles.items()
     }
+    return _chunk_particle_dict_to_csr(
+        chunk_particle_dict,
+        nchunks=grid.nchunks,
+    )
 
 
 def select_particles_in_hard_chunk(
@@ -691,18 +803,30 @@ def generate_hard_chunk_meshes(
         )
         record_timing("Chunk pass total", 0.0, operation="Meshing")
         return []
+    # Build the full chunk-to-particle association once up front. This is the
+    # key scaling fix: chunk workers no longer rescan the full particle set.
+    association_start = time.perf_counter()
     if smoothing_arr is None and overlap_voxels == 0 and halo_voxels == 0:
         chunk_particle_index = _bucket_point_particles_into_hard_chunks(
             coords_arr,
             grid,
         )
+        # Convert the direct point-particle ownership buckets into the same CSR
+        # layout used by the general overlap-aware association builder.
+        chunk_offsets, chunk_particle_indices = _chunk_particle_dict_to_csr(
+            chunk_particle_index,
+            nchunks=grid.nchunks,
+        )
     else:
-        chunk_particle_index = _build_chunk_particle_index(
+        # Use the general builder whenever chunk overlap, Gaussian halo, or
+        # smoothing support can make one particle contribute to many chunks.
+        chunk_offsets, chunk_particle_indices = _build_chunk_particle_index(
             coords_arr,
             grid,
             smoothing_lengths=smoothing_arr,
             overlap_voxels=overlap_voxels + halo_voxels,
         )
+    association_time = time.perf_counter() - association_start
 
     def process_chunk(
         chunk_bounds: HardChunkBounds,
@@ -727,9 +851,11 @@ def generate_hard_chunk_meshes(
 
         # Reuse the precomputed per-chunk particle list rather than scanning
         # the full particle set in every worker.
-        particle_indices = chunk_particle_index.get(
-            chunk_bounds.index,
-            np.empty(0, dtype=np.int64),
+        particle_indices = _chunk_particles_from_csr(
+            chunk_offsets,
+            chunk_particle_indices,
+            chunk_index=chunk_bounds.index,
+            nchunks=grid.nchunks,
         )
         if particle_indices.size == 0:
             return {
@@ -924,6 +1050,13 @@ def generate_hard_chunk_meshes(
                     handle_result(result)
                     bar.update(1)
 
+    # Report the one-time association build separately so logs show whether
+    # chunk lookup or downstream voxel/mesh work dominates the run.
+    record_timing(
+        "Chunk association",
+        association_time,
+        operation="Meshing",
+    )
     record_timing(
         "Chunk voxelization",
         voxelize_total,
@@ -965,6 +1098,7 @@ def generate_hard_chunk_meshes(
         f"  processed chunks: {processed_chunks}\n"
         f"  non-empty chunks: {nonempty_chunks}\n"
         f"  emitted meshes:   {emitted_meshes}\n"
+        f"  association:      {association_time:.3f} s total\n"
         f"  voxelization:     {voxelize_total:.3f} s total\n"
         f"  preprocessing:    {preprocess_total:.3f} s total\n"
         f"  sdf meshing:      {meshing_total:.3f} s total\n"

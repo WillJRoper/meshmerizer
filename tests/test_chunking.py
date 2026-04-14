@@ -892,7 +892,7 @@ def test_build_chunk_particle_index_matches_exact_selection() -> None:
     smoothing = np.array([0.01, 0.06, 0.15, 0.05], dtype=np.float64)
     overlap_voxels = 1
 
-    chunk_index = _build_chunk_particle_index(
+    offsets, particle_indices = _build_chunk_particle_index(
         coords,
         grid,
         smoothing_lengths=smoothing,
@@ -914,9 +914,126 @@ def test_build_chunk_particle_index_matches_exact_selection() -> None:
         if indices.size > 0:
             expected[bounds.index] = indices
 
-    assert chunk_index.keys() == expected.keys()
+    actual_keys = set()
+    for ix in range(grid.nchunks):
+        for iy in range(grid.nchunks):
+            for iz in range(grid.nchunks):
+                flat_index = (ix * grid.nchunks + iy) * grid.nchunks + iz
+                if offsets[flat_index + 1] > offsets[flat_index]:
+                    actual_keys.add((ix, iy, iz))
+
+    assert actual_keys == set(expected.keys())
     for chunk_key, indices in expected.items():
-        assert np.array_equal(chunk_index[chunk_key], indices)
+        flat_index = (
+            chunk_key[0] * grid.nchunks + chunk_key[1]
+        ) * grid.nchunks + chunk_key[2]
+        actual_indices = particle_indices[
+            offsets[flat_index] : offsets[flat_index + 1]
+        ]
+        assert np.array_equal(actual_indices, indices)
+
+
+def test_build_chunk_particle_index_returns_csr_layout() -> None:
+    """Ensure the chunk index builder returns consistent CSR arrays.
+
+    Returns:
+        ``None``. Assertions verify the returned CSR layout.
+    """
+    # The chunk association builder should return offsets and payload arrays in
+    # a deterministic CSR-style layout for later chunk lookup.
+    from meshmerizer.chunks.hard import _build_chunk_particle_index
+
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    coords = np.array([[0.10, 0.10, 0.10], [0.80, 0.80, 0.80]])
+
+    offsets, particle_indices = _build_chunk_particle_index(
+        coords,
+        grid,
+        smoothing_lengths=None,
+        overlap_voxels=0,
+    )
+
+    assert offsets.shape == (grid.nchunks**3 + 1,)
+    assert particle_indices.ndim == 1
+    assert np.all(offsets[1:] >= offsets[:-1])
+
+
+def test_build_chunk_particle_index_uses_c_extension_when_available(
+    monkeypatch,
+) -> None:
+    """Ensure the wrapper uses the C builder when the extension exposes it.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        ``None``. Assertions verify the C builder is called.
+    """
+    # The Python wrapper should prefer the extension-backed builder when it is
+    # available, while preserving the same returned CSR shape.
+    from meshmerizer.chunks import hard as hard_module
+
+    grid = VirtualGrid(
+        origin=np.zeros(3),
+        box_size=1.0,
+        resolution=8,
+        nchunks=2,
+    )
+    coords = np.array([[0.10, 0.10, 0.10]], dtype=np.float64)
+    called = {"value": False}
+
+    class FakeVoxelizeModule:
+        """Stub extension exposing the chunk-index builder."""
+
+        def build_chunk_particle_index(
+            self,
+            coordinates,
+            support_radius,
+            lower_bounds,
+            upper_bounds,
+            nchunks,
+        ):
+            """Return a trivial CSR layout.
+
+            Args:
+                coordinates: Particle coordinates.
+                support_radius: Support radius array.
+                lower_bounds: Lower chunk bounds.
+                upper_bounds: Upper chunk bounds.
+                nchunks: Number of chunks per axis.
+
+            Returns:
+                Tuple of CSR arrays.
+            """
+            del (
+                coordinates,
+                support_radius,
+                lower_bounds,
+                upper_bounds,
+                nchunks,
+            )
+            called["value"] = True
+            offsets = np.zeros(grid.nchunks**3 + 1, dtype=np.int64)
+            offsets[1:] = 1
+            return offsets, np.array([0], dtype=np.int64)
+
+    monkeypatch.setattr(hard_module, "_voxelize", FakeVoxelizeModule())
+
+    offsets, particle_indices = hard_module._build_chunk_particle_index(
+        coords,
+        grid,
+        smoothing_lengths=np.array([0.01], dtype=np.float64),
+        overlap_voxels=0,
+    )
+
+    assert called["value"] is True
+    assert offsets.shape == (grid.nchunks**3 + 1,)
+    assert particle_indices.shape == (1,)
 
 
 def test_generate_hard_chunk_meshes_avoids_exact_selector_scan(

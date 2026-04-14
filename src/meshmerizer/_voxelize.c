@@ -4,23 +4,22 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
 static int get_effective_nthreads(int requested_nthreads) {
+    // Chunk-level parallelism is handled by the Python pipeline, so the local
+    // deposition helper always runs with a single effective worker.
     if (requested_nthreads < 1) {
         requested_nthreads = 1;
     }
+    return requested_nthreads > 1 ? 1 : requested_nthreads;
+}
 
-#ifdef _OPENMP
-    {
-        int max_threads = omp_get_max_threads();
-        return requested_nthreads < max_threads ? requested_nthreads : max_threads;
-    }
-#else
-    return 1;
-#endif
+static npy_int64 flatten_chunk_index(
+    npy_int64 ix,
+    npy_int64 iy,
+    npy_int64 iz,
+    npy_int64 nchunks
+) {
+    return ((ix * nchunks) + iy) * nchunks + iz;
 }
 
 static int deposit_box_kernel(
@@ -41,98 +40,39 @@ static int deposit_box_kernel(
         grid[idx] = 0.0;
     }
 
-    if (nthreads <= 1 || n_points == 0) {
-        for (npy_intp i = 0; i < n_points; i++) {
-            npy_int64 cx = coords[i * 3 + 0];
-            npy_int64 cy = coords[i * 3 + 1];
-            npy_int64 cz = coords[i * 3 + 2];
-            npy_int64 h = smoothing[i];
-            npy_float64 val = data[i];
+    // The deposition helper is intentionally serial now. This keeps the local
+    // kernel simple because the chunk pipeline already parallelizes across
+    // chunks at a higher level.
+    (void)nthreads;
+    for (npy_intp i = 0; i < n_points; i++) {
+        npy_int64 cx = coords[i * 3 + 0];
+        npy_int64 cy = coords[i * 3 + 1];
+        npy_int64 cz = coords[i * 3 + 2];
+        npy_int64 h = smoothing[i];
+        npy_float64 val = data[i];
 
-            if (h < 0) h = 0;
-
-            npy_int64 ii_start = cx - h;
-            npy_int64 ii_end = cx + h;
-            npy_int64 jj_start = cy - h;
-            npy_int64 jj_end = cy + h;
-            npy_int64 kk_start = cz - h;
-            npy_int64 kk_end = cz + h;
-
-            for (npy_int64 ii = ii_start; ii <= ii_end; ii++) {
-                for (npy_int64 jj = jj_start; jj <= jj_end; jj++) {
-                    for (npy_int64 kk = kk_start; kk <= kk_end; kk++) {
-                        if (ii >= 0 && ii < nx &&
-                            jj >= 0 && jj < ny &&
-                            kk >= 0 && kk < nz) {
-                            npy_intp idx = ii * (ny * nz) + jj * nz + kk;
-                            grid[idx] += val;
-                        }
-                    }
-                }
-            }
+        if (h < 0) {
+            h = 0;
         }
-        return 0;
-    }
 
-    npy_float64 *private_grids = (npy_float64*)calloc((size_t)nthreads * (size_t)grid_size, sizeof(npy_float64));
-    if (private_grids == NULL) {
-        return -1;
-    }
+        npy_int64 ii_start = cx - h;
+        npy_int64 ii_end = cx + h;
+        npy_int64 jj_start = cy - h;
+        npy_int64 jj_end = cy + h;
+        npy_int64 kk_start = cz - h;
+        npy_int64 kk_end = cz + h;
 
-    Py_BEGIN_ALLOW_THREADS
-#ifdef _OPENMP
-#pragma omp parallel num_threads(nthreads)
-#endif
-    {
-#ifdef _OPENMP
-        int tid = omp_get_thread_num();
-#else
-        int tid = 0;
-#endif
-        npy_float64 *local_grid = private_grids + ((npy_intp)tid * grid_size);
-
-#ifdef _OPENMP
-#pragma omp for schedule(static)
-#endif
-        for (npy_intp i = 0; i < n_points; i++) {
-            npy_int64 cx = coords[i * 3 + 0];
-            npy_int64 cy = coords[i * 3 + 1];
-            npy_int64 cz = coords[i * 3 + 2];
-            npy_int64 h = smoothing[i];
-            npy_float64 val = data[i];
-
-            if (h < 0) h = 0;
-
-            npy_int64 ii_start = cx - h;
-            npy_int64 ii_end = cx + h;
-            npy_int64 jj_start = cy - h;
-            npy_int64 jj_end = cy + h;
-            npy_int64 kk_start = cz - h;
-            npy_int64 kk_end = cz + h;
-
-            for (npy_int64 ii = ii_start; ii <= ii_end; ii++) {
-                for (npy_int64 jj = jj_start; jj <= jj_end; jj++) {
-                    for (npy_int64 kk = kk_start; kk <= kk_end; kk++) {
-                        if (ii >= 0 && ii < nx &&
-                            jj >= 0 && jj < ny &&
-                            kk >= 0 && kk < nz) {
-                            npy_intp idx = ii * (ny * nz) + jj * nz + kk;
-                            local_grid[idx] += val;
-                        }
+        for (npy_int64 ii = ii_start; ii <= ii_end; ii++) {
+            for (npy_int64 jj = jj_start; jj <= jj_end; jj++) {
+                for (npy_int64 kk = kk_start; kk <= kk_end; kk++) {
+                    if (ii >= 0 && ii < nx && jj >= 0 && jj < ny && kk >= 0 && kk < nz) {
+                        npy_intp idx = ii * (ny * nz) + jj * nz + kk;
+                        grid[idx] += val;
                     }
                 }
             }
         }
     }
-    Py_END_ALLOW_THREADS
-
-    for (int tid = 0; tid < nthreads; tid++) {
-        npy_float64 *local_grid = private_grids + ((npy_intp)tid * grid_size);
-        for (npy_intp idx = 0; idx < grid_size; idx++) {
-            grid[idx] += local_grid[idx];
-        }
-    }
-    free(private_grids);
     return 0;
 }
 
@@ -317,9 +257,292 @@ static PyObject* voxelize_box_deposition_local(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* voxelize_build_chunk_particle_index(
+    PyObject* self,
+    PyObject* args
+) {
+    PyArrayObject *coords_arr_in = NULL;
+    PyArrayObject *radius_arr_in = NULL;
+    PyArrayObject *lower_arr_in = NULL;
+    PyArrayObject *upper_arr_in = NULL;
+    PyArrayObject *coords_arr = NULL;
+    PyArrayObject *radius_arr = NULL;
+    PyArrayObject *lower_arr = NULL;
+    PyArrayObject *upper_arr = NULL;
+    int nchunks;
+
+    if (!PyArg_ParseTuple(
+        args,
+        "O!O!O!O!i",
+        &PyArray_Type,
+        &coords_arr_in,
+        &PyArray_Type,
+        &radius_arr_in,
+        &PyArray_Type,
+        &lower_arr_in,
+        &PyArray_Type,
+        &upper_arr_in,
+        &nchunks
+    )) {
+        return NULL;
+    }
+
+    coords_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        (PyObject*)coords_arr_in,
+        NPY_FLOAT64,
+        NPY_ARRAY_CARRAY
+    );
+    radius_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        (PyObject*)radius_arr_in,
+        NPY_FLOAT64,
+        NPY_ARRAY_CARRAY
+    );
+    lower_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        (PyObject*)lower_arr_in,
+        NPY_FLOAT64,
+        NPY_ARRAY_CARRAY
+    );
+    upper_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        (PyObject*)upper_arr_in,
+        NPY_FLOAT64,
+        NPY_ARRAY_CARRAY
+    );
+
+    if (!coords_arr || !radius_arr || !lower_arr || !upper_arr) {
+        Py_XDECREF(coords_arr);
+        Py_XDECREF(radius_arr);
+        Py_XDECREF(lower_arr);
+        Py_XDECREF(upper_arr);
+        PyErr_SetString(
+            PyExc_RuntimeError,
+            "Could not convert chunk-index inputs to contiguous arrays."
+        );
+        return NULL;
+    }
+
+    if (nchunks < 1) {
+        Py_DECREF(coords_arr);
+        Py_DECREF(radius_arr);
+        Py_DECREF(lower_arr);
+        Py_DECREF(upper_arr);
+        PyErr_SetString(PyExc_ValueError, "nchunks must be >= 1");
+        return NULL;
+    }
+
+    npy_intp n_points = PyArray_DIM(coords_arr, 0);
+    if (PyArray_NDIM(coords_arr) != 2 ||
+        PyArray_DIM(coords_arr, 1) != 3) {
+        Py_DECREF(coords_arr);
+        Py_DECREF(radius_arr);
+        Py_DECREF(lower_arr);
+        Py_DECREF(upper_arr);
+        PyErr_SetString(PyExc_ValueError, "coordinates must have shape (N, 3)");
+        return NULL;
+    }
+    if (PyArray_NDIM(radius_arr) != 1 || PyArray_DIM(radius_arr, 0) != n_points) {
+        Py_DECREF(coords_arr);
+        Py_DECREF(radius_arr);
+        Py_DECREF(lower_arr);
+        Py_DECREF(upper_arr);
+        PyErr_SetString(PyExc_ValueError, "support radii must have shape (N,)");
+        return NULL;
+    }
+    if (PyArray_NDIM(lower_arr) != 1 ||
+        PyArray_NDIM(upper_arr) != 1 ||
+        PyArray_DIM(lower_arr, 0) != nchunks ||
+        PyArray_DIM(upper_arr, 0) != nchunks) {
+        Py_DECREF(coords_arr);
+        Py_DECREF(radius_arr);
+        Py_DECREF(lower_arr);
+        Py_DECREF(upper_arr);
+        PyErr_SetString(
+            PyExc_ValueError,
+            "chunk bounds must have shape (nchunks,)"
+        );
+        return NULL;
+    }
+
+    npy_float64 *coords = (npy_float64*)PyArray_DATA(coords_arr);
+    npy_float64 *radius = (npy_float64*)PyArray_DATA(radius_arr);
+    npy_float64 *lower = (npy_float64*)PyArray_DATA(lower_arr);
+    npy_float64 *upper = (npy_float64*)PyArray_DATA(upper_arr);
+    npy_intp chunk_count = (npy_intp)nchunks * nchunks * nchunks;
+
+    npy_intp *counts = (npy_intp*)calloc((size_t)chunk_count, sizeof(npy_intp));
+    if (counts == NULL) {
+        Py_DECREF(coords_arr);
+        Py_DECREF(radius_arr);
+        Py_DECREF(lower_arr);
+        Py_DECREF(upper_arr);
+        PyErr_SetString(PyExc_MemoryError, "Could not allocate chunk counts.");
+        return NULL;
+    }
+
+    for (npy_intp i = 0; i < n_points; i++) {
+        npy_float64 min_x = coords[i * 3 + 0] - radius[i];
+        npy_float64 min_y = coords[i * 3 + 1] - radius[i];
+        npy_float64 min_z = coords[i * 3 + 2] - radius[i];
+        npy_float64 max_x = coords[i * 3 + 0] + radius[i];
+        npy_float64 max_y = coords[i * 3 + 1] + radius[i];
+        npy_float64 max_z = coords[i * 3 + 2] + radius[i];
+
+        npy_int64 start_x = 0;
+        while (start_x < nchunks && upper[start_x] <= min_x) {
+            start_x++;
+        }
+        npy_int64 start_y = 0;
+        while (start_y < nchunks && upper[start_y] <= min_y) {
+            start_y++;
+        }
+        npy_int64 start_z = 0;
+        while (start_z < nchunks && upper[start_z] <= min_z) {
+            start_z++;
+        }
+
+        npy_int64 stop_x = 0;
+        while (stop_x < nchunks && lower[stop_x] <= max_x) {
+            stop_x++;
+        }
+        npy_int64 stop_y = 0;
+        while (stop_y < nchunks && lower[stop_y] <= max_y) {
+            stop_y++;
+        }
+        npy_int64 stop_z = 0;
+        while (stop_z < nchunks && lower[stop_z] <= max_z) {
+            stop_z++;
+        }
+
+        if (start_x >= stop_x || start_y >= stop_y || start_z >= stop_z) {
+            continue;
+        }
+
+        for (npy_int64 ix = start_x; ix < stop_x; ix++) {
+            for (npy_int64 iy = start_y; iy < stop_y; iy++) {
+                for (npy_int64 iz = start_z; iz < stop_z; iz++) {
+                    npy_int64 flat_index = flatten_chunk_index(ix, iy, iz, nchunks);
+                    counts[flat_index] += 1;
+                }
+            }
+        }
+    }
+
+    npy_intp offsets_dims[1] = {chunk_count + 1};
+    PyArrayObject *offsets_arr = (PyArrayObject *)PyArray_ZEROS(
+        1,
+        offsets_dims,
+        NPY_INT64,
+        0
+    );
+    if (offsets_arr == NULL) {
+        free(counts);
+        Py_DECREF(coords_arr);
+        Py_DECREF(radius_arr);
+        Py_DECREF(lower_arr);
+        Py_DECREF(upper_arr);
+        return NULL;
+    }
+
+    npy_int64 *offsets = (npy_int64*)PyArray_DATA(offsets_arr);
+    for (npy_intp idx = 0; idx < chunk_count; idx++) {
+        offsets[idx + 1] = offsets[idx] + (npy_int64)counts[idx];
+    }
+
+    npy_intp payload_dims[1] = {offsets[chunk_count]};
+    PyArrayObject *particle_arr = (PyArrayObject *)PyArray_EMPTY(
+        1,
+        payload_dims,
+        NPY_INT64,
+        0
+    );
+    if (particle_arr == NULL) {
+        free(counts);
+        Py_DECREF(offsets_arr);
+        Py_DECREF(coords_arr);
+        Py_DECREF(radius_arr);
+        Py_DECREF(lower_arr);
+        Py_DECREF(upper_arr);
+        return NULL;
+    }
+
+    npy_int64 *particle_indices = (npy_int64*)PyArray_DATA(particle_arr);
+    npy_int64 *write_positions = (npy_int64*)malloc((size_t)chunk_count * sizeof(npy_int64));
+    if (write_positions == NULL) {
+        free(counts);
+        Py_DECREF(offsets_arr);
+        Py_DECREF(particle_arr);
+        Py_DECREF(coords_arr);
+        Py_DECREF(radius_arr);
+        Py_DECREF(lower_arr);
+        Py_DECREF(upper_arr);
+        PyErr_SetString(PyExc_MemoryError, "Could not allocate write positions.");
+        return NULL;
+    }
+    for (npy_intp idx = 0; idx < chunk_count; idx++) {
+        write_positions[idx] = offsets[idx];
+    }
+
+    for (npy_intp i = 0; i < n_points; i++) {
+        npy_float64 min_x = coords[i * 3 + 0] - radius[i];
+        npy_float64 min_y = coords[i * 3 + 1] - radius[i];
+        npy_float64 min_z = coords[i * 3 + 2] - radius[i];
+        npy_float64 max_x = coords[i * 3 + 0] + radius[i];
+        npy_float64 max_y = coords[i * 3 + 1] + radius[i];
+        npy_float64 max_z = coords[i * 3 + 2] + radius[i];
+
+        npy_int64 start_x = 0;
+        while (start_x < nchunks && upper[start_x] <= min_x) {
+            start_x++;
+        }
+        npy_int64 start_y = 0;
+        while (start_y < nchunks && upper[start_y] <= min_y) {
+            start_y++;
+        }
+        npy_int64 start_z = 0;
+        while (start_z < nchunks && upper[start_z] <= min_z) {
+            start_z++;
+        }
+
+        npy_int64 stop_x = 0;
+        while (stop_x < nchunks && lower[stop_x] <= max_x) {
+            stop_x++;
+        }
+        npy_int64 stop_y = 0;
+        while (stop_y < nchunks && lower[stop_y] <= max_y) {
+            stop_y++;
+        }
+        npy_int64 stop_z = 0;
+        while (stop_z < nchunks && lower[stop_z] <= max_z) {
+            stop_z++;
+        }
+
+        if (start_x >= stop_x || start_y >= stop_y || start_z >= stop_z) {
+            continue;
+        }
+
+        for (npy_int64 ix = start_x; ix < stop_x; ix++) {
+            for (npy_int64 iy = start_y; iy < stop_y; iy++) {
+                for (npy_int64 iz = start_z; iz < stop_z; iz++) {
+                    npy_int64 flat_index = flatten_chunk_index(ix, iy, iz, nchunks);
+                    particle_indices[write_positions[flat_index]++] = (npy_int64)i;
+                }
+            }
+        }
+    }
+
+    free(write_positions);
+    free(counts);
+    Py_DECREF(coords_arr);
+    Py_DECREF(radius_arr);
+    Py_DECREF(lower_arr);
+    Py_DECREF(upper_arr);
+
+    return Py_BuildValue("NN", offsets_arr, particle_arr);
+}
+
 static PyMethodDef VoxelizeMethods[] = {
     {"box_deposition", voxelize_box_deposition, METH_VARARGS, "Voxelize with box deposition kernel."},
     {"box_deposition_local", voxelize_box_deposition_local, METH_VARARGS, "Voxelize with a local box deposition kernel."},
+    {"build_chunk_particle_index", voxelize_build_chunk_particle_index, METH_VARARGS, "Build CSR-style chunk particle lists."},
     {NULL, NULL, 0, NULL}
 };
 
