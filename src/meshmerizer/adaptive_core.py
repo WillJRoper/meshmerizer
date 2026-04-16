@@ -440,6 +440,55 @@ def solve_qef_for_leaf(
     return _adaptive.solve_qef_for_leaf(samples, bounds)
 
 
+def generate_mesh(
+    cells: list[dict[str, object]],
+    contributors: list[int],
+    positions: list[tuple[float, float, float]],
+    smoothing_lengths: list[float],
+    isovalue: float,
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    max_depth: int,
+    base_resolution: int,
+) -> tuple["numpy.ndarray", "numpy.ndarray", "numpy.ndarray"]:
+    """Generate a dual-contour mesh from pre-built octree cells.
+
+    This is the legacy dual contouring path kept as a fallback
+    alternative to the Poisson reconstruction pipeline.  It
+    solves QEF vertices AND generates triangle faces entirely
+    in C++.
+
+    Args:
+        cells: Octree cell dictionaries (from ``refine_octree``).
+        contributors: Flat contributor index array.
+        positions: Particle positions in world space.
+        smoothing_lengths: Per-particle support radii.
+        isovalue: Target surface level.
+        domain_minimum: Inclusive lower corner of the working domain.
+        domain_maximum: Exclusive upper corner of the working domain.
+        max_depth: Maximum octree depth.
+        base_resolution: Number of top-level cells per axis.
+
+    Returns:
+        Tuple of ``(vert_positions, vert_normals, triangles)`` where
+        ``vert_positions`` is an (N, 3) float64 array of vertex
+        positions, ``vert_normals`` is an (N, 3) float64 array of
+        normals, and ``triangles`` is an (M, 3) int64 array of
+        triangle indices.
+    """
+    return _adaptive.generate_mesh(
+        cells,
+        contributors,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        domain_minimum,
+        domain_maximum,
+        max_depth,
+        base_resolution,
+    )
+
+
 def solve_vertices(
     cells: list[dict[str, object]],
     contributors: list[int],

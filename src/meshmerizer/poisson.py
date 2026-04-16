@@ -87,11 +87,19 @@ def poisson_reconstruct_group(
     # Poisson solver (not our adaptive octree).  A depth of 8 gives
     # 256^3 effective resolution, which is a good balance between
     # detail and speed.
-    mesh, densities = (
-        o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcd, depth=poisson_depth
+    #
+    # Suppress the extremely verbose "getValue assumes leaf node"
+    # warning that PoissonRecon prints for every non-leaf evaluation.
+    prev_verbosity = o3d.utility.get_verbosity_level()
+    o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
+    try:
+        mesh, densities = (
+            o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                pcd, depth=poisson_depth
+            )
         )
-    )
+    finally:
+        o3d.utility.set_verbosity_level(prev_verbosity)
 
     # ── Density-based trimming ────────────────────────────────────
     # The Poisson solver produces a closed surface that extends well
