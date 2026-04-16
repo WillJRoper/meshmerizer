@@ -393,3 +393,53 @@ def solve_qef_for_leaf(
         position and the normalized mean sample normal.
     """
     return _adaptive.solve_qef_for_leaf(samples, bounds)
+
+
+def generate_mesh(
+    cells: list[dict[str, object]],
+    contributors: list[int],
+    positions: list[tuple[float, float, float]],
+    smoothing_lengths: list[float],
+    isovalue: float,
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    max_depth: int,
+    base_resolution: int,
+) -> tuple[
+    list[tuple[tuple[float, float, float], tuple[float, float, float]]],
+    list[tuple[int, int, int]],
+]:
+    """Generate a triangle mesh from a refined octree via dual contouring.
+
+    Runs the complete Phase 9 pipeline: solves QEF vertices for all
+    active leaf cells, builds a spatial index for neighbor lookups,
+    and emits triangles by connecting representative vertices across
+    sign-changing primal edges.
+
+    Args:
+        cells: Octree cell dictionaries (from ``refine_octree``).
+        contributors: Flat contributor index array (from ``refine_octree``).
+        positions: Particle positions in world space.
+        smoothing_lengths: Per-particle support radii.
+        isovalue: Target surface level.
+        domain_minimum: Inclusive lower corner of the working domain.
+        domain_maximum: Exclusive upper corner of the working domain.
+        max_depth: Maximum octree depth.
+        base_resolution: Number of top-level cells per axis.
+
+    Returns:
+        Tuple of ``(vertices, triangles)`` where vertices is a list of
+        ``((px, py, pz), (nx, ny, nz))`` pairs and triangles is a list
+        of ``(i0, i1, i2)`` index triples into the vertex array.
+    """
+    return _adaptive.generate_mesh(
+        cells,
+        contributors,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        domain_minimum,
+        domain_maximum,
+        max_depth,
+        base_resolution,
+    )

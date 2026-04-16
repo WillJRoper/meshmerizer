@@ -9,6 +9,7 @@ from meshmerizer.adaptive_core import (
     create_child_cells,
     create_top_level_cells,
     filter_child_contributors,
+    generate_mesh,
     hermite_samples_for_cell,
     morton_decode_3d,
     morton_encode_3d,
@@ -689,3 +690,231 @@ def test_solve_qef_normal_is_unit_length() -> None:
     position, normal = solve_qef_for_leaf(samples, bounds)
     magnitude = math.sqrt(normal[0] ** 2 + normal[1] ** 2 + normal[2] ** 2)
     assert abs(magnitude - 1.0) < 1e-10
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: Face generation tests
+# ---------------------------------------------------------------------------
+
+
+def _build_sphere_octree(
+    base_resolution=4,
+    max_depth=2,
+    isovalue=0.5,
+):
+    """Helper: build a refined octree from a cluster of particles.
+
+    Places multiple particles near the center of a domain with enough
+    padding that the isosurface at ``isovalue`` is fully contained
+    within the domain interior (not touching any boundary face).
+
+    The domain is [-1, 2]^3 with particles near (0.5, 0.5, 0.5) and
+    smoothing lengths of 0.8.  The Wendland C2 kernel has compact
+    support, so the field is zero beyond radius 0.8 from any particle.
+    At isovalue=0.5 the isosurface sits well inside the kernel support,
+    far from the domain boundary.
+
+    Returns:
+        Tuple of (cells, contributors, positions, smoothing_lengths,
+        isovalue, domain_min, domain_max, max_depth, base_resolution).
+    """
+    # A small cluster of particles near the center ensures every
+    # cell near the surface has at least 2 contributors.
+    positions = [
+        (0.45, 0.5, 0.5),
+        (0.55, 0.5, 0.5),
+        (0.5, 0.45, 0.5),
+        (0.5, 0.55, 0.5),
+        (0.5, 0.5, 0.45),
+        (0.5, 0.5, 0.55),
+    ]
+    smoothing_lengths = [0.8] * len(positions)
+    domain_min = (-1.0, -1.0, -1.0)
+    domain_max = (2.0, 2.0, 2.0)
+
+    # Build initial cells with contributor ranges.
+    top_cells = create_top_level_cells(domain_min, domain_max, base_resolution)
+    initial_cells = []
+    for i, cell in enumerate(top_cells):
+        cell_dict = dict(cell)
+        cell_dict["contributor_begin"] = 0
+        cell_dict["contributor_end"] = len(positions)
+        initial_cells.append(cell_dict)
+
+    cells, contributors = refine_octree(
+        initial_cells, positions, smoothing_lengths, isovalue, max_depth
+    )
+
+    return (
+        cells,
+        contributors,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        domain_min,
+        domain_max,
+        max_depth,
+        base_resolution,
+    )
+
+
+def test_generate_mesh_produces_vertices_and_triangles() -> None:
+    """generate_mesh should produce a non-empty mesh from a simple field."""
+    args = _build_sphere_octree()
+    vertices, triangles = generate_mesh(*args)
+    assert len(vertices) > 0, "Expected at least one vertex"
+    assert len(triangles) > 0, "Expected at least one triangle"
+
+
+def test_generate_mesh_vertex_indices_valid() -> None:
+    """All triangle vertex indices must reference valid vertices."""
+    args = _build_sphere_octree()
+    vertices, triangles = generate_mesh(*args)
+    num_verts = len(vertices)
+    for tri in triangles:
+        for idx in tri:
+            assert 0 <= idx < num_verts, (
+                f"Vertex index {idx} out of range [0, {num_verts})"
+            )
+
+
+def test_generate_mesh_no_degenerate_triangles() -> None:
+    """No triangle should have two identical vertex indices."""
+    args = _build_sphere_octree()
+    vertices, triangles = generate_mesh(*args)
+    for tri in triangles:
+        assert tri[0] != tri[1], f"Degenerate triangle: {tri}"
+        assert tri[1] != tri[2], f"Degenerate triangle: {tri}"
+        assert tri[0] != tri[2], f"Degenerate triangle: {tri}"
+
+
+def _edge_key(a, b):
+    """Return a canonical (sorted) edge key."""
+    return (min(a, b), max(a, b))
+
+
+def test_generate_mesh_watertight() -> None:
+    """Every edge in the mesh must be shared by exactly 2 triangles.
+
+    This is the fundamental watertightness condition for a closed
+    manifold triangle mesh.
+    """
+    args = _build_sphere_octree()
+    vertices, triangles = generate_mesh(*args)
+
+    # Count how many triangles reference each edge.
+    edge_counts = {}
+    for tri in triangles:
+        edges = [
+            _edge_key(tri[0], tri[1]),
+            _edge_key(tri[1], tri[2]),
+            _edge_key(tri[2], tri[0]),
+        ]
+        for edge in edges:
+            edge_counts[edge] = edge_counts.get(edge, 0) + 1
+
+    # Every edge must appear exactly twice in a watertight mesh.
+    for edge, count in edge_counts.items():
+        assert count == 2, (
+            f"Edge {edge} shared by {count} triangles "
+            f"(expected 2 for watertight mesh)"
+        )
+
+
+def test_generate_mesh_consistent_winding() -> None:
+    """Adjacent triangles should have consistent winding order.
+
+    For a manifold mesh, each directed half-edge (a, b) should appear
+    exactly once, and its reverse (b, a) should also appear exactly
+    once.  This ensures consistent orientation across the surface.
+    """
+    args = _build_sphere_octree()
+    vertices, triangles = generate_mesh(*args)
+
+    half_edge_counts = {}
+    for tri in triangles:
+        half_edges = [
+            (tri[0], tri[1]),
+            (tri[1], tri[2]),
+            (tri[2], tri[0]),
+        ]
+        for he in half_edges:
+            half_edge_counts[he] = half_edge_counts.get(he, 0) + 1
+
+    # Each directed half-edge should appear exactly once.
+    for he, count in half_edge_counts.items():
+        assert count == 1, (
+            f"Half-edge {he} appears {count} times "
+            f"(expected 1 for consistent winding)"
+        )
+
+    # Each half-edge must have its reverse present.
+    for he in half_edge_counts:
+        reverse = (he[1], he[0])
+        assert reverse in half_edge_counts, (
+            f"Half-edge {he} has no reverse {reverse}"
+        )
+
+
+def test_generate_mesh_euler_characteristic() -> None:
+    """The Euler characteristic V - E + F should be 2 for a closed sphere.
+
+    For a closed genus-0 surface, V - E + F = 2.
+    """
+    args = _build_sphere_octree()
+    vertices, triangles = generate_mesh(*args)
+
+    v_count = len(vertices)
+    f_count = len(triangles)
+
+    # Count unique edges.
+    edges = set()
+    for tri in triangles:
+        edges.add(_edge_key(tri[0], tri[1]))
+        edges.add(_edge_key(tri[1], tri[2]))
+        edges.add(_edge_key(tri[2], tri[0]))
+    e_count = len(edges)
+
+    euler = v_count - e_count + f_count
+    assert euler == 2, (
+        f"Euler characteristic is {euler} (V={v_count}, "
+        f"E={e_count}, F={f_count}), expected 2"
+    )
+
+
+def test_generate_mesh_empty_field() -> None:
+    """A field with no surface crossings should produce an empty mesh."""
+    # Place particle far outside the domain so no isosurface exists.
+    positions = [(10.0, 10.0, 10.0)]
+    smoothing_lengths = [0.1]
+    domain_min = (0.0, 0.0, 0.0)
+    domain_max = (1.0, 1.0, 1.0)
+    isovalue = 0.5
+    base_resolution = 2
+    max_depth = 1
+
+    top_cells = create_top_level_cells(domain_min, domain_max, base_resolution)
+    initial_cells = []
+    for cell in top_cells:
+        cell_dict = dict(cell)
+        cell_dict["contributor_begin"] = 0
+        cell_dict["contributor_end"] = len(positions)
+        initial_cells.append(cell_dict)
+
+    cells, contributors = refine_octree(
+        initial_cells, positions, smoothing_lengths, isovalue, max_depth
+    )
+
+    vertices, triangles = generate_mesh(
+        cells,
+        contributors,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        domain_min,
+        domain_max,
+        max_depth,
+        base_resolution,
+    )
+    assert len(vertices) == 0
+    assert len(triangles) == 0

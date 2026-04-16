@@ -22,6 +22,7 @@
 #include "adaptive_cpp/octree_cell.hpp"
 #include "adaptive_cpp/particle.hpp"
 #include "adaptive_cpp/particle_grid.hpp"
+#include "adaptive_cpp/faces.hpp"
 #include "adaptive_cpp/qef.hpp"
 
 /**
@@ -1020,6 +1021,272 @@ static PyObject *solve_qef_for_leaf_py(PyObject *self, PyObject *args) {
 }
 
 /**
+ * @brief Run the full mesh generation pipeline on a refined octree.
+ *
+ * Takes the output of ``refine_octree`` (cells and contributors) along
+ * with particle data, and produces a triangle mesh via dual contouring.
+ *
+ * @param self Unused.
+ * @param args Python tuple: (cells, contributors, positions,
+ *     smoothing_lengths, isovalue, domain_min, domain_max,
+ *     max_depth, base_resolution).
+ * @return Python tuple: (vertices, triangles) where vertices is a list
+ *     of ``((px, py, pz), (nx, ny, nz))`` and triangles is a list of
+ *     ``(i0, i1, i2)`` index triples.
+ */
+static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
+    PyObject *cells_object = NULL;
+    PyObject *contributors_object = NULL;
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    double isovalue = 0.0;
+    PyObject *domain_min_object = NULL;
+    PyObject *domain_max_object = NULL;
+    unsigned int max_depth = 0U;
+    unsigned int base_resolution = 0U;
+    BoundingBox domain{};
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    (void)self;
+
+    if (!PyArg_ParseTuple(args, "OOOOdOOII",
+                          &cells_object,
+                          &contributors_object,
+                          &positions_object,
+                          &smoothing_object,
+                          &isovalue,
+                          &domain_min_object,
+                          &domain_max_object,
+                          &max_depth,
+                          &base_resolution)) {
+        return NULL;
+    }
+
+    if (!parse_vector3d_sequence(positions_object, positions) ||
+        !parse_double_sequence(smoothing_object, smoothing_lengths)) {
+        return NULL;
+    }
+    if (positions.size() != smoothing_lengths.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing lengths must match");
+        return NULL;
+    }
+    if (!parse_vector3d(domain_min_object, domain.min) ||
+        !parse_vector3d(domain_max_object, domain.max)) {
+        return NULL;
+    }
+
+    // Parse the contributor array.
+    PyObject *contrib_fast = PySequence_Fast(
+        contributors_object, "expected a sequence of ints");
+    if (contrib_fast == NULL) {
+        return NULL;
+    }
+    const Py_ssize_t num_contrib =
+        PySequence_Fast_GET_SIZE(contrib_fast);
+    std::vector<std::size_t> all_contributors;
+    all_contributors.reserve(static_cast<std::size_t>(num_contrib));
+    for (Py_ssize_t i = 0; i < num_contrib; ++i) {
+        long val = PyLong_AsLong(
+            PySequence_Fast_GET_ITEM(contrib_fast, i));
+        if (val < 0 && PyErr_Occurred()) {
+            Py_DECREF(contrib_fast);
+            return NULL;
+        }
+        all_contributors.push_back(static_cast<std::size_t>(val));
+    }
+    Py_DECREF(contrib_fast);
+
+    // Parse the cells array.
+    PyObject *cells_fast = PySequence_Fast(
+        cells_object, "expected a sequence of cell dicts");
+    if (cells_fast == NULL) {
+        return NULL;
+    }
+    const Py_ssize_t num_cells =
+        PySequence_Fast_GET_SIZE(cells_fast);
+    std::vector<OctreeCell> all_cells;
+    all_cells.reserve(static_cast<std::size_t>(num_cells));
+
+    for (Py_ssize_t i = 0; i < num_cells; ++i) {
+        PyObject *d = PySequence_Fast_GET_ITEM(cells_fast, i);
+        if (!PyDict_Check(d)) {
+            Py_DECREF(cells_fast);
+            PyErr_SetString(PyExc_TypeError,
+                            "each cell must be a dictionary");
+            return NULL;
+        }
+
+        OctreeCell cell{};
+        cell.morton_key = PyLong_AsUnsignedLongLong(
+            PyDict_GetItemString(d, "morton_key"));
+        cell.depth = static_cast<std::uint32_t>(
+            PyLong_AsUnsignedLong(
+                PyDict_GetItemString(d, "depth")));
+
+        PyObject *bounds_obj = PyDict_GetItemString(d, "bounds");
+        if (bounds_obj && PyTuple_Check(bounds_obj) &&
+            PyTuple_Size(bounds_obj) == 2) {
+            parse_vector3d(
+                PyTuple_GetItem(bounds_obj, 0), cell.bounds.min);
+            parse_vector3d(
+                PyTuple_GetItem(bounds_obj, 1), cell.bounds.max);
+        }
+
+        PyObject *is_leaf_obj =
+            PyDict_GetItemString(d, "is_leaf");
+        cell.is_leaf = is_leaf_obj
+            ? (PyLong_AsLong(is_leaf_obj) != 0)
+            : true;
+
+        PyObject *has_surface_obj =
+            PyDict_GetItemString(d, "has_surface");
+        cell.has_surface = has_surface_obj
+            ? (PyLong_AsLong(has_surface_obj) != 0)
+            : false;
+
+        PyObject *is_active_obj =
+            PyDict_GetItemString(d, "is_active");
+        cell.is_active = is_active_obj
+            ? (PyLong_AsLong(is_active_obj) != 0)
+            : false;
+
+        PyObject *child_begin_obj =
+            PyDict_GetItemString(d, "child_begin");
+        cell.child_begin = child_begin_obj
+            ? static_cast<std::int64_t>(
+                  PyLong_AsLong(child_begin_obj))
+            : -1;
+
+        cell.representative_vertex_index = -1;
+
+        // Parse corner_sign_mask.
+        PyObject *csm_obj =
+            PyDict_GetItemString(d, "corner_sign_mask");
+        cell.corner_sign_mask = csm_obj
+            ? static_cast<std::uint8_t>(
+                  PyLong_AsUnsignedLong(csm_obj))
+            : 0U;
+
+        // Parse corner_values.
+        PyObject *cv_obj =
+            PyDict_GetItemString(d, "corner_values");
+        if (cv_obj) {
+            std::vector<double> cv;
+            if (parse_double_sequence(cv_obj, cv) &&
+                cv.size() == 8U) {
+                std::copy(cv.begin(), cv.end(),
+                          cell.corner_values.begin());
+            }
+        }
+
+        // Parse contributor range.
+        PyObject *cb_obj =
+            PyDict_GetItemString(d, "contributor_begin");
+        PyObject *ce_obj =
+            PyDict_GetItemString(d, "contributor_end");
+        if (cb_obj && ce_obj) {
+            cell.contributor_begin =
+                static_cast<std::int64_t>(
+                    PyLong_AsLong(cb_obj));
+            cell.contributor_end =
+                static_cast<std::int64_t>(
+                    PyLong_AsLong(ce_obj));
+        } else {
+            // Fall back to contributors list if present.
+            PyObject *contribs_obj =
+                PyDict_GetItemString(d, "contributors");
+            if (contribs_obj) {
+                PyObject *cfast = PySequence_Fast(
+                    contribs_obj, "contributors");
+                if (cfast) {
+                    Py_ssize_t nc =
+                        PySequence_Fast_GET_SIZE(cfast);
+                    cell.contributor_begin =
+                        static_cast<std::int64_t>(
+                            all_contributors.size());
+                    for (Py_ssize_t ci = 0; ci < nc; ++ci) {
+                        long v = PyLong_AsLong(
+                            PySequence_Fast_GET_ITEM(
+                                cfast, ci));
+                        all_contributors.push_back(
+                            static_cast<std::size_t>(v));
+                    }
+                    cell.contributor_end =
+                        static_cast<std::int64_t>(
+                            all_contributors.size());
+                    Py_DECREF(cfast);
+                }
+            } else {
+                cell.contributor_begin = -1;
+                cell.contributor_end = -1;
+            }
+        }
+
+        if (PyErr_Occurred()) {
+            Py_DECREF(cells_fast);
+            return NULL;
+        }
+        all_cells.push_back(cell);
+    }
+    Py_DECREF(cells_fast);
+
+    // Run the mesh generation pipeline.
+    auto [vertices, triangles] = generate_mesh(
+        all_cells, all_contributors, positions, smoothing_lengths,
+        isovalue, domain, max_depth, base_resolution);
+
+    // Build the Python result.
+    PyObject *verts_list = PyList_New(
+        static_cast<Py_ssize_t>(vertices.size()));
+    if (verts_list == NULL) {
+        return NULL;
+    }
+    for (std::size_t i = 0; i < vertices.size(); ++i) {
+        PyObject *v = Py_BuildValue(
+            "((ddd)(ddd))",
+            vertices[i].position.x,
+            vertices[i].position.y,
+            vertices[i].position.z,
+            vertices[i].normal.x,
+            vertices[i].normal.y,
+            vertices[i].normal.z);
+        if (v == NULL) {
+            Py_DECREF(verts_list);
+            return NULL;
+        }
+        PyList_SET_ITEM(verts_list,
+                        static_cast<Py_ssize_t>(i), v);
+    }
+
+    PyObject *tris_list = PyList_New(
+        static_cast<Py_ssize_t>(triangles.size()));
+    if (tris_list == NULL) {
+        Py_DECREF(verts_list);
+        return NULL;
+    }
+    for (std::size_t i = 0; i < triangles.size(); ++i) {
+        PyObject *t = Py_BuildValue(
+            "(nnn)",
+            static_cast<Py_ssize_t>(
+                triangles[i].vertex_indices[0]),
+            static_cast<Py_ssize_t>(
+                triangles[i].vertex_indices[1]),
+            static_cast<Py_ssize_t>(
+                triangles[i].vertex_indices[2]));
+        if (t == NULL) {
+            Py_DECREF(tris_list);
+            Py_DECREF(verts_list);
+            return NULL;
+        }
+        PyList_SET_ITEM(tris_list,
+                        static_cast<Py_ssize_t>(i), t);
+    }
+
+    return Py_BuildValue("(OO)", verts_list, tris_list);
+}
+
+/**
  * @brief Python methods exported by the adaptive extension.
  */
 static PyMethodDef adaptive_methods[] = {
@@ -1130,6 +1397,12 @@ static PyMethodDef adaptive_methods[] = {
         solve_qef_for_leaf_py,
         METH_VARARGS,
         PyDoc_STR("Solve the QEF and return the representative vertex for a leaf cell."),
+    },
+    {
+        "generate_mesh",
+        generate_mesh_py,
+        METH_VARARGS,
+        PyDoc_STR("Generate a triangle mesh from a refined octree via dual contouring."),
     },
     {NULL, NULL, 0, NULL},
 };
