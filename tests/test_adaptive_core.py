@@ -7,6 +7,8 @@ from meshmerizer.adaptive_core import (
     morton_decode_3d,
     morton_encode_3d,
     particle_fields,
+    wendland_c2_gradient,
+    wendland_c2_value,
 )
 
 
@@ -52,3 +54,24 @@ def test_bounding_box_overlap_requires_positive_volume() -> None:
 def test_particle_fields_document_minimal_payload() -> None:
     """The adaptive particle payload should expose its documented fields."""
     assert particle_fields() == ("position", "value", "smoothing_length", "id")
+
+
+def test_wendland_c2_value_matches_expected_profile() -> None:
+    """The unnormalized Wendland value should peak at one and vanish at `h`."""
+    assert wendland_c2_value(0.0, 2.0) == 1.0
+    assert wendland_c2_value(2.0, 2.0) == 0.0
+    assert wendland_c2_value(3.0, 2.0) == 0.0
+
+
+def test_wendland_c2_gradient_points_inward() -> None:
+    """The kernel gradient should point back toward the particle center."""
+    gradient = wendland_c2_gradient((0.5, 0.0, 0.0), 1.0)
+    assert gradient[0] < 0.0
+    assert gradient[1] == 0.0
+    assert gradient[2] == 0.0
+
+
+def test_wendland_c2_gradient_vanishes_at_center_and_support() -> None:
+    """The kernel gradient should vanish at the center and support edge."""
+    assert wendland_c2_gradient((0.0, 0.0, 0.0), 1.0) == (0.0, 0.0, 0.0)
+    assert wendland_c2_gradient((1.0, 0.0, 0.0), 1.0) == (0.0, 0.0, 0.0)

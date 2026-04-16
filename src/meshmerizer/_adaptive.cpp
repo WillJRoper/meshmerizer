@@ -14,6 +14,7 @@
 #include <cstdint>
 
 #include "adaptive_cpp/bounding_box.hpp"
+#include "adaptive_cpp/kernel_wendland_c2.hpp"
 #include "adaptive_cpp/morton.hpp"
 #include "adaptive_cpp/particle.hpp"
 
@@ -138,6 +139,49 @@ static PyObject *particle_fields_py(PyObject *self, PyObject *args) {
 }
 
 /**
+ * @brief Evaluate the Wendland C2 kernel at one radius.
+ *
+ * @param self Unused Python self/module object.
+ * @param args Python tuple containing radius, smoothing length, and a
+ *     normalization flag.
+ * @return Python float containing the evaluated kernel value.
+ */
+static PyObject *wendland_c2_value_py(PyObject *self, PyObject *args) {
+    double radius = 0.0;
+    double smoothing_length = 0.0;
+    int normalize = 0;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "ddi", &radius, &smoothing_length,
+                          &normalize)) {
+        return NULL;
+    }
+    return PyFloat_FromDouble(
+        evaluate_wendland_c2(radius, smoothing_length, normalize != 0));
+}
+
+/**
+ * @brief Evaluate the Wendland C2 gradient for one displacement vector.
+ *
+ * @param self Unused Python self/module object.
+ * @param args Python tuple containing displacement, smoothing length, and a
+ *     normalization flag.
+ * @return Python tuple containing the gradient components.
+ */
+static PyObject *wendland_c2_gradient_py(PyObject *self, PyObject *args) {
+    Vector3d displacement{};
+    double smoothing_length = 0.0;
+    int normalize = 0;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "(ddd)di", &displacement.x, &displacement.y,
+                          &displacement.z, &smoothing_length, &normalize)) {
+        return NULL;
+    }
+    const Vector3d gradient = evaluate_wendland_c2_gradient(
+        displacement, smoothing_length, normalize != 0);
+    return Py_BuildValue("(ddd)", gradient.x, gradient.y, gradient.z);
+}
+
+/**
  * @brief Python methods exported by the adaptive extension.
  */
 static PyMethodDef adaptive_methods[] = {
@@ -176,6 +220,18 @@ static PyMethodDef adaptive_methods[] = {
         particle_fields_py,
         METH_NOARGS,
         PyDoc_STR("Return the adaptive particle field names."),
+    },
+    {
+        "wendland_c2_value",
+        wendland_c2_value_py,
+        METH_VARARGS,
+        PyDoc_STR("Evaluate the Wendland C2 kernel value."),
+    },
+    {
+        "wendland_c2_gradient",
+        wendland_c2_gradient_py,
+        METH_VARARGS,
+        PyDoc_STR("Evaluate the Wendland C2 kernel gradient."),
     },
     {NULL, NULL, 0, NULL},
 };

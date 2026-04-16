@@ -99,3 +99,43 @@ def particle_fields() -> tuple[str, str, str, str]:
         Tuple containing the current adaptive `Particle` member names.
     """
     return _adaptive.particle_fields()
+
+
+def wendland_c2_value(
+    radius: float,
+    smoothing_length: float,
+    normalize: bool = False,
+) -> float:
+    """Evaluate the Wendland C2 kernel at one radius.
+
+    Args:
+        radius: Distance from the particle center.
+        smoothing_length: Particle kernel support radius.
+        normalize: Whether to apply the 3-D normalization constant.
+
+    Returns:
+        Kernel value at the requested radius.
+    """
+    return _adaptive.wendland_c2_value(radius, smoothing_length, normalize)
+
+
+def wendland_c2_gradient(
+    displacement: tuple[float, float, float],
+    smoothing_length: float,
+    normalize: bool = False,
+) -> tuple[float, float, float]:
+    """Evaluate the Wendland C2 kernel gradient for one displacement.
+
+    Args:
+        displacement: Vector from particle center to query position.
+        smoothing_length: Particle kernel support radius.
+        normalize: Whether to apply the 3-D normalization constant.
+
+    Returns:
+        Gradient vector of the kernel at the requested displacement.
+    """
+    return _adaptive.wendland_c2_gradient(
+        displacement,
+        smoothing_length,
+        normalize,
+    )
