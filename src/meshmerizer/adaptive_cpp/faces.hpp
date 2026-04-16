@@ -131,13 +131,17 @@ struct LeafSpatialIndex {
                 "max_depth >= 21 would overflow 21-bit grid "
                 "coordinate packing");
         }
-        const std::uint32_t fine_res_int =
-            base_resolution * (1U << max_depth);
-        constexpr std::uint32_t MAX_COORD = (1U << 21U) - 1U;
-        if (fine_res_int > MAX_COORD) {
+        // Compute in uint64_t to detect overflow before narrowing.
+        const std::uint64_t fine_res_wide =
+            static_cast<std::uint64_t>(base_resolution) *
+            (1ULL << max_depth);
+        constexpr std::uint64_t MAX_COORD = (1ULL << 21U) - 1U;
+        if (fine_res_wide > MAX_COORD) {
             throw std::overflow_error(
                 "fine_res exceeds 21-bit grid coordinate capacity");
         }
+        const std::uint32_t fine_res_int =
+            static_cast<std::uint32_t>(fine_res_wide);
 
         // The finest grid has base_resolution * 2^max_depth cells per axis.
         const double fine_cells_per_axis_x =
@@ -306,15 +310,26 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
         // Gather contributor indices for this cell.  Construct the
         // vector directly from the iterator range into
         // all_contributors, avoiding per-element push_back overhead.
+        // Validate the range to prevent out-of-bounds access from
+        // corrupt cell data.
         std::vector<std::size_t> contributors;
         if (cell.contributor_begin >= 0 &&
             cell.contributor_end > cell.contributor_begin) {
+            const auto begin_idx =
+                static_cast<std::size_t>(cell.contributor_begin);
+            const auto end_idx =
+                static_cast<std::size_t>(cell.contributor_end);
+            if (end_idx > all_contributors.size()) {
+                throw std::out_of_range(
+                    "cell contributor_end exceeds "
+                    "all_contributors size");
+            }
             const auto begin_it =
                 all_contributors.begin() +
-                static_cast<std::ptrdiff_t>(cell.contributor_begin);
+                static_cast<std::ptrdiff_t>(begin_idx);
             const auto end_it =
                 all_contributors.begin() +
-                static_cast<std::ptrdiff_t>(cell.contributor_end);
+                static_cast<std::ptrdiff_t>(end_idx);
             contributors.assign(begin_it, end_it);
         }
 
@@ -616,14 +631,18 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
         throw std::overflow_error(
             "max_depth >= 21 would overflow grid coordinates");
     }
-    // The fine-grid has this many cells per axis.
-    const std::uint32_t fine_res =
-        base_resolution * (1U << max_depth);
-    constexpr std::uint32_t MAX_COORD = (1U << 21U) - 1U;
-    if (fine_res > MAX_COORD) {
+    // Compute in uint64_t to detect overflow before narrowing.
+    const std::uint64_t fine_res_wide =
+        static_cast<std::uint64_t>(base_resolution) *
+        (1ULL << max_depth);
+    constexpr std::uint64_t MAX_COORD_FACE = (1ULL << 21U) - 1U;
+    if (fine_res_wide > MAX_COORD_FACE) {
         throw std::overflow_error(
             "fine_res exceeds 21-bit grid coordinate capacity");
     }
+    // The fine-grid has this many cells per axis.
+    const std::uint32_t fine_res =
+        static_cast<std::uint32_t>(fine_res_wide);
 
     // Iterate over all fine-grid vertex positions.  Each vertex
     // position (ix, iy, iz) is the min corner of a fine-grid cell.

@@ -10,6 +10,9 @@
 
 #include "vector3d.hpp"
 
+/** @brief Pi constant, portable across compilers (avoids non-standard M_PI). */
+static constexpr double WENDLAND_PI = 3.14159265358979323846;
+
 /**
  * @brief Return the unnormalized Wendland C2 kernel profile.
  *
@@ -37,7 +40,7 @@ inline double wendland_c2_normalization(double smoothing_length) {
     if (smoothing_length <= 0.0) {
         return 0.0;
     }
-    return 21.0 / (2.0 * M_PI * std::pow(smoothing_length, 3));
+    return 21.0 / (2.0 * WENDLAND_PI * std::pow(smoothing_length, 3));
 }
 
 /**

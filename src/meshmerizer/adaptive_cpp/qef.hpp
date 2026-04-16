@@ -160,15 +160,16 @@ struct QEFAccumulator {
 };
 
 /**
- * @brief Solve a 3x3 linear system in place using Gaussian elimination with
+ * @brief Solve a 3x3 linear system using Gaussian elimination with
  * partial pivoting.
  *
- * The augmented matrix ``[mat | rhs]`` is modified during elimination. If any
- * pivot falls below ``pivot_threshold`` the system is considered rank-deficient
- * and the function returns ``false`` without writing a solution.
+ * ``mat`` and ``rhs`` are taken by value (copied), so the caller's
+ * originals are not modified.  If any pivot falls below
+ * ``pivot_threshold`` the system is considered rank-deficient and the
+ * function returns ``false`` without writing a solution.
  *
- * @param mat 3x3 coefficient matrix (modified in place).
- * @param rhs 3-element right-hand side (modified in place).
+ * @param mat 3x3 coefficient matrix (copied internally).
+ * @param rhs 3-element right-hand side (copied internally).
  * @param solution Output 3-element solution vector.
  * @param pivot_threshold Minimum acceptable pivot magnitude.
  * @return ``true`` when a unique solution was found.

@@ -324,7 +324,12 @@ inline std::uint64_t neighbor_morton_key(std::uint64_t key,
     morton_decode_3d(key, x, y, z);
 
     // Valid coordinates at depth d span [0, root_resolution * 2^d).
-    const std::uint32_t max_coord = root_resolution << depth;
+    // Guard: depth >= 32 would cause undefined behavior on the shift.
+    if (depth >= 32U) {
+        return 0ULL;  // No valid neighbor at extreme depths.
+    }
+    const std::uint64_t max_coord =
+        static_cast<std::uint64_t>(root_resolution) << depth;
 
     switch (direction) {
         case 0:  // +X

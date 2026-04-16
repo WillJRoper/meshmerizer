@@ -7,8 +7,10 @@
 #define MESHMERIZER_ADAPTIVE_CPP_PARTICLE_GRID_HPP_
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "bounding_box.hpp"
@@ -41,7 +43,12 @@ struct TopLevelParticleGrid {
     TopLevelParticleGrid(const BoundingBox &input_domain,
                          std::uint32_t input_resolution)
         : domain(input_domain), resolution(input_resolution),
-          bins(static_cast<std::size_t>(resolution) * resolution * resolution) {}
+          bins(static_cast<std::size_t>(resolution) * resolution * resolution) {
+        if (resolution == 0U) {
+            throw std::invalid_argument(
+                "TopLevelParticleGrid resolution must be > 0");
+        }
+    }
 
     /**
      * @brief Return the world-space width of one top-level bin.

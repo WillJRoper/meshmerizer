@@ -97,6 +97,45 @@ static bool parse_double_sequence(PyObject *sequence, std::vector<double> &outpu
 }
 
 /**
+ * @brief Parse a Python sequence of non-negative integers into size_t.
+ *
+ * Each element is converted via ``PyLong_AsLong`` and validated to be
+ * non-negative.  This avoids the silent truncation that occurs when
+ * parsing indices through ``parse_double_sequence``.
+ *
+ * @param sequence Python sequence containing int-like values.
+ * @param output Parsed index list destination.
+ * @return ``true`` when parsing succeeds.
+ */
+static bool parse_index_sequence(PyObject *sequence,
+                                 std::vector<std::size_t> &output) {
+    PyObject *fast = PySequence_Fast(
+        sequence, "expected a sequence of non-negative integers");
+    if (fast == NULL) {
+        return false;
+    }
+    const Py_ssize_t size = PySequence_Fast_GET_SIZE(fast);
+    output.reserve(static_cast<std::size_t>(size));
+    for (Py_ssize_t index = 0; index < size; ++index) {
+        const long value = PyLong_AsLong(
+            PySequence_Fast_GET_ITEM(fast, index));
+        if (value == -1 && PyErr_Occurred()) {
+            Py_DECREF(fast);
+            return false;
+        }
+        if (value < 0) {
+            Py_DECREF(fast);
+            PyErr_SetString(PyExc_ValueError,
+                            "index must be non-negative");
+            return false;
+        }
+        output.push_back(static_cast<std::size_t>(value));
+    }
+    Py_DECREF(fast);
+    return true;
+}
+
+/**
  * @brief Build one Python dictionary from an octree cell.
  *
  * @param cell Source octree cell.
@@ -569,7 +608,7 @@ static PyObject *filter_child_contributors_py(PyObject *self, PyObject *args) {
     PyObject *positions_object = NULL;
     PyObject *smoothing_object = NULL;
     PyObject *parent_bounds_object = NULL;
-    std::vector<double> parsed_parent_contributors;
+    std::vector<std::size_t> parent_contributors;
     std::vector<Vector3d> positions;
     std::vector<double> smoothing_lengths;
     BoundingBox parent_bounds{};
@@ -579,7 +618,7 @@ static PyObject *filter_child_contributors_py(PyObject *self, PyObject *args) {
                           &parent_bounds_object)) {
         return NULL;
     }
-    if (!parse_double_sequence(parent_contributors_object, parsed_parent_contributors) ||
+    if (!parse_index_sequence(parent_contributors_object, parent_contributors) ||
         !parse_vector3d_sequence(positions_object, positions) ||
         !parse_double_sequence(smoothing_object, smoothing_lengths)) {
         return NULL;
@@ -599,22 +638,13 @@ static PyObject *filter_child_contributors_py(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    std::vector<std::size_t> parent_contributors;
-    parent_contributors.reserve(parsed_parent_contributors.size());
-    for (double contributor_value : parsed_parent_contributors) {
-        if (contributor_value < 0.0) {
-            PyErr_SetString(PyExc_ValueError,
-                            "parent contributor indices must be non-negative");
-            return NULL;
-        }
-        const std::size_t particle_index =
-            static_cast<std::size_t>(contributor_value);
-        if (particle_index >= positions.size()) {
+    // Validate contributor indices are in range.
+    for (std::size_t idx : parent_contributors) {
+        if (idx >= positions.size()) {
             PyErr_SetString(PyExc_ValueError,
                             "parent contributor index is out of range");
             return NULL;
         }
-        parent_contributors.push_back(particle_index);
     }
 
     const OctreeCell parent = {
@@ -687,7 +717,7 @@ static PyObject *build_octree_cell_dict_with_contributors(
     }
 
     return Py_BuildValue(
-        "{sK,sI,s((ddd)(ddd)),sI,sI,sI,sI,sB,sO,sO}",
+        "{sK,sI,s((ddd)(ddd)),sI,sI,sI,sL,sB,sN,sN}",
         "morton_key",
         static_cast<unsigned long long>(cell.morton_key),
         "depth",
@@ -706,7 +736,7 @@ static PyObject *build_octree_cell_dict_with_contributors(
         "has_surface",
         cell.has_surface ? 1 : 0,
         "child_begin",
-        static_cast<long>(cell.child_begin),
+        static_cast<long long>(cell.child_begin),
         "corner_sign_mask",
         static_cast<unsigned int>(cell.corner_sign_mask),
         "corner_values",
@@ -866,7 +896,6 @@ static PyObject *hermite_samples_for_cell_py(PyObject *self, PyObject *args) {
     BoundingBox bounds{};
     std::vector<double> parsed_corner_values;
     std::array<double, 8> corner_values{};
-    std::vector<double> parsed_contributors;
     std::vector<std::size_t> contributor_indices;
     std::vector<Vector3d> positions;
     std::vector<double> smoothing_lengths;
@@ -893,7 +922,7 @@ static PyObject *hermite_samples_for_cell_py(PyObject *self, PyObject *args) {
     }
 
     if (!parse_double_sequence(corner_values_object, parsed_corner_values) ||
-        !parse_double_sequence(contributors_object, parsed_contributors) ||
+        !parse_index_sequence(contributors_object, contributor_indices) ||
         !parse_vector3d_sequence(positions_object, positions) ||
         !parse_double_sequence(smoothing_object, smoothing_lengths)) {
         return NULL;
@@ -912,15 +941,13 @@ static PyObject *hermite_samples_for_cell_py(PyObject *self, PyObject *args) {
     std::copy(parsed_corner_values.begin(), parsed_corner_values.end(),
               corner_values.begin());
 
-    contributor_indices.reserve(parsed_contributors.size());
-    for (double value : parsed_contributors) {
-        if (value < 0.0 ||
-            static_cast<std::size_t>(value) >= positions.size()) {
+    // Validate contributor indices are in range.
+    for (std::size_t idx : contributor_indices) {
+        if (idx >= positions.size()) {
             PyErr_SetString(PyExc_ValueError,
                             "contributor index out of range");
             return NULL;
         }
-        contributor_indices.push_back(static_cast<std::size_t>(value));
     }
 
     const std::uint8_t corner_sign_mask =
@@ -1089,8 +1116,14 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
     for (Py_ssize_t i = 0; i < num_contrib; ++i) {
         long val = PyLong_AsLong(
             PySequence_Fast_GET_ITEM(contrib_fast, i));
-        if (val < 0 && PyErr_Occurred()) {
+        if (val == -1 && PyErr_Occurred()) {
             Py_DECREF(contrib_fast);
+            return NULL;
+        }
+        if (val < 0) {
+            Py_DECREF(contrib_fast);
+            PyErr_SetString(PyExc_ValueError,
+                            "contributor indices must be non-negative");
             return NULL;
         }
         all_contributors.push_back(static_cast<std::size_t>(val));
@@ -1283,7 +1316,9 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
                         static_cast<Py_ssize_t>(i), t);
     }
 
-    return Py_BuildValue("(OO)", verts_list, tris_list);
+    // Use "N" format to steal references — Py_BuildValue with "O" would
+    // increment the refcount, leaking the lists we already own.
+    return Py_BuildValue("(NN)", verts_list, tris_list);
 }
 
 /**
