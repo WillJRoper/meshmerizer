@@ -184,8 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Octree depth for the Poisson surface reconstruction. "
-            "Higher values produce finer detail. Defaults to "
-            "--max-depth."
+            "Higher values produce finer detail. Defaults to 9."
         ),
     )
     adaptive.add_argument(

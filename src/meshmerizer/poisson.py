@@ -24,7 +24,7 @@ import open3d as o3d
 def poisson_reconstruct_group(
     positions: np.ndarray,
     normals: np.ndarray,
-    poisson_depth: int = 8,
+    poisson_depth: int = 9,
     density_quantile: float = 0.1,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct a watertight mesh from oriented points via Poisson.
@@ -124,7 +124,7 @@ def poisson_reconstruct(
     positions: np.ndarray,
     normals: np.ndarray,
     group_labels: np.ndarray,
-    poisson_depth: int = 8,
+    poisson_depth: int = 9,
     density_quantile: float = 0.1,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct meshes for all FOF groups and merge them.

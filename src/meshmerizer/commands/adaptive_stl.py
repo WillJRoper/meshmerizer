@@ -463,9 +463,7 @@ def run_adaptive(args) -> None:
     # ------------------------------------------------------------------
     # Step 5: FOF clustering + Poisson surface reconstruction.
     # ------------------------------------------------------------------
-    poisson_depth = (
-        args.poisson_depth if args.poisson_depth is not None else max_depth
-    )
+    poisson_depth = args.poisson_depth if args.poisson_depth is not None else 9
 
     # Cluster QEF vertices into distinct objects.
     log_status(
