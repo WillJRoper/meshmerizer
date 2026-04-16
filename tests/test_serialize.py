@@ -262,11 +262,11 @@ def test_round_trip_mesh_usable_for_generate_mesh():
             base_resolution,
         )
 
-        # Must produce identical results
+        # Must produce identical results (triangle order may differ
+        # with OpenMP, so compare as sorted tuples).
         assert len(verts) == len(orig_verts)
         assert len(tris) == len(orig_tris)
-        for a, b in zip(tris, orig_tris):
-            assert a == b
+        assert sorted(tris) == sorted(orig_tris)
     finally:
         os.unlink(path)
 

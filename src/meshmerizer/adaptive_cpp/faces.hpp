@@ -46,6 +46,7 @@
 #include "hermite.hpp"
 #include "mesh.hpp"
 #include "octree_cell.hpp"
+#include "omp_config.hpp"
 #include "qef.hpp"
 #include "vector3d.hpp"
 
@@ -297,13 +298,28 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
     double isovalue) {
-    std::vector<MeshVertex> vertices;
+    const std::size_t n_cells = all_cells.size();
 
-    for (std::size_t cell_idx = 0; cell_idx < all_cells.size();
-         ++cell_idx) {
+    // Per-cell results computed in parallel.  Each entry is either a
+    // valid MeshVertex (when the cell is an active surface leaf) or
+    // an empty placeholder.  A separate flag marks which cells are
+    // active so the serial index-assignment pass can skip non-active
+    // cells cheaply.
+    std::vector<MeshVertex> per_cell_vertex(n_cells);
+    // Use char instead of bool to avoid the std::vector<bool> bit-packing
+    // specialisation, which causes data races when adjacent elements are
+    // written by different threads (they share the same byte).
+    std::vector<char> is_active_leaf(n_cells, 0);
+
+    // Pass 1 (parallel): For each leaf cell, lazily sample corners if
+    // needed, compute Hermite samples, and solve the QEF.  Each
+    // iteration touches only its own cell and reads shared immutable
+    // data (positions, smoothing_lengths, all_contributors), so there
+    // are no data races.
+#pragma omp parallel for schedule(dynamic)
+    for (std::size_t cell_idx = 0; cell_idx < n_cells; ++cell_idx) {
         OctreeCell &cell = all_cells[cell_idx];
         if (!cell.is_leaf) {
-            cell.representative_vertex_index = -1;
             continue;
         }
 
@@ -320,9 +336,9 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
             const auto end_idx =
                 static_cast<std::size_t>(cell.contributor_end);
             if (end_idx > all_contributors.size()) {
-                throw std::out_of_range(
-                    "cell contributor_end exceeds "
-                    "all_contributors size");
+                // Cannot throw from an OpenMP region on all
+                // compilers; mark the cell inactive and continue.
+                continue;
             }
             const auto begin_it =
                 all_contributors.begin() +
@@ -347,7 +363,6 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
         }
 
         if (!cell.has_surface) {
-            cell.representative_vertex_index = -1;
             continue;
         }
 
@@ -358,7 +373,6 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
         // If no sign change, skip (safety check).
         if (cell.corner_sign_mask == 0U ||
             cell.corner_sign_mask == 0xFFU) {
-            cell.representative_vertex_index = -1;
             cell.has_surface = false;
             continue;
         }
@@ -371,13 +385,25 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
                 positions, smoothing_lengths, isovalue);
 
         // Solve the QEF.
-        const MeshVertex vertex =
+        per_cell_vertex[cell_idx] =
             solve_qef_for_leaf(samples, cell.bounds);
+        is_active_leaf[cell_idx] = 1;
+    }
 
-        cell.representative_vertex_index =
-            static_cast<std::int64_t>(vertices.size());
-        cell.is_active = true;
-        vertices.push_back(vertex);
+    // Pass 2 (serial): Assign contiguous vertex indices and build
+    // the compact output vertex array.  This must be serial because
+    // vertex indices must be dense and deterministic.
+    std::vector<MeshVertex> vertices;
+    for (std::size_t cell_idx = 0; cell_idx < n_cells; ++cell_idx) {
+        OctreeCell &cell = all_cells[cell_idx];
+        if (is_active_leaf[cell_idx]) {
+            cell.representative_vertex_index =
+                static_cast<std::int64_t>(vertices.size());
+            cell.is_active = true;
+            vertices.push_back(per_cell_vertex[cell_idx]);
+        } else {
+            cell.representative_vertex_index = -1;
+        }
     }
 
     return vertices;
@@ -623,7 +649,6 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
     std::uint32_t max_depth,
     std::uint32_t base_resolution,
     double isovalue) {
-    std::vector<MeshTriangle> triangles;
 
     // Guard: ensure fine_res does not overflow uint32 or exceed
     // the 21-bit pack_grid_coords capacity.
@@ -644,11 +669,33 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
     const std::uint32_t fine_res =
         static_cast<std::uint32_t>(fine_res_wide);
 
+    // Determine the number of threads.  When OpenMP is disabled the
+    // stub returns 1 and the code degrades to a single-threaded path
+    // with no overhead beyond the extra indirection through the
+    // per-thread vector.
+    const int n_threads = omp_get_max_threads();
+
+    // Per-thread triangle buffers.  Each thread appends only to its
+    // own buffer, avoiding synchronization inside the hot loop.
+    std::vector<std::vector<MeshTriangle>> thread_triangles(
+        static_cast<std::size_t>(n_threads));
+
     // Iterate over all fine-grid vertex positions.  Each vertex
     // position (ix, iy, iz) is the min corner of a fine-grid cell.
     // We process the 3 edges emanating from it in the +X, +Y, +Z
     // directions.
+    //
+    // The outer loop over ix is parallelised.  Each ix slice is
+    // independent because edges only connect adjacent vertices and
+    // emit_quad reads (but never writes) shared cell/vertex data.
+    // The only writes go into the thread-local triangle buffer.
+#pragma omp parallel for schedule(dynamic)
     for (std::uint32_t ix = 0; ix < fine_res; ++ix) {
+        // Select this thread's triangle buffer.
+        std::vector<MeshTriangle> &local_triangles =
+            thread_triangles[
+                static_cast<std::size_t>(omp_get_thread_num())];
+
         for (std::uint32_t iy = 0; iy < fine_res; ++iy) {
             for (std::uint32_t iz = 0; iz < fine_res; ++iz) {
                 // Look up the leaf cell containing this vertex.
@@ -676,16 +723,7 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
                             spatial_index, max_depth, isovalue);
 
                         if (sign_a != sign_b) {
-                            // 4 incident cells for an X-edge at
-                            // (ix, iy, iz).  In the Y-Z plane:
-                            //   c0=(iy,iz)     c2=(iy,iz-1)
-                            //   c1=(iy-1,iz)   c3=(iy-1,iz-1)
-                            // Cyclic CW around +X (normal in -X
-                            // direction): c0, c2, c3, c1.
-                            // Winding is reversed when sign_a_above.
                             if (iy > 0U && iz > 0U) {
-                                // c0 is the cell at (ix,iy,iz),
-                                // already looked up as cell_a_idx.
                                 const std::size_t c1 =
                                     spatial_index.find_leaf_at(
                                         ix, iy - 1U, iz);
@@ -697,7 +735,8 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
                                         ix, iy - 1U, iz - 1U);
 
                                 emit_quad(
-                                    all_cells, vertices, triangles,
+                                    all_cells, vertices,
+                                    local_triangles,
                                     cell_a_idx, c2, c3, c1,
                                     sign_a);
                             }
@@ -717,16 +756,7 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
                             spatial_index, max_depth, isovalue);
 
                         if (sign_a != sign_c) {
-                            // 4 incident cells for a Y-edge at
-                            // (ix, iy, iz).  In the X-Z plane:
-                            //   c0=(ix,iz)     c2=(ix,iz-1)
-                            //   c1=(ix-1,iz)   c3=(ix-1,iz-1)
-                            // Cyclic CW around +Y (normal in -Y
-                            // direction): c0, c1, c3, c2.
-                            // Winding is reversed when sign_a_above.
                             if (ix > 0U && iz > 0U) {
-                                // c0 is the cell at (ix,iy,iz),
-                                // already looked up as cell_a_idx.
                                 const std::size_t c1 =
                                     spatial_index.find_leaf_at(
                                         ix - 1U, iy, iz);
@@ -738,7 +768,8 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
                                         ix - 1U, iy, iz - 1U);
 
                                 emit_quad(
-                                    all_cells, vertices, triangles,
+                                    all_cells, vertices,
+                                    local_triangles,
                                     cell_a_idx, c1, c3, c2,
                                     sign_a);
                             }
@@ -758,16 +789,7 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
                             spatial_index, max_depth, isovalue);
 
                         if (sign_a != sign_d) {
-                            // 4 incident cells for a Z-edge at
-                            // (ix, iy, iz).  In the X-Y plane:
-                            //   c0=(ix,iy)     c2=(ix,iy-1)
-                            //   c1=(ix-1,iy)   c3=(ix-1,iy-1)
-                            // Cyclic CW around +Z (normal in -Z
-                            // direction): c0, c2, c3, c1.
-                            // Winding is reversed when sign_a_above.
                             if (ix > 0U && iy > 0U) {
-                                // c0 is the cell at (ix,iy,iz),
-                                // already looked up as cell_a_idx.
                                 const std::size_t c1 =
                                     spatial_index.find_leaf_at(
                                         ix - 1U, iy, iz);
@@ -779,7 +801,8 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
                                         ix - 1U, iy - 1U, iz);
 
                                 emit_quad(
-                                    all_cells, vertices, triangles,
+                                    all_cells, vertices,
+                                    local_triangles,
                                     cell_a_idx, c2, c3, c1,
                                     sign_a);
                             }
@@ -788,6 +811,18 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
                 }
             }
         }
+    }
+
+    // Merge thread-local triangle buffers into a single output.
+    // Count total triangles first for a single allocation.
+    std::size_t total_triangles = 0;
+    for (const auto &buf : thread_triangles) {
+        total_triangles += buf.size();
+    }
+    std::vector<MeshTriangle> triangles;
+    triangles.reserve(total_triangles);
+    for (const auto &buf : thread_triangles) {
+        triangles.insert(triangles.end(), buf.begin(), buf.end());
     }
 
     return triangles;
