@@ -224,8 +224,8 @@ def export_octree(
         cgrp = f.create_group("contributors")
         cgrp.create_dataset("indices", data=contrib_arr)
 
-        # -- mesh (optional) --
-        if vertices is not None and triangles is not None:
+        # -- mesh / vertex data (optional) --
+        if vertices is not None:
             mgrp = f.create_group("mesh")
             # Support both old format (list of ((px,py,pz),(nx,ny,nz)))
             # and new format (Nx3 ndarray of positions + separate normals).
@@ -241,15 +241,19 @@ def export_octree(
                 # Old format: list of ((px,py,pz),(nx,ny,nz)).
                 vert_pos = np.array([v[0] for v in vertices], dtype=np.float64)
                 vert_nrm = np.array([v[1] for v in vertices], dtype=np.float64)
-            tri_arr = np.asarray(triangles, dtype=np.int64)
             if vert_pos.ndim == 1 and vert_pos.size == 0:
                 vert_pos = vert_pos.reshape((0, 3))
                 vert_nrm = vert_nrm.reshape((0, 3))
-            if tri_arr.ndim == 1 and tri_arr.size == 0:
-                tri_arr = tri_arr.reshape((0, 3))
             mgrp.create_dataset("vertices", data=vert_pos)
             mgrp.create_dataset("normals", data=vert_nrm)
-            mgrp.create_dataset("triangles", data=tri_arr)
+
+            # Triangles are optional — Poisson pipeline does not
+            # produce them at this stage.
+            if triangles is not None:
+                tri_arr = np.asarray(triangles, dtype=np.int64)
+                if tri_arr.ndim == 1 and tri_arr.size == 0:
+                    tri_arr = tri_arr.reshape((0, 3))
+                mgrp.create_dataset("triangles", data=tri_arr)
 
 
 # ===================================================================
@@ -349,7 +353,6 @@ def import_octree(
             mgrp = f["mesh"]
             vert_pos = mgrp["vertices"][:]
             vert_nrm = mgrp["normals"][:]
-            tri_arr = mgrp["triangles"][:]
             vertices = [
                 (
                     tuple(vert_pos[i].tolist()),
@@ -357,9 +360,11 @@ def import_octree(
                 )
                 for i in range(len(vert_pos))
             ]
-            triangles_out = [
-                tuple(int(x) for x in row) for row in tri_arr.tolist()
-            ]
+            if "triangles" in mgrp:
+                tri_arr = mgrp["triangles"][:]
+                triangles_out = [
+                    tuple(int(x) for x in row) for row in tri_arr.tolist()
+                ]
 
     return {
         "isovalue": isovalue,

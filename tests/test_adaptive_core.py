@@ -11,7 +11,6 @@ from meshmerizer.adaptive_core import (
     create_top_level_cells,
     filter_child_contributors,
     fof_cluster,
-    generate_mesh,
     hermite_samples_for_cell,
     morton_decode_3d,
     morton_encode_3d,
@@ -20,6 +19,7 @@ from meshmerizer.adaptive_core import (
     refine_octree,
     run_octree_pipeline,
     solve_qef_for_leaf,
+    solve_vertices,
     top_level_bin_counts,
     wendland_c2_gradient,
     wendland_c2_value,
@@ -787,120 +787,30 @@ def _build_sphere_octree(
     )
 
 
-def test_generate_mesh_produces_vertices_and_triangles() -> None:
-    """generate_mesh should produce a non-empty mesh from a simple field."""
+def test_solve_vertices_produces_vertices() -> None:
+    """solve_vertices should produce QEF vertices from a simple field."""
     args = _build_sphere_octree()
-    vert_positions, vert_normals, triangles = generate_mesh(*args)
+    vert_positions, vert_normals = solve_vertices(*args)
     assert len(vert_positions) > 0, "Expected at least one vertex"
-    assert len(triangles) > 0, "Expected at least one triangle"
+    assert vert_positions.shape[1] == 3
+    assert vert_normals.shape[1] == 3
+    assert vert_positions.shape[0] == vert_normals.shape[0]
 
 
-def test_generate_mesh_vertex_indices_valid() -> None:
-    """All triangle vertex indices must reference valid vertices."""
+def test_solve_vertices_normals_unit_length() -> None:
+    """QEF vertex normals should be approximately unit length."""
+    import numpy as np
+
     args = _build_sphere_octree()
-    vert_positions, vert_normals, triangles = generate_mesh(*args)
-    num_verts = len(vert_positions)
-    for tri in triangles:
-        for idx in tri:
-            assert 0 <= idx < num_verts, (
-                f"Vertex index {idx} out of range [0, {num_verts})"
-            )
+    vert_positions, vert_normals = solve_vertices(*args)
+    norms = np.linalg.norm(vert_normals, axis=1)
+    # Some normals may be zero for degenerate cells; check non-zero ones.
+    nonzero = norms > 0.01
+    assert np.allclose(norms[nonzero], 1.0, atol=0.05)
 
 
-def test_generate_mesh_no_degenerate_triangles() -> None:
-    """No triangle should have two identical vertex indices."""
-    args = _build_sphere_octree()
-    vert_positions, vert_normals, triangles = generate_mesh(*args)
-    for tri in triangles:
-        assert tri[0] != tri[1], f"Degenerate triangle: {tri}"
-        assert tri[1] != tri[2], f"Degenerate triangle: {tri}"
-        assert tri[0] != tri[2], f"Degenerate triangle: {tri}"
-
-
-def _edge_key(a, b):
-    """Return a canonical (sorted) edge key."""
-    return (min(a, b), max(a, b))
-
-
-def test_generate_mesh_watertight() -> None:
-    """Every edge in the mesh must be shared by exactly 2 triangles."""
-    args = _build_sphere_octree()
-    vert_positions, vert_normals, triangles = generate_mesh(*args)
-
-    # Count how many triangles reference each edge.
-    edge_counts = {}
-    for tri in triangles:
-        edges = [
-            _edge_key(tri[0], tri[1]),
-            _edge_key(tri[1], tri[2]),
-            _edge_key(tri[2], tri[0]),
-        ]
-        for edge in edges:
-            edge_counts[edge] = edge_counts.get(edge, 0) + 1
-
-    # Every edge must appear exactly twice in a watertight mesh.
-    for edge, count in edge_counts.items():
-        assert count == 2, (
-            f"Edge {edge} shared by {count} triangles "
-            f"(expected 2 for watertight mesh)"
-        )
-
-
-def test_generate_mesh_consistent_winding() -> None:
-    """Adjacent triangles should have consistent winding order."""
-    args = _build_sphere_octree()
-    vert_positions, vert_normals, triangles = generate_mesh(*args)
-
-    half_edge_counts = {}
-    for tri in triangles:
-        half_edges = [
-            (tri[0], tri[1]),
-            (tri[1], tri[2]),
-            (tri[2], tri[0]),
-        ]
-        for he in half_edges:
-            half_edge_counts[he] = half_edge_counts.get(he, 0) + 1
-
-    # Each directed half-edge should appear exactly once.
-    for he, count in half_edge_counts.items():
-        assert count == 1, (
-            f"Half-edge {he} appears {count} times "
-            f"(expected 1 for consistent winding)"
-        )
-
-    # Each half-edge must have its reverse present.
-    for he in half_edge_counts:
-        reverse = (he[1], he[0])
-        assert reverse in half_edge_counts, (
-            f"Half-edge {he} has no reverse {reverse}"
-        )
-
-
-def test_generate_mesh_euler_characteristic() -> None:
-    """The Euler characteristic V - E + F should be 2 for a closed sphere."""
-    args = _build_sphere_octree()
-    vert_positions, vert_normals, triangles = generate_mesh(*args)
-
-    v_count = len(vert_positions)
-    f_count = len(triangles)
-
-    # Count unique edges.
-    edges = set()
-    for tri in triangles:
-        edges.add(_edge_key(tri[0], tri[1]))
-        edges.add(_edge_key(tri[1], tri[2]))
-        edges.add(_edge_key(tri[2], tri[0]))
-    e_count = len(edges)
-
-    euler = v_count - e_count + f_count
-    assert euler == 2, (
-        f"Euler characteristic is {euler} (V={v_count}, "
-        f"E={e_count}, F={f_count}), expected 2"
-    )
-
-
-def test_generate_mesh_empty_field() -> None:
-    """A field with no surface crossings should produce an empty mesh."""
+def test_solve_vertices_empty_field() -> None:
+    """A field with no surface crossings should produce no vertices."""
     # Place particle far outside the domain so no isosurface exists.
     positions = [(10.0, 10.0, 10.0)]
     smoothing_lengths = [0.1]
@@ -928,7 +838,7 @@ def test_generate_mesh_empty_field() -> None:
         base_resolution=base_resolution,
     )
 
-    vert_positions, vert_normals, triangles = generate_mesh(
+    vert_positions, vert_normals = solve_vertices(
         cells,
         contributors,
         positions,
@@ -940,78 +850,15 @@ def test_generate_mesh_empty_field() -> None:
         base_resolution,
     )
     assert len(vert_positions) == 0
-    assert len(triangles) == 0
+    assert len(vert_normals) == 0
 
 
-def test_generate_mesh_mixed_depth_adjacency() -> None:
-    """Mixed-depth octree should produce a valid watertight mesh.
-
-    Uses max_depth=3 to create deeper refinement near the surface,
-    forcing adjacent leaves at different depths.  The degenerate
-    quad path (3 unique vertices from a coarse cell covering
-    multiple fine-grid positions) must produce correct triangles.
-    """
+def test_solve_vertices_mixed_depth() -> None:
+    """Mixed-depth octree should produce vertices."""
     args = _build_sphere_octree(base_resolution=4, max_depth=3)
-    vert_positions, vert_normals, triangles = generate_mesh(*args)
-
+    vert_positions, vert_normals = solve_vertices(*args)
     assert len(vert_positions) > 0, "Expected at least one vertex"
-    assert len(triangles) > 0, "Expected at least one triangle"
-
-    # Verify no degenerate triangles.
-    for tri in triangles:
-        assert tri[0] != tri[1], f"Degenerate triangle: {tri}"
-        assert tri[1] != tri[2], f"Degenerate triangle: {tri}"
-        assert tri[0] != tri[2], f"Degenerate triangle: {tri}"
-
-    # Verify watertightness: every edge shared by exactly 2 triangles.
-    edge_counts: dict = {}
-    for tri in triangles:
-        edges = [
-            _edge_key(tri[0], tri[1]),
-            _edge_key(tri[1], tri[2]),
-            _edge_key(tri[2], tri[0]),
-        ]
-        for edge in edges:
-            edge_counts[edge] = edge_counts.get(edge, 0) + 1
-
-    for edge, count in edge_counts.items():
-        assert count == 2, (
-            f"Edge {edge} shared by {count} triangles "
-            f"(expected 2 for watertight mesh)"
-        )
-
-    # Verify consistent winding.
-    half_edge_counts: dict = {}
-    for tri in triangles:
-        half_edges = [
-            (tri[0], tri[1]),
-            (tri[1], tri[2]),
-            (tri[2], tri[0]),
-        ]
-        for he in half_edges:
-            half_edge_counts[he] = half_edge_counts.get(he, 0) + 1
-
-    for he, count in half_edge_counts.items():
-        assert count == 1, f"Half-edge {he} appears {count} times"
-        reverse = (he[1], he[0])
-        assert reverse in half_edge_counts, (
-            f"Half-edge {he} has no reverse {reverse}"
-        )
-
-    # Verify Euler characteristic V - E + F = 2.
-    v_count = len(vert_positions)
-    f_count = len(triangles)
-    edges_set = set()
-    for tri in triangles:
-        edges_set.add(_edge_key(tri[0], tri[1]))
-        edges_set.add(_edge_key(tri[1], tri[2]))
-        edges_set.add(_edge_key(tri[2], tri[0]))
-    e_count = len(edges_set)
-    euler = v_count - e_count + f_count
-    assert euler == 2, (
-        f"Euler characteristic is {euler} "
-        f"(V={v_count}, E={e_count}, F={f_count}), expected 2"
-    )
+    assert vert_positions.shape[1] == 3
 
 
 # ---------------------------------------------------------------------------

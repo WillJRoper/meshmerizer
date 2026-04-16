@@ -1328,113 +1328,25 @@ static PyObject *solve_qef_for_leaf_py(PyObject *self, PyObject *args) {
         vertex.normal.z);
 }
 
-/**
- * @brief Build a Python tuple of (positions, normals, triangles) as NumPy
- *        arrays from the C++ mesh output.
- *
- * Returns (positions_Nx3_float64, normals_Nx3_float64, triangles_Mx3_int64).
- * On failure sets a Python exception and returns NULL.
- */
-static PyObject *build_mesh_numpy_result(
-    const std::vector<MeshVertex> &vertices,
-    const std::vector<MeshTriangle> &triangles) {
-    // -- Vertex positions: Nx3 float64 --
-    const npy_intp n_verts = static_cast<npy_intp>(vertices.size());
-    npy_intp pos_dims[2] = {n_verts, 3};
-    PyObject *pos_arr = PyArray_SimpleNew(2, pos_dims, NPY_DOUBLE);
-    if (pos_arr == NULL) return NULL;
-    {
-        double *data = static_cast<double *>(
-            PyArray_DATA(reinterpret_cast<PyArrayObject *>(pos_arr)));
-        for (npy_intp i = 0; i < n_verts; ++i) {
-            data[i * 3 + 0] = vertices[static_cast<std::size_t>(i)]
-                                   .position.x;
-            data[i * 3 + 1] = vertices[static_cast<std::size_t>(i)]
-                                   .position.y;
-            data[i * 3 + 2] = vertices[static_cast<std::size_t>(i)]
-                                   .position.z;
-        }
-    }
-
-    // -- Vertex normals: Nx3 float64 --
-    PyObject *norm_arr = PyArray_SimpleNew(2, pos_dims, NPY_DOUBLE);
-    if (norm_arr == NULL) {
-        Py_DECREF(pos_arr);
-        return NULL;
-    }
-    {
-        double *data = static_cast<double *>(
-            PyArray_DATA(reinterpret_cast<PyArrayObject *>(norm_arr)));
-        for (npy_intp i = 0; i < n_verts; ++i) {
-            data[i * 3 + 0] = vertices[static_cast<std::size_t>(i)]
-                                   .normal.x;
-            data[i * 3 + 1] = vertices[static_cast<std::size_t>(i)]
-                                   .normal.y;
-            data[i * 3 + 2] = vertices[static_cast<std::size_t>(i)]
-                                   .normal.z;
-        }
-    }
-
-    // -- Triangle indices: Mx3 int64 --
-    const npy_intp n_tris = static_cast<npy_intp>(triangles.size());
-    npy_intp tri_dims[2] = {n_tris, 3};
-    PyObject *tri_arr = PyArray_SimpleNew(2, tri_dims, NPY_INT64);
-    if (tri_arr == NULL) {
-        Py_DECREF(pos_arr);
-        Py_DECREF(norm_arr);
-        return NULL;
-    }
-    {
-        std::int64_t *data = static_cast<std::int64_t *>(
-            PyArray_DATA(reinterpret_cast<PyArrayObject *>(tri_arr)));
-        for (npy_intp i = 0; i < n_tris; ++i) {
-            data[i * 3 + 0] = static_cast<std::int64_t>(
-                triangles[static_cast<std::size_t>(i)]
-                    .vertex_indices[0]);
-            data[i * 3 + 1] = static_cast<std::int64_t>(
-                triangles[static_cast<std::size_t>(i)]
-                    .vertex_indices[1]);
-            data[i * 3 + 2] = static_cast<std::int64_t>(
-                triangles[static_cast<std::size_t>(i)]
-                    .vertex_indices[2]);
-        }
-    }
-
-    // -- Build the result tuple manually so we can clean up on error.
-    // Py_BuildValue("NNN") steals references, which means if it fails
-    // partway through, already-stolen refs are lost.  Using explicit
-    // PyTuple_New + PyTuple_SET_ITEM avoids this: SET_ITEM steals the
-    // ref only on success, and on any allocation failure we can still
-    // Py_DECREF all three arrays. --
-    PyObject *result = PyTuple_New(3);
-    if (result == NULL) {
-        Py_DECREF(pos_arr);
-        Py_DECREF(norm_arr);
-        Py_DECREF(tri_arr);
-        return NULL;
-    }
-    PyTuple_SET_ITEM(result, 0, pos_arr);   // steals ref
-    PyTuple_SET_ITEM(result, 1, norm_arr);  // steals ref
-    PyTuple_SET_ITEM(result, 2, tri_arr);   // steals ref
-    return result;
-}
+/* Forward declaration — used by solve_vertices_py before definition. */
+static PyObject *build_vertices_numpy_result(
+    const std::vector<MeshVertex> &vertices);
 
 /**
- * @brief Run the full mesh generation pipeline on a refined octree.
+ * @brief Solve QEF vertices for all active leaf cells in a refined octree.
  *
  * Takes the output of ``refine_octree`` (cells and contributors) along
- * with particle data, and produces a triangle mesh via dual contouring.
+ * with particle data, and produces QEF vertex positions and normals
+ * for every active surface leaf cell.
  *
  * @param self Unused.
  * @param args Python tuple: (cells, contributors, positions,
  *     smoothing_lengths, isovalue, domain_min, domain_max,
  *     max_depth, base_resolution).
- * @return Python tuple: (positions, normals, triangles) where positions
- *     is an Nx3 float64 NumPy array, normals is an Nx3 float64 NumPy
- *     array, and triangles is an Mx3 int64 NumPy array of vertex
- *     index triples.
+ * @return Python tuple: (positions_Nx3, normals_Nx3) as NumPy
+ *     float64 arrays.
  */
-static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
+static PyObject *solve_vertices_py(PyObject *self, PyObject *args) {
     PyObject *cells_object = NULL;
     PyObject *contributors_object = NULL;
     PyObject *positions_object = NULL;
@@ -1637,13 +1549,13 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
     }
     Py_DECREF(cells_fast);
 
-    // Run the mesh generation pipeline.
-    auto [vertices, triangles] = generate_mesh(
+    // Solve QEF vertices for active leaf cells.
+    std::vector<MeshVertex> vertices = solve_all_leaf_vertices(
         all_cells, all_contributors, positions, smoothing_lengths,
-        isovalue, domain, max_depth, base_resolution);
+        isovalue);
 
-    // Return (positions_Nx3, normals_Nx3, triangles_Mx3) as NumPy arrays.
-    return build_mesh_numpy_result(vertices, triangles);
+    // Return (positions_Nx3, normals_Nx3) as NumPy arrays.
+    return build_vertices_numpy_result(vertices);
 }
 
 /**
@@ -2067,10 +1979,12 @@ static PyMethodDef adaptive_methods[] = {
         PyDoc_STR("Solve the QEF and return the representative vertex for a leaf cell."),
     },
     {
-        "generate_mesh",
-        generate_mesh_py,
+        "solve_vertices",
+        solve_vertices_py,
         METH_VARARGS,
-        PyDoc_STR("Generate a triangle mesh from a refined octree via dual contouring."),
+        PyDoc_STR(
+            "Solve QEF vertices for all active leaf cells "
+            "in a refined octree."),
     },
     {
         "set_num_threads",

@@ -5,8 +5,8 @@ import tempfile
 
 from meshmerizer.adaptive_core import (
     create_top_level_cells,
-    generate_mesh,
     refine_octree,
+    solve_vertices,
 )
 from meshmerizer.serialize import export_octree, import_octree
 
@@ -151,7 +151,7 @@ def test_round_trip_with_mesh():
         base_resolution,
     ) = _build_sphere_octree()
 
-    vert_positions, vert_normals, triangles = generate_mesh(
+    vert_positions, vert_normals = solve_vertices(
         cells,
         contributors,
         positions,
@@ -180,17 +180,14 @@ def test_round_trip_with_mesh():
             contributors=contributors,
             vertices=vert_positions,
             normals=vert_normals,
-            triangles=triangles,
             version="test-0.2",
         )
 
         result = import_octree(path)
 
-        # Check mesh
+        # Check vertices are present
         assert result["vertices"] is not None
-        assert result["triangles"] is not None
         assert len(result["vertices"]) == len(vert_positions)
-        assert len(result["triangles"]) == len(triangles)
 
         # Verify vertex positions are close
         for orig, loaded in zip(vert_positions, result["vertices"]):
@@ -201,17 +198,12 @@ def test_round_trip_with_mesh():
         for orig, loaded in zip(vert_normals, result["vertices"]):
             for a, b in zip(orig, loaded[1]):
                 assert abs(a - b) < 1e-12
-
-        # Verify triangles match exactly
-        for orig, loaded in zip(triangles, result["triangles"]):
-            for a, b in zip(orig, loaded):
-                assert a == b
     finally:
         os.unlink(path)
 
 
-def test_round_trip_mesh_usable_for_generate_mesh():
-    """Imported octree can be fed back into generate_mesh."""
+def test_round_trip_mesh_usable_for_solve_vertices():
+    """Imported octree can be fed back into solve_vertices."""
     (
         cells,
         contributors,
@@ -243,8 +235,8 @@ def test_round_trip_mesh_usable_for_generate_mesh():
 
         result = import_octree(path)
 
-        # Use imported data to generate mesh
-        verts_p, verts_n, tris = generate_mesh(
+        # Use imported data to solve vertices
+        verts_p, verts_n = solve_vertices(
             result["cells"],
             result["contributors"],
             result["positions"],
@@ -256,8 +248,8 @@ def test_round_trip_mesh_usable_for_generate_mesh():
             result["base_resolution"],
         )
 
-        # Original mesh
-        orig_verts_p, orig_verts_n, orig_tris = generate_mesh(
+        # Original vertices
+        orig_verts_p, orig_verts_n = solve_vertices(
             cells,
             contributors,
             positions,
@@ -269,11 +261,8 @@ def test_round_trip_mesh_usable_for_generate_mesh():
             base_resolution,
         )
 
-        # Must produce identical results (triangle order may differ
-        # with OpenMP, so compare as sorted tuples).
+        # Must produce identical results.
         assert len(verts_p) == len(orig_verts_p)
-        assert len(tris) == len(orig_tris)
-        assert sorted(map(tuple, tris)) == sorted(map(tuple, orig_tris))
     finally:
         os.unlink(path)
 

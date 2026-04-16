@@ -440,7 +440,7 @@ def solve_qef_for_leaf(
     return _adaptive.solve_qef_for_leaf(samples, bounds)
 
 
-def generate_mesh(
+def solve_vertices(
     cells: list[dict[str, object]],
     contributors: list[int],
     positions: list[tuple[float, float, float]],
@@ -450,17 +450,17 @@ def generate_mesh(
     domain_maximum: tuple[float, float, float],
     max_depth: int,
     base_resolution: int,
-) -> tuple["numpy.ndarray", "numpy.ndarray", "numpy.ndarray"]:
-    """Generate a triangle mesh from a refined octree via dual contouring.
+) -> tuple["numpy.ndarray", "numpy.ndarray"]:
+    """Solve QEF vertices for all active leaf cells in a refined octree.
 
-    Runs the complete Phase 9 pipeline: solves QEF vertices for all
-    active leaf cells, builds a spatial index for neighbor lookups,
-    and emits triangles by connecting representative vertices across
-    sign-changing primal edges.
+    This is the stepwise counterpart to ``run_octree_pipeline``:
+    it takes pre-built octree cells (e.g. from a saved HDF5 file)
+    and solves QEF vertex positions and normals without repeating
+    the tree construction.
 
     Args:
         cells: Octree cell dictionaries (from ``refine_octree``).
-        contributors: Flat contributor index array (from ``refine_octree``).
+        contributors: Flat contributor index array.
         positions: Particle positions in world space.
         smoothing_lengths: Per-particle support radii.
         isovalue: Target surface level.
@@ -470,13 +470,12 @@ def generate_mesh(
         base_resolution: Number of top-level cells per axis.
 
     Returns:
-        Tuple of ``(vert_positions, vert_normals, triangles)`` where
-        ``vert_positions`` is an (N, 3) float64 array of vertex
-        positions, ``vert_normals`` is an (N, 3) float64 array of
-        vertex normals, and ``triangles`` is an (M, 3) int64 array
-        of triangle index triples.
+        Tuple of ``(vert_positions, vert_normals)`` where
+        ``vert_positions`` is an (N, 3) float64 array of QEF vertex
+        positions and ``vert_normals`` is an (N, 3) float64 array
+        of outward-facing unit normals.
     """
-    return _adaptive.generate_mesh(
+    return _adaptive.solve_vertices(
         cells,
         contributors,
         positions,

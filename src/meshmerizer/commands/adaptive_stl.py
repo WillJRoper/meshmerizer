@@ -18,9 +18,9 @@ from meshmerizer.adaptive_core import (
     compute_isovalue_from_percentile,
     create_top_level_cells_with_contributors,
     fof_cluster,
-    generate_mesh,
     refine_octree,
     run_octree_pipeline,
+    solve_vertices,
 )
 from meshmerizer.logging import log_status, record_elapsed
 from meshmerizer.mesh.core import Mesh
@@ -347,7 +347,7 @@ def run_adaptive(args) -> None:
                 "Solving QEF vertices...",
             )
             mesh_start = time.perf_counter()
-            vert_positions, vert_normals, _tri = generate_mesh(
+            vert_positions, vert_normals = solve_vertices(
                 cells,
                 contributors,
                 positions,
@@ -419,7 +419,7 @@ def run_adaptive(args) -> None:
             "Solving QEF vertices from loaded octree...",
         )
         mesh_start = time.perf_counter()
-        vert_positions, vert_normals, _tri = generate_mesh(
+        vert_positions, vert_normals = solve_vertices(
             cells,
             contributors,
             positions,
