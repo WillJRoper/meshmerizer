@@ -1,8 +1,8 @@
-"""Setuptools build configuration for the meshmerizer C extension.
+"""Setuptools build configuration for the meshmerizer extensions.
 
 This repository uses ``pyproject.toml`` for project metadata, but the compiled
-``meshmerizer._voxelize`` extension still needs an explicit ``ext_modules``
-declaration so editable installs rebuild the shared object from source.
+extensions still need explicit ``ext_modules`` declarations so editable
+installs rebuild the shared objects from source.
 """
 
 from __future__ import annotations
@@ -26,4 +26,18 @@ def _build_voxelize_extension() -> Extension:
     )
 
 
-setup(ext_modules=[_build_voxelize_extension()])
+def _build_adaptive_extension() -> Extension:
+    """Create the ``meshmerizer._adaptive`` extension definition.
+
+    Returns:
+        Configured setuptools extension for the new adaptive meshing core.
+    """
+    return Extension(
+        "meshmerizer._adaptive",
+        sources=["src/meshmerizer/_adaptive.cpp"],
+        include_dirs=[numpy.get_include()],
+        language="c++",
+    )
+
+
+setup(ext_modules=[_build_voxelize_extension(), _build_adaptive_extension()])
