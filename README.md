@@ -2,31 +2,40 @@
 
 Meshmerizer converts particle-based simulation outputs into watertight STL
 meshes for 3D printing or visualization. It uses an adaptive octree with
-dual contouring and a Wendland C2 SPH kernel to produce smooth, resolution-
-adaptive surfaces directly from particle data — no intermediate voxel grids.
+a Wendland C2 SPH kernel and Poisson surface reconstruction (via Open3D)
+to produce smooth, resolution-adaptive surfaces directly from particle
+data — no intermediate voxel grids.
 
 ## Features
 
 - **Adaptive octree refinement** — concentrates resolution near the
   isosurface, keeping memory proportional to the surface rather than the
   full volume.
-- **Dual contouring** — produces smooth, feature-preserving meshes without
-  voxel staircase artefacts.
+- **Poisson surface reconstruction** — produces smooth, watertight meshes
+  from oriented point clouds (QEF vertices + normals) via Open3D's
+  screened Poisson algorithm.
+- **FOF clustering** — Friends-of-Friends clustering separates distinct
+  objects before Poisson reconstruction, preventing thin bridges between
+  unrelated structures.
 - **Wendland C2 kernel** — the same compact-support kernel used in modern
   SPH codes, with analytic gradients for accurate surface normals.
 - **C++ core with optional OpenMP** — the heavy computation (refinement,
-  QEF solve, face generation) runs in compiled C++ with optional
-  multi-threaded parallelism.
-- **HDF5 serialization** — save and reload the full octree state so
-  refinement and meshing can be resumed without reprocessing particles.
+  QEF solve) runs in compiled C++ with optional multi-threaded parallelism.
+- **HDF5 serialization** — save and reload the full octree state (including
+  QEF vertices and FOF labels) so meshing can be resumed without
+  reprocessing particles.
 - **SWIFT snapshot support** — load particles directly from SWIFT HDF5
   snapshots via swiftsimio.
 - **Print scaling** — scale the output mesh to a target physical size for
   3D printing with `--target-size`.
 - **Island removal** — discard small disconnected components with
   `--remove-islands-fraction`.
+- **Density percentile isovalue** — automatically choose the isovalue
+  from a density percentile with `--surface-percentile`.
 
 ## Installation
+
+Requires Python 3.8+ and Open3D (installed automatically):
 
 ```bash
 pip install -e .
@@ -125,7 +134,8 @@ meshmerizer adaptive snapshot.hdf5 \
 |------|-------------|
 | `--base-resolution` | Number of top-level octree cells per axis (default: 4) |
 | `--max-depth` | Maximum octree refinement depth (default: 4) |
-| `--isovalue` / `-t` | Isosurface threshold (default: 0.5) |
+| `--isovalue` / `-t` | Isosurface threshold (overrides `--surface-percentile`) |
+| `--surface-percentile` | Density percentile for auto isovalue (default: 5) |
 | `--particle-type` / `-p` | Particle type: `gas`, `dark_matter`, `stars`, `black_holes` |
 | `--field` / `-f` | Particle field to project (default: `masses`) |
 | `--smoothing-factor` | Multiplier for particle smoothing lengths (default: 1.0) |
@@ -136,6 +146,9 @@ meshmerizer adaptive snapshot.hdf5 \
 | `--shift` | Coordinate shift `DX DY DZ` before cropping |
 | `--wrap-shift` / `--no-wrap-shift` | Wrap coordinates after shifting |
 | `--no-periodic` | Disable periodic wrapping for subregion selection |
+| `--poisson-depth` | Poisson reconstruction octree depth (default: max-depth) |
+| `--density-quantile` | Trim vertices below this density quantile (default: 0.1) |
+| `--linking-factor` | FOF linking length as fraction of mean separation (default: 1.5) |
 | `--remove-islands-fraction` | Volume fraction threshold for island removal |
 | `--target-size` / `-s` | Scale longest mesh dimension to this size (cm) |
 | `--save-octree` | Save octree state to HDF5 after construction |
@@ -148,11 +161,10 @@ meshmerizer adaptive snapshot.hdf5 \
 import numpy as np
 
 from meshmerizer.adaptive_core import (
-    create_top_level_cells,
-    generate_mesh,
-    query_cell_contributors,
-    refine_octree,
+    run_octree_pipeline,
+    fof_cluster,
 )
+from meshmerizer.poisson import poisson_reconstruct
 from meshmerizer.mesh.core import Mesh
 
 # Example: sphere of particles
@@ -174,37 +186,26 @@ base_resolution = 4
 max_depth = 4
 isovalue = 0.5
 
-# Build top-level cells with contributor queries.
-top_cells = create_top_level_cells(domain_min, domain_max, base_resolution)
-initial_cells = []
-for cell in top_cells:
-    cell_dict = dict(cell)
-    contribs = query_cell_contributors(
-        positions, smoothing_lengths,
-        domain_min, domain_max, base_resolution,
-        cell["bounds"][0], cell["bounds"][1],
-    )
-    cell_dict["contributor_begin"] = 0
-    cell_dict["contributor_end"] = len(contribs)
-    cell_dict["contributors"] = contribs
-    initial_cells.append(cell_dict)
-
-# Refine the octree.
-cells, contributors = refine_octree(
-    initial_cells, positions, smoothing_lengths, isovalue, max_depth,
+# Run the C++ octree pipeline (returns QEF vertex positions + normals).
+vert_positions, vert_normals = run_octree_pipeline(
+    positions, smoothing_lengths,
+    domain_min, domain_max,
+    base_resolution, isovalue, max_depth,
 )
 
-# Generate the mesh.
-vertices, triangles = generate_mesh(
-    cells, contributors, positions, smoothing_lengths,
-    isovalue, domain_min, domain_max, max_depth, base_resolution,
+# Cluster vertices into distinct objects.
+group_labels = fof_cluster(
+    vert_positions, domain_min, domain_max, linking_factor=1.5,
 )
 
-# Convert to a Mesh and save.
-vert_pos = np.array([v[0] for v in vertices])
-vert_norms = np.array([v[1] for v in vertices])
-faces = np.array(triangles)
-mesh = Mesh(vertices=vert_pos, faces=faces, vertex_normals=vert_norms)
+# Poisson surface reconstruction.
+mesh_verts, mesh_faces = poisson_reconstruct(
+    vert_positions, vert_normals, group_labels,
+    poisson_depth=max_depth, density_quantile=0.1,
+)
+
+# Save as STL.
+mesh = Mesh(vertices=mesh_verts, faces=mesh_faces)
 mesh.save("output.stl")
 ```
 
@@ -243,6 +244,7 @@ src/meshmerizer/
   __init__.py
   adaptive_core.py          # Stable Python API for the C++ core
   _adaptive.cpp             # Python/C++ extension bindings
+  poisson.py                # Poisson surface reconstruction (Open3D)
   serialize.py              # HDF5 octree export/import
   logging.py                # Structured logging helpers
   logging_utils.py          # Logging utilities
@@ -261,7 +263,8 @@ src/meshmerizer/
     hermite.hpp             # HermiteSample, edge crossings
     qef.hpp                 # QEF accumulator, 3x3 solver
     mesh.hpp                # MeshVertex, MeshTriangle structs
-    faces.hpp               # Spatial index, face generation
+    faces.hpp               # QEF vertex solving for active leaves
+    fof.hpp                 # Friends-of-Friends clustering
 
   commands/                 # CLI modules
     args.py                 # Argument parser definitions
@@ -273,8 +276,9 @@ src/meshmerizer/
     core.py                 # Mesh class, repair, save
 
 tests/
-  test_adaptive_core.py     # 45 unit tests for the C++ core
-  test_serialize.py         # 4 HDF5 round-trip tests
+  test_adaptive_core.py     # Unit tests for the C++ core
+  test_poisson.py           # Poisson reconstruction tests
+  test_serialize.py         # HDF5 round-trip tests
   test_logging.py           # Logging test
 ```
 
