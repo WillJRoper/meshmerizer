@@ -77,16 +77,57 @@ def poisson_reconstruct_group(
             f"reconstruction, got {positions.shape[0]}"
         )
 
+    # ── Sanitize input points ────────────────────────────────────
+    # QEF solving can produce degenerate vertices: zero-length
+    # normals from ill-conditioned cells, near-duplicate positions
+    # from adjacent cells at different octree depths, and normals
+    # that are not exactly unit length.  All of these confuse the
+    # Poisson solver and can cause it to hang on isosurface
+    # extraction ("Failed to close loop") or produce garbage.
+
+    # 1. Remove points whose normals have near-zero magnitude.
+    #    These carry no orientation information and inject "bad
+    #    data" into the Poisson indicator function.
+    nrm_lengths = np.linalg.norm(normals, axis=1)
+    valid_mask = nrm_lengths > 1e-12
+    positions = positions[valid_mask]
+    normals = normals[valid_mask]
+    nrm_lengths = nrm_lengths[valid_mask]
+
+    if positions.shape[0] < 3:
+        raise ValueError(
+            "Fewer than 3 points remain after removing zero-normal vertices"
+        )
+
+    # 2. Re-normalize normals to exact unit length.  Small
+    #    deviations from unit length accumulate into the Poisson
+    #    gradient field and degrade surface quality.
+    normals = normals / nrm_lengths[:, np.newaxis]
+
+    # 3. Remove near-duplicate points.  Open3D's
+    #    remove_duplicated_points uses an exact-match grid, so
+    #    we use a voxel-based downsampling with a tiny voxel
+    #    size to merge points that are effectively coincident.
+    #    The voxel size is set to 1e-8 times the bounding box
+    #    diagonal, which is far below any meaningful feature
+    #    but catches true duplicates from floating-point
+    #    coincidence.
+    bbox_diag = np.linalg.norm(positions.max(axis=0) - positions.min(axis=0))
+    dedup_voxel = max(bbox_diag * 1e-8, 1e-15)
+
     # ── Build Open3D point cloud ──────────────────────────────────
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(positions)
     pcd.normals = o3d.utility.Vector3dVector(normals)
 
+    # Deduplicate via voxel downsampling.
+    pcd = pcd.voxel_down_sample(voxel_size=dedup_voxel)
+
     # ── Run screened Poisson reconstruction ───────────────────────
     # The depth parameter controls the octree resolution of the
-    # Poisson solver (not our adaptive octree).  A depth of 8 gives
-    # 256^3 effective resolution, which is a good balance between
-    # detail and speed.
+    # Poisson solver (not our adaptive octree).  A depth of 9 gives
+    # 512^3 effective resolution, which is a good balance between
+    # detail and speed for typical SPH particle counts.
     #
     # Suppress the extremely verbose "getValue assumes leaf node"
     # warning that PoissonRecon prints for every non-leaf evaluation.
