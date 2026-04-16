@@ -1647,8 +1647,74 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
 }
 
 /**
- * @brief Run the full meshing pipeline in C++ without round-tripping
- *        octree cells through Python.
+ * @brief Build a (positions_Nx3, normals_Nx3) Python tuple from
+ *        a vector of MeshVertex.
+ *
+ * This is the vertex-only counterpart to ``build_mesh_numpy_result``,
+ * used by the octree pipeline which returns QEF vertices without
+ * triangle faces (Poisson reconstruction happens in Python).
+ */
+static PyObject *build_vertices_numpy_result(
+    const std::vector<MeshVertex> &vertices) {
+    const npy_intp n_verts = static_cast<npy_intp>(vertices.size());
+    npy_intp dims[2] = {n_verts, 3};
+
+    // -- Vertex positions: Nx3 float64 --
+    PyObject *pos_arr = PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+    if (pos_arr == NULL) return NULL;
+    {
+        double *data = static_cast<double *>(
+            PyArray_DATA(
+                reinterpret_cast<PyArrayObject *>(pos_arr)));
+        for (npy_intp i = 0; i < n_verts; ++i) {
+            data[i * 3 + 0] = vertices[
+                static_cast<std::size_t>(i)].position.x;
+            data[i * 3 + 1] = vertices[
+                static_cast<std::size_t>(i)].position.y;
+            data[i * 3 + 2] = vertices[
+                static_cast<std::size_t>(i)].position.z;
+        }
+    }
+
+    // -- Vertex normals: Nx3 float64 --
+    PyObject *norm_arr = PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+    if (norm_arr == NULL) {
+        Py_DECREF(pos_arr);
+        return NULL;
+    }
+    {
+        double *data = static_cast<double *>(
+            PyArray_DATA(
+                reinterpret_cast<PyArrayObject *>(norm_arr)));
+        for (npy_intp i = 0; i < n_verts; ++i) {
+            data[i * 3 + 0] = vertices[
+                static_cast<std::size_t>(i)].normal.x;
+            data[i * 3 + 1] = vertices[
+                static_cast<std::size_t>(i)].normal.y;
+            data[i * 3 + 2] = vertices[
+                static_cast<std::size_t>(i)].normal.z;
+        }
+    }
+
+    // Build result tuple.
+    PyObject *result = PyTuple_New(2);
+    if (result == NULL) {
+        Py_DECREF(pos_arr);
+        Py_DECREF(norm_arr);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(result, 0, pos_arr);   // steals ref
+    PyTuple_SET_ITEM(result, 1, norm_arr);  // steals ref
+    return result;
+}
+
+/**
+ * @brief Run the octree pipeline in C++ and return QEF vertices.
+ *
+ * This builds the adaptive octree and solves QEF vertices for every
+ * active leaf cell, but does NOT generate triangle faces.  Face
+ * generation is handled in Python via FOF clustering + Poisson
+ * surface reconstruction.
  *
  * Accepts:
  *   positions         – Nx3 float64 array (or list of 3-tuples)
@@ -1659,17 +1725,15 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
  *   isovalue          – double
  *   max_depth         – unsigned int
  *
- * Returns (vertices, triangles) where:
- *   vertices  – list of ((px,py,pz), (nx,ny,nz))
- *   triangles – list of (i0, i1, i2)
+ * Returns (positions_Nx3, normals_Nx3) as NumPy float64 arrays
+ * where N is the number of active leaf cells with surface crossings.
  *
  * This combines create_top_level_cells + contributor query +
- * refine_octree + generate_mesh into one C++ call, eliminating the
- * massive serialization overhead of passing octree cells and
- * contributor arrays through Python dictionaries.  For 100M+
- * particles this saves ~3 min of pure Python↔C++ data marshalling.
+ * refine_octree + solve_all_leaf_vertices into one C++ call,
+ * eliminating the massive serialization overhead of passing octree
+ * cells and contributor arrays through Python dictionaries.
  */
-static PyObject *run_full_pipeline_py(
+static PyObject *run_octree_pipeline_py(
         PyObject *self, PyObject *args) {
     PyObject *positions_object = NULL;
     PyObject *smoothing_object = NULL;
@@ -1719,7 +1783,6 @@ static PyObject *run_full_pipeline_py(
     // Release the GIL for the entire C++ pipeline since we no
     // longer need any Python objects after parsing.
     std::vector<MeshVertex> vertices;
-    std::vector<MeshTriangle> triangles;
 
     Py_BEGIN_ALLOW_THREADS
 
@@ -1795,20 +1858,15 @@ static PyObject *run_full_pipeline_py(
         domain,
         static_cast<std::uint32_t>(base_resolution));
 
-    // -- Step 3: Generate mesh --
-    auto [verts, tris] = generate_mesh(
+    // -- Step 3: Solve QEF vertices for active leaf cells --
+    vertices = solve_all_leaf_vertices(
         all_cells, all_contributors, positions,
-        smoothing_lengths, isovalue, domain,
-        static_cast<std::uint32_t>(max_depth),
-        static_cast<std::uint32_t>(base_resolution));
-
-    vertices = std::move(verts);
-    triangles = std::move(tris);
+        smoothing_lengths, isovalue);
 
     Py_END_ALLOW_THREADS
 
-    // Return (positions_Nx3, normals_Nx3, triangles_Mx3) as NumPy arrays.
-    return build_mesh_numpy_result(vertices, triangles);
+    // Return (positions_Nx3, normals_Nx3) as NumPy arrays.
+    return build_vertices_numpy_result(vertices);
 }
 
 /**
@@ -2033,13 +2091,13 @@ static PyMethodDef adaptive_methods[] = {
         PyDoc_STR("Set the number of OpenMP threads."),
     },
     {
-        "run_full_pipeline",
-        run_full_pipeline_py,
+        "run_octree_pipeline",
+        run_octree_pipeline_py,
         METH_VARARGS,
         PyDoc_STR(
-            "Run the full meshing pipeline in C++ "
-            "(build + refine + mesh) without Python "
-            "round-trips."),
+            "Run the octree pipeline in C++ "
+            "(build + refine + solve vertices) "
+            "and return (positions, normals)."),
     },
     {NULL, NULL, 0, NULL},
 };

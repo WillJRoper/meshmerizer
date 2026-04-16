@@ -489,7 +489,7 @@ def generate_mesh(
     )
 
 
-def run_full_pipeline(
+def run_octree_pipeline(
     positions: "numpy.ndarray",
     smoothing_lengths: "numpy.ndarray",
     domain_minimum: tuple[float, float, float],
@@ -497,13 +497,13 @@ def run_full_pipeline(
     base_resolution: int,
     isovalue: float,
     max_depth: int,
-) -> tuple["numpy.ndarray", "numpy.ndarray", "numpy.ndarray"]:
-    """Run the full meshing pipeline entirely in C++.
+) -> tuple["numpy.ndarray", "numpy.ndarray"]:
+    """Run the octree pipeline in C++ and return QEF vertices.
 
     This combines top-level cell creation, contributor queries,
-    octree refinement, and mesh generation into a single C++ call,
-    eliminating the overhead of serializing octree cells and
-    contributor arrays through Python.
+    octree refinement, and QEF vertex solving into a single C++
+    call.  Triangle face generation is NOT included — that is
+    handled in Python via FOF clustering + Poisson reconstruction.
 
     Args:
         positions: Nx3 float64 array of particle positions.
@@ -515,13 +515,12 @@ def run_full_pipeline(
         max_depth: Maximum octree refinement depth.
 
     Returns:
-        Tuple of ``(vert_positions, vert_normals, triangles)`` where
-        ``vert_positions`` is an (N, 3) float64 array of vertex
-        positions, ``vert_normals`` is an (N, 3) float64 array of
-        vertex normals, and ``triangles`` is an (M, 3) int64 array
-        of triangle index triples.
+        Tuple of ``(vert_positions, vert_normals)`` where
+        ``vert_positions`` is an (N, 3) float64 array of QEF
+        vertex positions and ``vert_normals`` is an (N, 3) float64
+        array of outward-facing unit normals.
     """
-    return _adaptive.run_full_pipeline(
+    return _adaptive.run_octree_pipeline(
         positions,
         smoothing_lengths,
         domain_minimum,

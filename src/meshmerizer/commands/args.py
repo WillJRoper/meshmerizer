@@ -179,6 +179,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Post-processing.
     adaptive.add_argument(
+        "--poisson-depth",
+        type=int,
+        default=None,
+        help=(
+            "Octree depth for the Poisson surface reconstruction. "
+            "Higher values produce finer detail. Defaults to "
+            "--max-depth."
+        ),
+    )
+    adaptive.add_argument(
+        "--density-quantile",
+        type=float,
+        default=0.1,
+        help=(
+            "Fraction of lowest-density vertices to trim after "
+            "Poisson reconstruction. Removes spurious membranes. "
+            "Default: 0.1"
+        ),
+    )
+    adaptive.add_argument(
+        "--linking-factor",
+        type=float,
+        default=1.5,
+        help=(
+            "FOF linking factor: multiplier on mean inter-point "
+            "separation for clustering vertices into distinct "
+            "objects. Default: 1.5"
+        ),
+    )
+    adaptive.add_argument(
         "--remove-islands-fraction",
         type=float,
         default=None,

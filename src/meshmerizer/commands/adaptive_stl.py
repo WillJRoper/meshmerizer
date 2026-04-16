@@ -1,8 +1,9 @@
 """Adaptive meshing CLI command.
 
 This module implements the ``adaptive`` subcommand which runs the new
-adaptive octree + dual contouring pipeline from a SWIFT snapshot to an
-STL file.
+adaptive octree pipeline from a SWIFT snapshot to an STL file.  QEF
+vertices are solved in C++, then clustered via FOF and reconstructed
+into a watertight mesh via Poisson surface reconstruction.
 """
 
 from __future__ import annotations
@@ -16,12 +17,14 @@ import numpy as np
 from meshmerizer.adaptive_core import (
     compute_isovalue_from_percentile,
     create_top_level_cells_with_contributors,
+    fof_cluster,
     generate_mesh,
     refine_octree,
-    run_full_pipeline,
+    run_octree_pipeline,
 )
 from meshmerizer.logging import log_status, record_elapsed
 from meshmerizer.mesh.core import Mesh
+from meshmerizer.poisson import poisson_reconstruct
 from meshmerizer.printing import scale_mesh_to_print
 from meshmerizer.serialize import export_octree, import_octree
 
@@ -338,13 +341,13 @@ def run_adaptive(args) -> None:
             )
             record_elapsed("Octree save", save_start, operation="Saving")
 
-            # Generate mesh from the saved octree data.
+            # Generate QEF vertices from the saved octree data.
             log_status(
                 "Meshing",
-                "Generating mesh via dual contouring...",
+                "Solving QEF vertices...",
             )
             mesh_start = time.perf_counter()
-            vert_positions, vert_normals, tri_indices = generate_mesh(
+            vert_positions, vert_normals, _tri = generate_mesh(
                 cells,
                 contributors,
                 positions,
@@ -356,23 +359,23 @@ def run_adaptive(args) -> None:
                 base_resolution,
             )
             record_elapsed(
-                "Mesh generation",
+                "Vertex solve",
                 mesh_start,
                 operation="Meshing",
             )
         else:
-            # Fast path: run the entire pipeline in C++ without
+            # Fast path: run the octree pipeline in C++ without
             # round-tripping octree cells through Python dicts.
-            # This eliminates ~3 min of serialization overhead
-            # for 100M+ particle datasets.
+            # Returns QEF vertices only; face generation is done
+            # via FOF + Poisson in Python below.
             log_status(
                 "Pipeline",
-                f"Running full C++ pipeline: "
+                f"Running C++ octree pipeline: "
                 f"base_resolution={base_resolution}, "
                 f"max_depth={max_depth}, isovalue={isovalue}",
             )
             pipeline_start = time.perf_counter()
-            vert_positions, vert_normals, tri_indices = run_full_pipeline(
+            vert_positions, vert_normals = run_octree_pipeline(
                 positions,
                 smoothing_lengths,
                 domain_min,
@@ -382,7 +385,7 @@ def run_adaptive(args) -> None:
                 max_depth,
             )
             record_elapsed(
-                "Full pipeline",
+                "Octree pipeline",
                 pipeline_start,
                 operation="Pipeline",
             )
@@ -413,10 +416,10 @@ def run_adaptive(args) -> None:
     if args.load_octree is not None:
         log_status(
             "Meshing",
-            "Generating mesh via dual contouring...",
+            "Solving QEF vertices from loaded octree...",
         )
         mesh_start = time.perf_counter()
-        vert_positions, vert_normals, tri_indices = generate_mesh(
+        vert_positions, vert_normals, _tri = generate_mesh(
             cells,
             contributors,
             positions,
@@ -427,38 +430,98 @@ def run_adaptive(args) -> None:
             max_depth,
             base_resolution,
         )
-        record_elapsed("Mesh generation", mesh_start, operation="Meshing")
+        record_elapsed("Vertex solve", mesh_start, operation="Meshing")
 
     n_verts = len(vert_positions)
-    n_tris = len(tri_indices)
     log_status(
         "Meshing",
-        f"Generated mesh: {n_verts} vertices, {n_tris} triangles.",
+        f"Solved {n_verts} QEF vertices.",
     )
 
     # Optionally visualize QEF vertices as a 3D scatter plot.
     if getattr(args, "visualise_verts", False):
         _visualize_vertices(vert_positions)
 
-    if n_tris == 0:
+    if n_verts == 0:
         print(
-            "Warning: Mesh generation produced no triangles. "
+            "Warning: No QEF vertices produced. "
             "Check isovalue and domain selection.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # Step 5: Convert to a Mesh object and apply post-processing.
+    # Step 5: FOF clustering + Poisson surface reconstruction.
+    # ------------------------------------------------------------------
+    poisson_depth = (
+        args.poisson_depth if args.poisson_depth is not None else max_depth
+    )
+
+    # Cluster QEF vertices into distinct objects.
+    log_status(
+        "Clustering",
+        f"Running FOF clustering (linking_factor={args.linking_factor})...",
+    )
+    cluster_start = time.perf_counter()
+    group_labels = fof_cluster(
+        vert_positions,
+        domain_min,
+        domain_max,
+        args.linking_factor,
+    )
+    n_groups = len(set(group_labels.tolist()))
+    record_elapsed("FOF clustering", cluster_start, operation="Clustering")
+    log_status(
+        "Clustering",
+        f"Found {n_groups} group(s).",
+    )
+
+    # Run Poisson reconstruction per group and merge.
+    log_status(
+        "Meshing",
+        f"Running Poisson reconstruction "
+        f"(depth={poisson_depth}, "
+        f"quantile={args.density_quantile})...",
+    )
+    poisson_start = time.perf_counter()
+    mesh_verts, mesh_faces = poisson_reconstruct(
+        vert_positions,
+        vert_normals,
+        group_labels,
+        poisson_depth=poisson_depth,
+        density_quantile=args.density_quantile,
+    )
+    record_elapsed(
+        "Poisson reconstruction",
+        poisson_start,
+        operation="Meshing",
+    )
+
+    n_mesh_verts = len(mesh_verts)
+    n_tris = len(mesh_faces)
+    log_status(
+        "Meshing",
+        f"Poisson mesh: {n_mesh_verts} vertices, {n_tris} triangles.",
+    )
+
+    if n_tris == 0:
+        print(
+            "Warning: Poisson reconstruction produced no "
+            "triangles. Check isovalue and domain selection.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Step 6: Convert to a Mesh object and apply post-processing.
     # ------------------------------------------------------------------
 
     # Translate vertex positions back to world-space coordinates.
-    vert_positions += origin
+    mesh_verts += origin
 
     mesh = Mesh(
-        vertices=vert_positions,
-        faces=tri_indices,
-        vertex_normals=vert_normals,
+        vertices=mesh_verts,
+        faces=mesh_faces,
     )
 
     # Remove small disconnected islands if requested.

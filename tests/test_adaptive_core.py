@@ -18,7 +18,7 @@ from meshmerizer.adaptive_core import (
     particle_fields,
     query_cell_contributors,
     refine_octree,
-    run_full_pipeline,
+    run_octree_pipeline,
     solve_qef_for_leaf,
     top_level_bin_counts,
     wendland_c2_gradient,
@@ -1049,12 +1049,12 @@ def test_refine_octree_accepts_numpy_arrays() -> None:
 
 
 # ---------------------------------------------------------------------------
-# run_full_pipeline tests
+# run_octree_pipeline tests
 # ---------------------------------------------------------------------------
 
 
-def test_run_full_pipeline_matches_stepwise() -> None:
-    """Full pipeline should produce same result as step-by-step."""
+def test_run_octree_pipeline_produces_vertices() -> None:
+    """Octree pipeline should produce QEF vertices."""
     import numpy as np
 
     domain_min = (-1.0, -1.0, -1.0)
@@ -1077,7 +1077,7 @@ def test_run_full_pipeline_matches_stepwise() -> None:
     positions_arr = np.array(positions_list, dtype=np.float64)
     smoothing_arr = np.array(smoothing_list, dtype=np.float64)
 
-    vert_positions, vert_normals, triangles = run_full_pipeline(
+    vert_positions, vert_normals = run_octree_pipeline(
         positions_arr,
         smoothing_arr,
         domain_min,
@@ -1087,29 +1087,23 @@ def test_run_full_pipeline_matches_stepwise() -> None:
         max_depth,
     )
 
-    # The pipeline should produce a non-empty mesh for this
-    # configuration (same setup as _build_sphere_octree).
+    # The pipeline should produce vertices for this configuration.
     assert len(vert_positions) > 0
-    assert len(triangles) > 0
 
     # Verify vertex format: (N, 3) float64 arrays.
     assert vert_positions.shape[1] == 3
     assert vert_normals.shape[1] == 3
     assert vert_positions.shape[0] == vert_normals.shape[0]
 
-    # Verify triangle format: (M, 3) int64 array.
-    assert triangles.shape[1] == 3
-    assert all(0 <= idx < len(vert_positions) for idx in triangles.ravel())
 
-
-def test_run_full_pipeline_empty_particles() -> None:
-    """Pipeline with no particles should produce empty mesh."""
+def test_run_octree_pipeline_empty_particles() -> None:
+    """Pipeline with no particles should produce empty arrays."""
     import numpy as np
 
     positions = np.zeros((0, 3), dtype=np.float64)
     smoothing = np.zeros(0, dtype=np.float64)
 
-    vert_positions, vert_normals, triangles = run_full_pipeline(
+    vert_positions, vert_normals = run_octree_pipeline(
         positions,
         smoothing,
         (0.0, 0.0, 0.0),
@@ -1119,7 +1113,7 @@ def test_run_full_pipeline_empty_particles() -> None:
         3,
     )
     assert len(vert_positions) == 0
-    assert len(triangles) == 0
+    assert len(vert_normals) == 0
 
 
 # ---------------------------------------------------------------------------
