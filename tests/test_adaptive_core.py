@@ -207,6 +207,8 @@ def test_refine_octree_returns_both_cells_and_contributors() -> None:
         smoothing_lengths=[],
         isovalue=0.5,
         max_depth=3,
+        domain=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        base_resolution=2,
     )
 
     assert isinstance(result, tuple)
@@ -230,6 +232,8 @@ def test_refine_octree_empty_particles_no_surface() -> None:
         smoothing_lengths=[],
         isovalue=0.5,
         max_depth=3,
+        domain=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        base_resolution=2,
     )
 
     active_cells = [c for c in refined_cells if c.get("has_surface")]
@@ -250,6 +254,8 @@ def test_refine_octree_respects_max_depth() -> None:
         smoothing_lengths=[0.6],
         isovalue=0.5,
         max_depth=1,
+        domain=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        base_resolution=2,
     )
 
     max_depth_found = max(
@@ -266,6 +272,8 @@ def test_refine_octree_empty_initial_cells() -> None:
         smoothing_lengths=[0.6],
         isovalue=0.5,
         max_depth=3,
+        domain=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        base_resolution=2,
     )
 
     assert result == ([], [])
@@ -347,6 +355,8 @@ def test_refine_octree_satisfies_balance_invariant_with_surface() -> None:
         smoothing_lengths=[0.02],
         isovalue=0.5,
         max_depth=4,
+        domain=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        base_resolution=2,
     )
 
     violations = _check_balance_invariant(refined_cells)
@@ -370,6 +380,8 @@ def test_refine_octree_balance_does_not_exceed_max_depth() -> None:
         smoothing_lengths=[0.02],
         isovalue=0.5,
         max_depth=max_depth,
+        domain=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        base_resolution=2,
     )
 
     deepest = max((c["depth"] for c in refined_cells), default=0)
@@ -742,7 +754,13 @@ def _build_sphere_octree(
         initial_cells.append(cell_dict)
 
     cells, contributors = refine_octree(
-        initial_cells, positions, smoothing_lengths, isovalue, max_depth
+        initial_cells,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        max_depth,
+        domain=(domain_min, domain_max),
+        base_resolution=base_resolution,
     )
 
     return (
@@ -902,7 +920,13 @@ def test_generate_mesh_empty_field() -> None:
         initial_cells.append(cell_dict)
 
     cells, contributors = refine_octree(
-        initial_cells, positions, smoothing_lengths, isovalue, max_depth
+        initial_cells,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        max_depth,
+        domain=(domain_min, domain_max),
+        base_resolution=base_resolution,
     )
 
     vertices, triangles = generate_mesh(

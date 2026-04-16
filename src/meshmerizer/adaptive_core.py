@@ -374,6 +374,8 @@ def refine_octree(
     smoothing_lengths: list[float],
     isovalue: float,
     max_depth: int,
+    domain: tuple[tuple[float, float, float], tuple[float, float, float]],
+    base_resolution: int,
 ) -> tuple[tuple[dict[str, object], ...], tuple[int, ...]]:
     """Refine the octree using breadth-first refinement.
 
@@ -383,6 +385,9 @@ def refine_octree(
         smoothing_lengths: Per-particle support radii.
         isovalue: The target surface level.
         max_depth: Maximum refinement depth.
+        domain: Bounding box of the simulation domain as
+            ``((min_x, min_y, min_z), (max_x, max_y, max_z))``.
+        base_resolution: Number of top-level cells per axis.
 
     Returns:
         Tuple of (all_cells, all_contributors) where cells store indices
@@ -394,6 +399,8 @@ def refine_octree(
         smoothing_lengths,
         isovalue,
         max_depth,
+        domain,
+        base_resolution,
     )
 
 

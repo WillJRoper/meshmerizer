@@ -27,7 +27,8 @@ inline double wendland_c2_profile(double q) {
         return 0.0;
     }
     const double one_minus_q = 1.0 - q;
-    return std::pow(one_minus_q, 4) * (1.0 + 4.0 * q);
+    const double t2 = one_minus_q * one_minus_q;
+    return t2 * t2 * (1.0 + 4.0 * q);
 }
 
 /**
@@ -40,7 +41,8 @@ inline double wendland_c2_normalization(double smoothing_length) {
     if (smoothing_length <= 0.0) {
         return 0.0;
     }
-    return 21.0 / (2.0 * WENDLAND_PI * std::pow(smoothing_length, 3));
+    const double h2 = smoothing_length * smoothing_length;
+    return 21.0 / (2.0 * WENDLAND_PI * h2 * smoothing_length);
 }
 
 /**
@@ -73,7 +75,9 @@ inline double wendland_c2_profile_derivative(double q) {
     if (q < 0.0 || q >= 1.0) {
         return 0.0;
     }
-    return -20.0 * q * std::pow(1.0 - q, 3);
+    const double one_minus_q = 1.0 - q;
+    const double t2 = one_minus_q * one_minus_q;
+    return -20.0 * q * t2 * one_minus_q;
 }
 
 /**

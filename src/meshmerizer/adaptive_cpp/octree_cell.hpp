@@ -808,7 +808,9 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
     double isovalue,
-    std::uint32_t max_depth) {
+    std::uint32_t max_depth,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution) {
     if (initial_cells.empty()) {
         return {{}, {}};
     }
@@ -865,13 +867,16 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
             continue;
         }
 
-        std::vector<std::size_t> contributors;
-        contributors.reserve(static_cast<std::size_t>(contrib_end - contrib_begin));
-        for (std::int64_t i = contrib_begin; i < contrib_end; ++i) {
-            if (static_cast<std::size_t>(i) < all_contributors.size()) {
-                contributors.push_back(all_contributors[static_cast<std::size_t>(i)]);
-            }
-        }
+        // Build the contributor list for this cell using iterator-range
+        // assign instead of individual push_back calls — avoids per-element
+        // branch overhead and lets the allocator do a single bulk copy.
+        const auto safe_begin = static_cast<std::size_t>(
+            std::min(contrib_begin, static_cast<std::int64_t>(all_contributors.size())));
+        const auto safe_end = static_cast<std::size_t>(
+            std::min(contrib_end, static_cast<std::int64_t>(all_contributors.size())));
+        std::vector<std::size_t> contributors(
+            all_contributors.begin() + static_cast<std::ptrdiff_t>(safe_begin),
+            all_contributors.begin() + static_cast<std::ptrdiff_t>(safe_end));
 
         if (contributors.size() < 2) {
             current_cell.is_leaf = true;
@@ -930,31 +935,9 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
     // Enforce the 2:1 balance rule as a post-pass. Any leaf that has an
     // adjacent leaf more than one level deeper is split and its contributors
     // are inherited from the parent. This repeats until the invariant holds.
-    //
-    // Compute the domain bounding box from all cells (union of bounds)
-    // and infer the base_resolution from the number of initial cells
-    // (cube root of initial_cells.size()).  These are needed by the
-    // spatial hash used for O(1) neighbor lookups during balancing.
-    BoundingBox domain;
-    domain.min = all_cells[0].bounds.min;
-    domain.max = all_cells[0].bounds.max;
-    for (const auto &c : all_cells) {
-        domain.min.x = std::min(domain.min.x, c.bounds.min.x);
-        domain.min.y = std::min(domain.min.y, c.bounds.min.y);
-        domain.min.z = std::min(domain.min.z, c.bounds.min.z);
-        domain.max.x = std::max(domain.max.x, c.bounds.max.x);
-        domain.max.y = std::max(domain.max.y, c.bounds.max.y);
-        domain.max.z = std::max(domain.max.z, c.bounds.max.z);
-    }
-    // Infer base_resolution: initial_cells.size() == base_res^3.
-    std::uint32_t base_resolution = 1;
-    {
-        const std::size_t n = initial_cells.size();
-        while (base_resolution * base_resolution * base_resolution < n) {
-            ++base_resolution;
-        }
-    }
-
+    // The domain bounding box and base_resolution are passed in from the
+    // caller (computed once at top-level cell creation time) to avoid
+    // redundant O(n_cells) inference on every call.
     balance_octree(all_cells, all_contributors, positions, smoothing_lengths,
                    isovalue, domain, base_resolution, max_depth);
 

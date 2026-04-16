@@ -385,11 +385,9 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
             continue;
         }
 
-        // Recompute the sign mask to ensure consistency.
-        cell.corner_sign_mask =
-            compute_corner_sign_mask(cell.corner_values, isovalue);
-
-        // If no sign change, skip (safety check).
+        // If no sign change, skip (safety check).  The corner_sign_mask
+        // was already set during refinement (octree_cell.hpp) or in the
+        // lazy sampling block above, so no recomputation is needed here.
         if (cell.corner_sign_mask == 0U ||
             cell.corner_sign_mask == 0xFFU) {
             cell.has_surface = false;

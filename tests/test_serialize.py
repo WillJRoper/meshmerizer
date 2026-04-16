@@ -46,6 +46,8 @@ def _build_sphere_octree(
         smoothing_lengths,
         isovalue,
         max_depth,
+        domain=(domain_min, domain_max),
+        base_resolution=base_resolution,
     )
 
     return (

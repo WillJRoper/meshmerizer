@@ -290,6 +290,8 @@ def run_adaptive(args) -> None:
             smoothing_lengths,
             isovalue,
             max_depth,
+            domain=(domain_min, domain_max),
+            base_resolution=base_resolution,
         )
         record_elapsed("Octree construction", tree_start, operation="Building")
 

@@ -878,15 +878,18 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
     PyObject *initial_cells_object = NULL;
     PyObject *positions_object = NULL;
     PyObject *smoothing_object = NULL;
+    PyObject *domain_object = NULL;
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
+    unsigned int base_resolution = 0U;
     std::vector<Vector3d> positions;
     std::vector<double> smoothing_lengths;
     std::vector<OctreeCell> initial_cells;
     (void)self;
 
-    if (!PyArg_ParseTuple(args, "OOOdI", &initial_cells_object, &positions_object,
-                          &smoothing_object, &isovalue, &max_depth)) {
+    if (!PyArg_ParseTuple(args, "OOOdIOI", &initial_cells_object,
+                          &positions_object, &smoothing_object, &isovalue,
+                          &max_depth, &domain_object, &base_resolution)) {
         return NULL;
     }
     if (!parse_vector3d_sequence(positions_object, positions) ||
@@ -896,6 +899,19 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
     if (positions.size() != smoothing_lengths.size()) {
         PyErr_SetString(PyExc_ValueError,
                         "positions and smoothing lengths must match in size");
+        return NULL;
+    }
+
+    // Parse domain bounding box from a 2-tuple of 3-tuples:
+    // ((min_x, min_y, min_z), (max_x, max_y, max_z)).
+    BoundingBox domain;
+    if (!PyTuple_Check(domain_object) || PyTuple_Size(domain_object) != 2) {
+        PyErr_SetString(PyExc_TypeError,
+                        "domain must be a 2-tuple of 3-tuples");
+        return NULL;
+    }
+    if (!parse_vector3d(PyTuple_GetItem(domain_object, 0), domain.min) ||
+        !parse_vector3d(PyTuple_GetItem(domain_object, 1), domain.max)) {
         return NULL;
     }
 
@@ -960,7 +976,9 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
         positions,
         smoothing_lengths,
         isovalue,
-        max_depth);
+        max_depth,
+        domain,
+        static_cast<std::uint32_t>(base_resolution));
 
     PyObject *result = PyTuple_New(2);
     if (result == NULL) {

@@ -36,6 +36,9 @@ struct TopLevelParticleGrid {
     std::uint32_t resolution;
     std::vector<TopLevelBin> bins;
 
+    /** Cached reciprocal of bin size for fast coordinate mapping. */
+    Vector3d inv_bin_size_;
+
     /**
      * @brief Construct the grid and allocate all bins.
      *
@@ -50,6 +53,14 @@ struct TopLevelParticleGrid {
             throw std::invalid_argument(
                 "TopLevelParticleGrid resolution must be > 0");
         }
+        // Pre-compute inverse bin sizes so bin_coordinates can multiply
+        // instead of dividing on every call.
+        const double res_d = static_cast<double>(resolution);
+        inv_bin_size_ = {
+            res_d / (domain.max.x - domain.min.x),
+            res_d / (domain.max.y - domain.min.y),
+            res_d / (domain.max.z - domain.min.z),
+        };
     }
 
     /**
@@ -88,17 +99,15 @@ struct TopLevelParticleGrid {
      * @return Integer bin coordinates.
      */
     Vector3d bin_coordinates(const Vector3d &point) const {
-        const Vector3d size = bin_size();
         const auto clamp_axis = [this](double value) {
-            const double clipped = std::max(
+            return std::max(
                 0.0,
                 std::min(value, static_cast<double>(resolution - 1)));
-            return clipped;
         };
         return {
-            clamp_axis((point.x - domain.min.x) / size.x),
-            clamp_axis((point.y - domain.min.y) / size.y),
-            clamp_axis((point.z - domain.min.z) / size.z),
+            clamp_axis((point.x - domain.min.x) * inv_bin_size_.x),
+            clamp_axis((point.y - domain.min.y) * inv_bin_size_.y),
+            clamp_axis((point.z - domain.min.z) * inv_bin_size_.z),
         };
     }
 
