@@ -24,10 +24,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     if argv is None:
         argv = sys.argv[1:]
 
-    # Preserve the historical shorthand ``meshmerizer snapshot.hdf5`` by
-    # rewriting it to the explicit ``stl`` subcommand form.
-    if argv and argv[0] not in ("stl", "adaptive"):
-        argv = ["stl", *argv]
+    # Preserve the shorthand ``meshmerizer snapshot.hdf5`` by rewriting it
+    # to the explicit ``adaptive`` subcommand form.
+    if argv and argv[0] not in ("adaptive",):
+        argv = ["adaptive", *argv]
 
     # Build the parser only after the argv normalization step so the parser
     # always sees the canonical command layout.

@@ -1,4 +1,4 @@
-"""Snapshot loading and voxel-preparation helpers for the CLI."""
+"""Snapshot loading helpers for the CLI."""
 
 from __future__ import annotations
 
@@ -9,13 +9,6 @@ from typing import Optional
 import numpy as np
 
 from meshmerizer.logging import log_debug_status, log_status, record_elapsed
-from meshmerizer.voxels import (
-    generate_voxel_grid,
-    process_filament_filter,
-    process_gaussian_smoothing,
-    process_log_scale,
-    process_remove_halos,
-)
 
 
 def boxsize_to_float(boxsize: object) -> float:
@@ -270,124 +263,6 @@ def raise_if_empty_subregion_selection(
         "If periodic wrapping is causing confusion, try --no-periodic."
     )
     raise RuntimeError(msg)
-
-
-def apply_preprocess(
-    grid: np.ndarray,
-    preprocess: str,
-    clip_halos: Optional[float],
-    gaussian_sigma: float,
-) -> np.ndarray:
-    """Apply scalar-field preprocessing requested by the CLI.
-
-    Args:
-        grid: Dense voxel grid.
-        preprocess: Preprocessing mode.
-        clip_halos: Optional clipping percentile.
-        gaussian_sigma: Gaussian smoothing width in voxel units.
-
-    Returns:
-        Preprocessed grid.
-
-    Raises:
-        ValueError: If ``gaussian_sigma`` is negative.
-    """
-    # Apply clipping before the named preprocessing mode so the dynamic-range
-    # suppression affects whatever transform follows.
-    if clip_halos is not None:
-        grid = process_remove_halos(grid, threshold_percentile=clip_halos)
-
-    # Keep the preprocessing dispatch explicit so invalid mode names fail close
-    # to the CLI boundary.
-    if preprocess != "none":
-        log_debug_status("Cleaning", f"Applying preprocessing: {preprocess}")
-        if preprocess == "log":
-            grid = process_log_scale(grid)
-        elif preprocess == "filaments":
-            grid = process_filament_filter(grid)
-
-    # Gaussian smoothing is always the last preprocessing step because it is a
-    # generic spatial smoothing rather than a field remapping.
-    if gaussian_sigma < 0:
-        raise ValueError("--gaussian-sigma must be >= 0")
-    grid = process_gaussian_smoothing(grid, sigma=gaussian_sigma)
-
-    log_debug_status(
-        "Cleaning",
-        f"Processed grid range: [{grid.min():.4e}, {grid.max():.4e}]",
-    )
-    return grid
-
-
-def load_swift_volume(
-    filename: Path,
-    particle_type: str,
-    field: str,
-    resolution: int,
-    nthreads: int,
-    smoothing_factor: float,
-    box_size: Optional[float],
-    shift: list[float],
-    wrap_shift: bool,
-    center: Optional[list[float]],
-    extent: Optional[float],
-    periodic: bool,
-    tight_bounds: bool,
-) -> tuple[np.ndarray, float, np.ndarray]:
-    """Load particles from a SWIFT snapshot and voxelize them.
-
-    Args:
-        filename: Snapshot filename.
-        particle_type: Particle family to load.
-        field: Particle field to project.
-        resolution: Output grid resolution per axis.
-        nthreads: Thread count for smoothed deposition.
-        smoothing_factor: Factor applied to smoothing lengths.
-        box_size: Optional box size override.
-        shift: Coordinate shift applied before crop/voxelization.
-        wrap_shift: Whether to wrap the shifted coordinates periodically.
-        center: Optional crop centre.
-        extent: Optional crop extent.
-        periodic: Whether region selection is periodic.
-        tight_bounds: Whether to shrink the voxelization domain to occupancy.
-
-    Returns:
-        Tuple containing the voxel grid, voxel size, and world-space origin.
-    """
-    # Reuse the lower-level particle preparation helper so the dense and
-    # chunked code paths share all loading, shifting, and cropping behaviour.
-    voxelize_start = time.perf_counter()
-    field_data, coords, h, effective_box_size, origin = load_swift_particles(
-        filename=filename,
-        particle_type=particle_type,
-        field=field,
-        smoothing_factor=smoothing_factor,
-        box_size=box_size,
-        shift=shift,
-        wrap_shift=wrap_shift,
-        center=center,
-        extent=extent,
-        periodic=periodic,
-        tight_bounds=tight_bounds,
-    )
-
-    # Deposit the prepared particles into one dense voxel cube for the
-    # unchunked STL workflow.
-    log_status("Voxelising", f"Voxelizing to {resolution}^3 grid...")
-    grid, voxel_size = generate_voxel_grid(
-        data=field_data,
-        coordinates=coords,
-        resolution=resolution,
-        smoothing_lengths=h,
-        box_size=effective_box_size,
-        nthreads=nthreads,
-    )
-    log_debug_status(
-        "Voxelising",
-        f"Voxel size: {voxel_size:.4e} (sim units)",
-    )
-    record_elapsed("Voxelization", voxelize_start, operation="Voxelising")
-    return grid, voxel_size, origin
 
 
 def load_swift_particles(

@@ -52,15 +52,9 @@ classifiers = [
 # Dependencies
 dependencies = [
   "numpy>=1.21",
-  "scipy>=1.7",
-  "scikit-image>=0.19",
-  "tqdm>=4.66",
-  "fast-simplification>=0.1",
-  "manifold3d>=2.5",
   "trimesh>=3.9",
   "swiftsimio>=10.2.0",
   "h5py>=3.8",
-  "pyglet<2.0.0,>=1.5.0",
 ]
 
 [project.optional-dependencies]
