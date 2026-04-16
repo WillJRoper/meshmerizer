@@ -139,3 +139,62 @@ def wendland_c2_gradient(
         smoothing_length,
         normalize,
     )
+
+
+def top_level_bin_counts(
+    positions: list[tuple[float, float, float]],
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    resolution: int,
+) -> tuple[int, ...]:
+    """Count particles in the flattened top-level bins.
+
+    Args:
+        positions: Particle positions in world space.
+        domain_minimum: Inclusive lower corner of the working domain.
+        domain_maximum: Exclusive upper corner of the working domain.
+        resolution: Number of bins per axis.
+
+    Returns:
+        Flattened row-major tuple of particle counts per top-level bin.
+    """
+    return _adaptive.top_level_bin_counts(
+        positions,
+        domain_minimum,
+        domain_maximum,
+        resolution,
+    )
+
+
+def query_cell_contributors(
+    positions: list[tuple[float, float, float]],
+    smoothing_lengths: list[float],
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    resolution: int,
+    cell_minimum: tuple[float, float, float],
+    cell_maximum: tuple[float, float, float],
+) -> tuple[int, ...]:
+    """Return candidate contributor indices for one query cell.
+
+    Args:
+        positions: Particle positions in world space.
+        smoothing_lengths: Per-particle support radii.
+        domain_minimum: Inclusive lower corner of the working domain.
+        domain_maximum: Exclusive upper corner of the working domain.
+        resolution: Number of top-level bins per axis.
+        cell_minimum: Inclusive lower corner of the query cell.
+        cell_maximum: Exclusive upper corner of the query cell.
+
+    Returns:
+        Tuple of particle indices whose support overlaps the query cell.
+    """
+    return _adaptive.query_cell_contributors(
+        positions,
+        smoothing_lengths,
+        domain_minimum,
+        domain_maximum,
+        resolution,
+        cell_minimum,
+        cell_maximum,
+    )

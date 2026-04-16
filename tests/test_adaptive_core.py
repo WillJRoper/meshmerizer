@@ -7,6 +7,8 @@ from meshmerizer.adaptive_core import (
     morton_decode_3d,
     morton_encode_3d,
     particle_fields,
+    query_cell_contributors,
+    top_level_bin_counts,
     wendland_c2_gradient,
     wendland_c2_value,
 )
@@ -75,3 +77,28 @@ def test_wendland_c2_gradient_vanishes_at_center_and_support() -> None:
     """The kernel gradient should vanish at the center and support edge."""
     assert wendland_c2_gradient((0.0, 0.0, 0.0), 1.0) == (0.0, 0.0, 0.0)
     assert wendland_c2_gradient((1.0, 0.0, 0.0), 1.0) == (0.0, 0.0, 0.0)
+
+
+def test_top_level_bin_counts_tracks_particle_ownership() -> None:
+    """Top-level particle binning should count particles in row-major bins."""
+    counts = top_level_bin_counts(
+        positions=[(0.1, 0.1, 0.1), (0.6, 0.1, 0.1), (0.6, 0.6, 0.6)],
+        domain_minimum=(0.0, 0.0, 0.0),
+        domain_maximum=(1.0, 1.0, 1.0),
+        resolution=2,
+    )
+    assert counts == (1, 0, 0, 0, 1, 0, 0, 1)
+
+
+def test_query_cell_contributors_filters_by_support_overlap() -> None:
+    """Contributor queries should return only overlapping particles."""
+    contributors = query_cell_contributors(
+        positions=[(0.1, 0.1, 0.1), (0.75, 0.75, 0.75), (0.9, 0.1, 0.1)],
+        smoothing_lengths=[0.05, 0.2, 0.05],
+        domain_minimum=(0.0, 0.0, 0.0),
+        domain_maximum=(1.0, 1.0, 1.0),
+        resolution=2,
+        cell_minimum=(0.5, 0.5, 0.5),
+        cell_maximum=(1.0, 1.0, 1.0),
+    )
+    assert contributors == (1,)
