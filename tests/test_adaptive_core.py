@@ -10,6 +10,7 @@ from meshmerizer.adaptive_core import (
     create_child_cells,
     create_top_level_cells,
     filter_child_contributors,
+    fof_cluster,
     generate_mesh,
     hermite_samples_for_cell,
     morton_decode_3d,
@@ -1160,3 +1161,63 @@ def test_compute_isovalue_percentile_rejects_invalid() -> None:
         compute_isovalue_from_percentile(h, 101.0)
     with pytest.raises(ValueError):
         compute_isovalue_from_percentile(np.array([]), 50.0)
+
+
+# ── FOF clustering tests ─────────────────────────────────────────
+
+
+def test_fof_single_cluster() -> None:
+    """Tightly packed points should form one cluster."""
+    import numpy as np
+
+    rng = np.random.default_rng(42)
+    positions = rng.uniform(0.4, 0.6, size=(50, 3))
+    labels = fof_cluster(
+        positions,
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 1.0),
+        1.5,
+    )
+    assert labels.shape == (50,)
+    assert labels.dtype == np.int64
+    # All points should share the same label.
+    assert len(set(labels.tolist())) == 1
+
+
+def test_fof_two_separated_clusters() -> None:
+    """Two well-separated clumps should get different labels."""
+    import numpy as np
+
+    rng = np.random.default_rng(99)
+    # Cluster A near origin, cluster B near (10, 10, 10).
+    cluster_a = rng.uniform(0.0, 0.1, size=(30, 3))
+    cluster_b = rng.uniform(9.9, 10.0, size=(30, 3))
+    positions = np.vstack([cluster_a, cluster_b])
+
+    labels = fof_cluster(
+        positions,
+        (0.0, 0.0, 0.0),
+        (10.0, 10.0, 10.0),
+        1.5,
+    )
+    assert labels.shape == (60,)
+    assert len(set(labels.tolist())) == 2
+    # First 30 should share one label, last 30 another.
+    assert len(set(labels[:30].tolist())) == 1
+    assert len(set(labels[30:].tolist())) == 1
+    assert labels[0] != labels[30]
+
+
+def test_fof_empty_input() -> None:
+    """Empty positions should return an empty label array."""
+    import numpy as np
+
+    positions = np.empty((0, 3), dtype=np.float64)
+    labels = fof_cluster(
+        positions,
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 1.0),
+        1.5,
+    )
+    assert labels.shape == (0,)
+    assert labels.dtype == np.int64

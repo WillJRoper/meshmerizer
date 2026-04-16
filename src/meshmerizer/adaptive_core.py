@@ -581,3 +581,39 @@ def compute_isovalue_from_percentile(
 
     isovalue = float(np.percentile(self_density, percentile))
     return isovalue
+
+
+def fof_cluster(
+    positions: "numpy.ndarray",
+    domain_min: tuple[float, float, float],
+    domain_max: tuple[float, float, float],
+    linking_factor: float = 1.5,
+) -> "numpy.ndarray":
+    """Cluster points using a friends-of-friends algorithm.
+
+    Groups 3-D positions into connected components where any two
+    points within a linking length of each other belong to the same
+    group.  The linking length is derived from the mean inter-point
+    separation scaled by ``linking_factor``.
+
+    This is used before Poisson surface reconstruction to identify
+    distinct objects (e.g. separate galaxies or halos) so that each
+    object can be reconstructed independently, avoiding thin bridges
+    between unrelated structures.
+
+    Args:
+        positions: (N, 3) float64 array of point positions.
+        domain_min: Lower corner of the spatial domain as
+            ``(x_min, y_min, z_min)``.
+        domain_max: Upper corner of the spatial domain as
+            ``(x_max, y_max, z_max)``.
+        linking_factor: Multiplicative factor applied to the mean
+            inter-point separation to obtain the linking length.
+            Default is 1.5.
+
+    Returns:
+        (N,) int64 array of group labels starting from 0.
+    """
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    labels = _adaptive.fof_cluster(pos, domain_min, domain_max, linking_factor)
+    return labels

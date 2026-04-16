@@ -31,6 +31,7 @@
 #include "adaptive_cpp/particle_grid.hpp"
 #include "adaptive_cpp/progress_bar.hpp"
 #include "adaptive_cpp/faces.hpp"
+#include "adaptive_cpp/fof.hpp"
 #include "adaptive_cpp/qef.hpp"
 
 /**
@@ -1811,9 +1812,88 @@ static PyObject *run_full_pipeline_py(
 }
 
 /**
+ * @brief Python binding for friends-of-friends clustering.
+ *
+ * Args (positional):
+ *     positions: (N, 3) float64 array of point positions.
+ *     domain_min: 3-tuple giving the domain lower corner.
+ *     domain_max: 3-tuple giving the domain upper corner.
+ *     linking_factor: float scaling factor for the linking length.
+ *
+ * Returns:
+ *     1-D int64 NumPy array of length N with group labels (0-based).
+ */
+static PyObject *fof_cluster_py(PyObject * /* self */,
+                                PyObject *args) {
+    PyObject *positions_object = NULL;
+    PyObject *domain_min_object = NULL;
+    PyObject *domain_max_object = NULL;
+    double linking_factor = 1.5;
+
+    if (!PyArg_ParseTuple(args, "OOOd",
+                          &positions_object,
+                          &domain_min_object,
+                          &domain_max_object,
+                          &linking_factor)) {
+        return NULL;
+    }
+
+    // Parse positions via the fast buffer path, falling back to the
+    // sequence parser if the buffer protocol is not supported.
+    std::vector<Vector3d> positions;
+    if (!try_parse_positions_buffer(positions_object, positions)) {
+        if (!parse_vector3d_sequence(positions_object, positions)) {
+            PyErr_SetString(
+                PyExc_TypeError,
+                "positions must be an (N, 3) float64 array or "
+                "sequence of 3-tuples");
+            return NULL;
+        }
+    }
+
+    // Parse domain bounds.
+    Vector3d domain_min, domain_max;
+    if (!parse_vector3d(domain_min_object, domain_min) ||
+        !parse_vector3d(domain_max_object, domain_max)) {
+        return NULL;
+    }
+
+    // Run FOF clustering with the GIL released.
+    std::vector<std::int64_t> labels;
+
+    Py_BEGIN_ALLOW_THREADS
+    labels = fof_cluster(positions, domain_min, domain_max,
+                         linking_factor);
+    Py_END_ALLOW_THREADS
+
+    // Build a 1-D int64 NumPy array from the labels.
+    const npy_intp dims[1] = {
+        static_cast<npy_intp>(labels.size())};
+    PyObject *result = PyArray_SimpleNew(1, dims, NPY_INT64);
+    if (result == NULL) {
+        return NULL;
+    }
+
+    // Copy label data into the NumPy array.
+    void *dest = PyArray_DATA(
+        reinterpret_cast<PyArrayObject *>(result));
+    std::memcpy(dest, labels.data(),
+                labels.size() * sizeof(std::int64_t));
+
+    return result;
+}
+
+/**
  * @brief Python methods exported by the adaptive extension.
  */
 static PyMethodDef adaptive_methods[] = {
+    {
+        "fof_cluster",
+        fof_cluster_py,
+        METH_VARARGS,
+        PyDoc_STR(
+            "Run FOF clustering on vertex positions."),
+    },
     {
         "adaptive_status",
         adaptive_status,
