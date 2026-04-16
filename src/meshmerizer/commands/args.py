@@ -205,6 +205,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     adaptive.add_argument(
+        "--visualize",
+        action="store_true",
+        help=(
+            "Open a 3D scatter plot of QEF vertices after meshing "
+            "(requires matplotlib)."
+        ),
+    )
+    adaptive.add_argument(
         "--nthreads",
         type=int,
         default=None,

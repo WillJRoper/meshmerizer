@@ -165,6 +165,43 @@ def _load_particles_for_adaptive(args):
     return positions, smoothing_lengths, domain_min, domain_max, origin
 
 
+def _visualize_vertices(vertices) -> None:
+    """Open a 3D scatter plot of QEF vertex positions.
+
+    Each vertex is a ``(position, normal)`` tuple as returned by
+    ``generate_mesh``.  Only the position is plotted.
+
+    Args:
+        vertices: List of ``((x, y, z), (nx, ny, nz))`` tuples.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(
+            "Error: matplotlib is required for --visualize. "
+            "Install it with: pip install matplotlib",
+            file=sys.stderr,
+        )
+        return
+
+    positions = np.array([v[0] for v in vertices], dtype=np.float64)
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(
+        positions[:, 0],
+        positions[:, 1],
+        positions[:, 2],
+        s=1,
+        alpha=0.6,
+    )
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.set_title(f"QEF Vertices ({len(vertices)} points)")
+    plt.tight_layout()
+    plt.show()
+
+
 def run_adaptive(args) -> None:
     """Run the adaptive meshing pipeline from CLI arguments.
 
@@ -317,6 +354,10 @@ def run_adaptive(args) -> None:
         "Meshing",
         f"Generated mesh: {n_verts} vertices, {n_tris} triangles.",
     )
+
+    # Optionally visualize QEF vertices as a 3D scatter plot.
+    if getattr(args, "visualize", False):
+        _visualize_vertices(vertices)
 
     if n_tris == 0:
         print(
