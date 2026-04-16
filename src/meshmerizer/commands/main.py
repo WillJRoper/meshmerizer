@@ -26,7 +26,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     # Preserve the historical shorthand ``meshmerizer snapshot.hdf5`` by
     # rewriting it to the explicit ``stl`` subcommand form.
-    if argv and argv[0] != "stl":
+    if argv and argv[0] not in ("stl", "adaptive"):
         argv = ["stl", *argv]
 
     # Build the parser only after the argv normalization step so the parser
