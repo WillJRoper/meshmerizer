@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "bounding_box.hpp"
+#include "omp_config.hpp"
 
 /**
  * @brief One uniform top-level bin storing particle indices.
@@ -103,17 +104,87 @@ struct TopLevelParticleGrid {
     /**
      * @brief Insert particles into their owning top-level bins.
      *
+     * When compiled with OpenMP (``WITH_OPENMP`` defined), uses a
+     * three-pass parallel algorithm:
+     *
+     *   1. **Count pass** (parallel): compute the bin index for each
+     *      particle and atomically increment per-bin counts.
+     *   2. **Prefix-sum pass** (serial): convert counts to write
+     *      offsets via an exclusive prefix sum.
+     *   3. **Scatter pass** (parallel): write each particle's index
+     *      into the correct position in each bin's pre-allocated
+     *      storage using an atomic fetch-and-add on a per-bin write
+     *      cursor.  Each slot is written exactly once, so there is
+     *      no data race on the storage itself.
+     *
+     * Without OpenMP, falls back to the original serial loop.
+     *
+     * Note: the parallel path produces bins with identical contents
+     * to the serial path, but the order of particle indices within
+     * each bin may differ.  This is acceptable because no downstream
+     * code depends on intra-bin ordering.
+     *
      * @param positions Particle positions in world space.
      */
     void insert_particles(const std::vector<Vector3d> &positions) {
-        for (std::size_t particle_index = 0; particle_index < positions.size();
+#ifdef WITH_OPENMP
+        const std::size_t n_particles = positions.size();
+        const std::size_t n_bins = bins.size();
+
+        // Per-particle bin assignment computed in pass 1.
+        std::vector<std::size_t> particle_bin(n_particles);
+
+        // Per-bin counts (use int for OpenMP atomic compatibility).
+        std::vector<int> bin_counts(n_bins, 0);
+
+        // Pass 1: compute bin index per particle and count per bin.
+#pragma omp parallel for schedule(static)
+        for (std::size_t i = 0; i < n_particles; ++i) {
+            const Vector3d coords = bin_coordinates(positions[i]);
+            const std::size_t bin_idx = flatten_index(
+                static_cast<std::uint32_t>(coords.x),
+                static_cast<std::uint32_t>(coords.y),
+                static_cast<std::uint32_t>(coords.z));
+            particle_bin[i] = bin_idx;
+#pragma omp atomic
+            bin_counts[bin_idx]++;
+        }
+
+        // Pass 2: pre-allocate each bin and set up write cursors.
+        // Also create a per-bin atomic write cursor initialised to 0.
+        std::vector<int> bin_cursor(n_bins, 0);
+        for (std::size_t b = 0; b < n_bins; ++b) {
+            bins[b].particle_indices.resize(
+                static_cast<std::size_t>(bin_counts[b]));
+        }
+
+        // Pass 3: scatter particle indices into pre-allocated bins.
+        // Each bin slot is written exactly once (cursor increments
+        // atomically), so there is no race on the storage vector's
+        // data buffer.
+#pragma omp parallel for schedule(static)
+        for (std::size_t i = 0; i < n_particles; ++i) {
+            const std::size_t bin_idx = particle_bin[i];
+            int pos;
+#pragma omp atomic capture
+            pos = bin_cursor[bin_idx]++;
+            bins[bin_idx].particle_indices[
+                static_cast<std::size_t>(pos)] = i;
+        }
+#else
+        // Serial fallback: simple loop with push_back.
+        for (std::size_t particle_index = 0;
+             particle_index < positions.size();
              ++particle_index) {
-            const Vector3d coords = bin_coordinates(positions[particle_index]);
-            bins[flatten_index(static_cast<std::uint32_t>(coords.x),
-                               static_cast<std::uint32_t>(coords.y),
-                               static_cast<std::uint32_t>(coords.z))]
+            const Vector3d coords =
+                bin_coordinates(positions[particle_index]);
+            bins[flatten_index(
+                     static_cast<std::uint32_t>(coords.x),
+                     static_cast<std::uint32_t>(coords.y),
+                     static_cast<std::uint32_t>(coords.z))]
                 .particle_indices.push_back(particle_index);
         }
+#endif
     }
 
     /**
