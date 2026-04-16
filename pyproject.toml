@@ -55,6 +55,7 @@ dependencies = [
   "trimesh>=3.9",
   "swiftsimio>=10.2.0",
   "h5py>=3.8",
+  "open3d>=0.17",
 ]
 
 [project.optional-dependencies]
