@@ -1,21 +1,30 @@
 # Meshmerizer
 
 Meshmerizer converts particle-based simulation outputs into watertight STL
-meshes. It is built around dense voxelization, signed-distance-field surface
-extraction, and a chunked union path for cases that are too large to mesh in
-one pass.
-
-The current package focuses on STL generation from SWIFT snapshots and generic
-particle data.
+meshes for 3D printing or visualization. It uses an adaptive octree with
+dual contouring and a Wendland C2 SPH kernel to produce smooth, resolution-
+adaptive surfaces directly from particle data — no intermediate voxel grids.
 
 ## Features
 
-- C-accelerated smoothed voxelization for SPH-style particle data
-- signed-distance-field meshing for watertight surfaces
-- chunked meshing with a watertight `unioned` output mode
-- optional preprocessing with log scaling, filament filtering, halo clipping,
-  and Gaussian smoothing
-- optional print scaling via `--target-size`
+- **Adaptive octree refinement** — concentrates resolution near the
+  isosurface, keeping memory proportional to the surface rather than the
+  full volume.
+- **Dual contouring** — produces smooth, feature-preserving meshes without
+  voxel staircase artefacts.
+- **Wendland C2 kernel** — the same compact-support kernel used in modern
+  SPH codes, with analytic gradients for accurate surface normals.
+- **C++ core with optional OpenMP** — the heavy computation (refinement,
+  QEF solve, face generation) runs in compiled C++ with optional
+  multi-threaded parallelism.
+- **HDF5 serialization** — save and reload the full octree state so
+  refinement and meshing can be resumed without reprocessing particles.
+- **SWIFT snapshot support** — load particles directly from SWIFT HDF5
+  snapshots via swiftsimio.
+- **Print scaling** — scale the output mesh to a target physical size for
+  3D printing with `--target-size`.
+- **Island removal** — discard small disconnected components with
+  `--remove-islands-fraction`.
 
 ## Installation
 
@@ -23,137 +32,251 @@ particle data.
 pip install -e .
 ```
 
-For development tools and tests:
+For development tools (ruff, pytest, mypy):
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-## CLI
+### Building with OpenMP
 
-The package currently exposes one command group:
+Set the `WITH_OPENMP` environment variable before installing to enable
+multi-threaded parallelism in the C++ extension:
 
 ```bash
-meshmerizer stl snapshot.hdf5
+# Linux — uses system libgomp
+WITH_OPENMP=1 pip install -e .
+
+# macOS with Homebrew libomp
+WITH_OPENMP=/opt/homebrew/opt/libomp pip install -e .
 ```
 
-The historical shorthand still works:
+When `WITH_OPENMP` is unset or empty, the extension builds in serial mode
+with no OpenMP dependency.
+
+## CLI
+
+The package exposes the `meshmerizer adaptive` subcommand:
 
 ```bash
-meshmerizer snapshot.hdf5
+meshmerizer adaptive snapshot.hdf5
 ```
 
 ### Common examples
 
-Dense STL generation:
+Basic adaptive STL generation:
 
 ```bash
-meshmerizer stl snapshot.hdf5 \
+meshmerizer adaptive snapshot.hdf5 \
   --particle-type gas \
-  --field densities \
-  --resolution 256 \
-  --output dense.stl
+  --field masses \
+  --base-resolution 4 \
+  --max-depth 4 \
+  --isovalue 0.5 \
+  --output mesh.stl
 ```
 
-Chunked watertight union:
+Higher resolution with island removal and print scaling:
 
 ```bash
-meshmerizer stl snapshot.hdf5 \
-  --particle-type gas \
-  --field densities \
-  --resolution 128 \
-  --nchunks 2 \
-  --chunk-output unioned \
-  --output chunked.stl
+meshmerizer adaptive snapshot.hdf5 \
+  --base-resolution 4 \
+  --max-depth 6 \
+  --isovalue 0.3 \
+  --remove-islands-fraction 0.01 \
+  --target-size 15 \
+  --output print_ready.stl
 ```
 
-Separate chunk files:
+Subregion extraction:
 
 ```bash
-meshmerizer stl snapshot.hdf5 \
-  --resolution 128 \
-  --nchunks 2 \
-  --chunk-output separate \
-  --output chunked.stl
-```
-
-Subregion extraction with tighter bounds:
-
-```bash
-meshmerizer stl snapshot.hdf5 \
-  --particle-type gas \
-  --field densities \
+meshmerizer adaptive snapshot.hdf5 \
   --center 60 60 60 \
   --extent 15 \
   --tight-bounds \
   --output region.stl
 ```
 
+### Saving and loading the octree
+
+Build the octree once and save it to HDF5:
+
+```bash
+meshmerizer adaptive snapshot.hdf5 \
+  --max-depth 5 \
+  --save-octree tree.hdf5 \
+  --output first_try.stl
+```
+
+Reload the octree later to re-mesh with a different isovalue or
+post-processing without rebuilding:
+
+```bash
+meshmerizer adaptive snapshot.hdf5 \
+  --load-octree tree.hdf5 \
+  --remove-islands-fraction 0.0 \
+  --output second_try.stl
+```
+
 ## Important options
 
-- `--resolution`: voxel grid resolution per axis
-- `--nchunks`: number of chunks per axis for chunked meshing
-- `--chunk-output`: `unioned` or `separate`
-- `--threshold`: isosurface threshold
-- `--preprocess`: `none`, `log`, or `filaments`
-- `--clip-halos`: percentile clip before preprocessing
-- `--gaussian-sigma`: Gaussian smoothing width in voxel units
-- `--target-size`: scale the longest mesh dimension to the given centimetres
-- `--remove-islands`: keep only the largest connected component
+| Flag | Description |
+|------|-------------|
+| `--base-resolution` | Number of top-level octree cells per axis (default: 4) |
+| `--max-depth` | Maximum octree refinement depth (default: 4) |
+| `--isovalue` / `-t` | Isosurface threshold (default: 0.5) |
+| `--particle-type` / `-p` | Particle type: `gas`, `dark_matter`, `stars`, `black_holes` |
+| `--field` / `-f` | Particle field to project (default: `masses`) |
+| `--smoothing-factor` | Multiplier for particle smoothing lengths (default: 1.0) |
+| `--box-size` / `-b` | Physical box size override |
+| `--center` | Subregion center `X Y Z` in simulation units |
+| `--extent` | Subregion side length in simulation units |
+| `--tight-bounds` | Shrink domain to occupied particle bounds |
+| `--shift` | Coordinate shift `DX DY DZ` before cropping |
+| `--wrap-shift` / `--no-wrap-shift` | Wrap coordinates after shifting |
+| `--no-periodic` | Disable periodic wrapping for subregion selection |
+| `--remove-islands-fraction` | Volume fraction threshold for island removal |
+| `--target-size` / `-s` | Scale longest mesh dimension to this size (cm) |
+| `--save-octree` | Save octree state to HDF5 after construction |
+| `--load-octree` | Load a previously saved octree from HDF5 |
+| `--output` / `-o` | Output STL filename |
 
-## Python usage
+## Python API
 
 ```python
 import numpy as np
 
-from meshmerizer.mesh import voxels_to_stl_via_sdf
-from meshmerizer.voxels import generate_voxel_grid
+from meshmerizer.adaptive_core import (
+    create_top_level_cells,
+    generate_mesh,
+    query_cell_contributors,
+    refine_octree,
+)
+from meshmerizer.mesh.core import Mesh
 
-coordinates = np.random.rand(1000, 3)
-data = np.ones(1000)
-smoothing_lengths = np.full(1000, 0.05)
+# Example: sphere of particles
+n = 500
+theta = np.random.uniform(0, 2 * np.pi, n)
+phi = np.random.uniform(0, np.pi, n)
+r = 0.3 + 0.02 * np.random.randn(n)
+positions = [
+    (0.5 + r[i] * np.sin(phi[i]) * np.cos(theta[i]),
+     0.5 + r[i] * np.sin(phi[i]) * np.sin(theta[i]),
+     0.5 + r[i] * np.cos(phi[i]))
+    for i in range(n)
+]
+smoothing_lengths = [0.1] * n
 
-grid, voxel_size = generate_voxel_grid(
-    data=data,
-    coordinates=coordinates,
-    resolution=128,
+domain_min = (0.0, 0.0, 0.0)
+domain_max = (1.0, 1.0, 1.0)
+base_resolution = 4
+max_depth = 4
+isovalue = 0.5
+
+# Build top-level cells with contributor queries.
+top_cells = create_top_level_cells(domain_min, domain_max, base_resolution)
+initial_cells = []
+for cell in top_cells:
+    cell_dict = dict(cell)
+    contribs = query_cell_contributors(
+        positions, smoothing_lengths,
+        domain_min, domain_max, base_resolution,
+        cell["bounds"][0], cell["bounds"][1],
+    )
+    cell_dict["contributor_begin"] = 0
+    cell_dict["contributor_end"] = len(contribs)
+    cell_dict["contributors"] = contribs
+    initial_cells.append(cell_dict)
+
+# Refine the octree.
+cells, contributors = refine_octree(
+    initial_cells, positions, smoothing_lengths, isovalue, max_depth,
+)
+
+# Generate the mesh.
+vertices, triangles = generate_mesh(
+    cells, contributors, positions, smoothing_lengths,
+    isovalue, domain_min, domain_max, max_depth, base_resolution,
+)
+
+# Convert to a Mesh and save.
+vert_pos = np.array([v[0] for v in vertices])
+vert_norms = np.array([v[1] for v in vertices])
+faces = np.array(triangles)
+mesh = Mesh(vertices=vert_pos, faces=faces, vertex_normals=vert_norms)
+mesh.save("output.stl")
+```
+
+## HDF5 serialization
+
+The `serialize` module provides `export_octree` and `import_octree` for
+saving and restoring the full octree state:
+
+```python
+from meshmerizer.serialize import export_octree, import_octree
+
+# Save after building the octree.
+export_octree(
+    "tree.hdf5",
+    isovalue=0.5,
+    base_resolution=4,
+    max_depth=4,
+    domain_minimum=(0.0, 0.0, 0.0),
+    domain_maximum=(1.0, 1.0, 1.0),
+    positions=positions,
     smoothing_lengths=smoothing_lengths,
-    box_size=1.0,
+    cells=cells,
+    contributors=contributors,
 )
 
-meshes = voxels_to_stl_via_sdf(
-    grid,
-    threshold=0.5,
-    voxel_size=voxel_size,
-)
-
-meshes[0].save("output.stl")
+# Reload later.
+state = import_octree("tree.hdf5")
+cells = state["cells"]
+contributors = state["contributors"]
 ```
 
 ## Package layout
 
-- `src/meshmerizer/commands/`: CLI parsing, SWIFT loading, and STL command execution
-- `src/meshmerizer/chunks/`: chunk geometry, hard-chunk meshing, union assembly, and chunk preprocessing
-- `src/meshmerizer/mesh/`: mesh wrapper plus voxel-to-surface extraction helpers
-- `src/meshmerizer/voxels/`: particle deposition, scalar-field preprocessing, and SWIFT voxel rendering
-- `src/meshmerizer/printing.py`: print-scaling helper used by `--target-size`
+```
+src/meshmerizer/
+  __init__.py
+  adaptive_core.py          # Stable Python API for the C++ core
+  _adaptive.cpp             # Python/C++ extension bindings
+  serialize.py              # HDF5 octree export/import
+  logging.py                # Structured logging helpers
+  logging_utils.py          # Logging utilities
+  printing.py               # Print-scaling helper (--target-size)
+  _version.py               # Auto-generated version (setuptools_scm)
 
-More specifically:
+  adaptive_cpp/             # Header-only C++ implementation
+    omp_config.hpp          # Conditional OpenMP include with stubs
+    vector3d.hpp            # Vector3d struct and helpers
+    bounding_box.hpp        # BoundingBox with containment/overlap
+    particle.hpp            # Minimal Particle struct
+    morton.hpp              # Morton encode/decode helpers
+    kernel_wendland_c2.hpp  # Wendland C2 value and gradient
+    particle_grid.hpp       # Top-level particle binning
+    octree_cell.hpp         # OctreeCell, refinement, balancing
+    hermite.hpp             # HermiteSample, edge crossings
+    qef.hpp                 # QEF accumulator, 3x3 solver
+    mesh.hpp                # MeshVertex, MeshTriangle structs
+    faces.hpp               # Spatial index, face generation
 
-- `src/meshmerizer/commands/args.py`: CLI argument definitions
-- `src/meshmerizer/commands/loading.py`: SWIFT particle loading, subregion extraction, and voxel-preparation helpers
-- `src/meshmerizer/commands/stl.py`: STL command orchestration
-- `src/meshmerizer/commands/main.py`: package CLI entry point
-- `src/meshmerizer/chunks/geometry.py`: virtual-grid and hard-chunk geometry types
-- `src/meshmerizer/chunks/hard.py`: hard-boundary chunk voxelization and meshing
-- `src/meshmerizer/chunks/assembly.py`: union assembly and connected-component helpers
-- `src/meshmerizer/chunks/processing.py`: shared chunk-field preprocessing helpers
-- `src/meshmerizer/mesh/core.py`: `Mesh` wrapper, repair, subdivision, and simplification
-- `src/meshmerizer/mesh/volume.py`: connected-component preparation for voxel volumes
-- `src/meshmerizer/mesh/extract.py`: marching-cubes and SDF extraction routines
-- `src/meshmerizer/voxels/deposition.py`: dense voxel-grid generation from particles
-- `src/meshmerizer/voxels/preprocess.py`: log scaling, filament filtering, halo clipping, and smoothing
-- `src/meshmerizer/voxels/swift.py`: SWIFTsimIO-backed voxel rendering
+  commands/                 # CLI modules
+    args.py                 # Argument parser definitions
+    main.py                 # CLI entry point
+    adaptive_stl.py         # Adaptive subcommand implementation
+    loading.py              # SWIFT particle loading
+
+  mesh/                     # Mesh wrapper
+    core.py                 # Mesh class, repair, save
+
+tests/
+  test_adaptive_core.py     # 45 unit tests for the C++ core
+  test_serialize.py         # 4 HDF5 round-trip tests
+  test_logging.py           # Logging test
+```
 
 ## Testing
 
@@ -161,9 +284,8 @@ More specifically:
 pytest
 ```
 
-To do list:
+Run a single test by name:
 
-- [ ] Further smoothing to remove voxelixed surface? (This must be done at the final mesh stage, after unioning, to avoid breaking watertightness.)
-- [x] Progress indicators with tqdm.
-- [x] Faster skipping of empty chunks.
-- [ ] Make python API more flexible and user-friendly, introducing clear function entry points for the main functionality.
+```bash
+pytest -k "watertightness"
+```
