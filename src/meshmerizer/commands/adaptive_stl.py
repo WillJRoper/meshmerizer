@@ -168,14 +168,11 @@ def _load_particles_for_adaptive(args):
     return positions, smoothing_lengths, domain_min, domain_max, origin
 
 
-def _visualize_vertices(vertices) -> None:
+def _visualize_vertices(vert_positions) -> None:
     """Open a 3D scatter plot of QEF vertex positions.
 
-    Each vertex is a ``(position, normal)`` tuple as returned by
-    ``generate_mesh``.  Only the position is plotted.
-
     Args:
-        vertices: List of ``((x, y, z), (nx, ny, nz))`` tuples.
+        vert_positions: (N, 3) float64 array of vertex positions.
     """
     try:
         import matplotlib.pyplot as plt
@@ -187,20 +184,19 @@ def _visualize_vertices(vertices) -> None:
         )
         return
 
-    positions = np.array([v[0] for v in vertices], dtype=np.float64)
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
     ax.scatter(
-        positions[:, 0],
-        positions[:, 1],
-        positions[:, 2],
+        vert_positions[:, 0],
+        vert_positions[:, 1],
+        vert_positions[:, 2],
         s=1,
         alpha=0.6,
     )
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
-    ax.set_title(f"QEF Vertices ({len(vertices)} points)")
+    ax.set_title(f"QEF Vertices ({len(vert_positions)} points)")
     plt.tight_layout()
     plt.show()
 
@@ -334,7 +330,7 @@ def run_adaptive(args) -> None:
                 "Generating mesh via dual contouring...",
             )
             mesh_start = time.perf_counter()
-            vertices, triangles = generate_mesh(
+            vert_positions, vert_normals, tri_indices = generate_mesh(
                 cells,
                 contributors,
                 positions,
@@ -362,7 +358,7 @@ def run_adaptive(args) -> None:
                 f"max_depth={max_depth}, isovalue={isovalue}",
             )
             pipeline_start = time.perf_counter()
-            vertices, triangles = run_full_pipeline(
+            vert_positions, vert_normals, tri_indices = run_full_pipeline(
                 positions,
                 smoothing_lengths,
                 domain_min,
@@ -406,7 +402,7 @@ def run_adaptive(args) -> None:
             "Generating mesh via dual contouring...",
         )
         mesh_start = time.perf_counter()
-        vertices, triangles = generate_mesh(
+        vert_positions, vert_normals, tri_indices = generate_mesh(
             cells,
             contributors,
             positions,
@@ -419,8 +415,8 @@ def run_adaptive(args) -> None:
         )
         record_elapsed("Mesh generation", mesh_start, operation="Meshing")
 
-    n_verts = len(vertices)
-    n_tris = len(triangles)
+    n_verts = len(vert_positions)
+    n_tris = len(tri_indices)
     log_status(
         "Meshing",
         f"Generated mesh: {n_verts} vertices, {n_tris} triangles.",
@@ -428,7 +424,7 @@ def run_adaptive(args) -> None:
 
     # Optionally visualize QEF vertices as a 3D scatter plot.
     if getattr(args, "visualise_verts", False):
-        _visualize_vertices(vertices)
+        _visualize_vertices(vert_positions)
 
     if n_tris == 0:
         print(
@@ -441,11 +437,6 @@ def run_adaptive(args) -> None:
     # ------------------------------------------------------------------
     # Step 5: Convert to a Mesh object and apply post-processing.
     # ------------------------------------------------------------------
-
-    # Build numpy arrays from the C++ output.
-    vert_positions = np.array([v[0] for v in vertices], dtype=np.float64)
-    vert_normals = np.array([v[1] for v in vertices], dtype=np.float64)
-    tri_indices = np.array(triangles, dtype=np.int64)
 
     # Translate vertex positions back to world-space coordinates.
     vert_positions += origin

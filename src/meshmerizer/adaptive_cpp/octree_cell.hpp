@@ -671,15 +671,15 @@ inline void balance_octree(
     std::uint32_t max_depth) {
     ProgressCounter balance_counter("Balancing", "cells split", 10);
 
+    // Build the spatial hash once; we will update it incrementally
+    // as cells are split rather than rebuilding from scratch each
+    // iteration.
+    BalanceSpatialHash hash;
+    hash.build(all_cells, domain, max_depth, base_resolution);
+
     bool any_split = true;
     while (any_split) {
         any_split = false;
-
-        // Build (or rebuild) the spatial hash of leaf cells for
-        // O(1) neighbor lookups.  This must be rebuilt each iteration
-        // because splits create new leaves.
-        BalanceSpatialHash hash;
-        hash.build(all_cells, domain, max_depth, base_resolution);
 
         // Collect indices of leaf cells that violate the 2:1 rule.
         std::vector<std::size_t> to_split;
@@ -739,6 +739,15 @@ inline void balance_octree(
             all_cells[split_index].child_begin =
                 static_cast<std::int64_t>(all_cells.size());
 
+            // Remove the parent from the spatial hash since it is no
+            // longer a leaf.
+            {
+                std::uint32_t pgx, pgy, pgz;
+                hash.quantize(parent_snapshot.bounds.min, pgx, pgy, pgz);
+                hash.map.erase(
+                    balance_pack_coords(pgx, pgy, pgz));
+            }
+
             for (std::size_t ci = 0; ci < children.size(); ++ci) {
                 OctreeCell child = children[ci];
 
@@ -768,7 +777,15 @@ inline void balance_octree(
                         child.corner_values, isovalue);
                 }
 
+                // Insert the new child leaf into the spatial hash
+                // so subsequent splits in this batch and future
+                // iterations can find it for neighbor lookups.
+                const std::size_t new_idx = all_cells.size();
                 all_cells.push_back(child);
+
+                std::uint32_t cgx, cgy, cgz;
+                hash.quantize(child.bounds.min, cgx, cgy, cgz);
+                hash.map[balance_pack_coords(cgx, cgy, cgz)] = new_idx;
             }
             balance_counter.tick();
         }

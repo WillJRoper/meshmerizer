@@ -56,6 +56,7 @@ def export_octree(
     cells: Sequence[CellDict],
     contributors: Sequence[int],
     vertices: Optional[Sequence[MeshVertex]] = None,
+    normals: Optional[Sequence] = None,
     triangles: Optional[Sequence[Triangle]] = None,
     version: str = "",
 ) -> None:
@@ -74,8 +75,11 @@ def export_octree(
             ``refine_octree``).
         contributors: Flat contributor index array (from
             ``refine_octree``).
-        vertices: Optional mesh vertices as ``((px,py,pz),(nx,ny,nz))``
-            pairs.
+        vertices: Optional mesh vertices.  Either a list of
+            ``((px,py,pz),(nx,ny,nz))`` pairs (old format) or an
+            (N, 3) float64 array of positions (new format).
+        normals: Optional (N, 3) float64 array of vertex normals.
+            Only used when ``vertices`` is an (N, 3) positions array.
         triangles: Optional mesh triangles as ``(i0, i1, i2)`` triples.
         version: Optional version string written into metadata.  If
             empty the field is still written as an empty string.
@@ -223,8 +227,20 @@ def export_octree(
         # -- mesh (optional) --
         if vertices is not None and triangles is not None:
             mgrp = f.create_group("mesh")
-            vert_pos = np.array([v[0] for v in vertices], dtype=np.float64)
-            vert_nrm = np.array([v[1] for v in vertices], dtype=np.float64)
+            # Support both old format (list of ((px,py,pz),(nx,ny,nz)))
+            # and new format (Nx3 ndarray of positions + separate normals).
+            vert_arr = np.asarray(vertices, dtype=np.float64)
+            if vert_arr.ndim == 2 and vert_arr.shape[1] == 3:
+                # New format: vertices is already Nx3 positions.
+                vert_pos = vert_arr
+                if normals is not None:
+                    vert_nrm = np.asarray(normals, dtype=np.float64)
+                else:
+                    vert_nrm = np.zeros_like(vert_pos)
+            else:
+                # Old format: list of ((px,py,pz),(nx,ny,nz)).
+                vert_pos = np.array([v[0] for v in vertices], dtype=np.float64)
+                vert_nrm = np.array([v[1] for v in vertices], dtype=np.float64)
             tri_arr = np.asarray(triangles, dtype=np.int64)
             if vert_pos.ndim == 1 and vert_pos.size == 0:
                 vert_pos = vert_pos.reshape((0, 3))

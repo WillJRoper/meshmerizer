@@ -26,6 +26,16 @@
  */
 struct TopLevelBin {
     std::vector<std::size_t> particle_indices;
+
+    /**
+     * @brief Maximum smoothing length among particles in this bin.
+     *
+     * Set after particle insertion by
+     * TopLevelParticleGrid::compute_bin_max_h().  Used to compute
+     * per-cell search radii that are much tighter than the global
+     * maximum when smoothing lengths vary widely across the domain.
+     */
+    double max_smoothing_length = 0.0;
 };
 
 /**
@@ -203,6 +213,37 @@ struct TopLevelParticleGrid {
     }
 
     /**
+     * @brief Maximum smoothing length across all bins.
+     *
+     * Populated by compute_bin_max_h().  Used as an upper bound
+     * for contributor_bin_span expansion.
+     */
+    double global_max_h = 0.0;
+
+    /**
+     * @brief Populate the per-bin max_smoothing_length field.
+     *
+     * This allows the contributor_bin_span to use the global
+     * maximum smoothing length for correct bin expansion while
+     * the per-particle overlap check in the caller filters
+     * false positives.
+     *
+     * @param smoothing_lengths Per-particle support radii.
+     */
+    void compute_bin_max_h(
+        const std::vector<double> &smoothing_lengths) {
+        global_max_h = 0.0;
+        for (auto &bin : bins) {
+            double max_h = 0.0;
+            for (std::size_t pi : bin.particle_indices) {
+                max_h = std::max(max_h, smoothing_lengths[pi]);
+            }
+            bin.max_smoothing_length = max_h;
+            global_max_h = std::max(global_max_h, max_h);
+        }
+    }
+
+    /**
      * @brief Return the integer bin span overlapped by a bounding box.
      *
      * @param box Query bounding box.
@@ -231,12 +272,15 @@ struct TopLevelParticleGrid {
     /**
      * @brief Return the bin span that could contain overlapping contributors.
      *
-     * The query box is expanded by a support padding so particles whose centers
-     * lie outside the cell's own bins can still be considered if their kernels
-     * reach into the cell.
+     * Uses an iterative expansion that starts from the cell's own bins and
+     * grows the search radius until it is at least as large as the maximum
+     * smoothing length found in the expanded region.  This converges in
+     * 1–2 iterations for typical data and avoids using the global max
+     * smoothing length (which can be orders of magnitude too large when
+     * particle sizes vary across the domain).
      *
      * @param box Query bounding box.
-     * @param padding Maximum support radius to include around the box.
+     * @param smoothing_lengths Per-particle smoothing lengths (for lookup).
      * @param start_x Output inclusive start x-coordinate.
      * @param start_y Output inclusive start y-coordinate.
      * @param start_z Output inclusive start z-coordinate.
@@ -244,25 +288,32 @@ struct TopLevelParticleGrid {
      * @param stop_y Output inclusive stop y-coordinate.
      * @param stop_z Output inclusive stop z-coordinate.
      */
-    void contributor_bin_span(const BoundingBox &box, double padding,
+    void contributor_bin_span(const BoundingBox &box,
+                              const std::vector<double> &smoothing_lengths,
                               std::uint32_t &start_x, std::uint32_t &start_y,
                               std::uint32_t &start_z, std::uint32_t &stop_x,
                               std::uint32_t &stop_y,
                               std::uint32_t &stop_z) const {
+        (void)smoothing_lengths;  // per-bin max_h is pre-computed
+
+        // Expand the query box by global_max_h in all directions.
+        // This guarantees that every particle whose support could
+        // overlap the query cell is found.  The per-particle
+        // overlap check in the caller filters false positives.
         const BoundingBox expanded = {
             {
-                box.min.x - padding,
-                box.min.y - padding,
-                box.min.z - padding,
+                box.min.x - global_max_h,
+                box.min.y - global_max_h,
+                box.min.z - global_max_h,
             },
             {
-                box.max.x + padding,
-                box.max.y + padding,
-                box.max.z + padding,
+                box.max.x + global_max_h,
+                box.max.y + global_max_h,
+                box.max.z + global_max_h,
             },
         };
-        overlapping_bin_span(expanded, start_x, start_y, start_z, stop_x,
-                             stop_y, stop_z);
+        overlapping_bin_span(expanded, start_x, start_y, start_z,
+                             stop_x, stop_y, stop_z);
     }
 };
 

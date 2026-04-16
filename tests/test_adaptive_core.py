@@ -780,16 +780,16 @@ def _build_sphere_octree(
 def test_generate_mesh_produces_vertices_and_triangles() -> None:
     """generate_mesh should produce a non-empty mesh from a simple field."""
     args = _build_sphere_octree()
-    vertices, triangles = generate_mesh(*args)
-    assert len(vertices) > 0, "Expected at least one vertex"
+    vert_positions, vert_normals, triangles = generate_mesh(*args)
+    assert len(vert_positions) > 0, "Expected at least one vertex"
     assert len(triangles) > 0, "Expected at least one triangle"
 
 
 def test_generate_mesh_vertex_indices_valid() -> None:
     """All triangle vertex indices must reference valid vertices."""
     args = _build_sphere_octree()
-    vertices, triangles = generate_mesh(*args)
-    num_verts = len(vertices)
+    vert_positions, vert_normals, triangles = generate_mesh(*args)
+    num_verts = len(vert_positions)
     for tri in triangles:
         for idx in tri:
             assert 0 <= idx < num_verts, (
@@ -800,7 +800,7 @@ def test_generate_mesh_vertex_indices_valid() -> None:
 def test_generate_mesh_no_degenerate_triangles() -> None:
     """No triangle should have two identical vertex indices."""
     args = _build_sphere_octree()
-    vertices, triangles = generate_mesh(*args)
+    vert_positions, vert_normals, triangles = generate_mesh(*args)
     for tri in triangles:
         assert tri[0] != tri[1], f"Degenerate triangle: {tri}"
         assert tri[1] != tri[2], f"Degenerate triangle: {tri}"
@@ -813,13 +813,9 @@ def _edge_key(a, b):
 
 
 def test_generate_mesh_watertight() -> None:
-    """Every edge in the mesh must be shared by exactly 2 triangles.
-
-    This is the fundamental watertightness condition for a closed
-    manifold triangle mesh.
-    """
+    """Every edge in the mesh must be shared by exactly 2 triangles."""
     args = _build_sphere_octree()
-    vertices, triangles = generate_mesh(*args)
+    vert_positions, vert_normals, triangles = generate_mesh(*args)
 
     # Count how many triangles reference each edge.
     edge_counts = {}
@@ -841,14 +837,9 @@ def test_generate_mesh_watertight() -> None:
 
 
 def test_generate_mesh_consistent_winding() -> None:
-    """Adjacent triangles should have consistent winding order.
-
-    For a manifold mesh, each directed half-edge (a, b) should appear
-    exactly once, and its reverse (b, a) should also appear exactly
-    once.  This ensures consistent orientation across the surface.
-    """
+    """Adjacent triangles should have consistent winding order."""
     args = _build_sphere_octree()
-    vertices, triangles = generate_mesh(*args)
+    vert_positions, vert_normals, triangles = generate_mesh(*args)
 
     half_edge_counts = {}
     for tri in triangles:
@@ -876,14 +867,11 @@ def test_generate_mesh_consistent_winding() -> None:
 
 
 def test_generate_mesh_euler_characteristic() -> None:
-    """The Euler characteristic V - E + F should be 2 for a closed sphere.
-
-    For a closed genus-0 surface, V - E + F = 2.
-    """
+    """The Euler characteristic V - E + F should be 2 for a closed sphere."""
     args = _build_sphere_octree()
-    vertices, triangles = generate_mesh(*args)
+    vert_positions, vert_normals, triangles = generate_mesh(*args)
 
-    v_count = len(vertices)
+    v_count = len(vert_positions)
     f_count = len(triangles)
 
     # Count unique edges.
@@ -930,7 +918,7 @@ def test_generate_mesh_empty_field() -> None:
         base_resolution=base_resolution,
     )
 
-    vertices, triangles = generate_mesh(
+    vert_positions, vert_normals, triangles = generate_mesh(
         cells,
         contributors,
         positions,
@@ -941,7 +929,7 @@ def test_generate_mesh_empty_field() -> None:
         max_depth,
         base_resolution,
     )
-    assert len(vertices) == 0
+    assert len(vert_positions) == 0
     assert len(triangles) == 0
 
 
@@ -954,9 +942,9 @@ def test_generate_mesh_mixed_depth_adjacency() -> None:
     multiple fine-grid positions) must produce correct triangles.
     """
     args = _build_sphere_octree(base_resolution=4, max_depth=3)
-    vertices, triangles = generate_mesh(*args)
+    vert_positions, vert_normals, triangles = generate_mesh(*args)
 
-    assert len(vertices) > 0, "Expected at least one vertex"
+    assert len(vert_positions) > 0, "Expected at least one vertex"
     assert len(triangles) > 0, "Expected at least one triangle"
 
     # Verify no degenerate triangles.
@@ -1001,7 +989,7 @@ def test_generate_mesh_mixed_depth_adjacency() -> None:
         )
 
     # Verify Euler characteristic V - E + F = 2.
-    v_count = len(vertices)
+    v_count = len(vert_positions)
     f_count = len(triangles)
     edges_set = set()
     for tri in triangles:
@@ -1079,7 +1067,7 @@ def test_run_full_pipeline_matches_stepwise() -> None:
     positions_arr = np.array(positions_list, dtype=np.float64)
     smoothing_arr = np.array(smoothing_list, dtype=np.float64)
 
-    vertices, triangles = run_full_pipeline(
+    vert_positions, vert_normals, triangles = run_full_pipeline(
         positions_arr,
         smoothing_arr,
         domain_min,
@@ -1091,18 +1079,17 @@ def test_run_full_pipeline_matches_stepwise() -> None:
 
     # The pipeline should produce a non-empty mesh for this
     # configuration (same setup as _build_sphere_octree).
-    assert len(vertices) > 0
+    assert len(vert_positions) > 0
     assert len(triangles) > 0
 
-    # Verify vertex format: ((px,py,pz), (nx,ny,nz)).
-    pos, normal = vertices[0]
-    assert len(pos) == 3
-    assert len(normal) == 3
+    # Verify vertex format: (N, 3) float64 arrays.
+    assert vert_positions.shape[1] == 3
+    assert vert_normals.shape[1] == 3
+    assert vert_positions.shape[0] == vert_normals.shape[0]
 
-    # Verify triangle format: (i0, i1, i2).
-    tri = triangles[0]
-    assert len(tri) == 3
-    assert all(0 <= idx < len(vertices) for idx in tri)
+    # Verify triangle format: (M, 3) int64 array.
+    assert triangles.shape[1] == 3
+    assert all(0 <= idx < len(vert_positions) for idx in triangles.ravel())
 
 
 def test_run_full_pipeline_empty_particles() -> None:
@@ -1112,7 +1099,7 @@ def test_run_full_pipeline_empty_particles() -> None:
     positions = np.zeros((0, 3), dtype=np.float64)
     smoothing = np.zeros(0, dtype=np.float64)
 
-    vertices, triangles = run_full_pipeline(
+    vert_positions, vert_normals, triangles = run_full_pipeline(
         positions,
         smoothing,
         (0.0, 0.0, 0.0),
@@ -1121,5 +1108,5 @@ def test_run_full_pipeline_empty_particles() -> None:
         0.5,
         3,
     )
-    assert len(vertices) == 0
+    assert len(vert_positions) == 0
     assert len(triangles) == 0

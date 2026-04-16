@@ -151,7 +151,7 @@ def test_round_trip_with_mesh():
         base_resolution,
     ) = _build_sphere_octree()
 
-    vertices, triangles = generate_mesh(
+    vert_positions, vert_normals, triangles = generate_mesh(
         cells,
         contributors,
         positions,
@@ -178,7 +178,8 @@ def test_round_trip_with_mesh():
             smoothing_lengths=smoothing_lengths,
             cells=cells,
             contributors=contributors,
-            vertices=vertices,
+            vertices=vert_positions,
+            normals=vert_normals,
             triangles=triangles,
             version="test-0.2",
         )
@@ -188,19 +189,23 @@ def test_round_trip_with_mesh():
         # Check mesh
         assert result["vertices"] is not None
         assert result["triangles"] is not None
-        assert len(result["vertices"]) == len(vertices)
+        assert len(result["vertices"]) == len(vert_positions)
         assert len(result["triangles"]) == len(triangles)
 
         # Verify vertex positions are close
-        for orig, loaded in zip(vertices, result["vertices"]):
-            for a, b in zip(orig[0], loaded[0]):
+        for orig, loaded in zip(vert_positions, result["vertices"]):
+            for a, b in zip(orig, loaded[0]):
                 assert abs(a - b) < 1e-12
-            for a, b in zip(orig[1], loaded[1]):
+
+        # Verify normals are close
+        for orig, loaded in zip(vert_normals, result["vertices"]):
+            for a, b in zip(orig, loaded[1]):
                 assert abs(a - b) < 1e-12
 
         # Verify triangles match exactly
         for orig, loaded in zip(triangles, result["triangles"]):
-            assert orig == loaded
+            for a, b in zip(orig, loaded):
+                assert a == b
     finally:
         os.unlink(path)
 
@@ -239,7 +244,7 @@ def test_round_trip_mesh_usable_for_generate_mesh():
         result = import_octree(path)
 
         # Use imported data to generate mesh
-        verts, tris = generate_mesh(
+        verts_p, verts_n, tris = generate_mesh(
             result["cells"],
             result["contributors"],
             result["positions"],
@@ -252,7 +257,7 @@ def test_round_trip_mesh_usable_for_generate_mesh():
         )
 
         # Original mesh
-        orig_verts, orig_tris = generate_mesh(
+        orig_verts_p, orig_verts_n, orig_tris = generate_mesh(
             cells,
             contributors,
             positions,
@@ -266,9 +271,9 @@ def test_round_trip_mesh_usable_for_generate_mesh():
 
         # Must produce identical results (triangle order may differ
         # with OpenMP, so compare as sorted tuples).
-        assert len(verts) == len(orig_verts)
+        assert len(verts_p) == len(orig_verts_p)
         assert len(tris) == len(orig_tris)
-        assert sorted(tris) == sorted(orig_tris)
+        assert sorted(map(tuple, tris)) == sorted(map(tuple, orig_tris))
     finally:
         os.unlink(path)
 

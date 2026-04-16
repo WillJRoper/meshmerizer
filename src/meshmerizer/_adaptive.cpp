@@ -11,6 +11,12 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+/* NumPy C API — must define NO_IMPORT_ARRAY in all translation units
+ * except the one that calls import_array().  Since this is the only
+ * .cpp file, we do NOT define it here (we want _import_array). */
+#define PY_ARRAY_UNIQUE_SYMBOL meshmerizer_ARRAY_API
+#include <numpy/arrayobject.h>
+
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -23,6 +29,7 @@
 #include "adaptive_cpp/octree_cell.hpp"
 #include "adaptive_cpp/particle.hpp"
 #include "adaptive_cpp/particle_grid.hpp"
+#include "adaptive_cpp/progress_bar.hpp"
 #include "adaptive_cpp/faces.hpp"
 #include "adaptive_cpp/qef.hpp"
 
@@ -536,13 +543,9 @@ static PyObject *query_cell_contributors_py(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    double max_smoothing_length = 0.0;
-    for (double smoothing_length : smoothing_lengths) {
-        max_smoothing_length = std::max(max_smoothing_length, smoothing_length);
-    }
-
     TopLevelParticleGrid grid(domain, resolution);
     grid.insert_particles(positions);
+    grid.compute_bin_max_h(smoothing_lengths);
 
     std::uint32_t start_x = 0U;
     std::uint32_t start_y = 0U;
@@ -552,7 +555,7 @@ static PyObject *query_cell_contributors_py(PyObject *self, PyObject *args) {
     std::uint32_t stop_z = 0U;
     grid.contributor_bin_span(
         cell,
-        max_smoothing_length,
+        smoothing_lengths,
         start_x,
         start_y,
         start_z,
@@ -726,15 +729,10 @@ static PyObject *create_top_level_cells_with_contributors_py(
         return NULL;
     }
 
-    /* Compute max smoothing length for bin-span queries. */
-    double max_h = 0.0;
-    for (double h : smoothing_lengths) {
-        max_h = std::max(max_h, h);
-    }
-
     /* Build the particle grid once. */
     TopLevelParticleGrid grid(domain, base_resolution);
     grid.insert_particles(positions);
+    grid.compute_bin_max_h(smoothing_lengths);
 
     /* Create top-level cells. */
     const std::vector<OctreeCell> cells =
@@ -746,12 +744,14 @@ static PyObject *create_top_level_cells_with_contributors_py(
         return NULL;
     }
 
+    ProgressBar contrib_bar("Contributor query", cells.size());
     for (std::size_t ci = 0; ci < cells.size(); ++ci) {
         /* Query contributors for this cell using the shared grid. */
         std::uint32_t sx = 0, sy = 0, sz = 0;
         std::uint32_t ex = 0, ey = 0, ez = 0;
         grid.contributor_bin_span(
-            cells[ci].bounds, max_h, sx, sy, sz, ex, ey, ez);
+            cells[ci].bounds, smoothing_lengths,
+            sx, sy, sz, ex, ey, ez);
 
         std::vector<std::size_t> contributors;
         for (std::uint32_t ix = sx; ix <= ex; ++ix) {
@@ -802,7 +802,9 @@ static PyObject *create_top_level_cells_with_contributors_py(
 
         PyTuple_SET_ITEM(result, static_cast<Py_ssize_t>(ci),
                          cell_dict);
+        contrib_bar.tick();
     }
+    contrib_bar.finish();
     return result;
 }
 
@@ -1326,6 +1328,81 @@ static PyObject *solve_qef_for_leaf_py(PyObject *self, PyObject *args) {
 }
 
 /**
+ * @brief Build a Python tuple of (positions, normals, triangles) as NumPy
+ *        arrays from the C++ mesh output.
+ *
+ * Returns (positions_Nx3_float64, normals_Nx3_float64, triangles_Mx3_int64).
+ * On failure sets a Python exception and returns NULL.
+ */
+static PyObject *build_mesh_numpy_result(
+    const std::vector<MeshVertex> &vertices,
+    const std::vector<MeshTriangle> &triangles) {
+    // -- Vertex positions: Nx3 float64 --
+    const npy_intp n_verts = static_cast<npy_intp>(vertices.size());
+    npy_intp pos_dims[2] = {n_verts, 3};
+    PyObject *pos_arr = PyArray_SimpleNew(2, pos_dims, NPY_DOUBLE);
+    if (pos_arr == NULL) return NULL;
+    {
+        double *data = static_cast<double *>(
+            PyArray_DATA(reinterpret_cast<PyArrayObject *>(pos_arr)));
+        for (npy_intp i = 0; i < n_verts; ++i) {
+            data[i * 3 + 0] = vertices[static_cast<std::size_t>(i)]
+                                   .position.x;
+            data[i * 3 + 1] = vertices[static_cast<std::size_t>(i)]
+                                   .position.y;
+            data[i * 3 + 2] = vertices[static_cast<std::size_t>(i)]
+                                   .position.z;
+        }
+    }
+
+    // -- Vertex normals: Nx3 float64 --
+    PyObject *norm_arr = PyArray_SimpleNew(2, pos_dims, NPY_DOUBLE);
+    if (norm_arr == NULL) {
+        Py_DECREF(pos_arr);
+        return NULL;
+    }
+    {
+        double *data = static_cast<double *>(
+            PyArray_DATA(reinterpret_cast<PyArrayObject *>(norm_arr)));
+        for (npy_intp i = 0; i < n_verts; ++i) {
+            data[i * 3 + 0] = vertices[static_cast<std::size_t>(i)]
+                                   .normal.x;
+            data[i * 3 + 1] = vertices[static_cast<std::size_t>(i)]
+                                   .normal.y;
+            data[i * 3 + 2] = vertices[static_cast<std::size_t>(i)]
+                                   .normal.z;
+        }
+    }
+
+    // -- Triangle indices: Mx3 int64 --
+    const npy_intp n_tris = static_cast<npy_intp>(triangles.size());
+    npy_intp tri_dims[2] = {n_tris, 3};
+    PyObject *tri_arr = PyArray_SimpleNew(2, tri_dims, NPY_INT64);
+    if (tri_arr == NULL) {
+        Py_DECREF(pos_arr);
+        Py_DECREF(norm_arr);
+        return NULL;
+    }
+    {
+        std::int64_t *data = static_cast<std::int64_t *>(
+            PyArray_DATA(reinterpret_cast<PyArrayObject *>(tri_arr)));
+        for (npy_intp i = 0; i < n_tris; ++i) {
+            data[i * 3 + 0] = static_cast<std::int64_t>(
+                triangles[static_cast<std::size_t>(i)]
+                    .vertex_indices[0]);
+            data[i * 3 + 1] = static_cast<std::int64_t>(
+                triangles[static_cast<std::size_t>(i)]
+                    .vertex_indices[1]);
+            data[i * 3 + 2] = static_cast<std::int64_t>(
+                triangles[static_cast<std::size_t>(i)]
+                    .vertex_indices[2]);
+        }
+    }
+
+    return Py_BuildValue("(NNN)", pos_arr, norm_arr, tri_arr);
+}
+
+/**
  * @brief Run the full mesh generation pipeline on a refined octree.
  *
  * Takes the output of ``refine_octree`` (cells and contributors) along
@@ -1547,56 +1624,8 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
         all_cells, all_contributors, positions, smoothing_lengths,
         isovalue, domain, max_depth, base_resolution);
 
-    // Build the Python result.
-    PyObject *verts_list = PyList_New(
-        static_cast<Py_ssize_t>(vertices.size()));
-    if (verts_list == NULL) {
-        return NULL;
-    }
-    for (std::size_t i = 0; i < vertices.size(); ++i) {
-        PyObject *v = Py_BuildValue(
-            "((ddd)(ddd))",
-            vertices[i].position.x,
-            vertices[i].position.y,
-            vertices[i].position.z,
-            vertices[i].normal.x,
-            vertices[i].normal.y,
-            vertices[i].normal.z);
-        if (v == NULL) {
-            Py_DECREF(verts_list);
-            return NULL;
-        }
-        PyList_SET_ITEM(verts_list,
-                        static_cast<Py_ssize_t>(i), v);
-    }
-
-    PyObject *tris_list = PyList_New(
-        static_cast<Py_ssize_t>(triangles.size()));
-    if (tris_list == NULL) {
-        Py_DECREF(verts_list);
-        return NULL;
-    }
-    for (std::size_t i = 0; i < triangles.size(); ++i) {
-        PyObject *t = Py_BuildValue(
-            "(nnn)",
-            static_cast<Py_ssize_t>(
-                triangles[i].vertex_indices[0]),
-            static_cast<Py_ssize_t>(
-                triangles[i].vertex_indices[1]),
-            static_cast<Py_ssize_t>(
-                triangles[i].vertex_indices[2]));
-        if (t == NULL) {
-            Py_DECREF(tris_list);
-            Py_DECREF(verts_list);
-            return NULL;
-        }
-        PyList_SET_ITEM(tris_list,
-                        static_cast<Py_ssize_t>(i), t);
-    }
-
-    // Use "N" format to steal references — Py_BuildValue with "O" would
-    // increment the refcount, leaking the lists we already own.
-    return Py_BuildValue("(NN)", verts_list, tris_list);
+    // Return (positions_Nx3, normals_Nx3, triangles_Mx3) as NumPy arrays.
+    return build_mesh_numpy_result(vertices, triangles);
 }
 
 /**
@@ -1677,13 +1706,9 @@ static PyObject *run_full_pipeline_py(
     Py_BEGIN_ALLOW_THREADS
 
     // -- Step 1: Create top-level cells + query contributors --
-    double max_h = 0.0;
-    for (double h : smoothing_lengths) {
-        max_h = std::max(max_h, h);
-    }
-
     TopLevelParticleGrid grid(domain, base_resolution);
     grid.insert_particles(positions);
+    grid.compute_bin_max_h(smoothing_lengths);
 
     std::vector<OctreeCell> top_cells =
         create_top_level_cells(domain, base_resolution);
@@ -1694,13 +1719,16 @@ static PyObject *run_full_pipeline_py(
     initial_cells.reserve(top_cells.size());
     std::vector<std::size_t> initial_contributors;
 
+    ProgressBar pipeline_contrib_bar(
+        "Contributor query", top_cells.size());
     for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
         OctreeCell cell = top_cells[ci];
 
         std::uint32_t sx = 0, sy = 0, sz = 0;
         std::uint32_t ex = 0, ey = 0, ez = 0;
         grid.contributor_bin_span(
-            cell.bounds, max_h, sx, sy, sz, ex, ey, ez);
+            cell.bounds, smoothing_lengths,
+            sx, sy, sz, ex, ey, ez);
 
         const std::int64_t begin =
             static_cast<std::int64_t>(
@@ -1733,7 +1761,9 @@ static PyObject *run_full_pipeline_py(
         cell.contributor_begin = begin;
         cell.contributor_end = end;
         initial_cells.push_back(cell);
+        pipeline_contrib_bar.tick();
     }
+    pipeline_contrib_bar.finish();
 
     // -- Step 2: Refine octree (uses the overload that accepts
     //    pre-built initial contributors) --
@@ -1759,54 +1789,8 @@ static PyObject *run_full_pipeline_py(
 
     Py_END_ALLOW_THREADS
 
-    // Build the Python result lists.
-    PyObject *verts_list = PyList_New(
-        static_cast<Py_ssize_t>(vertices.size()));
-    if (verts_list == NULL) {
-        return NULL;
-    }
-    for (std::size_t i = 0; i < vertices.size(); ++i) {
-        PyObject *v = Py_BuildValue(
-            "((ddd)(ddd))",
-            vertices[i].position.x,
-            vertices[i].position.y,
-            vertices[i].position.z,
-            vertices[i].normal.x,
-            vertices[i].normal.y,
-            vertices[i].normal.z);
-        if (v == NULL) {
-            Py_DECREF(verts_list);
-            return NULL;
-        }
-        PyList_SET_ITEM(verts_list,
-                        static_cast<Py_ssize_t>(i), v);
-    }
-
-    PyObject *tris_list = PyList_New(
-        static_cast<Py_ssize_t>(triangles.size()));
-    if (tris_list == NULL) {
-        Py_DECREF(verts_list);
-        return NULL;
-    }
-    for (std::size_t i = 0; i < triangles.size(); ++i) {
-        PyObject *t = Py_BuildValue(
-            "(nnn)",
-            static_cast<Py_ssize_t>(
-                triangles[i].vertex_indices[0]),
-            static_cast<Py_ssize_t>(
-                triangles[i].vertex_indices[1]),
-            static_cast<Py_ssize_t>(
-                triangles[i].vertex_indices[2]));
-        if (t == NULL) {
-            Py_DECREF(tris_list);
-            Py_DECREF(verts_list);
-            return NULL;
-        }
-        PyList_SET_ITEM(tris_list,
-                        static_cast<Py_ssize_t>(i), t);
-    }
-
-    return Py_BuildValue("(NN)", verts_list, tris_list);
+    // Return (positions_Nx3, normals_Nx3, triangles_Mx3) as NumPy arrays.
+    return build_mesh_numpy_result(vertices, triangles);
 }
 
 /**
@@ -1979,4 +1963,7 @@ static struct PyModuleDef adaptive_module = {
  *
  * @return Initialized Python module object.
  */
-PyMODINIT_FUNC PyInit__adaptive(void) { return PyModule_Create(&adaptive_module); }
+PyMODINIT_FUNC PyInit__adaptive(void) {
+    import_array();  /* Initialize NumPy C API. */
+    return PyModule_Create(&adaptive_module);
+}

@@ -448,10 +448,7 @@ def generate_mesh(
     domain_maximum: tuple[float, float, float],
     max_depth: int,
     base_resolution: int,
-) -> tuple[
-    list[tuple[tuple[float, float, float], tuple[float, float, float]]],
-    list[tuple[int, int, int]],
-]:
+) -> tuple["numpy.ndarray", "numpy.ndarray", "numpy.ndarray"]:
     """Generate a triangle mesh from a refined octree via dual contouring.
 
     Runs the complete Phase 9 pipeline: solves QEF vertices for all
@@ -471,9 +468,11 @@ def generate_mesh(
         base_resolution: Number of top-level cells per axis.
 
     Returns:
-        Tuple of ``(vertices, triangles)`` where vertices is a list of
-        ``((px, py, pz), (nx, ny, nz))`` pairs and triangles is a list
-        of ``(i0, i1, i2)`` index triples into the vertex array.
+        Tuple of ``(vert_positions, vert_normals, triangles)`` where
+        ``vert_positions`` is an (N, 3) float64 array of vertex
+        positions, ``vert_normals`` is an (N, 3) float64 array of
+        vertex normals, and ``triangles`` is an (M, 3) int64 array
+        of triangle index triples.
     """
     return _adaptive.generate_mesh(
         cells,
@@ -496,7 +495,7 @@ def run_full_pipeline(
     base_resolution: int,
     isovalue: float,
     max_depth: int,
-) -> tuple[list, list]:
+) -> tuple["numpy.ndarray", "numpy.ndarray", "numpy.ndarray"]:
     """Run the full meshing pipeline entirely in C++.
 
     This combines top-level cell creation, contributor queries,
@@ -514,9 +513,11 @@ def run_full_pipeline(
         max_depth: Maximum octree refinement depth.
 
     Returns:
-        Tuple of ``(vertices, triangles)`` where vertices is a
-        list of ``((px, py, pz), (nx, ny, nz))`` pairs and
-        triangles is a list of ``(i0, i1, i2)`` index triples.
+        Tuple of ``(vert_positions, vert_normals, triangles)`` where
+        ``vert_positions`` is an (N, 3) float64 array of vertex
+        positions, ``vert_normals`` is an (N, 3) float64 array of
+        vertex normals, and ``triangles`` is an (M, 3) int64 array
+        of triangle index triples.
     """
     return _adaptive.run_full_pipeline(
         positions,
