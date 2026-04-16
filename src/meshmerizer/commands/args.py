@@ -205,7 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     adaptive.add_argument(
-        "--visualize",
+        "--visualise-verts",
         action="store_true",
         help=(
             "Open a 3D scatter plot of QEF vertices after meshing "

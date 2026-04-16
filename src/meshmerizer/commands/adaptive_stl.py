@@ -356,7 +356,7 @@ def run_adaptive(args) -> None:
     )
 
     # Optionally visualize QEF vertices as a 3D scatter plot.
-    if getattr(args, "visualize", False):
+    if getattr(args, "visualise_verts", False):
         _visualize_vertices(vertices)
 
     if n_tris == 0:
