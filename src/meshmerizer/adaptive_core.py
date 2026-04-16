@@ -249,3 +249,48 @@ def create_top_level_cells(
         domain_maximum,
         base_resolution,
     )
+
+
+def create_child_cells(
+    morton_key: int,
+    bounds: tuple[tuple[float, float, float], tuple[float, float, float]],
+    depth: int,
+) -> tuple[dict[str, object], ...]:
+    """Create the eight children of one parent octree cell.
+
+    Args:
+        morton_key: Parent cell Morton key.
+        bounds: Parent cell bounds as `(minimum, maximum)`.
+        depth: Parent cell depth.
+
+    Returns:
+        Tuple of dictionaries describing the child cells.
+    """
+    return _adaptive.create_child_cells(morton_key, bounds, depth)
+
+
+def filter_child_contributors(
+    parent_contributors: list[int],
+    positions: list[tuple[float, float, float]],
+    smoothing_lengths: list[float],
+    parent_bounds: tuple[
+        tuple[float, float, float], tuple[float, float, float]
+    ],
+) -> tuple[tuple[int, ...], ...]:
+    """Filter parent contributors into each child cell.
+
+    Args:
+        parent_contributors: Particle indices attached to the parent cell.
+        positions: Particle positions in world space.
+        smoothing_lengths: Per-particle support radii.
+        parent_bounds: Parent cell bounds as `(minimum, maximum)`.
+
+    Returns:
+        Tuple containing one contributor-index tuple per child cell.
+    """
+    return _adaptive.filter_child_contributors(
+        parent_contributors,
+        positions,
+        smoothing_lengths,
+        parent_bounds,
+    )

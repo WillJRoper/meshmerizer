@@ -93,6 +93,28 @@ static bool parse_double_sequence(PyObject *sequence, std::vector<double> &outpu
 }
 
 /**
+ * @brief Build one Python dictionary from an octree cell.
+ *
+ * @param cell Source octree cell.
+ * @return New Python dictionary describing the cell.
+ */
+static PyObject *build_octree_cell_dict(const OctreeCell &cell) {
+    return Py_BuildValue(
+        "{sK,sI,s((ddd)(ddd))}",
+        "morton_key",
+        static_cast<unsigned long long>(cell.morton_key),
+        "depth",
+        static_cast<unsigned int>(cell.depth),
+        "bounds",
+        cell.bounds.min.x,
+        cell.bounds.min.y,
+        cell.bounds.min.z,
+        cell.bounds.max.x,
+        cell.bounds.max.y,
+        cell.bounds.max.z);
+}
+
+/**
  * @brief Return the name of the adaptive core status.
  *
  * The first rewrite stage exposes a very small function so tests can verify
@@ -471,25 +493,165 @@ static PyObject *create_top_level_cells_py(PyObject *self, PyObject *args) {
         return NULL;
     }
     for (std::size_t index = 0; index < cells.size(); ++index) {
-        const OctreeCell &cell = cells[index];
-        PyObject *cell_dict = Py_BuildValue(
-            "{sK,sI,s((ddd)(ddd))}",
-            "morton_key",
-            static_cast<unsigned long long>(cell.morton_key),
-            "depth",
-            static_cast<unsigned int>(cell.depth),
-            "bounds",
-            cell.bounds.min.x,
-            cell.bounds.min.y,
-            cell.bounds.min.z,
-            cell.bounds.max.x,
-            cell.bounds.max.y,
-            cell.bounds.max.z);
+        PyObject *cell_dict = build_octree_cell_dict(cells[index]);
         if (cell_dict == NULL) {
             Py_DECREF(result);
             return NULL;
         }
         PyTuple_SET_ITEM(result, static_cast<Py_ssize_t>(index), cell_dict);
+    }
+    return result;
+}
+
+/**
+ * @brief Return the eight children created from one parent cell.
+ */
+static PyObject *create_child_cells_py(PyObject *self, PyObject *args) {
+    PyObject *parent_bounds_object = NULL;
+    unsigned long long parent_key = 0ULL;
+    unsigned int parent_depth = 0U;
+    BoundingBox parent_bounds{};
+    (void)self;
+    if (!PyArg_ParseTuple(args, "KOI", &parent_key, &parent_bounds_object,
+                          &parent_depth)) {
+        return NULL;
+    }
+    if (!PyTuple_Check(parent_bounds_object) || PyTuple_Size(parent_bounds_object) != 2) {
+        PyErr_SetString(PyExc_TypeError,
+                        "parent_bounds must be a pair of 3-tuples");
+        return NULL;
+    }
+    if (!parse_vector3d(PyTuple_GetItem(parent_bounds_object, 0), parent_bounds.min) ||
+        !parse_vector3d(PyTuple_GetItem(parent_bounds_object, 1), parent_bounds.max)) {
+        return NULL;
+    }
+
+    const OctreeCell parent = {
+        static_cast<std::uint64_t>(parent_key),
+        static_cast<std::uint32_t>(parent_depth),
+        parent_bounds,
+        false,
+        false,
+        false,
+        -1,
+        -1,
+        -1,
+        -1,
+        {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+        0U,
+    };
+    const std::vector<OctreeCell> children = create_child_cells(parent);
+
+    PyObject *result = PyTuple_New(static_cast<Py_ssize_t>(children.size()));
+    if (result == NULL) {
+        return NULL;
+    }
+    for (std::size_t index = 0; index < children.size(); ++index) {
+        PyObject *child_dict = build_octree_cell_dict(children[index]);
+        if (child_dict == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(result, static_cast<Py_ssize_t>(index), child_dict);
+    }
+    return result;
+}
+
+/**
+ * @brief Return contributor indices for each of a parent's eight children.
+ */
+static PyObject *filter_child_contributors_py(PyObject *self, PyObject *args) {
+    PyObject *parent_contributors_object = NULL;
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    PyObject *parent_bounds_object = NULL;
+    std::vector<double> parsed_parent_contributors;
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    BoundingBox parent_bounds{};
+    (void)self;
+    if (!PyArg_ParseTuple(args, "OOOO", &parent_contributors_object,
+                          &positions_object, &smoothing_object,
+                          &parent_bounds_object)) {
+        return NULL;
+    }
+    if (!parse_double_sequence(parent_contributors_object, parsed_parent_contributors) ||
+        !parse_vector3d_sequence(positions_object, positions) ||
+        !parse_double_sequence(smoothing_object, smoothing_lengths)) {
+        return NULL;
+    }
+    if (!PyTuple_Check(parent_bounds_object) || PyTuple_Size(parent_bounds_object) != 2) {
+        PyErr_SetString(PyExc_TypeError,
+                        "parent_bounds must be a pair of 3-tuples");
+        return NULL;
+    }
+    if (!parse_vector3d(PyTuple_GetItem(parent_bounds_object, 0), parent_bounds.min) ||
+        !parse_vector3d(PyTuple_GetItem(parent_bounds_object, 1), parent_bounds.max)) {
+        return NULL;
+    }
+    if (positions.size() != smoothing_lengths.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing lengths must match in size");
+        return NULL;
+    }
+
+    std::vector<std::size_t> parent_contributors;
+    parent_contributors.reserve(parsed_parent_contributors.size());
+    for (double contributor_value : parsed_parent_contributors) {
+        if (contributor_value < 0.0) {
+            PyErr_SetString(PyExc_ValueError,
+                            "parent contributor indices must be non-negative");
+            return NULL;
+        }
+        const std::size_t particle_index =
+            static_cast<std::size_t>(contributor_value);
+        if (particle_index >= positions.size()) {
+            PyErr_SetString(PyExc_ValueError,
+                            "parent contributor index is out of range");
+            return NULL;
+        }
+        parent_contributors.push_back(particle_index);
+    }
+
+    const OctreeCell parent = {
+        0ULL,
+        0U,
+        parent_bounds,
+        false,
+        false,
+        false,
+        -1,
+        -1,
+        -1,
+        -1,
+        {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+        0U,
+    };
+    const std::vector<OctreeCell> children = create_child_cells(parent);
+    const std::vector<std::vector<std::size_t>> child_contributors =
+        filter_child_contributors(
+            parent_contributors,
+            positions,
+            smoothing_lengths,
+            children);
+
+    PyObject *result = PyTuple_New(static_cast<Py_ssize_t>(child_contributors.size()));
+    if (result == NULL) {
+        return NULL;
+    }
+    for (std::size_t child_index = 0; child_index < child_contributors.size();
+         ++child_index) {
+        const std::vector<std::size_t> &contributors = child_contributors[child_index];
+        PyObject *child_tuple = PyTuple_New(static_cast<Py_ssize_t>(contributors.size()));
+        if (child_tuple == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        for (std::size_t index = 0; index < contributors.size(); ++index) {
+            PyTuple_SET_ITEM(child_tuple, static_cast<Py_ssize_t>(index),
+                             PyLong_FromSize_t(contributors[index]));
+        }
+        PyTuple_SET_ITEM(result, static_cast<Py_ssize_t>(child_index), child_tuple);
     }
     return result;
 }
@@ -575,6 +737,18 @@ static PyMethodDef adaptive_methods[] = {
         create_top_level_cells_py,
         METH_VARARGS,
         PyDoc_STR("Create the documented top-level octree cells."),
+    },
+    {
+        "create_child_cells",
+        create_child_cells_py,
+        METH_VARARGS,
+        PyDoc_STR("Create the eight children of one parent cell."),
+    },
+    {
+        "filter_child_contributors",
+        filter_child_contributors_py,
+        METH_VARARGS,
+        PyDoc_STR("Filter parent contributors into each child cell."),
     },
     {NULL, NULL, 0, NULL},
 };

@@ -6,7 +6,9 @@ from meshmerizer.adaptive_core import (
     bounding_box_overlaps,
     cell_may_contain_isosurface,
     corner_sign_mask,
+    create_child_cells,
     create_top_level_cells,
+    filter_child_contributors,
     morton_decode_3d,
     morton_encode_3d,
     particle_fields,
@@ -153,3 +155,35 @@ def test_create_top_level_cells_rejects_zero_resolution() -> None:
 
     with pytest.raises(ValueError, match="base_resolution"):
         create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 0)
+
+
+def test_create_child_cells_splits_bounds_and_depth_consistently() -> None:
+    """Child creation should halve the bounds and increment the depth."""
+    children = create_child_cells(
+        morton_key=morton_encode_3d(1, 2, 3),
+        bounds=((0.0, 0.0, 0.0), (2.0, 2.0, 2.0)),
+        depth=4,
+    )
+
+    assert len(children) == 8
+    assert children[0]["depth"] == 5
+    assert children[0]["morton_key"] == morton_encode_3d(2, 4, 6)
+    assert children[-1]["morton_key"] == morton_encode_3d(3, 5, 7)
+    assert children[0]["bounds"] == ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    assert children[-1]["bounds"] == ((1.0, 1.0, 1.0), (2.0, 2.0, 2.0))
+
+
+def test_filter_child_contributors_preserves_overlap_across_children() -> None:
+    """Wide-support parent contributors should attach to multiple children."""
+    child_contributors = filter_child_contributors(
+        parent_contributors=[0, 1],
+        positions=[(0.25, 0.25, 0.25), (0.5, 0.5, 0.5)],
+        smoothing_lengths=[0.05, 0.45],
+        parent_bounds=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+    )
+
+    assert child_contributors[0] == (0, 1)
+    assert child_contributors[7] == (1,)
+    assert (
+        sum(1 for contributors in child_contributors if 1 in contributors) > 1
+    )
