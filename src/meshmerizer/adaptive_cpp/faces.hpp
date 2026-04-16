@@ -58,14 +58,13 @@
  * The quantization grid matches the finest octree level so that each
  * fine-grid position maps to at most one leaf cell.
  *
- * For coarse cells that span multiple fine-grid positions, every
- * fine-grid position within the cell is registered at construction
- * time.  A leaf at depth ``d`` in an octree with ``max_depth`` levels
- * spans ``(2^(max_depth - d))^3`` fine-grid entries.  For the deepest
- * leaves (depth == max_depth) this is 1 entry; for shallower leaves
- * the count grows cubically — e.g., a depth-0 leaf with max_depth=6
- * registers ``64^3 = 262 144`` entries.  The total memory is
- * proportional to ``fine_res^3`` regardless of tree structure.
+ * Memory efficiency: each leaf cell registers exactly **one** entry in
+ * the hash map, keyed by its min-corner fine-grid coordinate.  Lookups
+ * use a hierarchical probe: starting at the queried fine-grid position,
+ * progressively round down to coarser alignments (stride 1, 2, 4, ...)
+ * until the containing leaf is found.  This costs at most
+ * ``max_depth + 1`` hash probes per lookup but reduces memory from
+ * O(fine_res^3) to O(num_leaves).
  */
 struct LeafSpatialIndex {
     /**
@@ -96,7 +95,7 @@ struct LeafSpatialIndex {
         }
     };
 
-    /** @brief Map from quantized grid position to leaf cell index. */
+    /** @brief Map from leaf min-corner grid position to cell index. */
     std::unordered_map<GridKey, std::size_t, GridKeyHash> lookup;
 
     /** @brief Inverse of the finest cell edge length. */
@@ -107,13 +106,14 @@ struct LeafSpatialIndex {
     /** @brief Domain minimum corner used for quantization. */
     Vector3d domain_min;
 
+    /** @brief Maximum octree depth, cached for hierarchical probe. */
+    std::uint32_t cached_max_depth;
+
     /**
      * @brief Build the spatial index from a set of octree cells.
      *
-     * Only leaf cells are indexed.  For each leaf, every fine-grid
-     * position that falls within the cell is registered.  The fine
-     * grid resolution is determined by the maximum depth present in
-     * the octree.
+     * Only leaf cells are indexed.  Each leaf registers exactly one
+     * entry keyed by its min-corner fine-grid coordinate.
      *
      * @param all_cells All octree cells (leaves and internal nodes).
      * @param domain The full simulation domain bounding box.
@@ -141,8 +141,8 @@ struct LeafSpatialIndex {
             throw std::overflow_error(
                 "fine_res exceeds 21-bit grid coordinate capacity");
         }
-        const std::uint32_t fine_res_int =
-            static_cast<std::uint32_t>(fine_res_wide);
+
+        cached_max_depth = max_depth;
 
         // The finest grid has base_resolution * 2^max_depth cells per axis.
         const double fine_cells_per_axis_x =
@@ -169,6 +169,16 @@ struct LeafSpatialIndex {
 
         lookup.clear();
 
+        // Count leaves first so we can reserve the hash map capacity
+        // and avoid rehashing during insertion.
+        std::size_t n_leaves = 0;
+        for (const auto &cell : all_cells) {
+            if (cell.is_leaf) {
+                ++n_leaves;
+            }
+        }
+        lookup.reserve(n_leaves);
+
         for (std::size_t cell_idx = 0; cell_idx < all_cells.size();
              ++cell_idx) {
             const OctreeCell &cell = all_cells[cell_idx];
@@ -177,6 +187,7 @@ struct LeafSpatialIndex {
             }
 
             // Quantize the cell's min corner to fine-grid coordinates.
+            // This gives the unique key for this leaf.
             const std::uint32_t ix_min = static_cast<std::uint32_t>(
                 (cell.bounds.min.x - domain_min.x) * inv_cell_size_x +
                 0.5);
@@ -187,27 +198,9 @@ struct LeafSpatialIndex {
                 (cell.bounds.min.z - domain_min.z) * inv_cell_size_z +
                 0.5);
 
-            // Determine how many fine-grid cells this leaf spans per axis.
-            // A leaf at depth d spans 2^(max_depth - d) fine cells.
-            // Guard: depth must not exceed max_depth (invariant from
-            // refinement), but check defensively.
-            if (cell.depth > max_depth) {
-                throw std::logic_error(
-                    "Leaf cell depth exceeds max_depth");
-            }
-            const std::uint32_t span =
-                1U << (max_depth - cell.depth);
-
-            // Register every fine-grid position within this leaf.
-            for (std::uint32_t dx = 0; dx < span; ++dx) {
-                for (std::uint32_t dy = 0; dy < span; ++dy) {
-                    for (std::uint32_t dz = 0; dz < span; ++dz) {
-                        const GridKey key = {pack_grid_coords(
-                            ix_min + dx, iy_min + dy, iz_min + dz)};
-                        lookup[key] = cell_idx;
-                    }
-                }
-            }
+            const GridKey key = {pack_grid_coords(
+                ix_min, iy_min, iz_min)};
+            lookup[key] = cell_idx;
         }
     }
 
@@ -238,6 +231,14 @@ struct LeafSpatialIndex {
     /**
      * @brief Look up the leaf cell index at a given fine-grid position.
      *
+     * Uses a hierarchical probe: starting at stride 1 (finest level),
+     * rounds the query coordinates down to progressively coarser
+     * alignments until a matching leaf is found.  A cell at depth d
+     * has its min corner aligned to stride ``2^(max_depth - d)``, so
+     * rounding down to that stride recovers the cell's key.
+     *
+     * Worst case: ``max_depth + 1`` hash probes.
+     *
      * @param ix X fine-grid coordinate.
      * @param iy Y fine-grid coordinate.
      * @param iz Z fine-grid coordinate.
@@ -245,10 +246,20 @@ struct LeafSpatialIndex {
      */
     std::size_t find_leaf_at(std::uint32_t ix, std::uint32_t iy,
                              std::uint32_t iz) const {
-        const GridKey key = {pack_grid_coords(ix, iy, iz)};
-        auto it = lookup.find(key);
-        if (it != lookup.end()) {
-            return it->second;
+        // Probe from finest to coarsest.  At each level, round the
+        // query coordinates down to the alignment of that level.
+        // Level 0 corresponds to max_depth (stride 1, finest cells).
+        // Level k corresponds to depth (max_depth - k) with stride 2^k.
+        for (std::uint32_t k = 0; k <= cached_max_depth; ++k) {
+            const std::uint32_t mask = ~((1U << k) - 1U);
+            const std::uint32_t ax = ix & mask;
+            const std::uint32_t ay = iy & mask;
+            const std::uint32_t az = iz & mask;
+            const GridKey key = {pack_grid_coords(ax, ay, az)};
+            auto it = lookup.find(key);
+            if (it != lookup.end()) {
+                return it->second;
+            }
         }
         return SIZE_MAX;
     }
@@ -257,7 +268,9 @@ struct LeafSpatialIndex {
      * @brief Quantize a cell's min corner to fine-grid coordinates.
      *
      * @param cell_min Minimum corner of the cell in world space.
-     * @return Tuple of (ix, iy, iz) fine-grid coordinates.
+     * @param ix Output X fine-grid coordinate.
+     * @param iy Output Y fine-grid coordinate.
+     * @param iz Output Z fine-grid coordinate.
      */
     void quantize_min_corner(const Vector3d &cell_min,
                              std::uint32_t &ix,
