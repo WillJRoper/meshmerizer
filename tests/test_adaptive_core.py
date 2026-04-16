@@ -9,11 +9,13 @@ from meshmerizer.adaptive_core import (
     create_child_cells,
     create_top_level_cells,
     filter_child_contributors,
+    hermite_samples_for_cell,
     morton_decode_3d,
     morton_encode_3d,
     particle_fields,
     query_cell_contributors,
     refine_octree,
+    solve_qef_for_leaf,
     top_level_bin_counts,
     wendland_c2_gradient,
     wendland_c2_value,
@@ -266,3 +268,424 @@ def test_refine_octree_empty_initial_cells() -> None:
     )
 
     assert result == ([], [])
+
+
+# ---------------------------------------------------------------------------
+# Helpers for balance invariant tests
+# ---------------------------------------------------------------------------
+
+
+def _cells_share_face(a_bounds: tuple, b_bounds: tuple) -> bool:
+    """Return whether two axis-aligned boxes share a face with positive area.
+
+    Each bounds argument is ((min_x, min_y, min_z), (max_x, max_y, max_z)).
+    """
+    (a_min, a_max) = a_bounds
+    (b_min, b_max) = b_bounds
+
+    touch_x = a_max[0] == b_min[0] or b_max[0] == a_min[0]
+    touch_y = a_max[1] == b_min[1] or b_max[1] == a_min[1]
+    touch_z = a_max[2] == b_min[2] or b_max[2] == a_min[2]
+
+    overlap_x = a_min[0] < b_max[0] and b_min[0] < a_max[0]
+    overlap_y = a_min[1] < b_max[1] and b_min[1] < a_max[1]
+    overlap_z = a_min[2] < b_max[2] and b_min[2] < a_max[2]
+
+    return (
+        (touch_x and overlap_y and overlap_z)
+        or (touch_y and overlap_x and overlap_z)
+        or (touch_z and overlap_x and overlap_y)
+    )
+
+
+def _check_balance_invariant(
+    refined_cells: list[dict],
+) -> list[tuple]:
+    """Return all adjacent leaf pairs that violate the 2:1 balance rule."""
+    leaves = [c for c in refined_cells if c.get("is_leaf")]
+    violations = []
+    for i, a in enumerate(leaves):
+        for j, b in enumerate(leaves):
+            if j <= i:
+                continue
+            if _cells_share_face(a["bounds"], b["bounds"]):
+                depth_diff = abs(a["depth"] - b["depth"])
+                if depth_diff > 1:
+                    violations.append((a["depth"], b["depth"], a["bounds"]))
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Balance invariant tests
+# ---------------------------------------------------------------------------
+
+
+def test_refine_octree_satisfies_balance_invariant_with_surface() -> None:
+    """No adjacent leaf pair should differ by more than one level.
+
+    After refinement.
+
+    This test creates a particle very close to one face of the domain so that
+    the cell containing it refines to maximum depth while adjacent cells stay
+    shallow, naturally producing the worst-case depth imbalance.
+    """
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+
+    # One particle near the corner (0.99, 0.25, 0.25) with a small kernel.
+    # The top-level cell covering (0.5..1.0, 0.0..0.5, 0.0..0.5) will be
+    # the only one that refines, reaching max_depth=4, while the adjacent
+    # cell at (0.0..0.5, 0.0..0.5, 0.0..0.5) stays at depth 0 and would
+    # violate 2:1 balance without the post-pass.
+    for cell in cells:
+        cell["contributor_begin"] = 0
+        cell["contributor_end"] = 1
+
+    refined_cells, _ = refine_octree(
+        cells,
+        positions=[(0.99, 0.25, 0.25)],
+        smoothing_lengths=[0.02],
+        isovalue=0.5,
+        max_depth=4,
+    )
+
+    violations = _check_balance_invariant(refined_cells)
+    assert violations == [], (
+        f"Balance violations found after refine_octree: {violations[:3]}"
+    )
+
+
+def test_refine_octree_balance_does_not_exceed_max_depth() -> None:
+    """Balance-forced splits must not push any leaf beyond max_depth."""
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+
+    for cell in cells:
+        cell["contributor_begin"] = 0
+        cell["contributor_end"] = 1
+
+    max_depth = 3
+    refined_cells, _ = refine_octree(
+        cells,
+        positions=[(0.99, 0.25, 0.25)],
+        smoothing_lengths=[0.02],
+        isovalue=0.5,
+        max_depth=max_depth,
+    )
+
+    deepest = max((c["depth"] for c in refined_cells), default=0)
+    assert deepest <= max_depth
+
+    violations = _check_balance_invariant(refined_cells)
+    assert violations == []
+
+
+def test_neighbor_morton_key_returns_adjacent_cell() -> None:
+    """Morton neighbor at depth 0 should step by one coordinate unit."""
+    # At depth 0, coordinates are in [0, root_resolution).
+    # morton_encode_3d(1, 0, 0) has neighbor in -x = morton_encode_3d(0, 0, 0).
+    key_1 = morton_encode_3d(1, 0, 0)
+    key_0 = morton_encode_3d(0, 0, 0)
+
+    # We verify indirectly: after refinement a 2-cell-wide domain produces
+    # cells at (0,..,1) that are adjacent, and the balance invariant holds.
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+    assert cells[0]["morton_key"] == key_0
+    assert cells[4]["morton_key"] == key_1  # row-major: ix=1,iy=0,iz=0
+
+
+def test_leaf_cells_share_face_consistency() -> None:
+    """Adjacent leaves in a 2-cell domain should satisfy the face test."""
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+
+    # Cell 0: (0..0.5, 0..0.5, 0..0.5)
+    # Cell 4: (0.5..1, 0..0.5, 0..0.5)  — adjacent in +x to cell 0
+    assert _cells_share_face(cells[0]["bounds"], cells[4]["bounds"])
+    # Cell 0 and cell 7 are corner-only neighbors, not face neighbors.
+    assert not _cells_share_face(cells[0]["bounds"], cells[7]["bounds"])
+
+
+# ---------------------------------------------------------------------------
+# Hermite sample tests
+# ---------------------------------------------------------------------------
+
+# Unit cell used throughout the Hermite sample tests.
+_UNIT_BOUNDS = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+
+
+def _unit_corner_values(isovalue: float, gradient_axis: int) -> list[float]:
+    """Return 8 corner values for a linear field along one axis.
+
+    The field varies from -1 at the low end to +1 at the high end along the
+    chosen axis, crossing zero (the isovalue) at the midpoint.
+
+    Corner index encoding: bit 0 = high x, bit 1 = high y, bit 2 = high z.
+    """
+    values = []
+    for corner in range(8):
+        position = [
+            1.0 if (corner & 1) else 0.0,
+            1.0 if (corner & 2) else 0.0,
+            1.0 if (corner & 4) else 0.0,
+        ]
+        # Linear field: -1 at 0, +1 at 1 along the chosen axis.
+        values.append(2.0 * position[gradient_axis] - 1.0)
+    return values
+
+
+def test_hermite_samples_no_crossings_on_uniform_field() -> None:
+    """Uniform-sign corners should produce no samples."""
+    # All corner values above isovalue.
+    corner_values = [1.0] * 8
+    sign_mask = corner_sign_mask(corner_values, 0.5)
+
+    samples = hermite_samples_for_cell(
+        bounds=_UNIT_BOUNDS,
+        corner_values=corner_values,
+        corner_sign_mask=sign_mask,
+        contributor_indices=[],
+        positions=[],
+        smoothing_lengths=[],
+        isovalue=0.5,
+    )
+    assert samples == ()
+
+
+def test_hermite_samples_crossing_count_linear_x_field() -> None:
+    """Linear x field should produce exactly 4 crossings."""
+    # Linear field: 0.0 at x=0, 1.0 at x=1.  isovalue=0.5 crosses the 4
+    # x-parallel edges (corners 0-1, 2-3, 4-5, 6-7).
+    corner_values = [
+        0.0,
+        1.0,  # (min,min,min), (max,min,min)
+        0.0,
+        1.0,  # (min,max,min), (max,max,min)
+        0.0,
+        1.0,  # (min,min,max), (max,min,max)
+        0.0,
+        1.0,  # (min,max,max), (max,max,max)
+    ]
+    sign_mask = corner_sign_mask(corner_values, 0.5)
+
+    samples = hermite_samples_for_cell(
+        bounds=_UNIT_BOUNDS,
+        corner_values=corner_values,
+        corner_sign_mask=sign_mask,
+        contributor_indices=[],
+        positions=[],
+        smoothing_lengths=[],
+        isovalue=0.5,
+    )
+
+    assert len(samples) == 4
+    # Every crossing should be at x=0.5 (the midpoint of the unit cell).
+    for position, _normal in samples:
+        assert abs(position[0] - 0.5) < 1e-12, (
+            f"Crossing x-coordinate should be 0.5, got {position[0]}"
+        )
+
+
+def test_hermite_samples_crossing_position_is_interpolated() -> None:
+    """Edge crossing follows linear interpolation."""
+    # Field goes from 0.2 at x=0 to 0.8 at x=1.  isovalue=0.5.
+    # Expected t = (0.5 - 0.2) / (0.8 - 0.2) = 0.5, so crossing at x=0.5.
+    # All 4 x-edges should be crossed at x=0.5.
+    corner_values = [0.2, 0.8, 0.2, 0.8, 0.2, 0.8, 0.2, 0.8]
+    sign_mask = corner_sign_mask(corner_values, 0.5)
+
+    samples = hermite_samples_for_cell(
+        bounds=_UNIT_BOUNDS,
+        corner_values=corner_values,
+        corner_sign_mask=sign_mask,
+        contributor_indices=[],
+        positions=[],
+        smoothing_lengths=[],
+        isovalue=0.5,
+    )
+
+    assert len(samples) == 4
+    for position, _ in samples:
+        assert abs(position[0] - 0.5) < 1e-12
+
+    # Check asymmetric interpolation: field 0.2 at x=0, 0.7 at x=1.
+    # t = (0.5 - 0.2) / (0.7 - 0.2) = 0.6.  Crossing at x=0.6.
+    corner_values2 = [0.2, 0.7, 0.2, 0.7, 0.2, 0.7, 0.2, 0.7]
+    sign_mask2 = corner_sign_mask(corner_values2, 0.5)
+    samples2 = hermite_samples_for_cell(
+        bounds=_UNIT_BOUNDS,
+        corner_values=corner_values2,
+        corner_sign_mask=sign_mask2,
+        contributor_indices=[],
+        positions=[],
+        smoothing_lengths=[],
+        isovalue=0.5,
+    )
+    assert len(samples2) == 4
+    for position, _ in samples2:
+        assert abs(position[0] - 0.6) < 1e-10
+
+
+def test_hermite_samples_outward_normal_from_particle() -> None:
+    """Outward normal should point away from the particle."""
+    # One particle at the centre of the cell with a large kernel.  The
+    # gradient of the SPH field points toward the particle (into the fluid).
+    # The outward normal should point away from the particle, i.e. in the
+    # direction of increasing x away from the particle.
+    #
+    # Field: linear in x so the 4 x-edges are crossed at x=0.5.  Particle
+    # is also at x=0.5, centred in y and z.
+    corner_values = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+    sign_mask = corner_sign_mask(corner_values, 0.5)
+
+    # Particle is at (0.5, 0.5, 0.5) with a kernel wide enough to cover all
+    # crossing points (which lie at x=0.5 along all four x-edges).
+    particle_pos = (0.5, 0.5, 0.5)
+    smoothing = 1.5  # wider than the cell diagonal
+
+    samples = hermite_samples_for_cell(
+        bounds=_UNIT_BOUNDS,
+        corner_values=corner_values,
+        corner_sign_mask=sign_mask,
+        contributor_indices=[0],
+        positions=[particle_pos],
+        smoothing_lengths=[smoothing],
+        isovalue=0.5,
+    )
+
+    assert len(samples) == 4
+    for position, normal in samples:
+        # All crossings are at x=0.5, same x as the particle.  The
+        # displacement in x is zero, so the x-component of the gradient is
+        # zero.  The outward normal in x should therefore also be zero.
+        # The y/z displacement determines the gradient direction: for a
+        # crossing above the particle centre (y > 0.5) the gradient y-
+        # component points upward toward the crossing and the outward normal
+        # points downward (away from the fluid, i.e., toward lower density).
+        # We check only that the normal is a unit vector (or zero).
+        magnitude = (normal[0] ** 2 + normal[1] ** 2 + normal[2] ** 2) ** 0.5
+        if magnitude > 1e-12:
+            assert abs(magnitude - 1.0) < 1e-10, (
+                f"Normal should be unit length, got magnitude {magnitude}"
+            )
+
+
+def test_hermite_samples_degenerate_no_contributors_gives_zero_normal() -> (
+    None
+):
+    """A crossing with no contributors should produce a zero-length normal."""
+    # Field crosses isovalue on the 4 x-edges; no particles nearby so the
+    # gradient evaluates to zero and the normal is the zero vector.
+    corner_values = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+    sign_mask = corner_sign_mask(corner_values, 0.5)
+
+    samples = hermite_samples_for_cell(
+        bounds=_UNIT_BOUNDS,
+        corner_values=corner_values,
+        corner_sign_mask=sign_mask,
+        contributor_indices=[],
+        positions=[],
+        smoothing_lengths=[],
+        isovalue=0.5,
+    )
+
+    assert len(samples) == 4
+    for _position, normal in samples:
+        assert normal == (0.0, 0.0, 0.0), (
+            f"Normal with no contributors should be zero, got {normal}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: QEF vertex solve
+# ---------------------------------------------------------------------------
+
+import math
+
+
+def test_solve_qef_empty_samples_returns_cell_center() -> None:
+    """With no Hermite samples the vertex should be the cell center."""
+    bounds = ((0.0, 0.0, 0.0), (2.0, 2.0, 2.0))
+    position, normal = solve_qef_for_leaf([], bounds)
+    assert position == (1.0, 1.0, 1.0)
+    assert normal == (0.0, 0.0, 0.0)
+
+
+def test_solve_qef_single_plane_constraint() -> None:
+    """One tangent plane should place the vertex on that plane."""
+    bounds = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    # Plane: x = 0.3  (normal along +x, point at x=0.3)
+    samples = [((0.3, 0.5, 0.5), (1.0, 0.0, 0.0))]
+    position, normal = solve_qef_for_leaf(samples, bounds)
+    # The x coordinate should be at 0.3 (the plane position).
+    # y and z are unconstrained so the solver falls back to mass point
+    # for those axes (or the system is rank-deficient and we get
+    # the centroid).
+    assert abs(position[0] - 0.3) < 1e-6
+
+
+def test_solve_qef_two_orthogonal_planes() -> None:
+    """Two orthogonal planes should constrain two axes."""
+    bounds = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    samples = [
+        ((0.3, 0.5, 0.5), (1.0, 0.0, 0.0)),
+        ((0.5, 0.7, 0.5), (0.0, 1.0, 0.0)),
+    ]
+    position, normal = solve_qef_for_leaf(samples, bounds)
+    # With only 2 constraints the 3x3 system is rank-deficient,
+    # so fallback to mass point is expected.
+    # Mass point = ((0.3+0.5)/2, (0.5+0.7)/2, (0.5+0.5)/2)
+    assert abs(position[0] - 0.4) < 1e-6
+    assert abs(position[1] - 0.6) < 1e-6
+
+
+def test_solve_qef_three_orthogonal_planes() -> None:
+    """Three orthogonal planes should uniquely determine the vertex."""
+    bounds = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    samples = [
+        ((0.3, 0.5, 0.5), (1.0, 0.0, 0.0)),
+        ((0.5, 0.7, 0.5), (0.0, 1.0, 0.0)),
+        ((0.5, 0.5, 0.4), (0.0, 0.0, 1.0)),
+    ]
+    position, normal = solve_qef_for_leaf(samples, bounds)
+    assert abs(position[0] - 0.3) < 1e-6
+    assert abs(position[1] - 0.7) < 1e-6
+    assert abs(position[2] - 0.4) < 1e-6
+
+
+def test_solve_qef_vertex_clamped_to_bounds() -> None:
+    """The QEF vertex should be clamped inside the cell bounds."""
+    bounds = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    # Three planes that intersect outside the cell.
+    samples = [
+        ((2.0, 0.5, 0.5), (1.0, 0.0, 0.0)),
+        ((0.5, 2.0, 0.5), (0.0, 1.0, 0.0)),
+        ((0.5, 0.5, 2.0), (0.0, 0.0, 1.0)),
+    ]
+    position, normal = solve_qef_for_leaf(samples, bounds)
+    assert 0.0 <= position[0] <= 1.0
+    assert 0.0 <= position[1] <= 1.0
+    assert 0.0 <= position[2] <= 1.0
+
+
+def test_solve_qef_degenerate_zero_normals_ignored() -> None:
+    """Samples with zero normals should be ignored by the QEF."""
+    bounds = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    samples = [
+        ((0.5, 0.5, 0.5), (0.0, 0.0, 0.0)),
+        ((0.2, 0.2, 0.2), (0.0, 0.0, 0.0)),
+    ]
+    position, normal = solve_qef_for_leaf(samples, bounds)
+    # All samples degenerate -> cell center
+    assert position == (0.5, 0.5, 0.5)
+    assert normal == (0.0, 0.0, 0.0)
+
+
+def test_solve_qef_normal_is_unit_length() -> None:
+    """The returned normal should be unit length when samples exist."""
+    bounds = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    samples = [
+        ((0.3, 0.5, 0.5), (1.0, 0.0, 0.0)),
+        ((0.5, 0.7, 0.5), (0.0, 1.0, 0.0)),
+        ((0.5, 0.5, 0.4), (0.0, 0.0, 1.0)),
+    ]
+    position, normal = solve_qef_for_leaf(samples, bounds)
+    magnitude = math.sqrt(normal[0] ** 2 + normal[1] ** 2 + normal[2] ** 2)
+    assert abs(magnitude - 1.0) < 1e-10

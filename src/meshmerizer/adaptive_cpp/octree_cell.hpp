@@ -294,19 +294,304 @@ inline std::array<double, 8> sample_cell_corners(
 }
 
 /**
- * @brief Breadth-first octree refinement based on corner sign changes.
+ * @brief Compute Morton key of a face-neighbor cell in a given direction.
+ *
+ * Given a cell Morton key and depth, return the neighbor key in the
+ * positive or negative direction along one axis. Returns 0 if the
+ * neighbor would be outside the domain covered by the root cells.
+ *
+ * Neighbor directions:
+ * - 0: +X, 1: -X, 2: +Y, 3: -Y, 4: +Z, 5: -Z
+ *
+ * At depth d the coordinate grid spans ``[0, root_resolution * 2^d)`` on
+ * each axis. A face neighbor differs by exactly one unit in the relevant
+ * axis, so the only bound check needed is whether that one-unit step stays
+ * inside the grid.
+ *
+ * @param key Current cell Morton key.
+ * @param depth Cell depth.
+ * @param direction Neighbor direction (0-5).
+ * @param root_resolution Base resolution of the top-level grid.
+ * @return Neighbor Morton key, or 0 if out of bounds.
+ */
+inline std::uint64_t neighbor_morton_key(std::uint64_t key,
+                                         std::uint32_t depth,
+                                         std::uint8_t direction,
+                                         std::uint32_t root_resolution) {
+    std::uint32_t x = 0U;
+    std::uint32_t y = 0U;
+    std::uint32_t z = 0U;
+    morton_decode_3d(key, x, y, z);
+
+    // Valid coordinates at depth d span [0, root_resolution * 2^d).
+    const std::uint32_t max_coord = root_resolution << depth;
+
+    switch (direction) {
+        case 0:  // +X
+            if (x + 1U >= max_coord) {
+                return 0ULL;
+            }
+            ++x;
+            break;
+        case 1:  // -X
+            if (x == 0U) {
+                return 0ULL;
+            }
+            --x;
+            break;
+        case 2:  // +Y
+            if (y + 1U >= max_coord) {
+                return 0ULL;
+            }
+            ++y;
+            break;
+        case 3:  // -Y
+            if (y == 0U) {
+                return 0ULL;
+            }
+            --y;
+            break;
+        case 4:  // +Z
+            if (z + 1U >= max_coord) {
+                return 0ULL;
+            }
+            ++z;
+            break;
+        case 5:  // -Z
+            if (z == 0U) {
+                return 0ULL;
+            }
+            --z;
+            break;
+        default:
+            return 0ULL;
+    }
+
+    return morton_encode_3d(x, y, z);
+}
+
+/**
+ * @brief Return whether two leaf cells share a face with positive area.
+ *
+ * Two axis-aligned cells share a face when they touch along exactly one axis
+ * (one box's max equals the other's min on that axis) and overlap with
+ * positive length in each of the remaining two axes.
+ *
+ * This test works correctly for cells of different sizes, which is required
+ * when detecting octree balance violations between leaves at different depths.
+ *
+ * @param a First cell.
+ * @param b Second cell.
+ * @return True when the cells share a face.
+ */
+inline bool leaf_cells_share_face(const OctreeCell &a, const OctreeCell &b) {
+    // Floating-point equality is intentional here. All cell boundaries in this
+    // codebase are derived by repeatedly halving the same initial domain
+    // values, so the midpoint of any parent is computed identically for both
+    // the parent's max and the child's min, giving exactly equal IEEE 754
+    // results. If bounds are ever accumulated rather than computed fresh, this
+    // assumption must be revisited.
+    const bool touch_x = (a.bounds.max.x == b.bounds.min.x) ||
+                         (b.bounds.max.x == a.bounds.min.x);
+    const bool touch_y = (a.bounds.max.y == b.bounds.min.y) ||
+                         (b.bounds.max.y == a.bounds.min.y);
+    const bool touch_z = (a.bounds.max.z == b.bounds.min.z) ||
+                         (b.bounds.max.z == a.bounds.min.z);
+    const bool overlap_x = a.bounds.min.x < b.bounds.max.x &&
+                           b.bounds.min.x < a.bounds.max.x;
+    const bool overlap_y = a.bounds.min.y < b.bounds.max.y &&
+                           b.bounds.min.y < a.bounds.max.y;
+    const bool overlap_z = a.bounds.min.z < b.bounds.max.z &&
+                           b.bounds.min.z < a.bounds.max.z;
+    return (touch_x && overlap_y && overlap_z) ||
+           (touch_y && overlap_x && overlap_z) ||
+           (touch_z && overlap_x && overlap_y);
+}
+
+/**
+ * @brief Return whether a leaf cell violates the 2:1 balance rule.
+ *
+ * The rule requires that any two adjacent leaf cells differ by at most one
+ * refinement level. This function returns true when any other leaf in
+ * ``cells_all`` is adjacent to the given cell and is more than one level
+ * deeper. An O(n) scan over all cells is used, which is acceptable for the
+ * iterative post-pass balancing algorithm.
+ *
+ * @param cell_index Index of the leaf to check.
+ * @param cells_all All octree cells.
+ * @return True when this leaf has an adjacent leaf more than one level deeper.
+ */
+inline bool needs_balance_split(std::size_t cell_index,
+                                const std::vector<OctreeCell> &cells_all) {
+    const OctreeCell &cell = cells_all[cell_index];
+    for (std::size_t other_index = 0; other_index < cells_all.size();
+         ++other_index) {
+        if (other_index == cell_index) {
+            continue;
+        }
+        const OctreeCell &other = cells_all[other_index];
+        if (!other.is_leaf) {
+            continue;
+        }
+        const std::int32_t depth_diff =
+            static_cast<std::int32_t>(other.depth) -
+            static_cast<std::int32_t>(cell.depth);
+        if (depth_diff <= 1) {
+            continue;
+        }
+        if (leaf_cells_share_face(cell, other)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Enforce the 2:1 octree balance rule on a refined octree.
+ *
+ * After the main breadth-first refinement, this function iteratively finds
+ * pairs of adjacent leaf cells that violate the 2:1 balance rule (differing
+ * by more than one refinement level) and splits the shallower leaf. The
+ * process repeats until no violations remain.
+ *
+ * Each balance-forced split inherits contributors from the parent cell via
+ * kernel-overlap filtering and samples corner values to support later surface
+ * extraction.
+ *
+ * The algorithm is intentionally simple: an O(n^2) scan per iteration over
+ * all leaf pairs. For the octree sizes expected in typical runs this is
+ * acceptable, and the flat-array layout keeps the constant factor small.
+ *
+ * @param all_cells All octree cells (modified in place).
+ * @param all_contributors Global flat contributor index array (modified in
+ *     place).
+ * @param positions Particle positions in world space.
+ * @param smoothing_lengths Per-particle support radii.
+ * @param isovalue The target surface level used to sample corner signs on
+ *     newly created balance cells.
+ * @param max_depth Maximum depth; balance splits stop at this depth.
+ */
+inline void balance_octree(
+    std::vector<OctreeCell> &all_cells,
+    std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    double isovalue,
+    std::uint32_t max_depth) {
+    bool any_split = true;
+    while (any_split) {
+        any_split = false;
+
+        // Collect indices of leaf cells that violate the 2:1 rule.
+        std::vector<std::size_t> to_split;
+        for (std::size_t i = 0; i < all_cells.size(); ++i) {
+            if (!all_cells[i].is_leaf) {
+                continue;
+            }
+            if (all_cells[i].depth >= max_depth) {
+                continue;
+            }
+            if (needs_balance_split(i, all_cells)) {
+                to_split.push_back(i);
+                any_split = true;
+            }
+        }
+
+        // Split each violating cell. The parent is copied before any
+        // push_back that could reallocate the vector, ensuring that the
+        // parent snapshot stays valid while children are appended.
+        for (std::size_t split_index : to_split) {
+            // Another split earlier in this batch may have already converted
+            // this cell to an internal node; skip it in that case.
+            if (!all_cells[split_index].is_leaf) {
+                continue;
+            }
+            if (all_cells[split_index].depth >= max_depth) {
+                continue;
+            }
+
+            const OctreeCell parent_snapshot = all_cells[split_index];
+
+            // Gather the parent's contributor particle indices.
+            std::vector<std::size_t> parent_contributors;
+            if (parent_snapshot.contributor_begin >= 0 &&
+                parent_snapshot.contributor_end >
+                    parent_snapshot.contributor_begin) {
+                parent_contributors.reserve(static_cast<std::size_t>(
+                    parent_snapshot.contributor_end -
+                    parent_snapshot.contributor_begin));
+                for (std::int64_t k = parent_snapshot.contributor_begin;
+                     k < parent_snapshot.contributor_end; ++k) {
+                    parent_contributors.push_back(
+                        all_contributors[static_cast<std::size_t>(k)]);
+                }
+            }
+
+            const std::vector<OctreeCell> children =
+                create_child_cells(parent_snapshot);
+            const std::vector<std::vector<std::size_t>> child_contributors =
+                filter_child_contributors(parent_contributors, positions,
+                                          smoothing_lengths, children);
+
+            // Mark the parent as internal before appending children.
+            // Accessing by index (not by reference) is safe even if
+            // push_back triggers a vector reallocation below.
+            all_cells[split_index].is_leaf = false;
+            all_cells[split_index].child_begin =
+                static_cast<std::int64_t>(all_cells.size());
+
+            for (std::size_t ci = 0; ci < children.size(); ++ci) {
+                OctreeCell child = children[ci];
+
+                const std::int64_t contrib_begin =
+                    static_cast<std::int64_t>(all_contributors.size());
+                for (std::size_t pidx : child_contributors[ci]) {
+                    all_contributors.push_back(pidx);
+                }
+                const std::int64_t contrib_end =
+                    static_cast<std::int64_t>(all_contributors.size());
+
+                child.contributor_begin = contrib_begin;
+                child.contributor_end = contrib_end;
+                child.is_leaf = true;
+                child.is_active = false;
+                child.has_surface = false;
+
+                // Sample corners so surface extraction can later determine
+                // whether this balance-forced leaf is active.
+                if (!child_contributors[ci].empty()) {
+                    child.corner_values = sample_cell_corners(
+                        child, child_contributors[ci], positions,
+                        smoothing_lengths);
+                    child.corner_sign_mask = compute_corner_sign_mask(
+                        child.corner_values, isovalue);
+                    child.has_surface = cell_may_contain_isosurface(
+                        child.corner_values, isovalue);
+                }
+
+                all_cells.push_back(child);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Breadth-first octree refinement followed by 2:1 balance enforcement.
  *
  * Starting from top-level cells, this function iteratively refines cells that
  * may contain the isosurface by evaluating corner field values. The algorithm
- * proceeds level by level (breadth-first) to maintain a balanced tree where
- * neighboring leaves differ by at most one refinement level.
+ * proceeds breadth-first (one depth level at a time), which simplifies later
+ * parallelization and keeps the working set predictable.
  *
- * The refinement stops when:
- * - A cell does not contain the isosurface (corner values don't straddle
- *   the isovalue), or
+ * The surface-driven refinement stops for a cell when:
+ * - The cell does not straddle the isovalue at any corner, or
  * - The maximum depth is reached, or
- * - A cell has fewer than two contributors (insufficient samples for
- *   meaningful refinement).
+ * - The cell has fewer than two contributors.
+ *
+ * After the BFS completes, a separate balancing post-pass (``balance_octree``)
+ * enforces the 2:1 rule: no two adjacent leaves may differ by more than one
+ * refinement level. Balance-forced splits inherit contributors from their
+ * parent and sample their own corner values.
  *
  * @param initial_cells Top-level cells with attached contributors.
  * @param positions Particle positions in world space.
@@ -337,11 +622,14 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
         const std::int64_t contrib_end = cell.contributor_end;
 
         if (contrib_begin >= 0 && contrib_end > contrib_begin) {
-            cell.contributor_begin = static_cast<std::int64_t>(all_contributors.size());
+            const std::int64_t original_size =
+                static_cast<std::int64_t>(all_contributors.size());
+            cell.contributor_begin = original_size;
             for (std::int64_t i = contrib_begin; i < contrib_end; ++i) {
                 all_contributors.push_back(static_cast<std::size_t>(i));
             }
-            cell.contributor_end = static_cast<std::int64_t>(all_contributors.size());
+            cell.contributor_end =
+                static_cast<std::int64_t>(all_contributors.size());
         } else {
             cell.contributor_begin = -1;
             cell.contributor_end = -1;
@@ -410,8 +698,9 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
             filter_child_contributors(contributors, positions, smoothing_lengths,
                                      children);
 
+        // Record where in all_cells the eight children will live.
         const std::int64_t child_begin_offset =
-            static_cast<std::int64_t>(all_contributors.size());
+            static_cast<std::int64_t>(all_cells.size());
         current_cell.child_begin = child_begin_offset;
 
         for (std::size_t i = 0; i < children.size(); ++i) {
@@ -430,6 +719,12 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
             leaf_queue.push(all_cells.size() - 1);
         }
     }
+
+    // Enforce the 2:1 balance rule as a post-pass. Any leaf that has an
+    // adjacent leaf more than one level deeper is split and its contributors
+    // are inherited from the parent. This repeats until the invariant holds.
+    balance_octree(all_cells, all_contributors, positions, smoothing_lengths,
+                   isovalue, max_depth);
 
     return {all_cells, all_contributors};
 }

@@ -296,6 +296,46 @@ def filter_child_contributors(
     )
 
 
+def hermite_samples_for_cell(
+    bounds: tuple[tuple[float, float, float], tuple[float, float, float]],
+    corner_values: list[float],
+    corner_sign_mask: int,
+    contributor_indices: list[int],
+    positions: list[tuple[float, float, float]],
+    smoothing_lengths: list[float],
+    isovalue: float,
+) -> tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...]:
+    """Compute Hermite samples for one leaf cell.
+
+    For each sign-changing edge of the cell, linearly interpolates the
+    isosurface crossing point and evaluates the outward SPH gradient normal.
+
+    Args:
+        bounds: Cell bounding box as ``(minimum, maximum)``.
+        corner_values: Scalar field samples at the eight cell corners.
+        corner_sign_mask: Precomputed sign mask from ``corner_sign_mask()``.
+        contributor_indices: Particle indices contributing to this cell.
+        positions: Particle positions in world space.
+        smoothing_lengths: Per-particle support radii.
+        isovalue: The target surface level.
+
+    Returns:
+        Tuple of ``((px, py, pz), (nx, ny, nz))`` sample pairs, one per
+        sign-changing edge.  The normal is the outward surface normal
+        (pointing away from the fluid).  A zero-length normal indicates a
+        degenerate sample where the SPH gradient vanished at the crossing.
+    """
+    return _adaptive.hermite_samples_for_cell(
+        bounds,
+        corner_values,
+        corner_sign_mask,
+        contributor_indices,
+        positions,
+        smoothing_lengths,
+        isovalue,
+    )
+
+
 def refine_octree(
     initial_cells: tuple[dict[str, object], ...],
     positions: list[tuple[float, float, float]],
@@ -323,3 +363,33 @@ def refine_octree(
         isovalue,
         max_depth,
     )
+
+
+def solve_qef_for_leaf(
+    samples: list[
+        tuple[
+            tuple[float, float, float],
+            tuple[float, float, float],
+        ]
+    ],
+    bounds: tuple[tuple[float, float, float], tuple[float, float, float]],
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Solve the QEF for one leaf cell and return its mesh vertex.
+
+    The QEF minimizer finds the point inside the cell that best
+    satisfies all tangent-plane constraints from the provided Hermite
+    samples.  If the system is rank-deficient the solver falls back
+    to the sample centroid.  The result is always clamped to the cell
+    bounding box.
+
+    Args:
+        samples: Hermite samples as ``((px, py, pz), (nx, ny, nz))``
+            pairs.  Zero-length normals are treated as degenerate and
+            ignored.
+        bounds: Cell bounding box as ``(minimum, maximum)``.
+
+    Returns:
+        Tuple ``((px, py, pz), (nx, ny, nz))`` giving the vertex
+        position and the normalized mean sample normal.
+    """
+    return _adaptive.solve_qef_for_leaf(samples, bounds)

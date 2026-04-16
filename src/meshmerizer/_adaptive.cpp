@@ -15,11 +15,14 @@
 #include <vector>
 
 #include "adaptive_cpp/bounding_box.hpp"
+#include "adaptive_cpp/hermite.hpp"
 #include "adaptive_cpp/kernel_wendland_c2.hpp"
+#include "adaptive_cpp/mesh.hpp"
 #include "adaptive_cpp/morton.hpp"
 #include "adaptive_cpp/octree_cell.hpp"
 #include "adaptive_cpp/particle.hpp"
 #include "adaptive_cpp/particle_grid.hpp"
+#include "adaptive_cpp/qef.hpp"
 
 /**
  * @brief Parse a Python `(x, y, z)` tuple into a `Vector3d`.
@@ -841,6 +844,182 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
 }
 
 /**
+ * @brief Return Hermite samples for one leaf cell.
+ *
+ * For each sign-changing edge of the cell, the function interpolates an
+ * isosurface crossing point and evaluates the outward SPH gradient normal.
+ *
+ * @param self Unused.
+ * @param args Python tuple: (bounds, corner_values, corner_sign_mask,
+ *     contributor_indices, positions, smoothing_lengths, isovalue).
+ * @return Python tuple of ``((px, py, pz), (nx, ny, nz))`` sample pairs.
+ */
+static PyObject *hermite_samples_for_cell_py(PyObject *self, PyObject *args) {
+    PyObject *bounds_object = NULL;
+    PyObject *corner_values_object = NULL;
+    unsigned int corner_sign_mask_uint = 0U;
+    PyObject *contributors_object = NULL;
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    double isovalue = 0.0;
+    BoundingBox bounds{};
+    std::vector<double> parsed_corner_values;
+    std::array<double, 8> corner_values{};
+    std::vector<double> parsed_contributors;
+    std::vector<std::size_t> contributor_indices;
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    (void)self;
+
+    if (!PyArg_ParseTuple(args, "OOIOOOd",
+                          &bounds_object,
+                          &corner_values_object,
+                          &corner_sign_mask_uint,
+                          &contributors_object,
+                          &positions_object,
+                          &smoothing_object,
+                          &isovalue)) {
+        return NULL;
+    }
+
+    if (!PyTuple_Check(bounds_object) || PyTuple_Size(bounds_object) != 2) {
+        PyErr_SetString(PyExc_TypeError, "bounds must be a pair of 3-tuples");
+        return NULL;
+    }
+    if (!parse_vector3d(PyTuple_GetItem(bounds_object, 0), bounds.min) ||
+        !parse_vector3d(PyTuple_GetItem(bounds_object, 1), bounds.max)) {
+        return NULL;
+    }
+
+    if (!parse_double_sequence(corner_values_object, parsed_corner_values) ||
+        !parse_double_sequence(contributors_object, parsed_contributors) ||
+        !parse_vector3d_sequence(positions_object, positions) ||
+        !parse_double_sequence(smoothing_object, smoothing_lengths)) {
+        return NULL;
+    }
+    if (parsed_corner_values.size() != 8U) {
+        PyErr_SetString(PyExc_ValueError,
+                        "corner_values must contain exactly 8 samples");
+        return NULL;
+    }
+    if (positions.size() != smoothing_lengths.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing_lengths must match in size");
+        return NULL;
+    }
+
+    std::copy(parsed_corner_values.begin(), parsed_corner_values.end(),
+              corner_values.begin());
+
+    contributor_indices.reserve(parsed_contributors.size());
+    for (double value : parsed_contributors) {
+        if (value < 0.0 ||
+            static_cast<std::size_t>(value) >= positions.size()) {
+            PyErr_SetString(PyExc_ValueError,
+                            "contributor index out of range");
+            return NULL;
+        }
+        contributor_indices.push_back(static_cast<std::size_t>(value));
+    }
+
+    const std::uint8_t corner_sign_mask =
+        static_cast<std::uint8_t>(corner_sign_mask_uint);
+
+    const std::vector<HermiteSample> samples = compute_cell_hermite_samples(
+        bounds, corner_values, corner_sign_mask, contributor_indices,
+        positions, smoothing_lengths, isovalue);
+
+    PyObject *result = PyTuple_New(static_cast<Py_ssize_t>(samples.size()));
+    if (result == NULL) {
+        return NULL;
+    }
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        PyObject *sample = Py_BuildValue(
+            "((ddd)(ddd))",
+            samples[i].position.x,
+            samples[i].position.y,
+            samples[i].position.z,
+            samples[i].normal.x,
+            samples[i].normal.y,
+            samples[i].normal.z);
+        if (sample == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(result, static_cast<Py_ssize_t>(i), sample);
+    }
+    return result;
+}
+
+/**
+ * @brief Solve the QEF for one leaf cell and return its representative vertex.
+ *
+ * @param self Unused.
+ * @param args Python tuple: (samples, bounds).  ``samples`` is a sequence of
+ *     ``((px, py, pz), (nx, ny, nz))`` pairs.  ``bounds`` is a
+ *     ``((min_x, min_y, min_z), (max_x, max_y, max_z))`` pair.
+ * @return Python tuple ``((px, py, pz), (nx, ny, nz))`` for the vertex.
+ */
+static PyObject *solve_qef_for_leaf_py(PyObject *self, PyObject *args) {
+    PyObject *samples_object = NULL;
+    PyObject *bounds_object = NULL;
+    BoundingBox bounds{};
+    (void)self;
+
+    if (!PyArg_ParseTuple(args, "OO", &samples_object, &bounds_object)) {
+        return NULL;
+    }
+
+    if (!PyTuple_Check(bounds_object) || PyTuple_Size(bounds_object) != 2) {
+        PyErr_SetString(PyExc_TypeError, "bounds must be a pair of 3-tuples");
+        return NULL;
+    }
+    if (!parse_vector3d(PyTuple_GetItem(bounds_object, 0), bounds.min) ||
+        !parse_vector3d(PyTuple_GetItem(bounds_object, 1), bounds.max)) {
+        return NULL;
+    }
+
+    PyObject *samples_fast = PySequence_Fast(samples_object,
+                                             "expected a sequence of sample pairs");
+    if (samples_fast == NULL) {
+        return NULL;
+    }
+
+    const Py_ssize_t num_samples = PySequence_Fast_GET_SIZE(samples_fast);
+    std::vector<HermiteSample> samples;
+    samples.reserve(static_cast<std::size_t>(num_samples));
+
+    for (Py_ssize_t i = 0; i < num_samples; ++i) {
+        PyObject *pair = PySequence_Fast_GET_ITEM(samples_fast, i);
+        if (!PyTuple_Check(pair) || PyTuple_Size(pair) != 2) {
+            Py_DECREF(samples_fast);
+            PyErr_SetString(PyExc_TypeError,
+                            "each sample must be a pair of 3-tuples");
+            return NULL;
+        }
+        HermiteSample sample{};
+        if (!parse_vector3d(PyTuple_GetItem(pair, 0), sample.position) ||
+            !parse_vector3d(PyTuple_GetItem(pair, 1), sample.normal)) {
+            Py_DECREF(samples_fast);
+            return NULL;
+        }
+        samples.push_back(sample);
+    }
+    Py_DECREF(samples_fast);
+
+    const MeshVertex vertex = solve_qef_for_leaf(samples, bounds);
+
+    return Py_BuildValue(
+        "((ddd)(ddd))",
+        vertex.position.x,
+        vertex.position.y,
+        vertex.position.z,
+        vertex.normal.x,
+        vertex.normal.y,
+        vertex.normal.z);
+}
+
+/**
  * @brief Python methods exported by the adaptive extension.
  */
 static PyMethodDef adaptive_methods[] = {
@@ -939,6 +1118,18 @@ static PyMethodDef adaptive_methods[] = {
         refine_octree_py,
         METH_VARARGS,
         PyDoc_STR("Refine the octree using breadth-first refinement."),
+    },
+    {
+        "hermite_samples_for_cell",
+        hermite_samples_for_cell_py,
+        METH_VARARGS,
+        PyDoc_STR("Compute Hermite samples for one leaf cell."),
+    },
+    {
+        "solve_qef_for_leaf",
+        solve_qef_for_leaf_py,
+        METH_VARARGS,
+        PyDoc_STR("Solve the QEF and return the representative vertex for a leaf cell."),
     },
     {NULL, NULL, 0, NULL},
 };

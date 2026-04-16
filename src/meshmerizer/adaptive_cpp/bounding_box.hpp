@@ -53,6 +53,19 @@ struct BoundingBox {
             0.5 * (min.z + max.z),
         };
     }
+
+    /**
+     * @brief Return the extent (width, height, depth) of the box.
+     *
+     * @return Vector indicating the box dimensions along each axis.
+     */
+    Vector3d extent() const {
+        return {
+            max.x - min.x,
+            max.y - min.y,
+            max.z - min.z,
+        };
+    }
 };
 
 #endif  // MESHMERIZER_ADAPTIVE_CPP_BOUNDING_BOX_HPP_
