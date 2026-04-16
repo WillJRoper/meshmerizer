@@ -13,6 +13,7 @@ from meshmerizer.adaptive_core import (
     morton_encode_3d,
     particle_fields,
     query_cell_contributors,
+    refine_octree,
     top_level_bin_counts,
     wendland_c2_gradient,
     wendland_c2_value,
@@ -187,3 +188,81 @@ def test_filter_child_contributors_preserves_overlap_across_children() -> None:
     assert (
         sum(1 for contributors in child_contributors if 1 in contributors) > 1
     )
+
+
+def test_refine_octree_returns_both_cells_and_contributors() -> None:
+    """Refinement should return a tuple of cells and contributor indices."""
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+
+    for cell in cells:
+        cell["contributor_begin"] = 0
+        cell["contributor_end"] = 0
+
+    result = refine_octree(
+        cells,
+        positions=[],
+        smoothing_lengths=[],
+        isovalue=0.5,
+        max_depth=3,
+    )
+
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    refined_cells, contributors = result
+    assert isinstance(refined_cells, (list, tuple))
+    assert isinstance(contributors, (list, tuple))
+
+
+def test_refine_octree_empty_particles_no_surface() -> None:
+    """Empty particle list should produce no surface cells."""
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+
+    for cell in cells:
+        cell["contributor_begin"] = 0
+        cell["contributor_end"] = 0
+
+    refined_cells, contributors = refine_octree(
+        cells,
+        positions=[],
+        smoothing_lengths=[],
+        isovalue=0.5,
+        max_depth=3,
+    )
+
+    active_cells = [c for c in refined_cells if c.get("has_surface")]
+    assert len(active_cells) == 0
+
+
+def test_refine_octree_respects_max_depth() -> None:
+    """Refinement should stop at the specified maximum depth."""
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+
+    for cell in cells:
+        cell["contributor_begin"] = 0
+        cell["contributor_end"] = 1
+
+    refined_cells, contributors = refine_octree(
+        cells,
+        positions=[(0.5, 0.5, 0.5)],
+        smoothing_lengths=[0.6],
+        isovalue=0.5,
+        max_depth=1,
+    )
+
+    max_depth_found = max(
+        (c.get("depth", 0) for c in refined_cells), default=0
+    )
+    assert max_depth_found <= 1
+
+
+def test_refine_octree_empty_initial_cells() -> None:
+    """Empty initial cells should return empty results."""
+    result = refine_octree(
+        [],
+        positions=[(0.5, 0.5, 0.5)],
+        smoothing_lengths=[0.6],
+        isovalue=0.5,
+        max_depth=3,
+    )
+
+    assert result == ([], [])

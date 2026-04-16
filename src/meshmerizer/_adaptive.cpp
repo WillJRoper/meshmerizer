@@ -657,6 +657,190 @@ static PyObject *filter_child_contributors_py(PyObject *self, PyObject *args) {
 }
 
 /**
+ * @brief Build a Python dictionary from a cell with contributor indices.
+ */
+static PyObject *build_octree_cell_dict_with_contributors(
+    const OctreeCell &cell,
+    const std::vector<std::size_t> &contributors) {
+    PyObject *corner_values = PyTuple_New(8);
+    if (corner_values == NULL) {
+        return NULL;
+    }
+    for (std::size_t i = 0; i < 8; ++i) {
+        PyTuple_SET_ITEM(corner_values, static_cast<Py_ssize_t>(i),
+                         PyFloat_FromDouble(cell.corner_values[i]));
+    }
+
+    PyObject *contrib_list = PyTuple_New(
+        static_cast<Py_ssize_t>(cell.contributor_end - cell.contributor_begin));
+    if (contrib_list == NULL) {
+        Py_DECREF(corner_values);
+        return NULL;
+    }
+    for (std::int64_t i = cell.contributor_begin; i < cell.contributor_end; ++i) {
+        PyTuple_SET_ITEM(contrib_list, static_cast<Py_ssize_t>(i - cell.contributor_begin),
+                         PyLong_FromSize_t(contributors[static_cast<std::size_t>(i)]));
+    }
+
+    return Py_BuildValue(
+        "{sK,sI,s((ddd)(ddd)),sI,sI,sI,sI,sB,sO,sO}",
+        "morton_key",
+        static_cast<unsigned long long>(cell.morton_key),
+        "depth",
+        static_cast<unsigned int>(cell.depth),
+        "bounds",
+        cell.bounds.min.x,
+        cell.bounds.min.y,
+        cell.bounds.min.z,
+        cell.bounds.max.x,
+        cell.bounds.max.y,
+        cell.bounds.max.z,
+        "is_leaf",
+        cell.is_leaf ? 1 : 0,
+        "is_active",
+        cell.is_active ? 1 : 0,
+        "has_surface",
+        cell.has_surface ? 1 : 0,
+        "child_begin",
+        static_cast<long>(cell.child_begin),
+        "corner_sign_mask",
+        static_cast<unsigned int>(cell.corner_sign_mask),
+        "corner_values",
+        corner_values,
+        "contributors",
+        contrib_list);
+}
+
+/**
+ * @brief Refine the octree using breadth-first refinement.
+ */
+static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
+    PyObject *initial_cells_object = NULL;
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    double isovalue = 0.0;
+    unsigned int max_depth = 0U;
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    std::vector<OctreeCell> initial_cells;
+    (void)self;
+
+    if (!PyArg_ParseTuple(args, "OOOdI", &initial_cells_object, &positions_object,
+                          &smoothing_object, &isovalue, &max_depth)) {
+        return NULL;
+    }
+    if (!parse_vector3d_sequence(positions_object, positions) ||
+        !parse_double_sequence(smoothing_object, smoothing_lengths)) {
+        return NULL;
+    }
+    if (positions.size() != smoothing_lengths.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing lengths must match in size");
+        return NULL;
+    }
+
+    PyObject *cells_fast = PySequence_Fast(initial_cells_object,
+                                            "expected a sequence of cell dicts");
+    if (cells_fast == NULL) {
+        return NULL;
+    }
+    const Py_ssize_t num_cells = PySequence_Fast_GET_SIZE(cells_fast);
+    initial_cells.reserve(static_cast<std::size_t>(num_cells));
+
+    for (Py_ssize_t i = 0; i < num_cells; ++i) {
+        PyObject *cell_dict = PySequence_Fast_GET_ITEM(cells_fast, i);
+        if (!PyDict_Check(cell_dict)) {
+            Py_DECREF(cells_fast);
+            PyErr_SetString(PyExc_TypeError, "each cell must be a dictionary");
+            return NULL;
+        }
+
+        PyObject *morton_key_obj = PyDict_GetItemString(cell_dict, "morton_key");
+        PyObject *depth_obj = PyDict_GetItemString(cell_dict, "depth");
+        PyObject *bounds_obj = PyDict_GetItemString(cell_dict, "bounds");
+        PyObject *contrib_begin_obj = PyDict_GetItemString(cell_dict, "contributor_begin");
+        PyObject *contrib_end_obj = PyDict_GetItemString(cell_dict, "contributor_end");
+
+        if (!morton_key_obj || !depth_obj || !bounds_obj || !contrib_begin_obj || !contrib_end_obj) {
+            Py_DECREF(cells_fast);
+            PyErr_SetString(PyExc_ValueError, "cell dict missing required fields");
+            return NULL;
+        }
+
+        OctreeCell cell{};
+        cell.morton_key = PyLong_AsUnsignedLongLong(morton_key_obj);
+        cell.depth = static_cast<std::uint32_t>(PyLong_AsUnsignedLong(depth_obj));
+        cell.is_leaf = true;
+        cell.is_active = false;
+        cell.has_surface = false;
+        cell.child_begin = -1;
+        cell.representative_vertex_index = -1;
+        cell.corner_sign_mask = 0U;
+
+        if (PyTuple_Check(bounds_obj) && PyTuple_Size(bounds_obj) == 2) {
+            if (!parse_vector3d(PyTuple_GetItem(bounds_obj, 0), cell.bounds.min) ||
+                !parse_vector3d(PyTuple_GetItem(bounds_obj, 1), cell.bounds.max)) {
+                Py_DECREF(cells_fast);
+                return NULL;
+            }
+        } else {
+            Py_DECREF(cells_fast);
+            PyErr_SetString(PyExc_TypeError, "bounds must be a pair of 3-tuples");
+            return NULL;
+        }
+
+        cell.contributor_begin = static_cast<std::int64_t>(PyLong_AsLong(contrib_begin_obj));
+        cell.contributor_end = static_cast<std::int64_t>(PyLong_AsLong(contrib_end_obj));
+        initial_cells.push_back(cell);
+    }
+    Py_DECREF(cells_fast);
+
+    auto [all_cells, all_contributors] = refine_octree(
+        std::move(initial_cells),
+        positions,
+        smoothing_lengths,
+        isovalue,
+        max_depth);
+
+    PyObject *result = PyTuple_New(2);
+    if (result == NULL) {
+        return NULL;
+    }
+
+    PyObject *cells_list = PyList_New(static_cast<Py_ssize_t>(all_cells.size()));
+    if (cells_list == NULL) {
+        Py_DECREF(result);
+        return NULL;
+    }
+    for (std::size_t i = 0; i < all_cells.size(); ++i) {
+        PyObject *cell_dict = build_octree_cell_dict_with_contributors(
+            all_cells[i], all_contributors);
+        if (cell_dict == NULL) {
+            Py_DECREF(cells_list);
+            Py_DECREF(result);
+            return NULL;
+        }
+        PyList_SET_ITEM(cells_list, static_cast<Py_ssize_t>(i), cell_dict);
+    }
+
+    PyObject *contributors_list = PyList_New(
+        static_cast<Py_ssize_t>(all_contributors.size()));
+    if (contributors_list == NULL) {
+        Py_DECREF(cells_list);
+        Py_DECREF(result);
+        return NULL;
+    }
+    for (std::size_t i = 0; i < all_contributors.size(); ++i) {
+        PyList_SET_ITEM(contributors_list, static_cast<Py_ssize_t>(i),
+                        PyLong_FromSize_t(all_contributors[i]));
+    }
+
+    PyTuple_SET_ITEM(result, 0, cells_list);
+    PyTuple_SET_ITEM(result, 1, contributors_list);
+    return result;
+}
+
+/**
  * @brief Python methods exported by the adaptive extension.
  */
 static PyMethodDef adaptive_methods[] = {
@@ -749,6 +933,12 @@ static PyMethodDef adaptive_methods[] = {
         filter_child_contributors_py,
         METH_VARARGS,
         PyDoc_STR("Filter parent contributors into each child cell."),
+    },
+    {
+        "refine_octree",
+        refine_octree_py,
+        METH_VARARGS,
+        PyDoc_STR("Refine the octree using breadth-first refinement."),
     },
     {NULL, NULL, 0, NULL},
 };

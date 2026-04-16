@@ -294,3 +294,32 @@ def filter_child_contributors(
         smoothing_lengths,
         parent_bounds,
     )
+
+
+def refine_octree(
+    initial_cells: tuple[dict[str, object], ...],
+    positions: list[tuple[float, float, float]],
+    smoothing_lengths: list[float],
+    isovalue: float,
+    max_depth: int,
+) -> tuple[tuple[dict[str, object], ...], tuple[int, ...]]:
+    """Refine the octree using breadth-first refinement.
+
+    Args:
+        initial_cells: Top-level cells with attached contributors.
+        positions: Particle positions in world space.
+        smoothing_lengths: Per-particle support radii.
+        isovalue: The target surface level.
+        max_depth: Maximum refinement depth.
+
+    Returns:
+        Tuple of (all_cells, all_contributors) where cells store indices
+        into the contributors vector.
+    """
+    return _adaptive.refine_octree(
+        initial_cells,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        max_depth,
+    )

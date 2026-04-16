@@ -9,11 +9,15 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <queue>
+#include <utility>
 #include <vector>
 
 #include "bounding_box.hpp"
+#include "kernel_wendland_c2.hpp"
 #include "morton.hpp"
 #include "particle_grid.hpp"
+#include "vector3d.hpp"
 
 /**
  * @brief One adaptive octree cell in flat-array storage.
@@ -227,6 +231,207 @@ inline std::vector<std::vector<std::size_t>> filter_child_contributors(
         }
     }
     return child_contributors;
+}
+
+/**
+ * @brief Evaluate the SPH field value at a given point.
+ *
+ * Sums the normalized Wendland C2 kernel contributions from all contributing
+ * particles. This is the scalar field we use for isosurface extraction.
+ *
+ * @param query_point Position at which to evaluate the field.
+ * @param contributor_indices Indices of particles that may contribute.
+ * @param positions Particle positions in world space.
+ * @param smoothing_lengths Per-particle support radii.
+ * @return Scalar field value at the query point.
+ */
+inline double evaluate_field_at_point(
+    const Vector3d &query_point,
+    const std::vector<std::size_t> &contributor_indices,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths) {
+    double field_value = 0.0;
+    for (std::size_t particle_index : contributor_indices) {
+        const Vector3d displacement = {
+            query_point.x - positions[particle_index].x,
+            query_point.y - positions[particle_index].y,
+            query_point.z - positions[particle_index].z,
+        };
+        const double radius = std::sqrt(
+            displacement.x * displacement.x + displacement.y * displacement.y +
+            displacement.z * displacement.z);
+        field_value +=
+            evaluate_wendland_c2(radius, smoothing_lengths[particle_index], true);
+    }
+    return field_value;
+}
+
+/**
+ * @brief Sample the eight corner values of a cell.
+ *
+ * @param cell The octree cell whose corners to sample.
+ * @param contributor_indices Indices of particles that may contribute.
+ * @param positions Particle positions in world space.
+ * @param smoothing_lengths Per-particle support radii.
+ * @return Array of eight field values, one per corner.
+ */
+inline std::array<double, 8> sample_cell_corners(
+    const OctreeCell &cell,
+    const std::vector<std::size_t> &contributor_indices,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths) {
+    std::array<double, 8> corner_values;
+    for (std::size_t corner_index = 0; corner_index < 8; ++corner_index) {
+        const Vector3d corner = {
+            (corner_index & 1U) ? cell.bounds.max.x : cell.bounds.min.x,
+            (corner_index & 2U) ? cell.bounds.max.y : cell.bounds.min.y,
+            (corner_index & 4U) ? cell.bounds.max.z : cell.bounds.min.z,
+        };
+        corner_values[corner_index] = evaluate_field_at_point(
+            corner, contributor_indices, positions, smoothing_lengths);
+    }
+    return corner_values;
+}
+
+/**
+ * @brief Breadth-first octree refinement based on corner sign changes.
+ *
+ * Starting from top-level cells, this function iteratively refines cells that
+ * may contain the isosurface by evaluating corner field values. The algorithm
+ * proceeds level by level (breadth-first) to maintain a balanced tree where
+ * neighboring leaves differ by at most one refinement level.
+ *
+ * The refinement stops when:
+ * - A cell does not contain the isosurface (corner values don't straddle
+ *   the isovalue), or
+ * - The maximum depth is reached, or
+ * - A cell has fewer than two contributors (insufficient samples for
+ *   meaningful refinement).
+ *
+ * @param initial_cells Top-level cells with attached contributors.
+ * @param positions Particle positions in world space.
+ * @param smoothing_lengths Per-particle support radii.
+ * @param isovalue The target surface level.
+ * @param max_depth Maximum refinement depth (prevents infinite refinement).
+ * @return Tuple of (all_cells, all_contributors) where cells store indices
+ *         into the contributors vector.
+ */
+inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octree(
+    std::vector<OctreeCell> initial_cells,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    double isovalue,
+    std::uint32_t max_depth) {
+    if (initial_cells.empty()) {
+        return {{}, {}};
+    }
+
+    std::vector<OctreeCell> all_cells;
+    std::vector<std::size_t> all_contributors;
+    std::queue<std::size_t> leaf_queue;
+
+    for (std::size_t cell_index = 0; cell_index < initial_cells.size();
+         ++cell_index) {
+        OctreeCell cell = initial_cells[cell_index];
+        const std::int64_t contrib_begin = cell.contributor_begin;
+        const std::int64_t contrib_end = cell.contributor_end;
+
+        if (contrib_begin >= 0 && contrib_end > contrib_begin) {
+            cell.contributor_begin = static_cast<std::int64_t>(all_contributors.size());
+            for (std::int64_t i = contrib_begin; i < contrib_end; ++i) {
+                all_contributors.push_back(static_cast<std::size_t>(i));
+            }
+            cell.contributor_end = static_cast<std::int64_t>(all_contributors.size());
+        } else {
+            cell.contributor_begin = -1;
+            cell.contributor_end = -1;
+        }
+
+        all_cells.push_back(cell);
+        leaf_queue.push(all_cells.size() - 1);
+    }
+
+    while (!leaf_queue.empty()) {
+        const std::size_t current_index = leaf_queue.front();
+        leaf_queue.pop();
+        OctreeCell &current_cell = all_cells[current_index];
+
+        if (current_cell.depth >= max_depth) {
+            current_cell.is_leaf = true;
+            current_cell.is_active = false;
+            current_cell.has_surface = false;
+            continue;
+        }
+
+        const std::int64_t contrib_begin = current_cell.contributor_begin;
+        const std::int64_t contrib_end = current_cell.contributor_end;
+        if (contrib_begin < 0 || contrib_end < 0 || contrib_begin >= contrib_end) {
+            current_cell.is_leaf = true;
+            current_cell.is_active = false;
+            current_cell.has_surface = false;
+            continue;
+        }
+
+        std::vector<std::size_t> contributors;
+        contributors.reserve(static_cast<std::size_t>(contrib_end - contrib_begin));
+        for (std::int64_t i = contrib_begin; i < contrib_end; ++i) {
+            if (static_cast<std::size_t>(i) < all_contributors.size()) {
+                contributors.push_back(all_contributors[static_cast<std::size_t>(i)]);
+            }
+        }
+
+        if (contributors.size() < 2) {
+            current_cell.is_leaf = true;
+            current_cell.is_active = false;
+            current_cell.has_surface = false;
+            continue;
+        }
+
+        std::array<double, 8> corner_values =
+            sample_cell_corners(current_cell, contributors, positions,
+                               smoothing_lengths);
+        current_cell.corner_values = corner_values;
+        current_cell.corner_sign_mask = compute_corner_sign_mask(corner_values, isovalue);
+
+        if (!cell_may_contain_isosurface(corner_values, isovalue)) {
+            current_cell.is_leaf = true;
+            current_cell.is_active = false;
+            current_cell.has_surface = false;
+            continue;
+        }
+
+        current_cell.is_leaf = false;
+        current_cell.is_active = true;
+        current_cell.has_surface = true;
+
+        std::vector<OctreeCell> children =
+            create_child_cells(current_cell);
+        std::vector<std::vector<std::size_t>> child_contributors =
+            filter_child_contributors(contributors, positions, smoothing_lengths,
+                                     children);
+
+        const std::int64_t child_begin_offset =
+            static_cast<std::int64_t>(all_contributors.size());
+        current_cell.child_begin = child_begin_offset;
+
+        for (std::size_t i = 0; i < children.size(); ++i) {
+            const std::int64_t child_contrib_begin =
+                static_cast<std::int64_t>(all_contributors.size());
+            std::copy(child_contributors[i].begin(),
+                      child_contributors[i].end(),
+                      std::back_inserter(all_contributors));
+            const std::int64_t child_contrib_end =
+                static_cast<std::int64_t>(all_contributors.size());
+
+            children[i].contributor_begin = child_contrib_begin;
+            children[i].contributor_end = child_contrib_end;
+
+            all_cells.push_back(children[i]);
+            leaf_queue.push(all_cells.size() - 1);
+        }
+    }
+
+    return {all_cells, all_contributors};
 }
 
 #endif  // MESHMERIZER_ADAPTIVE_CPP_OCTREE_CELL_HPP_
