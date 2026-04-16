@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <queue>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -414,37 +415,214 @@ inline bool leaf_cells_share_face(const OctreeCell &a, const OctreeCell &b) {
 }
 
 /**
- * @brief Return whether a leaf cell violates the 2:1 balance rule.
+ * @brief Pack three grid coordinates into a 64-bit key for balancing.
  *
- * The rule requires that any two adjacent leaf cells differ by at most one
- * refinement level. This function returns true when any other leaf in
- * ``cells_all`` is adjacent to the given cell and is more than one level
- * deeper. An O(n) scan over all cells is used, which is acceptable for the
- * iterative post-pass balancing algorithm.
+ * Each axis gets 21 bits, matching the Morton key encoding capacity.
+ * This is a local utility for the balance spatial hash; the same
+ * packing scheme is used by LeafSpatialIndex in faces.hpp.
+ *
+ * @param ix X grid coordinate.
+ * @param iy Y grid coordinate.
+ * @param iz Z grid coordinate.
+ * @return Packed 64-bit key.
+ */
+inline std::uint64_t balance_pack_coords(std::uint32_t ix,
+                                          std::uint32_t iy,
+                                          std::uint32_t iz) {
+    return (static_cast<std::uint64_t>(ix) << 42U) |
+           (static_cast<std::uint64_t>(iy) << 21U) |
+           static_cast<std::uint64_t>(iz);
+}
+
+/**
+ * @brief FNV-1a-style hash for 64-bit packed grid keys.
+ */
+struct BalanceKeyHash {
+    std::size_t operator()(std::uint64_t key) const {
+        std::uint64_t h = key;
+        h ^= h >> 33U;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33U;
+        h *= 0xc4ceb9fe1a85ec53ULL;
+        h ^= h >> 33U;
+        return static_cast<std::size_t>(h);
+    }
+};
+
+/**
+ * @brief Spatial hash mapping leaf min-corner grid positions to cell indices.
+ *
+ * Used by the balance algorithm for O(1) neighbor lookups.  Each leaf
+ * registers one entry keyed by its min-corner quantized to the finest
+ * grid resolution.  Lookups use a hierarchical probe (same approach as
+ * LeafSpatialIndex in faces.hpp) to find the leaf containing a given
+ * fine-grid position.
+ */
+struct BalanceSpatialHash {
+    std::unordered_map<std::uint64_t, std::size_t, BalanceKeyHash> map;
+    std::uint32_t max_depth;
+    double inv_cell_size_x;
+    double inv_cell_size_y;
+    double inv_cell_size_z;
+    Vector3d domain_min;
+
+    /**
+     * @brief Build the hash from the current set of leaf cells.
+     *
+     * @param all_cells All octree cells.
+     * @param domain Full domain bounding box.
+     * @param md Maximum octree depth.
+     * @param base_resolution Number of top-level cells per axis.
+     */
+    void build(const std::vector<OctreeCell> &all_cells,
+               const BoundingBox &domain,
+               std::uint32_t md,
+               std::uint32_t base_resolution) {
+        max_depth = md;
+        domain_min = domain.min;
+
+        const double fine_per_axis =
+            static_cast<double>(base_resolution) *
+            static_cast<double>(1U << max_depth);
+        inv_cell_size_x = fine_per_axis / (domain.max.x - domain.min.x);
+        inv_cell_size_y = fine_per_axis / (domain.max.y - domain.min.y);
+        inv_cell_size_z = fine_per_axis / (domain.max.z - domain.min.z);
+
+        map.clear();
+        std::size_t n_leaves = 0;
+        for (const auto &c : all_cells) {
+            if (c.is_leaf) ++n_leaves;
+        }
+        map.reserve(n_leaves);
+
+        for (std::size_t i = 0; i < all_cells.size(); ++i) {
+            if (!all_cells[i].is_leaf) continue;
+            std::uint32_t gx, gy, gz;
+            quantize(all_cells[i].bounds.min, gx, gy, gz);
+            map[balance_pack_coords(gx, gy, gz)] = i;
+        }
+    }
+
+    /**
+     * @brief Quantize a world-space position to fine-grid coordinates.
+     */
+    void quantize(const Vector3d &pos,
+                  std::uint32_t &gx,
+                  std::uint32_t &gy,
+                  std::uint32_t &gz) const {
+        gx = static_cast<std::uint32_t>(
+            (pos.x - domain_min.x) * inv_cell_size_x + 0.5);
+        gy = static_cast<std::uint32_t>(
+            (pos.y - domain_min.y) * inv_cell_size_y + 0.5);
+        gz = static_cast<std::uint32_t>(
+            (pos.z - domain_min.z) * inv_cell_size_z + 0.5);
+    }
+
+    /**
+     * @brief Find the leaf cell containing a given fine-grid position.
+     *
+     * Hierarchical probe from finest to coarsest alignment.
+     *
+     * @return Cell index, or SIZE_MAX if not found.
+     */
+    std::size_t find_leaf_at(std::uint32_t ix, std::uint32_t iy,
+                             std::uint32_t iz) const {
+        for (std::uint32_t k = 0; k <= max_depth; ++k) {
+            const std::uint32_t mask = ~((1U << k) - 1U);
+            const std::uint64_t key = balance_pack_coords(
+                ix & mask, iy & mask, iz & mask);
+            auto it = map.find(key);
+            if (it != map.end()) {
+                return it->second;
+            }
+        }
+        return SIZE_MAX;
+    }
+};
+
+/**
+ * @brief Check if a leaf needs splitting using spatial hash neighbor lookup.
+ *
+ * For each of the 6 face directions, computes a probe point just inside
+ * the neighboring region and looks up the leaf there via the spatial
+ * hash.  If any neighbor leaf is more than 1 level deeper, the cell
+ * needs splitting.
+ *
+ * Cost: O(6 * max_depth) hash probes per cell — much better than O(n).
  *
  * @param cell_index Index of the leaf to check.
- * @param cells_all All octree cells.
- * @return True when this leaf has an adjacent leaf more than one level deeper.
+ * @param all_cells All octree cells.
+ * @param hash Prebuilt spatial hash of leaf cells.
+ * @param max_depth Maximum octree depth.
+ * @return True when this leaf needs to be split for balance.
  */
-inline bool needs_balance_split(std::size_t cell_index,
-                                const std::vector<OctreeCell> &cells_all) {
-    const OctreeCell &cell = cells_all[cell_index];
-    for (std::size_t other_index = 0; other_index < cells_all.size();
-         ++other_index) {
-        if (other_index == cell_index) {
-            continue;
-        }
-        const OctreeCell &other = cells_all[other_index];
-        if (!other.is_leaf) {
-            continue;
-        }
+inline bool needs_balance_split(
+    std::size_t cell_index,
+    const std::vector<OctreeCell> &all_cells,
+    const BalanceSpatialHash &hash,
+    std::uint32_t max_depth) {
+    const OctreeCell &cell = all_cells[cell_index];
+
+    // The cell spans 'span' fine-grid cells per axis.
+    const std::uint32_t span = 1U << (max_depth - cell.depth);
+
+    // Quantize this cell's min corner.
+    std::uint32_t gx, gy, gz;
+    hash.quantize(cell.bounds.min, gx, gy, gz);
+
+    // For each face, probe one fine-grid cell into the neighbor region.
+    // The 6 face directions are: -X, +X, -Y, +Y, -Z, +Z.
+    // For the positive direction, the probe is at min + span.
+    // For the negative direction, the probe is at min - 1.
+    // We probe at the center of the face (offset by span/2 in the
+    // other two axes) to handle cases where the neighbor is larger.
+    // However, for detecting deeper neighbors (which are smaller),
+    // probing at the corner of the face is sufficient because any
+    // deeper neighbor along this face will be found.
+
+    // Face probe offsets: {dx, dy, dz} relative to cell min corner.
+    // +X face: probe at (gx + span, gy, gz)
+    // -X face: probe at (gx - 1, gy, gz)
+    // +Y face: probe at (gx, gy + span, gz)
+    // -Y face: probe at (gx, gy - 1, gz)
+    // +Z face: probe at (gx, gy, gz + span)
+    // -Z face: probe at (gx, gy, gz - 1)
+
+    struct Probe {
+        std::int64_t dx, dy, dz;
+    };
+    const Probe probes[6] = {
+        {static_cast<std::int64_t>(span), 0, 0},    // +X
+        {-1, 0, 0},                                   // -X
+        {0, static_cast<std::int64_t>(span), 0},    // +Y
+        {0, -1, 0},                                   // -Y
+        {0, 0, static_cast<std::int64_t>(span)},    // +Z
+        {0, 0, -1},                                   // -Z
+    };
+
+    for (const auto &p : probes) {
+        const std::int64_t px =
+            static_cast<std::int64_t>(gx) + p.dx;
+        const std::int64_t py =
+            static_cast<std::int64_t>(gy) + p.dy;
+        const std::int64_t pz =
+            static_cast<std::int64_t>(gz) + p.dz;
+
+        // Skip probes outside the domain.
+        if (px < 0 || py < 0 || pz < 0) continue;
+
+        const std::size_t neighbor_idx = hash.find_leaf_at(
+            static_cast<std::uint32_t>(px),
+            static_cast<std::uint32_t>(py),
+            static_cast<std::uint32_t>(pz));
+
+        if (neighbor_idx == SIZE_MAX) continue;
+
+        const OctreeCell &neighbor = all_cells[neighbor_idx];
         const std::int32_t depth_diff =
-            static_cast<std::int32_t>(other.depth) -
+            static_cast<std::int32_t>(neighbor.depth) -
             static_cast<std::int32_t>(cell.depth);
-        if (depth_diff <= 1) {
-            continue;
-        }
-        if (leaf_cells_share_face(cell, other)) {
+        if (depth_diff > 1) {
             return true;
         }
     }
@@ -463,9 +641,12 @@ inline bool needs_balance_split(std::size_t cell_index,
  * kernel-overlap filtering and samples corner values to support later surface
  * extraction.
  *
- * The algorithm is intentionally simple: an O(n^2) scan per iteration over
- * all leaf pairs. For the octree sizes expected in typical runs this is
- * acceptable, and the flat-array layout keeps the constant factor small.
+ * The algorithm uses a spatial hash of leaf min-corner positions for O(1)
+ * neighbor lookups.  For each leaf, the 6 face-adjacent neighbors are
+ * probed via the hash using a hierarchical search (finest to coarsest
+ * alignment).  The hash is rebuilt after each split round since new
+ * leaves are created.  Total cost per iteration is O(n * max_depth)
+ * where n is the number of leaves.
  *
  * @param all_cells All octree cells (modified in place).
  * @param all_contributors Global flat contributor index array (modified in
@@ -474,6 +655,8 @@ inline bool needs_balance_split(std::size_t cell_index,
  * @param smoothing_lengths Per-particle support radii.
  * @param isovalue The target surface level used to sample corner signs on
  *     newly created balance cells.
+ * @param domain Full domain bounding box (for spatial hash construction).
+ * @param base_resolution Number of top-level cells per axis.
  * @param max_depth Maximum depth; balance splits stop at this depth.
  */
 inline void balance_octree(
@@ -482,10 +665,18 @@ inline void balance_octree(
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
     double isovalue,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution,
     std::uint32_t max_depth) {
     bool any_split = true;
     while (any_split) {
         any_split = false;
+
+        // Build (or rebuild) the spatial hash of leaf cells for
+        // O(1) neighbor lookups.  This must be rebuilt each iteration
+        // because splits create new leaves.
+        BalanceSpatialHash hash;
+        hash.build(all_cells, domain, max_depth, base_resolution);
 
         // Collect indices of leaf cells that violate the 2:1 rule.
         std::vector<std::size_t> to_split;
@@ -496,7 +687,7 @@ inline void balance_octree(
             if (all_cells[i].depth >= max_depth) {
                 continue;
             }
-            if (needs_balance_split(i, all_cells)) {
+            if (needs_balance_split(i, all_cells, hash, max_depth)) {
                 to_split.push_back(i);
                 any_split = true;
             }
@@ -728,8 +919,33 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
     // Enforce the 2:1 balance rule as a post-pass. Any leaf that has an
     // adjacent leaf more than one level deeper is split and its contributors
     // are inherited from the parent. This repeats until the invariant holds.
+    //
+    // Compute the domain bounding box from all cells (union of bounds)
+    // and infer the base_resolution from the number of initial cells
+    // (cube root of initial_cells.size()).  These are needed by the
+    // spatial hash used for O(1) neighbor lookups during balancing.
+    BoundingBox domain;
+    domain.min = all_cells[0].bounds.min;
+    domain.max = all_cells[0].bounds.max;
+    for (const auto &c : all_cells) {
+        domain.min.x = std::min(domain.min.x, c.bounds.min.x);
+        domain.min.y = std::min(domain.min.y, c.bounds.min.y);
+        domain.min.z = std::min(domain.min.z, c.bounds.min.z);
+        domain.max.x = std::max(domain.max.x, c.bounds.max.x);
+        domain.max.y = std::max(domain.max.y, c.bounds.max.y);
+        domain.max.z = std::max(domain.max.z, c.bounds.max.z);
+    }
+    // Infer base_resolution: initial_cells.size() == base_res^3.
+    std::uint32_t base_resolution = 1;
+    {
+        const std::size_t n = initial_cells.size();
+        while (base_resolution * base_resolution * base_resolution < n) {
+            ++base_resolution;
+        }
+    }
+
     balance_octree(all_cells, all_contributors, positions, smoothing_lengths,
-                   isovalue, max_depth);
+                   isovalue, domain, base_resolution, max_depth);
 
     return {all_cells, all_contributors};
 }
