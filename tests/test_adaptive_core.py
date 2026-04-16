@@ -5,6 +5,7 @@ from meshmerizer.adaptive_core import (
     bounding_box_contains,
     bounding_box_overlaps,
     cell_may_contain_isosurface,
+    compute_isovalue_from_percentile,
     corner_sign_mask,
     create_child_cells,
     create_top_level_cells,
@@ -623,35 +624,39 @@ def test_solve_qef_empty_samples_returns_cell_center() -> None:
 
 
 def test_solve_qef_single_plane_constraint() -> None:
-    """One tangent plane should place the vertex on that plane."""
+    """One tangent plane with regularization biases toward center."""
     bounds = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     # Plane: x = 0.3  (normal along +x, point at x=0.3)
     samples = [((0.3, 0.5, 0.5), (1.0, 0.0, 0.0))]
     position, normal = solve_qef_for_leaf(samples, bounds)
-    # The x coordinate should be at 0.3 (the plane position).
-    # y and z are unconstrained so the solver falls back to mass point
-    # for those axes (or the system is rank-deficient and we get
-    # the centroid).
-    assert abs(position[0] - 0.3) < 1e-6
+    # With Tikhonov regularization (lambda=0.1, center=0.5):
+    #   mat = [[1.1, 0, 0], [0, 0.1, 0], [0, 0, 0.1]]
+    #   rhs = [0.3 + 0.05, 0.05, 0.05]
+    # x = 0.35/1.1 ≈ 0.3182, y = z = 0.5
+    assert abs(position[0] - 0.35 / 1.1) < 1e-6
+    assert abs(position[1] - 0.5) < 1e-6
+    assert abs(position[2] - 0.5) < 1e-6
 
 
 def test_solve_qef_two_orthogonal_planes() -> None:
-    """Two orthogonal planes should constrain two axes."""
+    """Two orthogonal planes with regularization give a unique solution."""
     bounds = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     samples = [
         ((0.3, 0.5, 0.5), (1.0, 0.0, 0.0)),
         ((0.5, 0.7, 0.5), (0.0, 1.0, 0.0)),
     ]
     position, normal = solve_qef_for_leaf(samples, bounds)
-    # With only 2 constraints the 3x3 system is rank-deficient,
-    # so fallback to mass point is expected.
-    # Mass point = ((0.3+0.5)/2, (0.5+0.7)/2, (0.5+0.5)/2)
-    assert abs(position[0] - 0.4) < 1e-6
-    assert abs(position[1] - 0.6) < 1e-6
+    # With regularization (lambda=0.1, center=0.5):
+    #   mat = [[1.1, 0, 0], [0, 1.1, 0], [0, 0, 0.1]]
+    #   rhs = [0.3+0.05, 0.7+0.05, 0.05]
+    # x = 0.35/1.1, y = 0.75/1.1, z = 0.5
+    assert abs(position[0] - 0.35 / 1.1) < 1e-6
+    assert abs(position[1] - 0.75 / 1.1) < 1e-6
+    assert abs(position[2] - 0.5) < 1e-6
 
 
 def test_solve_qef_three_orthogonal_planes() -> None:
-    """Three orthogonal planes should uniquely determine the vertex."""
+    """Three orthogonal planes with regularization bias toward center."""
     bounds = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     samples = [
         ((0.3, 0.5, 0.5), (1.0, 0.0, 0.0)),
@@ -659,9 +664,13 @@ def test_solve_qef_three_orthogonal_planes() -> None:
         ((0.5, 0.5, 0.4), (0.0, 0.0, 1.0)),
     ]
     position, normal = solve_qef_for_leaf(samples, bounds)
-    assert abs(position[0] - 0.3) < 1e-6
-    assert abs(position[1] - 0.7) < 1e-6
-    assert abs(position[2] - 0.4) < 1e-6
+    # With regularization (lambda=0.1, center=0.5):
+    #   mat = [[1.1, 0, 0], [0, 1.1, 0], [0, 0, 1.1]]
+    #   rhs = [0.3+0.05, 0.7+0.05, 0.4+0.05]
+    # x = 0.35/1.1, y = 0.75/1.1, z = 0.45/1.1
+    assert abs(position[0] - 0.35 / 1.1) < 1e-6
+    assert abs(position[1] - 0.75 / 1.1) < 1e-6
+    assert abs(position[2] - 0.45 / 1.1) < 1e-6
 
 
 def test_solve_qef_vertex_clamped_to_bounds() -> None:
@@ -1110,3 +1119,44 @@ def test_run_full_pipeline_empty_particles() -> None:
     )
     assert len(vert_positions) == 0
     assert len(triangles) == 0
+
+
+# ---------------------------------------------------------------------------
+# Density percentile isovalue tests
+# ---------------------------------------------------------------------------
+
+
+def test_compute_isovalue_from_percentile_basic() -> None:
+    """Percentile isovalue should match manual Wendland C2 self-density."""
+    import numpy as np
+
+    h = np.array([0.1, 0.2, 0.5, 1.0], dtype=np.float64)
+    iso = compute_isovalue_from_percentile(h, 50.0)
+    # Manual: self_density = 21 / (2*pi*h^3), median of those values.
+    self_density = 21.0 / (2.0 * np.pi * h**3)
+    expected = float(np.percentile(self_density, 50.0))
+    assert abs(iso - expected) < 1e-10
+
+
+def test_compute_isovalue_percentile_low_encloses_more() -> None:
+    """Lower percentile should give a lower isovalue (enclose more)."""
+    import numpy as np
+
+    h = np.random.default_rng(42).uniform(0.05, 1.0, size=1000)
+    iso_5 = compute_isovalue_from_percentile(h, 5.0)
+    iso_50 = compute_isovalue_from_percentile(h, 50.0)
+    assert iso_5 < iso_50
+
+
+def test_compute_isovalue_percentile_rejects_invalid() -> None:
+    """Out-of-range percentile should raise ValueError."""
+    import numpy as np
+    import pytest
+
+    h = np.array([0.1, 0.2], dtype=np.float64)
+    with pytest.raises(ValueError):
+        compute_isovalue_from_percentile(h, -1.0)
+    with pytest.raises(ValueError):
+        compute_isovalue_from_percentile(h, 101.0)
+    with pytest.raises(ValueError):
+        compute_isovalue_from_percentile(np.array([]), 50.0)

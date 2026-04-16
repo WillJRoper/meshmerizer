@@ -14,6 +14,7 @@ from typing import Optional
 import numpy as np
 
 from meshmerizer.adaptive_core import (
+    compute_isovalue_from_percentile,
     create_top_level_cells_with_contributors,
     generate_mesh,
     refine_octree,
@@ -251,9 +252,22 @@ def run_adaptive(args) -> None:
         positions, smoothing_lengths, domain_min, domain_max, origin = (
             _load_particles_for_adaptive(args)
         )
-        isovalue = args.isovalue
         max_depth = args.max_depth
         base_resolution = args.base_resolution
+
+        # Determine isovalue: explicit --isovalue takes priority,
+        # otherwise compute from the density percentile.
+        if args.isovalue is not None:
+            isovalue = args.isovalue
+        else:
+            isovalue = compute_isovalue_from_percentile(
+                smoothing_lengths, args.surface_percentile
+            )
+            log_status(
+                "Config",
+                f"Isovalue from {args.surface_percentile}th "
+                f"percentile: {isovalue:.6g}",
+            )
 
         if args.save_octree is not None:
             # We need intermediate cells/contributors for saving,

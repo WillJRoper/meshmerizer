@@ -158,8 +158,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--isovalue",
         "-t",
         type=float,
-        default=0.5,
-        help=("Isosurface threshold for mesh extraction. Default: 0.5"),
+        default=None,
+        help=(
+            "Isosurface threshold for mesh extraction. "
+            "Overrides --surface-percentile when set."
+        ),
+    )
+    adaptive.add_argument(
+        "--surface-percentile",
+        type=float,
+        default=5.0,
+        help=(
+            "Automatically compute the isovalue from the Nth "
+            "percentile of the particle self-density distribution. "
+            "Lower values enclose more mass (e.g. 5 captures ~95%% "
+            "of particles). Ignored when --isovalue is set. "
+            "Default: 5.0"
+        ),
     )
 
     # Post-processing.

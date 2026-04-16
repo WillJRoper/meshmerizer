@@ -239,22 +239,34 @@ inline bool solve_3x3_system(
  * The algorithm:
  *
  * 1. Accumulate the QEF normal equations from all provided Hermite samples.
- * 2. Attempt to solve the 3x3 system with Gaussian elimination.
- * 3. If the system is rank-deficient (the planes do not uniquely constrain a
- *    3-D point), fall back to the sample centroid (mass point).
- * 4. Clamp the result to the cell bounding box so the vertex stays inside the
- *    cell it belongs to.
- * 5. Assign the normalized mean sample normal as the vertex normal.
+ * 2. Apply Tikhonov regularization: add ``lambda * I`` to the matrix and
+ *    ``lambda * cell_center`` to the right-hand side.  This biases the
+ *    solution toward the cell center when tangent-plane constraints are
+ *    ill-conditioned (e.g., nearly parallel normals), preventing the
+ *    vertex from wandering to extreme positions.  The technique follows
+ *    Schaefer et al. 2007 ("Dual Contouring: The Secret Sauce").
+ * 3. Attempt to solve the regularized 3x3 system with Gaussian elimination.
+ * 4. If the system is still rank-deficient after regularization (should be
+ *    rare), fall back to the sample centroid (mass point).
+ * 5. Clamp the result to the cell bounding box so the vertex stays inside
+ *    the cell it belongs to.
+ * 6. Assign the normalized mean sample normal as the vertex normal.
  *
  * A leaf with no Hermite samples (or only degenerate zero-normal samples)
  * receives the cell center as its vertex position and a zero normal.
  *
  * @param samples Hermite samples for this leaf (from Phase 7).
- * @param bounds Cell bounding box used for clamping.
+ * @param bounds Cell bounding box used for clamping and regularization.
+ * @param regularization_weight Tikhonov regularization strength.  Larger
+ *     values pull the vertex more strongly toward the cell center.  A
+ *     value of 0.0 disables regularization (original behavior).
+ *     Default: 0.1, which provides gentle bias without distorting
+ *     well-constrained vertices.
  * @return Representative mesh vertex for this leaf.
  */
 inline MeshVertex solve_qef_for_leaf(const std::vector<HermiteSample> &samples,
-                                     const BoundingBox &bounds) {
+                                     const BoundingBox &bounds,
+                                     double regularization_weight = 0.1) {
     // Assemble the normal equations.
     QEFAccumulator accumulator;
     for (const HermiteSample &sample : samples) {
@@ -264,6 +276,25 @@ inline MeshVertex solve_qef_for_leaf(const std::vector<HermiteSample> &samples,
     // Degenerate leaf: no usable samples at all.
     if (accumulator.sample_count == 0U) {
         return {bounds.center(), {0.0, 0.0, 0.0}};
+    }
+
+    // Apply Tikhonov regularization: add lambda * I to A^T A and
+    // lambda * cell_center to A^T b.  This makes the system
+    //
+    //   (A^T A + lambda I) x = A^T b + lambda c
+    //
+    // which biases the solution toward the cell center c when the
+    // tangent-plane constraints alone are insufficient to uniquely
+    // determine a position.  Well-constrained vertices (where A^T A
+    // already has large eigenvalues) are barely affected.
+    if (regularization_weight > 0.0) {
+        const Vector3d center = bounds.center();
+        accumulator.mat[0][0] += regularization_weight;
+        accumulator.mat[1][1] += regularization_weight;
+        accumulator.mat[2][2] += regularization_weight;
+        accumulator.rhs[0] += regularization_weight * center.x;
+        accumulator.rhs[1] += regularization_weight * center.y;
+        accumulator.rhs[2] += regularization_weight * center.z;
     }
 
     // Attempt the 3x3 solve.

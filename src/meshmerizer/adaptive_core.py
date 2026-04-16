@@ -10,6 +10,8 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 if TYPE_CHECKING:
     import numpy
 
@@ -528,3 +530,54 @@ def run_full_pipeline(
         isovalue,
         max_depth,
     )
+
+
+def compute_isovalue_from_percentile(
+    smoothing_lengths: "numpy.ndarray",
+    percentile: float,
+) -> float:
+    """Compute an isovalue from a density percentile of the particles.
+
+    In SPH the smoothing length ``h`` adapts to the local particle
+    density: denser regions have smaller ``h``.  The Wendland C2 kernel
+    self-contribution at a particle's own position is:
+
+        W(0, h) = 21 / (2 * pi * h^3)
+
+    This is proportional to the local number density and serves as a
+    fast, parameter-free proxy for the full SPH density field that the
+    octree evaluates at cell corners.
+
+    The ``percentile`` parameter controls where the isosurface sits
+    relative to the distribution of these self-density values:
+
+    - ``percentile=5`` places the surface at the 5th percentile,
+      enclosing ~95% of the particle mass.  Good for capturing the
+      full extent of a galaxy or halo.
+    - ``percentile=50`` places the surface at the median density,
+      showing only the denser half of the distribution.
+
+    Args:
+        smoothing_lengths: (N,) float64 array of per-particle
+            support radii.
+        percentile: Percentile of the self-density distribution
+            at which to place the isosurface.  Must be in [0, 100].
+
+    Returns:
+        Isovalue suitable for passing to the adaptive pipeline.
+
+    Raises:
+        ValueError: If ``percentile`` is outside [0, 100] or the
+            input array is empty.
+    """
+    if percentile < 0.0 or percentile > 100.0:
+        raise ValueError(f"percentile must be in [0, 100], got {percentile}")
+    h = np.asarray(smoothing_lengths, dtype=np.float64)
+    if h.size == 0:
+        raise ValueError("smoothing_lengths array is empty")
+
+    # Wendland C2 3-D normalization: 21 / (2 * pi * h^3).
+    self_density = 21.0 / (2.0 * np.pi * h**3)
+
+    isovalue = float(np.percentile(self_density, percentile))
+    return isovalue
