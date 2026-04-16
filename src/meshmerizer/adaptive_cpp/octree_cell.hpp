@@ -81,6 +81,10 @@ inline std::uint8_t compute_corner_sign_mask(
 inline std::vector<OctreeCell> create_top_level_cells(
     const BoundingBox &domain,
     std::uint32_t base_resolution) {
+    if (base_resolution == 0U) {
+        return {};
+    }
+
     std::vector<OctreeCell> cells;
     cells.reserve(static_cast<std::size_t>(base_resolution) * base_resolution *
                   base_resolution);

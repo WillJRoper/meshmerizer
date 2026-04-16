@@ -134,6 +134,43 @@ struct TopLevelParticleGrid {
         stop_y = static_cast<std::uint32_t>(stop.y);
         stop_z = static_cast<std::uint32_t>(stop.z);
     }
+
+    /**
+     * @brief Return the bin span that could contain overlapping contributors.
+     *
+     * The query box is expanded by a support padding so particles whose centers
+     * lie outside the cell's own bins can still be considered if their kernels
+     * reach into the cell.
+     *
+     * @param box Query bounding box.
+     * @param padding Maximum support radius to include around the box.
+     * @param start_x Output inclusive start x-coordinate.
+     * @param start_y Output inclusive start y-coordinate.
+     * @param start_z Output inclusive start z-coordinate.
+     * @param stop_x Output inclusive stop x-coordinate.
+     * @param stop_y Output inclusive stop y-coordinate.
+     * @param stop_z Output inclusive stop z-coordinate.
+     */
+    void contributor_bin_span(const BoundingBox &box, double padding,
+                              std::uint32_t &start_x, std::uint32_t &start_y,
+                              std::uint32_t &start_z, std::uint32_t &stop_x,
+                              std::uint32_t &stop_y,
+                              std::uint32_t &stop_z) const {
+        const BoundingBox expanded = {
+            {
+                box.min.x - padding,
+                box.min.y - padding,
+                box.min.z - padding,
+            },
+            {
+                box.max.x + padding,
+                box.max.y + padding,
+                box.max.z + padding,
+            },
+        };
+        overlapping_bin_span(expanded, start_x, start_y, start_z, stop_x,
+                             stop_y, stop_z);
+    }
 };
 
 /**

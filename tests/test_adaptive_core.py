@@ -107,6 +107,20 @@ def test_query_cell_contributors_filters_by_support_overlap() -> None:
     assert contributors == (1,)
 
 
+def test_query_cell_contributors_includes_wide_support_particles() -> None:
+    """Contributor queries should include particles outside the cell bins."""
+    contributors = query_cell_contributors(
+        positions=[(0.2, 0.2, 0.2), (0.1, 0.5, 0.5)],
+        smoothing_lengths=[0.05, 0.45],
+        domain_minimum=(0.0, 0.0, 0.0),
+        domain_maximum=(1.0, 1.0, 1.0),
+        resolution=4,
+        cell_minimum=(0.5, 0.4, 0.4),
+        cell_maximum=(0.75, 0.6, 0.6),
+    )
+    assert contributors == (1,)
+
+
 def test_cell_may_contain_isosurface_detects_corner_straddle() -> None:
     """Corner values crossing the isovalue should trigger refinement."""
     assert cell_may_contain_isosurface(
@@ -131,3 +145,11 @@ def test_create_top_level_cells_returns_row_major_cells() -> None:
     assert cells[-1]["morton_key"] == morton_encode_3d(1, 1, 1)
     assert cells[0]["bounds"] == ((0.0, 0.0, 0.0), (0.5, 0.5, 0.5))
     assert cells[-1]["bounds"] == ((0.5, 0.5, 0.5), (1.0, 1.0, 1.0))
+
+
+def test_create_top_level_cells_rejects_zero_resolution() -> None:
+    """Top-level cell creation should reject a zero base resolution."""
+    import pytest
+
+    with pytest.raises(ValueError, match="base_resolution"):
+        create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 0)

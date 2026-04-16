@@ -337,6 +337,11 @@ static PyObject *query_cell_contributors_py(PyObject *self, PyObject *args) {
         return NULL;
     }
 
+    double max_smoothing_length = 0.0;
+    for (double smoothing_length : smoothing_lengths) {
+        max_smoothing_length = std::max(max_smoothing_length, smoothing_length);
+    }
+
     TopLevelParticleGrid grid(domain, resolution);
     grid.insert_particles(positions);
 
@@ -346,8 +351,15 @@ static PyObject *query_cell_contributors_py(PyObject *self, PyObject *args) {
     std::uint32_t stop_x = 0U;
     std::uint32_t stop_y = 0U;
     std::uint32_t stop_z = 0U;
-    grid.overlapping_bin_span(cell, start_x, start_y, start_z, stop_x, stop_y,
-                              stop_z);
+    grid.contributor_bin_span(
+        cell,
+        max_smoothing_length,
+        start_x,
+        start_y,
+        start_z,
+        stop_x,
+        stop_y,
+        stop_z);
 
     std::vector<std::size_t> contributors;
     for (std::uint32_t ix = start_x; ix <= stop_x; ++ix) {
@@ -444,6 +456,11 @@ static PyObject *create_top_level_cells_py(PyObject *self, PyObject *args) {
     }
     if (!parse_vector3d(domain_min_object, domain.min) ||
         !parse_vector3d(domain_max_object, domain.max)) {
+        return NULL;
+    }
+    if (base_resolution == 0U) {
+        PyErr_SetString(PyExc_ValueError,
+                        "base_resolution must be greater than zero");
         return NULL;
     }
 
