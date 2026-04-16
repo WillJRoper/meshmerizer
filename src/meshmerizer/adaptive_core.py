@@ -200,6 +200,38 @@ def query_cell_contributors(
     )
 
 
+def create_top_level_cells_with_contributors(
+    positions: list[tuple[float, float, float]],
+    smoothing_lengths: list[float],
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    base_resolution: int,
+) -> tuple[dict, ...]:
+    """Create top-level cells and query contributors in one pass.
+
+    Builds the particle grid once and reuses it for every top-level
+    cell, avoiding repeated O(n_particles) binning.
+
+    Args:
+        positions: Particle positions in world space.
+        smoothing_lengths: Per-particle support radii.
+        domain_minimum: Inclusive lower corner of the working domain.
+        domain_maximum: Exclusive upper corner of the working domain.
+        base_resolution: Number of top-level cells per axis.
+
+    Returns:
+        Tuple of cell dicts, each with a ``"contributors"`` key
+        holding a tuple of particle indices.
+    """
+    return _adaptive.create_top_level_cells_with_contributors(
+        positions,
+        smoothing_lengths,
+        domain_minimum,
+        domain_maximum,
+        base_resolution,
+    )
+
+
 def cell_may_contain_isosurface(
     corner_values: list[float],
     isovalue: float,

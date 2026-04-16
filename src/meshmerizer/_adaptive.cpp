@@ -547,6 +547,132 @@ static PyObject *create_top_level_cells_py(PyObject *self, PyObject *args) {
 }
 
 /**
+ * @brief Create top-level cells and query contributors in one pass.
+ *
+ * This builds the particle grid once and reuses it for every top-level
+ * cell, avoiding the O(n_cells * n_particles) cost of rebuilding the
+ * grid per cell.
+ *
+ * Arguments: (positions, smoothing_lengths, domain_min, domain_max,
+ *             base_resolution)
+ *
+ * Returns a tuple of cell dicts, each with an extra "contributors"
+ * key holding a tuple of particle indices.
+ */
+static PyObject *create_top_level_cells_with_contributors_py(
+        PyObject *self, PyObject *args) {
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    PyObject *domain_min_object = NULL;
+    PyObject *domain_max_object = NULL;
+    unsigned int base_resolution = 0U;
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    BoundingBox domain{};
+    (void)self;
+    if (!PyArg_ParseTuple(args, "OOOOI", &positions_object,
+                          &smoothing_object, &domain_min_object,
+                          &domain_max_object, &base_resolution)) {
+        return NULL;
+    }
+    if (!parse_vector3d_sequence(positions_object, positions) ||
+        !parse_double_sequence(smoothing_object, smoothing_lengths) ||
+        !parse_vector3d(domain_min_object, domain.min) ||
+        !parse_vector3d(domain_max_object, domain.max)) {
+        return NULL;
+    }
+    if (positions.size() != smoothing_lengths.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing lengths must match");
+        return NULL;
+    }
+    if (base_resolution == 0U) {
+        PyErr_SetString(PyExc_ValueError,
+                        "base_resolution must be > 0");
+        return NULL;
+    }
+
+    /* Compute max smoothing length for bin-span queries. */
+    double max_h = 0.0;
+    for (double h : smoothing_lengths) {
+        max_h = std::max(max_h, h);
+    }
+
+    /* Build the particle grid once. */
+    TopLevelParticleGrid grid(domain, base_resolution);
+    grid.insert_particles(positions);
+
+    /* Create top-level cells. */
+    const std::vector<OctreeCell> cells =
+        create_top_level_cells(domain, base_resolution);
+
+    PyObject *result = PyTuple_New(
+        static_cast<Py_ssize_t>(cells.size()));
+    if (result == NULL) {
+        return NULL;
+    }
+
+    for (std::size_t ci = 0; ci < cells.size(); ++ci) {
+        /* Query contributors for this cell using the shared grid. */
+        std::uint32_t sx = 0, sy = 0, sz = 0;
+        std::uint32_t ex = 0, ey = 0, ez = 0;
+        grid.contributor_bin_span(
+            cells[ci].bounds, max_h, sx, sy, sz, ex, ey, ez);
+
+        std::vector<std::size_t> contributors;
+        for (std::uint32_t ix = sx; ix <= ex; ++ix) {
+            for (std::uint32_t iy = sy; iy <= ey; ++iy) {
+                for (std::uint32_t iz = sz; iz <= ez; ++iz) {
+                    const TopLevelBin &bin =
+                        grid.bins[grid.flatten_index(ix, iy, iz)];
+                    for (std::size_t pi : bin.particle_indices) {
+                        if (particle_support_overlaps_box(
+                                positions[pi],
+                                smoothing_lengths[pi],
+                                cells[ci].bounds)) {
+                            contributors.push_back(pi);
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Build the cell dict. */
+        PyObject *cell_dict = build_octree_cell_dict(cells[ci]);
+        if (cell_dict == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+
+        /* Add contributors tuple. */
+        PyObject *contribs_tuple = PyTuple_New(
+            static_cast<Py_ssize_t>(contributors.size()));
+        if (contribs_tuple == NULL) {
+            Py_DECREF(cell_dict);
+            Py_DECREF(result);
+            return NULL;
+        }
+        for (std::size_t j = 0; j < contributors.size(); ++j) {
+            PyTuple_SET_ITEM(contribs_tuple,
+                             static_cast<Py_ssize_t>(j),
+                             PyLong_FromSize_t(contributors[j]));
+        }
+        if (PyDict_SetItemString(cell_dict, "contributors",
+                                 contribs_tuple) < 0) {
+            Py_DECREF(contribs_tuple);
+            Py_DECREF(cell_dict);
+            Py_DECREF(result);
+            return NULL;
+        }
+        Py_DECREF(contribs_tuple);
+
+        PyTuple_SET_ITEM(result, static_cast<Py_ssize_t>(ci),
+                         cell_dict);
+    }
+    return result;
+}
+
+/**
  * @brief Return the eight children created from one parent cell.
  */
 static PyObject *create_child_cells_py(PyObject *self, PyObject *args) {
@@ -1384,6 +1510,12 @@ static PyMethodDef adaptive_methods[] = {
         query_cell_contributors_py,
         METH_VARARGS,
         PyDoc_STR("Return candidate contributor indices for a query cell."),
+    },
+    {
+        "create_top_level_cells_with_contributors",
+        create_top_level_cells_with_contributors_py,
+        METH_VARARGS,
+        PyDoc_STR("Create top-level cells with contributors in one pass."),
     },
     {
         "cell_may_contain_isosurface",

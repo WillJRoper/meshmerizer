@@ -14,9 +14,8 @@ from typing import Optional
 import numpy as np
 
 from meshmerizer.adaptive_core import (
-    create_top_level_cells,
+    create_top_level_cells_with_contributors,
     generate_mesh,
-    query_cell_contributors,
     refine_octree,
 )
 from meshmerizer.logging import log_status, record_elapsed
@@ -266,31 +265,21 @@ def run_adaptive(args) -> None:
         )
         tree_start = time.perf_counter()
 
-        # Create top-level cells and attach contributors.
-        top_cells = create_top_level_cells(
-            domain_min, domain_max, base_resolution
+        # Create top-level cells and query contributors in a
+        # single pass (builds the particle grid once).
+        top_cells = create_top_level_cells_with_contributors(
+            positions,
+            smoothing_lengths,
+            domain_min,
+            domain_max,
+            base_resolution,
         )
         initial_cells = []
         for cell in top_cells:
             cell_dict = dict(cell)
-            # Attach all particles as contributors for each
-            # top-level cell; refine_octree will filter during
-            # refinement.  For large particle counts a spatial
-            # query per cell would be faster, but the current
-            # C++ contributor filtering handles this correctly.
-            contribs = query_cell_contributors(
-                positions,
-                smoothing_lengths,
-                domain_min,
-                domain_max,
-                base_resolution,
-                cell["bounds"][0],
-                cell["bounds"][1],
-            )
+            contribs = cell_dict.pop("contributors")
             cell_dict["contributor_begin"] = 0
             cell_dict["contributor_end"] = len(contribs)
-            # Store the actual contributor indices for
-            # refine_octree to use.
             cell_dict["contributors"] = contribs
             initial_cells.append(cell_dict)
 
