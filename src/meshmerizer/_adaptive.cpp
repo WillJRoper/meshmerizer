@@ -1439,6 +1439,24 @@ static PyMethodDef adaptive_methods[] = {
         METH_VARARGS,
         PyDoc_STR("Generate a triangle mesh from a refined octree via dual contouring."),
     },
+    {
+        "set_num_threads",
+        [](PyObject *, PyObject *args) -> PyObject * {
+            int n;
+            if (!PyArg_ParseTuple(args, "i", &n)) {
+                return NULL;
+            }
+            if (n < 1) {
+                PyErr_SetString(PyExc_ValueError,
+                                "nthreads must be >= 1");
+                return NULL;
+            }
+            omp_set_num_threads(n);
+            Py_RETURN_NONE;
+        },
+        METH_VARARGS,
+        PyDoc_STR("Set the number of OpenMP threads."),
+    },
     {NULL, NULL, 0, NULL},
 };
 

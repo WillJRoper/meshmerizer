@@ -176,6 +176,16 @@ def run_adaptive(args) -> None:
     """
     total_start = time.perf_counter()
 
+    # Set OpenMP thread count if requested.
+    if args.nthreads is not None:
+        from meshmerizer._adaptive import set_num_threads
+
+        set_num_threads(args.nthreads)
+        log_status(
+            "Config",
+            f"OpenMP threads set to {args.nthreads}.",
+        )
+
     # ------------------------------------------------------------------
     # Step 1: Load from HDF5 octree or from a SWIFT snapshot.
     # ------------------------------------------------------------------

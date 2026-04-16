@@ -204,6 +204,15 @@ def build_parser() -> argparse.ArgumentParser:
             "still required for the output path default."
         ),
     )
+    adaptive.add_argument(
+        "--nthreads",
+        type=int,
+        default=None,
+        help=(
+            "Number of OpenMP threads. Defaults to all available "
+            "cores. Only effective when built with WITH_OPENMP."
+        ),
+    )
 
     adaptive.set_defaults(func=run_adaptive)
 

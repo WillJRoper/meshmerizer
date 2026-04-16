@@ -28,6 +28,11 @@ inline int omp_get_max_threads() { return 1; }
  * @brief Stub: return thread 0 when OpenMP is disabled.
  */
 inline int omp_get_thread_num() { return 0; }
+
+/**
+ * @brief Stub: no-op when OpenMP is disabled.
+ */
+inline void omp_set_num_threads(int) {}
 #endif
 
 #endif  // MESHMERIZER_ADAPTIVE_CPP_OMP_CONFIG_HPP_
