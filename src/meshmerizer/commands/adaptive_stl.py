@@ -414,23 +414,33 @@ def run_adaptive(args) -> None:
     # Step 4: Generate mesh for load-octree path.
     # ------------------------------------------------------------------
     if args.load_octree is not None:
-        log_status(
-            "Meshing",
-            "Solving QEF vertices from loaded octree...",
-        )
-        mesh_start = time.perf_counter()
-        vert_positions, vert_normals = solve_vertices(
-            cells,
-            contributors,
-            positions,
-            smoothing_lengths,
-            isovalue,
-            domain_min,
-            domain_max,
-            max_depth,
-            base_resolution,
-        )
-        record_elapsed("Vertex solve", mesh_start, operation="Meshing")
+        # If the loaded HDF5 already contains QEF vertices, reuse them
+        # instead of re-solving (saves significant compute time).
+        if state.get("vertices") is not None:
+            log_status(
+                "Meshing",
+                "Using QEF vertices from loaded octree.",
+            )
+            vert_positions = state["vertices"]
+            vert_normals = state["normals"]
+        else:
+            log_status(
+                "Meshing",
+                "Solving QEF vertices from loaded octree...",
+            )
+            mesh_start = time.perf_counter()
+            vert_positions, vert_normals = solve_vertices(
+                cells,
+                contributors,
+                positions,
+                smoothing_lengths,
+                isovalue,
+                domain_min,
+                domain_max,
+                max_depth,
+                base_resolution,
+            )
+            record_elapsed("Vertex solve", mesh_start, operation="Meshing")
 
     n_verts = len(vert_positions)
     log_status(

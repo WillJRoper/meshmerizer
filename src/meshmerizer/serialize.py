@@ -34,8 +34,7 @@ _SCHEMA_VERSION = "1.0"
 # ---------------------------------------------------------------------------
 CellDict = Dict[str, object]
 Vec3 = Tuple[float, float, float]
-MeshVertex = Tuple[Vec3, Vec3]
-Triangle = Tuple[int, int, int]
+MeshVertex = Tuple[Vec3, Vec3]  # Legacy alias, kept for compat.
 
 
 # ===================================================================
@@ -55,9 +54,9 @@ def export_octree(
     smoothing_lengths: Sequence[float],
     cells: Sequence[CellDict],
     contributors: Sequence[int],
-    vertices: Optional[Sequence[MeshVertex]] = None,
+    vertices: Optional[np.ndarray] = None,
     normals: Optional[Sequence] = None,
-    triangles: Optional[Sequence[Triangle]] = None,
+    group_labels: Optional[Sequence[int]] = None,
     version: str = "",
 ) -> None:
     """Write the full adaptive octree state to an HDF5 file.
@@ -75,12 +74,12 @@ def export_octree(
             ``refine_octree``).
         contributors: Flat contributor index array (from
             ``refine_octree``).
-        vertices: Optional mesh vertices.  Either a list of
-            ``((px,py,pz),(nx,ny,nz))`` pairs (old format) or an
-            (N, 3) float64 array of positions (new format).
-        normals: Optional (N, 3) float64 array of vertex normals.
-            Only used when ``vertices`` is an (N, 3) positions array.
-        triangles: Optional mesh triangles as ``(i0, i1, i2)`` triples.
+        vertices: Optional QEF vertex positions as an ``(V, 3)``
+            float64 array.
+        normals: Optional QEF vertex normals as an ``(V, 3)``
+            float64 array.
+        group_labels: Optional FOF group labels as a ``(V,)``
+            int64 array.
         version: Optional version string written into metadata.  If
             empty the field is still written as an empty string.
     """
@@ -224,36 +223,25 @@ def export_octree(
         cgrp = f.create_group("contributors")
         cgrp.create_dataset("indices", data=contrib_arr)
 
-        # -- mesh / vertex data (optional) --
+        # -- QEF vertices (optional) --
         if vertices is not None:
-            mgrp = f.create_group("mesh")
-            # Support both old format (list of ((px,py,pz),(nx,ny,nz)))
-            # and new format (Nx3 ndarray of positions + separate normals).
-            vert_arr = np.asarray(vertices, dtype=np.float64)
-            if vert_arr.ndim == 2 and vert_arr.shape[1] == 3:
-                # New format: vertices is already Nx3 positions.
-                vert_pos = vert_arr
-                if normals is not None:
-                    vert_nrm = np.asarray(normals, dtype=np.float64)
-                else:
-                    vert_nrm = np.zeros_like(vert_pos)
-            else:
-                # Old format: list of ((px,py,pz),(nx,ny,nz)).
-                vert_pos = np.array([v[0] for v in vertices], dtype=np.float64)
-                vert_nrm = np.array([v[1] for v in vertices], dtype=np.float64)
+            qgrp = f.create_group("qef_vertices")
+            vert_pos = np.asarray(vertices, dtype=np.float64)
             if vert_pos.ndim == 1 and vert_pos.size == 0:
                 vert_pos = vert_pos.reshape((0, 3))
-                vert_nrm = vert_nrm.reshape((0, 3))
-            mgrp.create_dataset("vertices", data=vert_pos)
-            mgrp.create_dataset("normals", data=vert_nrm)
+            qgrp.create_dataset("positions", data=vert_pos)
 
-            # Triangles are optional — Poisson pipeline does not
-            # produce them at this stage.
-            if triangles is not None:
-                tri_arr = np.asarray(triangles, dtype=np.int64)
-                if tri_arr.ndim == 1 and tri_arr.size == 0:
-                    tri_arr = tri_arr.reshape((0, 3))
-                mgrp.create_dataset("triangles", data=tri_arr)
+            if normals is not None:
+                vert_nrm = np.asarray(normals, dtype=np.float64)
+                if vert_nrm.ndim == 1 and vert_nrm.size == 0:
+                    vert_nrm = vert_nrm.reshape((0, 3))
+            else:
+                vert_nrm = np.zeros_like(vert_pos)
+            qgrp.create_dataset("normals", data=vert_nrm)
+
+            if group_labels is not None:
+                gl_arr = np.asarray(group_labels, dtype=np.int64)
+                qgrp.create_dataset("group_labels", data=gl_arr)
 
 
 # ===================================================================
@@ -282,10 +270,11 @@ def import_octree(
         - ``positions`` (list of 3-tuples)
         - ``smoothing_lengths`` (list of floats)
         - ``cells`` (list of cell dicts compatible with
-          ``adaptive_core.generate_mesh``)
+          ``adaptive_core.solve_vertices``)
         - ``contributors`` (list of ints)
-        - ``vertices`` (list of ``((px,py,pz),(nx,ny,nz))`` or None)
-        - ``triangles`` (list of ``(i0,i1,i2)`` or None)
+        - ``vertices`` (Nx3 ndarray of float64 or None)
+        - ``normals`` (Nx3 ndarray of float64 or None)
+        - ``group_labels`` (length-N ndarray of int64 or None)
     """
     with h5py.File(path, "r") as f:
         # -- metadata --
@@ -346,25 +335,16 @@ def import_octree(
             }
             cells.append(cell)
 
-        # -- mesh (optional) --
+        # -- QEF vertices (optional) --
         vertices = None
-        triangles_out = None
-        if "mesh" in f:
-            mgrp = f["mesh"]
-            vert_pos = mgrp["vertices"][:]
-            vert_nrm = mgrp["normals"][:]
-            vertices = [
-                (
-                    tuple(vert_pos[i].tolist()),
-                    tuple(vert_nrm[i].tolist()),
-                )
-                for i in range(len(vert_pos))
-            ]
-            if "triangles" in mgrp:
-                tri_arr = mgrp["triangles"][:]
-                triangles_out = [
-                    tuple(int(x) for x in row) for row in tri_arr.tolist()
-                ]
+        vert_normals = None
+        group_labels = None
+        if "qef_vertices" in f:
+            qgrp = f["qef_vertices"]
+            vertices = qgrp["positions"][:]
+            vert_normals = qgrp["normals"][:]
+            if "group_labels" in qgrp:
+                group_labels = qgrp["group_labels"][:]
 
     return {
         "isovalue": isovalue,
@@ -379,5 +359,6 @@ def import_octree(
         "cells": cells,
         "contributors": contributors_list,
         "vertices": vertices,
-        "triangles": triangles_out,
+        "normals": vert_normals,
+        "group_labels": group_labels,
     }

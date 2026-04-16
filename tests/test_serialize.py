@@ -3,6 +3,8 @@
 import os
 import tempfile
 
+import numpy as np
+
 from meshmerizer.adaptive_core import (
     create_top_level_cells,
     refine_octree,
@@ -130,15 +132,16 @@ def test_round_trip_without_mesh():
             assert loaded["corner_values"] == orig["corner_values"]
             assert loaded["contributors"] == orig["contributors"]
 
-        # No mesh
+        # No QEF vertices
         assert result["vertices"] is None
-        assert result["triangles"] is None
+        assert result["normals"] is None
+        assert result["group_labels"] is None
     finally:
         os.unlink(path)
 
 
 def test_round_trip_with_mesh():
-    """Export then import an octree with mesh data."""
+    """Export then import an octree with QEF vertex data."""
     (
         cells,
         contributors,
@@ -163,6 +166,10 @@ def test_round_trip_with_mesh():
         base_resolution,
     )
 
+    # Fake group labels for testing.
+    n_verts = len(vert_positions)
+    group_labels = np.zeros(n_verts, dtype=np.int64)
+
     with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as f:
         path = f.name
 
@@ -180,24 +187,30 @@ def test_round_trip_with_mesh():
             contributors=contributors,
             vertices=vert_positions,
             normals=vert_normals,
+            group_labels=group_labels,
             version="test-0.2",
         )
 
         result = import_octree(path)
 
-        # Check vertices are present
+        # Check vertices are present as NumPy arrays.
         assert result["vertices"] is not None
-        assert len(result["vertices"]) == len(vert_positions)
+        assert result["normals"] is not None
+        assert result["group_labels"] is not None
+        assert len(result["vertices"]) == n_verts
 
-        # Verify vertex positions are close
-        for orig, loaded in zip(vert_positions, result["vertices"]):
-            for a, b in zip(orig, loaded[0]):
-                assert abs(a - b) < 1e-12
-
-        # Verify normals are close
-        for orig, loaded in zip(vert_normals, result["vertices"]):
-            for a, b in zip(orig, loaded[1]):
-                assert abs(a - b) < 1e-12
+        # Verify positions and normals are close.
+        np.testing.assert_allclose(
+            result["vertices"],
+            np.asarray(vert_positions),
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            result["normals"],
+            np.asarray(vert_normals),
+            atol=1e-12,
+        )
+        np.testing.assert_array_equal(result["group_labels"], group_labels)
     finally:
         os.unlink(path)
 
