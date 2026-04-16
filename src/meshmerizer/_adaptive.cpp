@@ -12,6 +12,7 @@
 #include <Python.h>
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "adaptive_cpp/bounding_box.hpp"
@@ -133,6 +134,139 @@ static bool parse_index_sequence(PyObject *sequence,
     }
     Py_DECREF(fast);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Buffer-protocol parsers for NumPy arrays.
+//
+// These functions attempt to read positions (Nx3 float64, C-contiguous)
+// and smoothing lengths (N float64, C-contiguous) directly from the
+// Python buffer protocol, avoiding the per-element PyFloat_AsDouble
+// overhead that dominates for 100M+ particles.  If the object does not
+// support the buffer protocol (e.g., a plain Python list), the functions
+// return false *without* setting a Python exception so the caller can
+// fall back to the slower sequence-based parsers.
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Try to parse an Nx3 C-contiguous float64 buffer into Vector3d.
+ *
+ * Returns true on success.  Returns false *without* setting a Python
+ * exception if the object does not support the buffer protocol or has
+ * the wrong shape/dtype — callers should fall back to
+ * ``parse_vector3d_sequence`` in that case.  Sets a Python exception
+ * only on genuine errors (e.g. buffer is float64 Nx3 but not
+ * C-contiguous).
+ */
+static bool try_parse_positions_buffer(PyObject *object,
+                                       std::vector<Vector3d> &output) {
+    Py_buffer view;
+    // Request C-contiguous, strided, format info.
+    if (PyObject_GetBuffer(
+            object, &view,
+            PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) != 0) {
+        // Object doesn't support buffer protocol — clear the error
+        // and let the caller fall back to the sequence parser.
+        PyErr_Clear();
+        return false;
+    }
+
+    // We expect dtype=float64 (format "d") and shape (N, 3).
+    bool ok = true;
+    if (view.format == NULL ||
+        std::strcmp(view.format, "d") != 0) {
+        ok = false;
+    }
+    if (view.ndim != 2 || view.shape == NULL ||
+        view.shape[1] != 3) {
+        ok = false;
+    }
+    if (!ok) {
+        PyBuffer_Release(&view);
+        return false;
+    }
+
+    const Py_ssize_t n = view.shape[0];
+    const double *data =
+        static_cast<const double *>(view.buf);
+    output.resize(static_cast<std::size_t>(n));
+
+    // memcpy is valid because Vector3d is a POD struct with three
+    // contiguous doubles (x, y, z) and the buffer is C-contiguous.
+    static_assert(sizeof(Vector3d) == 3 * sizeof(double),
+                  "Vector3d must be 3 contiguous doubles");
+    std::memcpy(output.data(), data,
+                static_cast<std::size_t>(n) * sizeof(Vector3d));
+
+    PyBuffer_Release(&view);
+    return true;
+}
+
+/**
+ * @brief Try to parse a 1-D C-contiguous float64 buffer into doubles.
+ *
+ * Same fallback semantics as ``try_parse_positions_buffer``.
+ */
+static bool try_parse_doubles_buffer(PyObject *object,
+                                     std::vector<double> &output) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(
+            object, &view,
+            PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) != 0) {
+        PyErr_Clear();
+        return false;
+    }
+
+    bool ok = true;
+    if (view.format == NULL ||
+        std::strcmp(view.format, "d") != 0) {
+        ok = false;
+    }
+    if (view.ndim != 1 || view.shape == NULL) {
+        ok = false;
+    }
+    if (!ok) {
+        PyBuffer_Release(&view);
+        return false;
+    }
+
+    const Py_ssize_t n = view.shape[0];
+    const double *data =
+        static_cast<const double *>(view.buf);
+    output.resize(static_cast<std::size_t>(n));
+    std::memcpy(output.data(), data,
+                static_cast<std::size_t>(n) * sizeof(double));
+
+    PyBuffer_Release(&view);
+    return true;
+}
+
+/**
+ * @brief Parse positions from a NumPy array or Python sequence.
+ *
+ * Tries the fast buffer-protocol path first; falls back to the
+ * element-by-element sequence parser for plain Python lists.
+ */
+static bool parse_positions(PyObject *object,
+                            std::vector<Vector3d> &output) {
+    if (try_parse_positions_buffer(object, output)) {
+        return true;
+    }
+    return parse_vector3d_sequence(object, output);
+}
+
+/**
+ * @brief Parse doubles from a NumPy array or Python sequence.
+ *
+ * Tries the fast buffer-protocol path first; falls back to the
+ * element-by-element sequence parser for plain Python lists.
+ */
+static bool parse_doubles(PyObject *object,
+                          std::vector<double> &output) {
+    if (try_parse_doubles_buffer(object, output)) {
+        return true;
+    }
+    return parse_double_sequence(object, output);
 }
 
 /**
@@ -340,7 +474,7 @@ static PyObject *top_level_bin_counts_py(PyObject *self, PyObject *args) {
                           &domain_max_object, &resolution)) {
         return NULL;
     }
-    if (!parse_vector3d_sequence(positions_object, positions) ||
+    if (!parse_positions(positions_object, positions) ||
         !parse_vector3d(domain_min_object, domain.min) ||
         !parse_vector3d(domain_max_object, domain.max)) {
         return NULL;
@@ -388,8 +522,8 @@ static PyObject *query_cell_contributors_py(PyObject *self, PyObject *args) {
                           &cell_min_object, &cell_max_object)) {
         return NULL;
     }
-    if (!parse_vector3d_sequence(positions_object, positions) ||
-        !parse_double_sequence(smoothing_object, smoothing_lengths) ||
+    if (!parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths) ||
         !parse_vector3d(domain_min_object, domain.min) ||
         !parse_vector3d(domain_max_object, domain.max) ||
         !parse_vector3d(cell_min_object, cell.min) ||
@@ -575,8 +709,8 @@ static PyObject *create_top_level_cells_with_contributors_py(
                           &domain_max_object, &base_resolution)) {
         return NULL;
     }
-    if (!parse_vector3d_sequence(positions_object, positions) ||
-        !parse_double_sequence(smoothing_object, smoothing_lengths) ||
+    if (!parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths) ||
         !parse_vector3d(domain_min_object, domain.min) ||
         !parse_vector3d(domain_max_object, domain.max)) {
         return NULL;
@@ -745,8 +879,8 @@ static PyObject *filter_child_contributors_py(PyObject *self, PyObject *args) {
         return NULL;
     }
     if (!parse_index_sequence(parent_contributors_object, parent_contributors) ||
-        !parse_vector3d_sequence(positions_object, positions) ||
-        !parse_double_sequence(smoothing_object, smoothing_lengths)) {
+        !parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths)) {
         return NULL;
     }
     if (!PyTuple_Check(parent_bounds_object) || PyTuple_Size(parent_bounds_object) != 2) {
@@ -892,8 +1026,8 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
                           &max_depth, &domain_object, &base_resolution)) {
         return NULL;
     }
-    if (!parse_vector3d_sequence(positions_object, positions) ||
-        !parse_double_sequence(smoothing_object, smoothing_lengths)) {
+    if (!parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths)) {
         return NULL;
     }
     if (positions.size() != smoothing_lengths.size()) {
@@ -1067,8 +1201,8 @@ static PyObject *hermite_samples_for_cell_py(PyObject *self, PyObject *args) {
 
     if (!parse_double_sequence(corner_values_object, parsed_corner_values) ||
         !parse_index_sequence(contributors_object, contributor_indices) ||
-        !parse_vector3d_sequence(positions_object, positions) ||
-        !parse_double_sequence(smoothing_object, smoothing_lengths)) {
+        !parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths)) {
         return NULL;
     }
     if (parsed_corner_values.size() != 8U) {
@@ -1233,8 +1367,8 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    if (!parse_vector3d_sequence(positions_object, positions) ||
-        !parse_double_sequence(smoothing_object, smoothing_lengths)) {
+    if (!parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths)) {
         return NULL;
     }
     if (positions.size() != smoothing_lengths.size()) {
@@ -1350,7 +1484,7 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
             PyDict_GetItemString(d, "corner_values");
         if (cv_obj) {
             std::vector<double> cv;
-            if (parse_double_sequence(cv_obj, cv) &&
+            if (parse_doubles(cv_obj, cv) &&
                 cv.size() == 8U) {
                 std::copy(cv.begin(), cv.end(),
                           cell.corner_values.begin());
@@ -1462,6 +1596,216 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
 
     // Use "N" format to steal references — Py_BuildValue with "O" would
     // increment the refcount, leaking the lists we already own.
+    return Py_BuildValue("(NN)", verts_list, tris_list);
+}
+
+/**
+ * @brief Run the full meshing pipeline in C++ without round-tripping
+ *        octree cells through Python.
+ *
+ * Accepts:
+ *   positions         – Nx3 float64 array (or list of 3-tuples)
+ *   smoothing_lengths – N float64 array (or list of floats)
+ *   domain_min        – (x, y, z) tuple
+ *   domain_max        – (x, y, z) tuple
+ *   base_resolution   – unsigned int
+ *   isovalue          – double
+ *   max_depth         – unsigned int
+ *
+ * Returns (vertices, triangles) where:
+ *   vertices  – list of ((px,py,pz), (nx,ny,nz))
+ *   triangles – list of (i0, i1, i2)
+ *
+ * This combines create_top_level_cells + contributor query +
+ * refine_octree + generate_mesh into one C++ call, eliminating the
+ * massive serialization overhead of passing octree cells and
+ * contributor arrays through Python dictionaries.  For 100M+
+ * particles this saves ~3 min of pure Python↔C++ data marshalling.
+ */
+static PyObject *run_full_pipeline_py(
+        PyObject *self, PyObject *args) {
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    PyObject *domain_min_object = NULL;
+    PyObject *domain_max_object = NULL;
+    unsigned int base_resolution = 0U;
+    double isovalue = 0.0;
+    unsigned int max_depth = 0U;
+    (void)self;
+
+    if (!PyArg_ParseTuple(args, "OOOOIdI",
+                          &positions_object,
+                          &smoothing_object,
+                          &domain_min_object,
+                          &domain_max_object,
+                          &base_resolution,
+                          &isovalue,
+                          &max_depth)) {
+        return NULL;
+    }
+
+    // Parse particle data (prefers NumPy buffer protocol).
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    BoundingBox domain{};
+
+    if (!parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths)) {
+        return NULL;
+    }
+    if (positions.size() != smoothing_lengths.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing lengths "
+                        "must match in size");
+        return NULL;
+    }
+    if (!parse_vector3d(domain_min_object, domain.min) ||
+        !parse_vector3d(domain_max_object, domain.max)) {
+        return NULL;
+    }
+    if (base_resolution == 0U) {
+        PyErr_SetString(PyExc_ValueError,
+                        "base_resolution must be > 0");
+        return NULL;
+    }
+
+    // Release the GIL for the entire C++ pipeline since we no
+    // longer need any Python objects after parsing.
+    std::vector<MeshVertex> vertices;
+    std::vector<MeshTriangle> triangles;
+
+    Py_BEGIN_ALLOW_THREADS
+
+    // -- Step 1: Create top-level cells + query contributors --
+    double max_h = 0.0;
+    for (double h : smoothing_lengths) {
+        max_h = std::max(max_h, h);
+    }
+
+    TopLevelParticleGrid grid(domain, base_resolution);
+    grid.insert_particles(positions);
+
+    std::vector<OctreeCell> top_cells =
+        create_top_level_cells(domain, base_resolution);
+
+    // Build initial cells with contributor ranges stored in a
+    // flat vector that refine_octree can consume directly.
+    std::vector<OctreeCell> initial_cells;
+    initial_cells.reserve(top_cells.size());
+    std::vector<std::size_t> initial_contributors;
+
+    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+        OctreeCell cell = top_cells[ci];
+
+        std::uint32_t sx = 0, sy = 0, sz = 0;
+        std::uint32_t ex = 0, ey = 0, ez = 0;
+        grid.contributor_bin_span(
+            cell.bounds, max_h, sx, sy, sz, ex, ey, ez);
+
+        const std::int64_t begin =
+            static_cast<std::int64_t>(
+                initial_contributors.size());
+
+        for (std::uint32_t ix = sx; ix <= ex; ++ix) {
+            for (std::uint32_t iy = sy; iy <= ey; ++iy) {
+                for (std::uint32_t iz = sz;
+                     iz <= ez; ++iz) {
+                    const TopLevelBin &bin =
+                        grid.bins[grid.flatten_index(
+                            ix, iy, iz)];
+                    for (std::size_t pi :
+                         bin.particle_indices) {
+                        if (particle_support_overlaps_box(
+                                positions[pi],
+                                smoothing_lengths[pi],
+                                cell.bounds)) {
+                            initial_contributors.push_back(
+                                pi);
+                        }
+                    }
+                }
+            }
+        }
+
+        const std::int64_t end =
+            static_cast<std::int64_t>(
+                initial_contributors.size());
+        cell.contributor_begin = begin;
+        cell.contributor_end = end;
+        initial_cells.push_back(cell);
+    }
+
+    // -- Step 2: Refine octree (uses the overload that accepts
+    //    pre-built initial contributors) --
+    auto [all_cells, all_contributors] = refine_octree(
+        std::move(initial_cells),
+        std::move(initial_contributors),
+        positions,
+        smoothing_lengths,
+        isovalue,
+        static_cast<std::uint32_t>(max_depth),
+        domain,
+        static_cast<std::uint32_t>(base_resolution));
+
+    // -- Step 3: Generate mesh --
+    auto [verts, tris] = generate_mesh(
+        all_cells, all_contributors, positions,
+        smoothing_lengths, isovalue, domain,
+        static_cast<std::uint32_t>(max_depth),
+        static_cast<std::uint32_t>(base_resolution));
+
+    vertices = std::move(verts);
+    triangles = std::move(tris);
+
+    Py_END_ALLOW_THREADS
+
+    // Build the Python result lists.
+    PyObject *verts_list = PyList_New(
+        static_cast<Py_ssize_t>(vertices.size()));
+    if (verts_list == NULL) {
+        return NULL;
+    }
+    for (std::size_t i = 0; i < vertices.size(); ++i) {
+        PyObject *v = Py_BuildValue(
+            "((ddd)(ddd))",
+            vertices[i].position.x,
+            vertices[i].position.y,
+            vertices[i].position.z,
+            vertices[i].normal.x,
+            vertices[i].normal.y,
+            vertices[i].normal.z);
+        if (v == NULL) {
+            Py_DECREF(verts_list);
+            return NULL;
+        }
+        PyList_SET_ITEM(verts_list,
+                        static_cast<Py_ssize_t>(i), v);
+    }
+
+    PyObject *tris_list = PyList_New(
+        static_cast<Py_ssize_t>(triangles.size()));
+    if (tris_list == NULL) {
+        Py_DECREF(verts_list);
+        return NULL;
+    }
+    for (std::size_t i = 0; i < triangles.size(); ++i) {
+        PyObject *t = Py_BuildValue(
+            "(nnn)",
+            static_cast<Py_ssize_t>(
+                triangles[i].vertex_indices[0]),
+            static_cast<Py_ssize_t>(
+                triangles[i].vertex_indices[1]),
+            static_cast<Py_ssize_t>(
+                triangles[i].vertex_indices[2]));
+        if (t == NULL) {
+            Py_DECREF(tris_list);
+            Py_DECREF(verts_list);
+            return NULL;
+        }
+        PyList_SET_ITEM(tris_list,
+                        static_cast<Py_ssize_t>(i), t);
+    }
+
     return Py_BuildValue("(NN)", verts_list, tris_list);
 }
 
@@ -1606,6 +1950,15 @@ static PyMethodDef adaptive_methods[] = {
         },
         METH_VARARGS,
         PyDoc_STR("Set the number of OpenMP threads."),
+    },
+    {
+        "run_full_pipeline",
+        run_full_pipeline_py,
+        METH_VARARGS,
+        PyDoc_STR(
+            "Run the full meshing pipeline in C++ "
+            "(build + refine + mesh) without Python "
+            "round-trips."),
     },
     {NULL, NULL, 0, NULL},
 };

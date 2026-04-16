@@ -8,6 +8,10 @@ core types and algorithms are introduced in later phases.
 from __future__ import annotations
 
 from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy
 
 _adaptive = import_module("meshmerizer._adaptive")
 
@@ -481,4 +485,45 @@ def generate_mesh(
         domain_maximum,
         max_depth,
         base_resolution,
+    )
+
+
+def run_full_pipeline(
+    positions: "numpy.ndarray",
+    smoothing_lengths: "numpy.ndarray",
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    base_resolution: int,
+    isovalue: float,
+    max_depth: int,
+) -> tuple[list, list]:
+    """Run the full meshing pipeline entirely in C++.
+
+    This combines top-level cell creation, contributor queries,
+    octree refinement, and mesh generation into a single C++ call,
+    eliminating the overhead of serializing octree cells and
+    contributor arrays through Python.
+
+    Args:
+        positions: Nx3 float64 array of particle positions.
+        smoothing_lengths: N float64 array of support radii.
+        domain_minimum: Simulation domain lower corner.
+        domain_maximum: Simulation domain upper corner.
+        base_resolution: Number of top-level cells per axis.
+        isovalue: Target surface level.
+        max_depth: Maximum octree refinement depth.
+
+    Returns:
+        Tuple of ``(vertices, triangles)`` where vertices is a
+        list of ``((px, py, pz), (nx, ny, nz))`` pairs and
+        triangles is a list of ``(i0, i1, i2)`` index triples.
+    """
+    return _adaptive.run_full_pipeline(
+        positions,
+        smoothing_lengths,
+        domain_minimum,
+        domain_maximum,
+        base_resolution,
+        isovalue,
+        max_depth,
     )

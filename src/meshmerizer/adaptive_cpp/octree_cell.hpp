@@ -803,6 +803,163 @@ inline void balance_octree(
  * @return Tuple of (all_cells, all_contributors) where cells store indices
  *         into the contributors vector.
  */
+/**
+ * @brief Overload that accepts pre-populated initial contributors.
+ *
+ * When initial cells are built in C++ (e.g., from the full pipeline),
+ * the actual contributor particle indices are already known and stored
+ * in @p initial_contributors.  Each cell's contributor_begin/end
+ * index into this vector.  This avoids the legacy path that treats
+ * contributor_begin..contributor_end as sequential particle indices.
+ *
+ * @param initial_cells Top-level cells with contributor ranges pointing
+ *     into @p initial_contributors.
+ * @param initial_contributors Pre-built flat contributor index array.
+ * @param positions Particle positions.
+ * @param smoothing_lengths Per-particle support radii.
+ * @param isovalue Target surface level.
+ * @param max_depth Maximum refinement depth.
+ * @param domain Simulation domain bounding box.
+ * @param base_resolution Top-level cells per axis.
+ * @return Tuple of (all_cells, all_contributors).
+ */
+inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>>
+refine_octree(
+    std::vector<OctreeCell> initial_cells,
+    std::vector<std::size_t> initial_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    double isovalue,
+    std::uint32_t max_depth,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution) {
+    if (initial_cells.empty()) {
+        return {{}, {}};
+    }
+
+    std::vector<OctreeCell> all_cells;
+    // Start with the pre-built contributors; new contributors from
+    // child splits will be appended after this initial segment.
+    std::vector<std::size_t> all_contributors =
+        std::move(initial_contributors);
+    std::queue<std::size_t> leaf_queue;
+
+    // Initial cells already have valid contributor_begin/end
+    // pointing into all_contributors, so just copy them over.
+    for (std::size_t cell_index = 0;
+         cell_index < initial_cells.size(); ++cell_index) {
+        all_cells.push_back(initial_cells[cell_index]);
+        leaf_queue.push(all_cells.size() - 1);
+    }
+
+    ProgressCounter refine_counter("Refining", "cells", 100);
+
+    while (!leaf_queue.empty()) {
+        const std::size_t current_index = leaf_queue.front();
+        leaf_queue.pop();
+        refine_counter.tick();
+        OctreeCell &current_cell = all_cells[current_index];
+
+        if (current_cell.depth >= max_depth) {
+            current_cell.is_leaf = true;
+            current_cell.is_active = false;
+            current_cell.has_surface = false;
+            continue;
+        }
+
+        const std::int64_t contrib_begin =
+            current_cell.contributor_begin;
+        const std::int64_t contrib_end =
+            current_cell.contributor_end;
+        if (contrib_begin < 0 || contrib_end < 0 ||
+            contrib_begin >= contrib_end) {
+            current_cell.is_leaf = true;
+            current_cell.is_active = false;
+            current_cell.has_surface = false;
+            continue;
+        }
+
+        const auto safe_begin = static_cast<std::size_t>(
+            std::min(contrib_begin,
+                     static_cast<std::int64_t>(
+                         all_contributors.size())));
+        const auto safe_end = static_cast<std::size_t>(
+            std::min(contrib_end,
+                     static_cast<std::int64_t>(
+                         all_contributors.size())));
+        std::vector<std::size_t> contributors(
+            all_contributors.begin() +
+                static_cast<std::ptrdiff_t>(safe_begin),
+            all_contributors.begin() +
+                static_cast<std::ptrdiff_t>(safe_end));
+
+        if (contributors.size() < 2) {
+            current_cell.is_leaf = true;
+            current_cell.is_active = false;
+            current_cell.has_surface = false;
+            continue;
+        }
+
+        std::array<double, 8> corner_values =
+            sample_cell_corners(current_cell, contributors,
+                                positions, smoothing_lengths);
+        current_cell.corner_values = corner_values;
+        current_cell.corner_sign_mask =
+            compute_corner_sign_mask(corner_values, isovalue);
+
+        if (!cell_may_contain_isosurface(
+                corner_values, isovalue)) {
+            current_cell.is_leaf = true;
+            current_cell.is_active = false;
+            current_cell.has_surface = false;
+            continue;
+        }
+
+        current_cell.is_leaf = false;
+        current_cell.is_active = true;
+        current_cell.has_surface = true;
+
+        std::vector<OctreeCell> children =
+            create_child_cells(current_cell);
+        std::vector<std::vector<std::size_t>>
+            child_contributors = filter_child_contributors(
+                contributors, positions, smoothing_lengths,
+                children);
+
+        const std::int64_t child_begin_offset =
+            static_cast<std::int64_t>(all_cells.size());
+        current_cell.child_begin = child_begin_offset;
+
+        for (std::size_t i = 0; i < children.size(); ++i) {
+            const std::int64_t child_contrib_begin =
+                static_cast<std::int64_t>(
+                    all_contributors.size());
+            std::copy(child_contributors[i].begin(),
+                      child_contributors[i].end(),
+                      std::back_inserter(all_contributors));
+            const std::int64_t child_contrib_end =
+                static_cast<std::int64_t>(
+                    all_contributors.size());
+
+            children[i].contributor_begin =
+                child_contrib_begin;
+            children[i].contributor_end = child_contrib_end;
+
+            all_cells.push_back(children[i]);
+            leaf_queue.push(all_cells.size() - 1);
+        }
+    }
+
+    refine_counter.finish();
+
+    // Enforce the 2:1 balance rule.
+    balance_octree(all_cells, all_contributors, positions,
+                   smoothing_lengths, isovalue, domain,
+                   base_resolution, max_depth);
+
+    return {all_cells, all_contributors};
+}
+
 inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octree(
     std::vector<OctreeCell> initial_cells,
     const std::vector<Vector3d> &positions,

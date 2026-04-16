@@ -17,6 +17,7 @@ from meshmerizer.adaptive_core import (
     create_top_level_cells_with_contributors,
     generate_mesh,
     refine_octree,
+    run_full_pipeline,
 )
 from meshmerizer.logging import log_status, record_elapsed
 from meshmerizer.mesh.core import Mesh
@@ -148,9 +149,12 @@ def _load_particles_for_adaptive(args):
         f"Prepared {n_particles} particles for adaptive meshing.",
     )
 
-    # Convert to the list-of-tuples format the C++ extension expects.
-    positions = [tuple(row) for row in coords.tolist()]
-    smoothing_lengths = h.tolist()
+    # Ensure positions are a contiguous float64 (N, 3) array and
+    # smoothing lengths are a contiguous float64 (N,) array so the
+    # C++ extension can read them via the buffer protocol in a single
+    # memcpy instead of per-element PyFloat_AsDouble calls.
+    positions = np.ascontiguousarray(coords, dtype=np.float64)
+    smoothing_lengths = np.ascontiguousarray(h, dtype=np.float64)
 
     # The adaptive pipeline uses an explicit domain bounding box.
     # After loading, coordinates live in [0, effective_box_size)^3.
@@ -255,56 +259,128 @@ def run_adaptive(args) -> None:
         max_depth = args.max_depth
         base_resolution = args.base_resolution
 
-        # ----------------------------------------------------------
-        # Step 2: Build the octree.
-        # ----------------------------------------------------------
-        log_status(
-            "Building",
-            f"Building octree: base_resolution={base_resolution}, "
-            f"max_depth={max_depth}, isovalue={isovalue}",
-        )
-        tree_start = time.perf_counter()
+        if args.save_octree is not None:
+            # We need intermediate cells/contributors for saving,
+            # so use the step-by-step path through Python.
+            log_status(
+                "Building",
+                f"Building octree: base_resolution="
+                f"{base_resolution}, "
+                f"max_depth={max_depth}, isovalue={isovalue}",
+            )
+            tree_start = time.perf_counter()
 
-        # Create top-level cells and query contributors in a
-        # single pass (builds the particle grid once).
-        top_cells = create_top_level_cells_with_contributors(
-            positions,
-            smoothing_lengths,
-            domain_min,
-            domain_max,
-            base_resolution,
-        )
-        initial_cells = []
-        for cell in top_cells:
-            cell_dict = dict(cell)
-            contribs = cell_dict.pop("contributors")
-            cell_dict["contributor_begin"] = 0
-            cell_dict["contributor_end"] = len(contribs)
-            cell_dict["contributors"] = contribs
-            initial_cells.append(cell_dict)
+            top_cells = create_top_level_cells_with_contributors(
+                positions,
+                smoothing_lengths,
+                domain_min,
+                domain_max,
+                base_resolution,
+            )
+            initial_cells = []
+            for cell in top_cells:
+                cell_dict = dict(cell)
+                contribs = cell_dict.pop("contributors")
+                cell_dict["contributor_begin"] = 0
+                cell_dict["contributor_end"] = len(contribs)
+                cell_dict["contributors"] = contribs
+                initial_cells.append(cell_dict)
 
-        # Run breadth-first refinement with balancing.
-        cells, contributors = refine_octree(
-            initial_cells,
-            positions,
-            smoothing_lengths,
-            isovalue,
-            max_depth,
-            domain=(domain_min, domain_max),
-            base_resolution=base_resolution,
-        )
-        record_elapsed("Octree construction", tree_start, operation="Building")
+            cells, contributors = refine_octree(
+                initial_cells,
+                positions,
+                smoothing_lengths,
+                isovalue,
+                max_depth,
+                domain=(domain_min, domain_max),
+                base_resolution=base_resolution,
+            )
+            record_elapsed(
+                "Octree construction",
+                tree_start,
+                operation="Building",
+            )
 
-        log_status(
-            "Building",
-            f"Octree built: {len(cells)} cells, "
-            f"{sum(1 for c in cells if c['is_leaf'])} leaves.",
-        )
+            log_status(
+                "Building",
+                f"Octree built: {len(cells)} cells, "
+                f"{sum(1 for c in cells if c['is_leaf'])}"
+                f" leaves.",
+            )
+
+            # Save the octree state.
+            log_status(
+                "Saving",
+                f"Saving octree to {args.save_octree}",
+            )
+            save_start = time.perf_counter()
+            export_octree(
+                str(args.save_octree),
+                isovalue=isovalue,
+                base_resolution=base_resolution,
+                max_depth=max_depth,
+                domain_minimum=domain_min,
+                domain_maximum=domain_max,
+                positions=positions,
+                smoothing_lengths=smoothing_lengths,
+                cells=cells,
+                contributors=contributors,
+            )
+            record_elapsed("Octree save", save_start, operation="Saving")
+
+            # Generate mesh from the saved octree data.
+            log_status(
+                "Meshing",
+                "Generating mesh via dual contouring...",
+            )
+            mesh_start = time.perf_counter()
+            vertices, triangles = generate_mesh(
+                cells,
+                contributors,
+                positions,
+                smoothing_lengths,
+                isovalue,
+                domain_min,
+                domain_max,
+                max_depth,
+                base_resolution,
+            )
+            record_elapsed(
+                "Mesh generation",
+                mesh_start,
+                operation="Meshing",
+            )
+        else:
+            # Fast path: run the entire pipeline in C++ without
+            # round-tripping octree cells through Python dicts.
+            # This eliminates ~3 min of serialization overhead
+            # for 100M+ particle datasets.
+            log_status(
+                "Pipeline",
+                f"Running full C++ pipeline: "
+                f"base_resolution={base_resolution}, "
+                f"max_depth={max_depth}, isovalue={isovalue}",
+            )
+            pipeline_start = time.perf_counter()
+            vertices, triangles = run_full_pipeline(
+                positions,
+                smoothing_lengths,
+                domain_min,
+                domain_max,
+                base_resolution,
+                isovalue,
+                max_depth,
+            )
+            record_elapsed(
+                "Full pipeline",
+                pipeline_start,
+                operation="Pipeline",
+            )
 
     # ------------------------------------------------------------------
-    # Step 3: Optionally save the octree state.
+    # Step 3: Optionally save the octree state (load-octree path).
     # ------------------------------------------------------------------
-    if args.save_octree is not None:
+    if args.load_octree is not None and args.save_octree is not None:
         log_status("Saving", f"Saving octree to {args.save_octree}")
         save_start = time.perf_counter()
         export_octree(
@@ -322,22 +398,26 @@ def run_adaptive(args) -> None:
         record_elapsed("Octree save", save_start, operation="Saving")
 
     # ------------------------------------------------------------------
-    # Step 4: Generate the mesh via dual contouring.
+    # Step 4: Generate mesh for load-octree path.
     # ------------------------------------------------------------------
-    log_status("Meshing", "Generating mesh via dual contouring...")
-    mesh_start = time.perf_counter()
-    vertices, triangles = generate_mesh(
-        cells,
-        contributors,
-        positions,
-        smoothing_lengths,
-        isovalue,
-        domain_min,
-        domain_max,
-        max_depth,
-        base_resolution,
-    )
-    record_elapsed("Mesh generation", mesh_start, operation="Meshing")
+    if args.load_octree is not None:
+        log_status(
+            "Meshing",
+            "Generating mesh via dual contouring...",
+        )
+        mesh_start = time.perf_counter()
+        vertices, triangles = generate_mesh(
+            cells,
+            contributors,
+            positions,
+            smoothing_lengths,
+            isovalue,
+            domain_min,
+            domain_max,
+            max_depth,
+            base_resolution,
+        )
+        record_elapsed("Mesh generation", mesh_start, operation="Meshing")
 
     n_verts = len(vertices)
     n_tris = len(triangles)

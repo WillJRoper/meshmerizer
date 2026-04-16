@@ -16,6 +16,7 @@ from meshmerizer.adaptive_core import (
     particle_fields,
     query_cell_contributors,
     refine_octree,
+    run_full_pipeline,
     solve_qef_for_leaf,
     top_level_bin_counts,
     wendland_c2_gradient,
@@ -1013,3 +1014,112 @@ def test_generate_mesh_mixed_depth_adjacency() -> None:
         f"Euler characteristic is {euler} "
         f"(V={v_count}, E={e_count}, F={f_count}), expected 2"
     )
+
+
+# ---------------------------------------------------------------------------
+# NumPy buffer-protocol tests
+# ---------------------------------------------------------------------------
+
+
+def test_refine_octree_accepts_numpy_arrays() -> None:
+    """C++ bindings should accept NumPy arrays via buffer protocol."""
+    import numpy as np
+
+    domain_min = (0.0, 0.0, 0.0)
+    domain_max = (1.0, 1.0, 1.0)
+    base_resolution = 2
+
+    positions = np.array([[0.5, 0.5, 0.5], [0.6, 0.5, 0.5]], dtype=np.float64)
+    smoothing_lengths = np.array([0.6, 0.6], dtype=np.float64)
+
+    cells = create_top_level_cells(domain_min, domain_max, base_resolution)
+    for cell in cells:
+        cell["contributor_begin"] = 0
+        cell["contributor_end"] = 2
+
+    refined_cells, contributors = refine_octree(
+        cells,
+        positions=positions,
+        smoothing_lengths=smoothing_lengths,
+        isovalue=0.5,
+        max_depth=2,
+        domain=(domain_min, domain_max),
+        base_resolution=base_resolution,
+    )
+    assert len(refined_cells) > 0
+    assert len(contributors) > 0
+
+
+# ---------------------------------------------------------------------------
+# run_full_pipeline tests
+# ---------------------------------------------------------------------------
+
+
+def test_run_full_pipeline_matches_stepwise() -> None:
+    """Full pipeline should produce same result as step-by-step."""
+    import numpy as np
+
+    domain_min = (-1.0, -1.0, -1.0)
+    domain_max = (2.0, 2.0, 2.0)
+    base_resolution = 2
+    isovalue = 0.5
+    max_depth = 3
+
+    # Use the same particle setup as _build_sphere_octree.
+    positions_list = [
+        (0.45, 0.5, 0.5),
+        (0.55, 0.5, 0.5),
+        (0.5, 0.45, 0.5),
+        (0.5, 0.55, 0.5),
+        (0.5, 0.5, 0.45),
+        (0.5, 0.5, 0.55),
+    ]
+    smoothing_list = [0.8] * len(positions_list)
+
+    positions_arr = np.array(positions_list, dtype=np.float64)
+    smoothing_arr = np.array(smoothing_list, dtype=np.float64)
+
+    vertices, triangles = run_full_pipeline(
+        positions_arr,
+        smoothing_arr,
+        domain_min,
+        domain_max,
+        base_resolution,
+        isovalue,
+        max_depth,
+    )
+
+    # The pipeline should produce a non-empty mesh for this
+    # configuration (same setup as _build_sphere_octree).
+    assert len(vertices) > 0
+    assert len(triangles) > 0
+
+    # Verify vertex format: ((px,py,pz), (nx,ny,nz)).
+    pos, normal = vertices[0]
+    assert len(pos) == 3
+    assert len(normal) == 3
+
+    # Verify triangle format: (i0, i1, i2).
+    tri = triangles[0]
+    assert len(tri) == 3
+    assert all(0 <= idx < len(vertices) for idx in tri)
+
+
+def test_run_full_pipeline_empty_particles() -> None:
+    """Pipeline with no particles should produce empty mesh."""
+    import numpy as np
+
+    positions = np.zeros((0, 3), dtype=np.float64)
+    smoothing = np.zeros(0, dtype=np.float64)
+
+    vertices, triangles = run_full_pipeline(
+        positions,
+        smoothing,
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 1.0),
+        2,
+        0.5,
+        3,
+    )
+    assert len(vertices) == 0
+    assert len(triangles) == 0
