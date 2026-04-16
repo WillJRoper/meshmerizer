@@ -5,16 +5,16 @@
  * Phase 9 of the adaptive meshing pipeline.  Given an octree whose active
  * leaf cells each carry a representative mesh vertex (from the QEF solve in
  * Phase 8), this module constructs the triangle mesh by finding every
- * sign-changing primal edge of the octree and connecting the representative
- * vertices of the (up to 4) leaf cells incident on that edge.
+ * sign-changing primal edge and connecting the representative vertices of
+ * the (up to 4) leaf cells incident on that edge.
  *
- * The algorithm iterates over leaf cells and, for each leaf, considers the
- * three primal edges emanating from its minimum corner (one per axis).
- * This "min-corner ownership" convention ensures each interior primal edge
- * is processed exactly once.  For each sign-changing edge, the four
- * incident leaf cells are located by spatial lookup, and a quad connecting
- * their QEF vertices is emitted.  Quads are split into two triangles with
- * consistent winding determined by the sign-change direction.
+ * The algorithm iterates every primal edge at the **finest grid resolution**
+ * (``base_resolution * 2^max_depth`` cells per axis).  At each fine-grid
+ * vertex the field sign is determined by trilinear interpolation of the
+ * containing leaf cell's corner values.  For a sign-changing edge, the four
+ * incident leaf cells are located via a hash-map spatial index and a quad
+ * is emitted connecting their QEF vertices.  Quads are split into two
+ * triangles with consistent winding determined by the sign-change direction.
  *
  * In an adaptive (2:1-balanced) octree, some of the four incident cells
  * may be the *same* cell (when a coarser cell covers multiple fine-grid
@@ -22,13 +22,14 @@
  * remain are discarded.
  *
  * Boundary edges (edges on the domain boundary where fewer than 4 cells
- * exist) are silently skipped to produce a closed mesh.
+ * exist) are silently skipped.  The isosurface must be fully contained
+ * within the domain interior for the resulting mesh to be watertight.
  *
  * Design for parallelism:
- * - Edge ownership is per-leaf and deterministic, so the iteration can be
- *   parallelized by partitioning leaves across workers.
- * - Face emission uses thread-local buffers that are concatenated at the
- *   end. (The initial implementation is serial but follows this pattern.)
+ * - The outer loop over fine-grid vertices can be partitioned across
+ *   threads with thread-local triangle buffers.
+ * - Vertex solving is per-leaf and independent, suitable for parallel
+ *   for-each.
  */
 
 #ifndef MESHMERIZER_ADAPTIVE_CPP_FACES_HPP_
@@ -38,6 +39,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -48,7 +50,7 @@
 #include "vector3d.hpp"
 
 /**
- * @brief Spatial index mapping positions to leaf cell indices.
+ * @brief Spatial index mapping fine-grid positions to leaf cell indices.
  *
  * Uses a hash map keyed by a quantized grid position to provide O(1)
  * lookup of the leaf cell that contains a given world-space point.
@@ -57,9 +59,12 @@
  *
  * For coarse cells that span multiple fine-grid positions, every
  * fine-grid position within the cell is registered at construction
- * time.  The 2:1 balance constraint ensures a coarse cell spans at
- * most 2x the fine-grid spacing, so the registration cost per coarse
- * cell is at most 8 entries (one octant of fine-grid positions).
+ * time.  A leaf at depth ``d`` in an octree with ``max_depth`` levels
+ * spans ``(2^(max_depth - d))^3`` fine-grid entries.  For the deepest
+ * leaves (depth == max_depth) this is 1 entry; for shallower leaves
+ * the count grows cubically — e.g., a depth-0 leaf with max_depth=6
+ * registers ``64^3 = 262 144`` entries.  The total memory is
+ * proportional to ``fine_res^3`` regardless of tree structure.
  */
 struct LeafSpatialIndex {
     /**
@@ -118,6 +123,22 @@ struct LeafSpatialIndex {
                const BoundingBox &domain,
                std::uint32_t max_depth,
                std::uint32_t base_resolution) {
+        // Guard: max_depth must be small enough that
+        // base_resolution * 2^max_depth fits in 21 bits (the
+        // pack_grid_coords capacity) and does not overflow uint32.
+        if (max_depth >= 21U) {
+            throw std::overflow_error(
+                "max_depth >= 21 would overflow 21-bit grid "
+                "coordinate packing");
+        }
+        const std::uint32_t fine_res_int =
+            base_resolution * (1U << max_depth);
+        constexpr std::uint32_t MAX_COORD = (1U << 21U) - 1U;
+        if (fine_res_int > MAX_COORD) {
+            throw std::overflow_error(
+                "fine_res exceeds 21-bit grid coordinate capacity");
+        }
+
         // The finest grid has base_resolution * 2^max_depth cells per axis.
         const double fine_cells_per_axis_x =
             static_cast<double>(base_resolution) *
@@ -163,6 +184,12 @@ struct LeafSpatialIndex {
 
             // Determine how many fine-grid cells this leaf spans per axis.
             // A leaf at depth d spans 2^(max_depth - d) fine cells.
+            // Guard: depth must not exceed max_depth (invariant from
+            // refinement), but check defensively.
+            if (cell.depth > max_depth) {
+                throw std::logic_error(
+                    "Leaf cell depth exceeds max_depth");
+            }
             const std::uint32_t span =
                 1U << (max_depth - cell.depth);
 
@@ -190,6 +217,14 @@ struct LeafSpatialIndex {
     static std::uint64_t pack_grid_coords(std::uint32_t ix,
                                            std::uint32_t iy,
                                            std::uint32_t iz) {
+        // Each axis gets 21 bits.  Values >= 2^21 would collide with
+        // adjacent fields, producing silent hash collisions.
+        constexpr std::uint32_t MAX_COORD = (1U << 21U) - 1U;
+        if (ix > MAX_COORD || iy > MAX_COORD || iz > MAX_COORD) {
+            throw std::overflow_error(
+                "Grid coordinate exceeds 21-bit capacity in "
+                "pack_grid_coords");
+        }
         return (static_cast<std::uint64_t>(ix) << 42U) |
                (static_cast<std::uint64_t>(iy) << 21U) |
                static_cast<std::uint64_t>(iz);
@@ -268,17 +303,19 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
             continue;
         }
 
-        // Gather contributor indices for this cell.
+        // Gather contributor indices for this cell.  Construct the
+        // vector directly from the iterator range into
+        // all_contributors, avoiding per-element push_back overhead.
         std::vector<std::size_t> contributors;
         if (cell.contributor_begin >= 0 &&
             cell.contributor_end > cell.contributor_begin) {
-            contributors.reserve(static_cast<std::size_t>(
-                cell.contributor_end - cell.contributor_begin));
-            for (std::int64_t k = cell.contributor_begin;
-                 k < cell.contributor_end; ++k) {
-                contributors.push_back(
-                    all_contributors[static_cast<std::size_t>(k)]);
-            }
+            const auto begin_it =
+                all_contributors.begin() +
+                static_cast<std::ptrdiff_t>(cell.contributor_begin);
+            const auto end_it =
+                all_contributors.begin() +
+                static_cast<std::ptrdiff_t>(cell.contributor_end);
+            contributors.assign(begin_it, end_it);
         }
 
         // If corner values were not sampled during refinement (e.g.,
@@ -389,19 +426,25 @@ inline void emit_quad(
     const std::size_t v2 = static_cast<std::size_t>(vi2);
     const std::size_t v3 = static_cast<std::size_t>(vi3);
 
-    // Count distinct vertices.  With adaptive octrees, some incident
-    // cells may be the same coarse cell, giving duplicate vertex indices.
-    std::size_t unique[4] = {v0, v1, v2, v3};
-    std::size_t num_unique = 4;
-    // Simple O(n^2) deduplicate for n=4.
-    for (std::size_t i = 0; i < num_unique; ++i) {
-        for (std::size_t j = i + 1; j < num_unique;) {
-            if (unique[j] == unique[i]) {
-                unique[j] = unique[num_unique - 1];
-                --num_unique;
-            } else {
-                ++j;
+    // Count distinct vertices and collect the first 3 in cyclic order.
+    // With adaptive octrees, some incident cells may be the same coarse
+    // cell, giving duplicate vertex indices.  We walk the cyclic
+    // sequence (v0, v1, v2, v3) and keep vertices that differ from
+    // all previously kept ones.  This preserves the cyclic winding
+    // order, which is essential for correct triangle orientation.
+    const std::size_t cyclic[4] = {v0, v1, v2, v3};
+    std::size_t unique[4];
+    std::size_t num_unique = 0;
+    for (std::size_t i = 0; i < 4; ++i) {
+        bool is_dup = false;
+        for (std::size_t j = 0; j < num_unique; ++j) {
+            if (cyclic[i] == unique[j]) {
+                is_dup = true;
+                break;
             }
+        }
+        if (!is_dup) {
+            unique[num_unique++] = cyclic[i];
         }
     }
 
@@ -462,6 +505,10 @@ inline bool sign_at_fine_vertex(
     double isovalue) {
     // The cell spans 'span' fine-grid cells per axis.  A cell at depth
     // d covers 2^(max_depth - d) fine cells along each axis.
+    // Guard: cell.depth must not exceed max_depth.
+    if (cell.depth > max_depth) {
+        return false;  // Defensive: should never happen.
+    }
     const std::uint32_t span = 1U << (max_depth - cell.depth);
 
     // For finest-level cells (span=1), the fine-grid vertex IS the min
@@ -486,28 +533,30 @@ inline bool sign_at_fine_vertex(
         static_cast<double>(iz - cz) / static_cast<double>(span);
 
     // Trilinear interpolation of corner values.
-    // Corner indexing: bit 0 = +X, bit 1 = +Y, bit 2 = +Z.
-    const double c000 = cell.corner_values[0];
-    const double c001 = cell.corner_values[1];
-    const double c010 = cell.corner_values[2];
-    const double c011 = cell.corner_values[3];
-    const double c100 = cell.corner_values[4];
-    const double c101 = cell.corner_values[5];
-    const double c110 = cell.corner_values[6];
-    const double c111 = cell.corner_values[7];
+    // Corner indexing: index = 4*dz + 2*dy + dx, where dx/dy/dz are
+    // 0 (low) or 1 (high) along each axis.  Variable names below use
+    // the pattern v_<dx><dy><dz> to match this convention.
+    const double v_000 = cell.corner_values[0];  // dx=0, dy=0, dz=0
+    const double v_100 = cell.corner_values[1];  // dx=1, dy=0, dz=0
+    const double v_010 = cell.corner_values[2];  // dx=0, dy=1, dz=0
+    const double v_110 = cell.corner_values[3];  // dx=1, dy=1, dz=0
+    const double v_001 = cell.corner_values[4];  // dx=0, dy=0, dz=1
+    const double v_101 = cell.corner_values[5];  // dx=1, dy=0, dz=1
+    const double v_011 = cell.corner_values[6];  // dx=0, dy=1, dz=1
+    const double v_111 = cell.corner_values[7];  // dx=1, dy=1, dz=1
 
-    // Interpolate along X first.
-    const double c00 = c000 + fx * (c001 - c000);
-    const double c01 = c010 + fx * (c011 - c010);
-    const double c10 = c100 + fx * (c101 - c100);
-    const double c11 = c110 + fx * (c111 - c110);
+    // Interpolate along X first (dx direction).
+    const double vx_00 = v_000 + fx * (v_100 - v_000);
+    const double vx_01 = v_010 + fx * (v_110 - v_010);
+    const double vx_10 = v_001 + fx * (v_101 - v_001);
+    const double vx_11 = v_011 + fx * (v_111 - v_011);
 
-    // Then along Y.
-    const double c0 = c00 + fy * (c01 - c00);
-    const double c1 = c10 + fy * (c11 - c10);
+    // Then along Y (dy direction).
+    const double vxy_0 = vx_00 + fy * (vx_01 - vx_00);
+    const double vxy_1 = vx_10 + fy * (vx_11 - vx_10);
 
-    // Then along Z.
-    const double value = c0 + fz * (c1 - c0);
+    // Then along Z (dz direction).
+    const double value = vxy_0 + fz * (vxy_1 - vxy_0);
 
     return value >= isovalue;
 }
@@ -561,9 +610,20 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
     double isovalue) {
     std::vector<MeshTriangle> triangles;
 
+    // Guard: ensure fine_res does not overflow uint32 or exceed
+    // the 21-bit pack_grid_coords capacity.
+    if (max_depth >= 21U) {
+        throw std::overflow_error(
+            "max_depth >= 21 would overflow grid coordinates");
+    }
     // The fine-grid has this many cells per axis.
     const std::uint32_t fine_res =
         base_resolution * (1U << max_depth);
+    constexpr std::uint32_t MAX_COORD = (1U << 21U) - 1U;
+    if (fine_res > MAX_COORD) {
+        throw std::overflow_error(
+            "fine_res exceeds 21-bit grid coordinate capacity");
+    }
 
     // Iterate over all fine-grid vertex positions.  Each vertex
     // position (ix, iy, iz) is the min corner of a fine-grid cell.
@@ -601,11 +661,12 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
                             // (ix, iy, iz).  In the Y-Z plane:
                             //   c0=(iy,iz)     c2=(iy,iz-1)
                             //   c1=(iy-1,iz)   c3=(iy-1,iz-1)
-                            // Cyclic CCW around +X: c0, c2, c3, c1.
+                            // Cyclic CW around +X (normal in -X
+                            // direction): c0, c2, c3, c1.
+                            // Winding is reversed when sign_a_above.
                             if (iy > 0U && iz > 0U) {
-                                const std::size_t c0 =
-                                    spatial_index.find_leaf_at(
-                                        ix, iy, iz);
+                                // c0 is the cell at (ix,iy,iz),
+                                // already looked up as cell_a_idx.
                                 const std::size_t c1 =
                                     spatial_index.find_leaf_at(
                                         ix, iy - 1U, iz);
@@ -618,7 +679,8 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
 
                                 emit_quad(
                                     all_cells, vertices, triangles,
-                                    c0, c2, c3, c1, sign_a);
+                                    cell_a_idx, c2, c3, c1,
+                                    sign_a);
                             }
                         }
                     }
@@ -640,11 +702,12 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
                             // (ix, iy, iz).  In the X-Z plane:
                             //   c0=(ix,iz)     c2=(ix,iz-1)
                             //   c1=(ix-1,iz)   c3=(ix-1,iz-1)
-                            // Cyclic CCW around +Y: c0, c1, c3, c2.
+                            // Cyclic CW around +Y (normal in -Y
+                            // direction): c0, c1, c3, c2.
+                            // Winding is reversed when sign_a_above.
                             if (ix > 0U && iz > 0U) {
-                                const std::size_t c0 =
-                                    spatial_index.find_leaf_at(
-                                        ix, iy, iz);
+                                // c0 is the cell at (ix,iy,iz),
+                                // already looked up as cell_a_idx.
                                 const std::size_t c1 =
                                     spatial_index.find_leaf_at(
                                         ix - 1U, iy, iz);
@@ -657,7 +720,8 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
 
                                 emit_quad(
                                     all_cells, vertices, triangles,
-                                    c0, c1, c3, c2, sign_a);
+                                    cell_a_idx, c1, c3, c2,
+                                    sign_a);
                             }
                         }
                     }
@@ -679,11 +743,12 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
                             // (ix, iy, iz).  In the X-Y plane:
                             //   c0=(ix,iy)     c2=(ix,iy-1)
                             //   c1=(ix-1,iy)   c3=(ix-1,iy-1)
-                            // Cyclic CCW around +Z: c0, c2, c3, c1.
+                            // Cyclic CW around +Z (normal in -Z
+                            // direction): c0, c2, c3, c1.
+                            // Winding is reversed when sign_a_above.
                             if (ix > 0U && iy > 0U) {
-                                const std::size_t c0 =
-                                    spatial_index.find_leaf_at(
-                                        ix, iy, iz);
+                                // c0 is the cell at (ix,iy,iz),
+                                // already looked up as cell_a_idx.
                                 const std::size_t c1 =
                                     spatial_index.find_leaf_at(
                                         ix - 1U, iy, iz);
@@ -696,7 +761,8 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
 
                                 emit_quad(
                                     all_cells, vertices, triangles,
-                                    c0, c2, c3, c1, sign_a);
+                                    cell_a_idx, c2, c3, c1,
+                                    sign_a);
                             }
                         }
                     }

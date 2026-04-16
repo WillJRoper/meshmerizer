@@ -918,3 +918,74 @@ def test_generate_mesh_empty_field() -> None:
     )
     assert len(vertices) == 0
     assert len(triangles) == 0
+
+
+def test_generate_mesh_mixed_depth_adjacency() -> None:
+    """Mixed-depth octree should produce a valid watertight mesh.
+
+    Uses max_depth=3 to create deeper refinement near the surface,
+    forcing adjacent leaves at different depths.  The degenerate
+    quad path (3 unique vertices from a coarse cell covering
+    multiple fine-grid positions) must produce correct triangles.
+    """
+    args = _build_sphere_octree(base_resolution=4, max_depth=3)
+    vertices, triangles = generate_mesh(*args)
+
+    assert len(vertices) > 0, "Expected at least one vertex"
+    assert len(triangles) > 0, "Expected at least one triangle"
+
+    # Verify no degenerate triangles.
+    for tri in triangles:
+        assert tri[0] != tri[1], f"Degenerate triangle: {tri}"
+        assert tri[1] != tri[2], f"Degenerate triangle: {tri}"
+        assert tri[0] != tri[2], f"Degenerate triangle: {tri}"
+
+    # Verify watertightness: every edge shared by exactly 2 triangles.
+    edge_counts: dict = {}
+    for tri in triangles:
+        edges = [
+            _edge_key(tri[0], tri[1]),
+            _edge_key(tri[1], tri[2]),
+            _edge_key(tri[2], tri[0]),
+        ]
+        for edge in edges:
+            edge_counts[edge] = edge_counts.get(edge, 0) + 1
+
+    for edge, count in edge_counts.items():
+        assert count == 2, (
+            f"Edge {edge} shared by {count} triangles "
+            f"(expected 2 for watertight mesh)"
+        )
+
+    # Verify consistent winding.
+    half_edge_counts: dict = {}
+    for tri in triangles:
+        half_edges = [
+            (tri[0], tri[1]),
+            (tri[1], tri[2]),
+            (tri[2], tri[0]),
+        ]
+        for he in half_edges:
+            half_edge_counts[he] = half_edge_counts.get(he, 0) + 1
+
+    for he, count in half_edge_counts.items():
+        assert count == 1, f"Half-edge {he} appears {count} times"
+        reverse = (he[1], he[0])
+        assert reverse in half_edge_counts, (
+            f"Half-edge {he} has no reverse {reverse}"
+        )
+
+    # Verify Euler characteristic V - E + F = 2.
+    v_count = len(vertices)
+    f_count = len(triangles)
+    edges_set = set()
+    for tri in triangles:
+        edges_set.add(_edge_key(tri[0], tri[1]))
+        edges_set.add(_edge_key(tri[1], tri[2]))
+        edges_set.add(_edge_key(tri[2], tri[0]))
+    e_count = len(edges_set)
+    euler = v_count - e_count + f_count
+    assert euler == 2, (
+        f"Euler characteristic is {euler} "
+        f"(V={v_count}, E={e_count}, F={f_count}), expected 2"
+    )
