@@ -17,6 +17,7 @@
 #include "adaptive_cpp/bounding_box.hpp"
 #include "adaptive_cpp/kernel_wendland_c2.hpp"
 #include "adaptive_cpp/morton.hpp"
+#include "adaptive_cpp/octree_cell.hpp"
 #include "adaptive_cpp/particle.hpp"
 #include "adaptive_cpp/particle_grid.hpp"
 
@@ -377,6 +378,106 @@ static PyObject *query_cell_contributors_py(PyObject *self, PyObject *args) {
 }
 
 /**
+ * @brief Return whether one cell's corners can contain the isosurface.
+ */
+static PyObject *cell_may_contain_isosurface_py(PyObject *self, PyObject *args) {
+    PyObject *corner_values_object = NULL;
+    double isovalue = 0.0;
+    std::vector<double> parsed_values;
+    std::array<double, 8> corner_values{};
+    (void)self;
+    if (!PyArg_ParseTuple(args, "Od", &corner_values_object, &isovalue)) {
+        return NULL;
+    }
+    if (!parse_double_sequence(corner_values_object, parsed_values)) {
+        return NULL;
+    }
+    if (parsed_values.size() != 8U) {
+        PyErr_SetString(PyExc_ValueError,
+                        "corner_values must contain exactly 8 samples");
+        return NULL;
+    }
+    std::copy(parsed_values.begin(), parsed_values.end(), corner_values.begin());
+    if (cell_may_contain_isosurface(corner_values, isovalue)) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
+/**
+ * @brief Return the sign mask of one cell's corner samples.
+ */
+static PyObject *corner_sign_mask_py(PyObject *self, PyObject *args) {
+    PyObject *corner_values_object = NULL;
+    double isovalue = 0.0;
+    std::vector<double> parsed_values;
+    std::array<double, 8> corner_values{};
+    (void)self;
+    if (!PyArg_ParseTuple(args, "Od", &corner_values_object, &isovalue)) {
+        return NULL;
+    }
+    if (!parse_double_sequence(corner_values_object, parsed_values)) {
+        return NULL;
+    }
+    if (parsed_values.size() != 8U) {
+        PyErr_SetString(PyExc_ValueError,
+                        "corner_values must contain exactly 8 samples");
+        return NULL;
+    }
+    std::copy(parsed_values.begin(), parsed_values.end(), corner_values.begin());
+    return PyLong_FromUnsignedLong(
+        compute_corner_sign_mask(corner_values, isovalue));
+}
+
+/**
+ * @brief Return a documented summary of the top-level octree cells.
+ */
+static PyObject *create_top_level_cells_py(PyObject *self, PyObject *args) {
+    PyObject *domain_min_object = NULL;
+    PyObject *domain_max_object = NULL;
+    unsigned int base_resolution = 0U;
+    BoundingBox domain{};
+    (void)self;
+    if (!PyArg_ParseTuple(args, "OOI", &domain_min_object, &domain_max_object,
+                          &base_resolution)) {
+        return NULL;
+    }
+    if (!parse_vector3d(domain_min_object, domain.min) ||
+        !parse_vector3d(domain_max_object, domain.max)) {
+        return NULL;
+    }
+
+    const std::vector<OctreeCell> cells =
+        create_top_level_cells(domain, base_resolution);
+    PyObject *result = PyTuple_New(static_cast<Py_ssize_t>(cells.size()));
+    if (result == NULL) {
+        return NULL;
+    }
+    for (std::size_t index = 0; index < cells.size(); ++index) {
+        const OctreeCell &cell = cells[index];
+        PyObject *cell_dict = Py_BuildValue(
+            "{sK,sI,s((ddd)(ddd))}",
+            "morton_key",
+            static_cast<unsigned long long>(cell.morton_key),
+            "depth",
+            static_cast<unsigned int>(cell.depth),
+            "bounds",
+            cell.bounds.min.x,
+            cell.bounds.min.y,
+            cell.bounds.min.z,
+            cell.bounds.max.x,
+            cell.bounds.max.y,
+            cell.bounds.max.z);
+        if (cell_dict == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(result, static_cast<Py_ssize_t>(index), cell_dict);
+    }
+    return result;
+}
+
+/**
  * @brief Python methods exported by the adaptive extension.
  */
 static PyMethodDef adaptive_methods[] = {
@@ -439,6 +540,24 @@ static PyMethodDef adaptive_methods[] = {
         query_cell_contributors_py,
         METH_VARARGS,
         PyDoc_STR("Return candidate contributor indices for a query cell."),
+    },
+    {
+        "cell_may_contain_isosurface",
+        cell_may_contain_isosurface_py,
+        METH_VARARGS,
+        PyDoc_STR("Return whether corner samples straddle the isosurface."),
+    },
+    {
+        "corner_sign_mask",
+        corner_sign_mask_py,
+        METH_VARARGS,
+        PyDoc_STR("Return the sign mask of eight corner samples."),
+    },
+    {
+        "create_top_level_cells",
+        create_top_level_cells_py,
+        METH_VARARGS,
+        PyDoc_STR("Create the documented top-level octree cells."),
     },
     {NULL, NULL, 0, NULL},
 };

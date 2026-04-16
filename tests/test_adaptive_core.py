@@ -4,6 +4,9 @@ from meshmerizer.adaptive_core import (
     adaptive_status,
     bounding_box_contains,
     bounding_box_overlaps,
+    cell_may_contain_isosurface,
+    corner_sign_mask,
+    create_top_level_cells,
     morton_decode_3d,
     morton_encode_3d,
     particle_fields,
@@ -102,3 +105,29 @@ def test_query_cell_contributors_filters_by_support_overlap() -> None:
         cell_maximum=(1.0, 1.0, 1.0),
     )
     assert contributors == (1,)
+
+
+def test_cell_may_contain_isosurface_detects_corner_straddle() -> None:
+    """Corner values crossing the isovalue should trigger refinement."""
+    assert cell_may_contain_isosurface(
+        [0.0, 0.2, 0.1, 0.3, 0.8, 0.9, 1.1, 1.2],
+        0.5,
+    )
+    assert not cell_may_contain_isosurface([0.1] * 8, 0.5)
+
+
+def test_corner_sign_mask_tracks_positive_corners() -> None:
+    """Corner sign masks should set bits for samples above the isovalue."""
+    assert (
+        corner_sign_mask([0.0, 0.6, 0.7, 0.2, 0.8, 0.9, 0.1, 0.0], 0.5) == 54
+    )
+
+
+def test_create_top_level_cells_returns_row_major_cells() -> None:
+    """Top-level cell creation should emit deterministic row-major cells."""
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+    assert len(cells) == 8
+    assert cells[0]["morton_key"] == morton_encode_3d(0, 0, 0)
+    assert cells[-1]["morton_key"] == morton_encode_3d(1, 1, 1)
+    assert cells[0]["bounds"] == ((0.0, 0.0, 0.0), (0.5, 0.5, 0.5))
+    assert cells[-1]["bounds"] == ((0.5, 0.5, 0.5), (1.0, 1.0, 1.0))
