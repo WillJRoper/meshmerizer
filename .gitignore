@@ -182,3 +182,5 @@ src/meshmerizer/_version.py
 
 # Local agent instructions
 AGENTS.md
+adaptive-plan.md
+REVIEWER_PROMPT.md
