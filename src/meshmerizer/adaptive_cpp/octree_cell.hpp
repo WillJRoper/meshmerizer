@@ -645,9 +645,9 @@ inline bool needs_balance_split(
  * The algorithm uses a spatial hash of leaf min-corner positions for O(1)
  * neighbor lookups.  For each leaf, the 6 face-adjacent neighbors are
  * probed via the hash using a hierarchical search (finest to coarsest
- * alignment).  The hash is rebuilt after each split round since new
- * leaves are created.  Total cost per iteration is O(n * max_depth)
- * where n is the number of leaves.
+ * alignment).  The hash is built once before the first round and updated
+ * incrementally after each split (only new leaves are inserted).  Total
+ * cost per iteration is O(n * max_depth) where n is the number of leaves.
  *
  * @param all_cells All octree cells (modified in place).
  * @param all_contributors Global flat contributor index array (modified in

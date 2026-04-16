@@ -223,12 +223,13 @@ struct TopLevelParticleGrid {
     /**
      * @brief Populate the per-bin max_smoothing_length field.
      *
-     * This allows the contributor_bin_span to use the global
-     * maximum smoothing length for correct bin expansion while
-     * the per-particle overlap check in the caller filters
-     * false positives.
+     * @brief Compute per-bin maximum smoothing lengths and the global max.
      *
-     * @param smoothing_lengths Per-particle support radii.
+     * Iterates all bins in O(B + N) time (B = number of bins, N = number
+     * of particles).  Empty bins are skipped cheaply (inner loop is a
+     * no-op).  The per-bin ``max_smoothing_length`` fields are populated
+     * for potential future per-cell search tightening; currently only
+     * ``global_max_h`` is used by ``contributor_bin_span``.
      */
     void compute_bin_max_h(
         const std::vector<double> &smoothing_lengths) {
@@ -272,12 +273,11 @@ struct TopLevelParticleGrid {
     /**
      * @brief Return the bin span that could contain overlapping contributors.
      *
-     * Uses an iterative expansion that starts from the cell's own bins and
-     * grows the search radius until it is at least as large as the maximum
-     * smoothing length found in the expanded region.  This converges in
-     * 1–2 iterations for typical data and avoids using the global max
-     * smoothing length (which can be orders of magnitude too large when
-     * particle sizes vary across the domain).
+     * Expands the query bounding box by ``global_max_h`` (pre-computed by
+     * ``compute_bin_max_h``) in all directions, then clamps to the grid
+     * extents.  This guarantees every particle whose kernel support could
+     * overlap the query cell is included; the per-particle overlap check
+     * in the caller filters false positives.
      *
      * @param box Query bounding box.
      * @param smoothing_lengths Per-particle smoothing lengths (for lookup).

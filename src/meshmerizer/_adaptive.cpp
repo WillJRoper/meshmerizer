@@ -1399,7 +1399,23 @@ static PyObject *build_mesh_numpy_result(
         }
     }
 
-    return Py_BuildValue("(NNN)", pos_arr, norm_arr, tri_arr);
+    // -- Build the result tuple manually so we can clean up on error.
+    // Py_BuildValue("NNN") steals references, which means if it fails
+    // partway through, already-stolen refs are lost.  Using explicit
+    // PyTuple_New + PyTuple_SET_ITEM avoids this: SET_ITEM steals the
+    // ref only on success, and on any allocation failure we can still
+    // Py_DECREF all three arrays. --
+    PyObject *result = PyTuple_New(3);
+    if (result == NULL) {
+        Py_DECREF(pos_arr);
+        Py_DECREF(norm_arr);
+        Py_DECREF(tri_arr);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(result, 0, pos_arr);   // steals ref
+    PyTuple_SET_ITEM(result, 1, norm_arr);  // steals ref
+    PyTuple_SET_ITEM(result, 2, tri_arr);   // steals ref
+    return result;
 }
 
 /**
@@ -1412,9 +1428,10 @@ static PyObject *build_mesh_numpy_result(
  * @param args Python tuple: (cells, contributors, positions,
  *     smoothing_lengths, isovalue, domain_min, domain_max,
  *     max_depth, base_resolution).
- * @return Python tuple: (vertices, triangles) where vertices is a list
- *     of ``((px, py, pz), (nx, ny, nz))`` and triangles is a list of
- *     ``(i0, i1, i2)`` index triples.
+ * @return Python tuple: (positions, normals, triangles) where positions
+ *     is an Nx3 float64 NumPy array, normals is an Nx3 float64 NumPy
+ *     array, and triangles is an Mx3 int64 NumPy array of vertex
+ *     index triples.
  */
 static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
     PyObject *cells_object = NULL;
