@@ -47,6 +47,7 @@
 #include "mesh.hpp"
 #include "octree_cell.hpp"
 #include "omp_config.hpp"
+#include "progress_bar.hpp"
 #include "qef.hpp"
 #include "vector3d.hpp"
 
@@ -324,6 +325,8 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
     // written by different threads (they share the same byte).
     std::vector<char> is_active_leaf(n_cells, 0);
 
+    ProgressBar vertex_bar("Solving vertices", n_cells);
+
     // Pass 1 (parallel): For each leaf cell, lazily sample corners if
     // needed, compute Hermite samples, and solve the QEF.  Each
     // iteration touches only its own cell and reads shared immutable
@@ -333,6 +336,7 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
     for (std::size_t cell_idx = 0; cell_idx < n_cells; ++cell_idx) {
         OctreeCell &cell = all_cells[cell_idx];
         if (!cell.is_leaf) {
+            vertex_bar.tick();
             continue;
         }
 
@@ -351,6 +355,7 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
             if (end_idx > all_contributors.size()) {
                 // Cannot throw from an OpenMP region on all
                 // compilers; mark the cell inactive and continue.
+                vertex_bar.tick();
                 continue;
             }
             const auto begin_it =
@@ -376,6 +381,7 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
         }
 
         if (!cell.has_surface) {
+            vertex_bar.tick();
             continue;
         }
 
@@ -387,6 +393,7 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
         if (cell.corner_sign_mask == 0U ||
             cell.corner_sign_mask == 0xFFU) {
             cell.has_surface = false;
+            vertex_bar.tick();
             continue;
         }
 
@@ -401,7 +408,10 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
         per_cell_vertex[cell_idx] =
             solve_qef_for_leaf(samples, cell.bounds);
         is_active_leaf[cell_idx] = 1;
+        vertex_bar.tick();
     }
+
+    vertex_bar.finish();
 
     // Pass 2 (serial): Assign contiguous vertex indices and build
     // the compact output vertex array.  This must be serial because
@@ -693,6 +703,9 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
     std::vector<std::vector<MeshTriangle>> thread_triangles(
         static_cast<std::size_t>(n_threads));
 
+    ProgressBar face_bar("Generating faces",
+                         static_cast<std::size_t>(fine_res));
+
     // Iterate over all fine-grid vertex positions.  Each vertex
     // position (ix, iy, iz) is the min corner of a fine-grid cell.
     // We process the 3 edges emanating from it in the +X, +Y, +Z
@@ -824,7 +837,10 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
                 }
             }
         }
+        face_bar.tick();
     }
+
+    face_bar.finish();
 
     // Merge thread-local triangle buffers into a single output.
     // Count total triangles first for a single allocation.

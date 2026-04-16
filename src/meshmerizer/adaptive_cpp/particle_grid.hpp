@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "progress_bar.hpp"
 #include "bounding_box.hpp"
 #include "omp_config.hpp"
 
@@ -127,6 +128,8 @@ struct TopLevelParticleGrid {
      * @param positions Particle positions in world space.
      */
     void insert_particles(const std::vector<Vector3d> &positions) {
+        ProgressBar grid_bar("Binning particles",
+                             positions.size());
 #ifdef WITH_OPENMP
         const std::size_t n_particles = positions.size();
         const std::size_t n_bins = bins.size();
@@ -170,6 +173,7 @@ struct TopLevelParticleGrid {
             pos = bin_cursor[bin_idx]++;
             bins[bin_idx].particle_indices[
                 static_cast<std::size_t>(pos)] = i;
+            grid_bar.tick();
         }
 #else
         // Serial fallback: simple loop with push_back.
@@ -183,8 +187,10 @@ struct TopLevelParticleGrid {
                      static_cast<std::uint32_t>(coords.y),
                      static_cast<std::uint32_t>(coords.z))]
                 .particle_indices.push_back(particle_index);
+            grid_bar.tick();
         }
 #endif
+        grid_bar.finish();
     }
 
     /**

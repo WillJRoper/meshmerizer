@@ -18,6 +18,7 @@
 #include "kernel_wendland_c2.hpp"
 #include "morton.hpp"
 #include "particle_grid.hpp"
+#include "progress_bar.hpp"
 #include "vector3d.hpp"
 
 /**
@@ -668,6 +669,8 @@ inline void balance_octree(
     const BoundingBox &domain,
     std::uint32_t base_resolution,
     std::uint32_t max_depth) {
+    ProgressCounter balance_counter("Balancing", "cells split", 10);
+
     bool any_split = true;
     while (any_split) {
         any_split = false;
@@ -767,8 +770,11 @@ inline void balance_octree(
 
                 all_cells.push_back(child);
             }
+            balance_counter.tick();
         }
     }
+
+    balance_counter.finish();
 }
 
 /**
@@ -835,9 +841,12 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
         leaf_queue.push(all_cells.size() - 1);
     }
 
+    ProgressCounter refine_counter("Refining", "cells", 100);
+
     while (!leaf_queue.empty()) {
         const std::size_t current_index = leaf_queue.front();
         leaf_queue.pop();
+        refine_counter.tick();
         OctreeCell &current_cell = all_cells[current_index];
 
         if (current_cell.depth >= max_depth) {
@@ -915,6 +924,8 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
             leaf_queue.push(all_cells.size() - 1);
         }
     }
+
+    refine_counter.finish();
 
     // Enforce the 2:1 balance rule as a post-pass. Any leaf that has an
     // adjacent leaf more than one level deeper is split and its contributors
