@@ -8,6 +8,7 @@ only attached during an active CLI command.
 
 from __future__ import annotations
 
+import inspect
 import logging as std_logging
 import threading
 import time
@@ -104,20 +105,54 @@ class TqdmConsoleHandler(std_logging.Handler):
             self.handleError(record)
 
 
-def format_status_prefix(operation: str, thread: int | None = None) -> str:
+def _caller_function_name(stack_offset: int = 2) -> str:
+    """Return the name of the calling function.
+
+    Args:
+        stack_offset: Number of frames to skip.  The default of 2
+            skips ``_caller_function_name`` itself and the direct
+            caller (typically ``log_status``), returning the name of
+            the function that invoked the logging helper.
+
+    Returns:
+        Name of the calling function, or ``"<unknown>"`` if the
+        frame cannot be inspected.
+    """
+    frame = inspect.currentframe()
+    try:
+        for _ in range(stack_offset):
+            if frame is not None:
+                frame = frame.f_back
+        if frame is not None:
+            return frame.f_code.co_name
+    finally:
+        del frame
+    return "<unknown>"
+
+
+def format_status_prefix(
+    operation: str,
+    thread: int | None = None,
+    func: str | None = None,
+) -> str:
     """Return a standardized terminal status prefix.
 
     Args:
         operation: Short operation label such as ``"Loading"`` or
             ``"Meshing"``.
         thread: Optional 1-based worker identifier.
+        func: Optional function name to include in the prefix.
 
     Returns:
-        Formatted prefix like ``"[Loading]"`` or ``"[Meshing][2]"``.
+        Formatted prefix like ``"[Loading][my_func]"`` or
+        ``"[Meshing][my_func][2]"``.
     """
-    if thread is None:
-        return f"[{operation}]"
-    return f"[{operation}][{thread}]"
+    parts = [f"[{operation}]"]
+    if func is not None:
+        parts.append(f"[{func}]")
+    if thread is not None:
+        parts.append(f"[{thread}]")
+    return "".join(parts)
 
 
 def current_thread_number() -> int | None:
@@ -182,6 +217,7 @@ def log_status(
     *,
     thread: int | None = None,
     level: int = std_logging.INFO,
+    _stack_offset: int = 2,
 ) -> None:
     """Log a terminal status line with a standardized prefix.
 
@@ -190,10 +226,14 @@ def log_status(
         message: Human-readable status message.
         thread: Optional 1-based worker identifier.
         level: Standard-library logging level.
+        _stack_offset: Internal parameter controlling how many stack
+            frames to skip when resolving the caller function name.
     """
+    func = _caller_function_name(stack_offset=_stack_offset)
     get_logger().log(
         level,
-        f"{format_status_prefix(operation, thread=thread)} {message}",
+        f"{format_status_prefix(operation, thread=thread, func=func)}"
+        f" {message}",
     )
 
 
@@ -202,6 +242,7 @@ def record_timing(
     elapsed: float,
     *,
     operation: str | None = None,
+    _stack_offset: int = 3,
 ) -> float:
     """Store one timing sample and write it to the detailed log.
 
@@ -209,6 +250,7 @@ def record_timing(
         label: Human-readable stage label.
         elapsed: Stage duration in seconds.
         operation: Optional explicit operation category.
+        _stack_offset: Internal parameter for caller resolution.
 
     Returns:
         The recorded elapsed time.
@@ -225,6 +267,7 @@ def record_timing(
         resolved_operation,
         f"{label} took {elapsed:.3f} s",
         level=std_logging.DEBUG,
+        _stack_offset=_stack_offset,
     )
     return elapsed
 
@@ -246,7 +289,10 @@ def record_elapsed(
         Recorded elapsed time in seconds.
     """
     return record_timing(
-        label, time.perf_counter() - start, operation=operation
+        label,
+        time.perf_counter() - start,
+        operation=operation,
+        _stack_offset=4,
     )
 
 
@@ -428,4 +474,5 @@ def log_debug_status(
         message,
         thread=thread,
         level=std_logging.DEBUG,
+        _stack_offset=3,
     )
