@@ -25,7 +25,8 @@ def poisson_reconstruct_group(
     positions: np.ndarray,
     normals: np.ndarray,
     poisson_depth: int = 9,
-    density_quantile: float = 0.1,
+    density_quantile: float = 0.02,
+    scale: float = 1.2,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct a watertight mesh from oriented points via Poisson.
 
@@ -42,11 +43,15 @@ def poisson_reconstruct_group(
             values produce finer detail but take longer.  Typical
             range is 6--12.
         density_quantile: Fraction of lowest-density vertices to
-            remove after reconstruction.  A value of 0.1 discards
-            the bottom 10% of the density distribution, which
-            removes the thin membranes that Poisson creates in
-            regions far from any input point.  Set to 0.0 to keep
-            everything.
+            remove after reconstruction.  A value of 0.02 discards
+            the bottom 2% of the density distribution, which
+            removes only the thinnest extrapolated membranes
+            without cutting into boundary geometry.  Set to 0.0 to
+            keep everything.
+        scale: Ratio of the Poisson solver bounding box to the
+            input point cloud bounding box.  Values above 1.0 add
+            padding so the reconstructed surface is not clipped at
+            the edges.  Default 1.2 adds 20% padding on each side.
 
     Returns:
         Tuple of ``(vertices, faces)`` where ``vertices`` is an
@@ -136,7 +141,7 @@ def poisson_reconstruct_group(
     try:
         mesh, densities = (
             o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                pcd, depth=poisson_depth
+                pcd, depth=poisson_depth, scale=scale
             )
         )
     finally:
@@ -166,7 +171,8 @@ def poisson_reconstruct(
     normals: np.ndarray,
     group_labels: np.ndarray,
     poisson_depth: int = 9,
-    density_quantile: float = 0.1,
+    density_quantile: float = 0.02,
+    scale: float = 1.2,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct meshes for all FOF groups and merge them.
 
@@ -187,6 +193,8 @@ def poisson_reconstruct(
         poisson_depth: Octree depth for the Poisson solver.
         density_quantile: Fraction of lowest-density vertices to
             trim per group.
+        scale: Ratio of the Poisson solver bounding box to the
+            input point cloud bounding box.
 
     Returns:
         Tuple of ``(vertices, faces)`` where ``vertices`` is an
@@ -215,6 +223,7 @@ def poisson_reconstruct(
             group_nrm,
             poisson_depth=poisson_depth,
             density_quantile=density_quantile,
+            scale=scale,
         )
 
         if verts.shape[0] == 0:
