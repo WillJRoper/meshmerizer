@@ -267,16 +267,17 @@ class TestStencilEnumeration:
         dmin = (0.0, 0.0, 0.0)
         dmax = (1.0, 1.0, 1.0)
         cells = _make_uniform_grid_cells(1, dmin, dmax)
-        offsets, neighbors = enumerate_stencils(cells, dmin, dmax, 1, 0)
+        offsets, neighbors, dd = enumerate_stencils(cells, dmin, dmax, 1, 0)
         assert len(offsets) == 2  # 1 DOF + sentinel
         assert neighbors == [0]  # self only
+        assert dd == [0]  # same depth
 
     def test_2x2x2_interior_stencil_size(self) -> None:
         """In a 2x2x2 grid, every cell neighbors all 8 cells."""
         dmin = (0.0, 0.0, 0.0)
         dmax = (2.0, 2.0, 2.0)
         cells = _make_uniform_grid_cells(2, dmin, dmax)
-        offsets, neighbors = enumerate_stencils(cells, dmin, dmax, 2, 0)
+        offsets, neighbors, _ = enumerate_stencils(cells, dmin, dmax, 2, 0)
         # 8 DOFs, each should see all 8 (including self)
         for i in range(8):
             stencil = neighbors[offsets[i] : offsets[i + 1]]
@@ -287,7 +288,7 @@ class TestStencilEnumeration:
         dmin = (0.0, 0.0, 0.0)
         dmax = (3.0, 3.0, 3.0)
         cells = _make_uniform_grid_cells(3, dmin, dmax)
-        offsets, neighbors = enumerate_stencils(cells, dmin, dmax, 3, 0)
+        offsets, neighbors, _ = enumerate_stencils(cells, dmin, dmax, 3, 0)
         n_dofs = len(offsets) - 1
         for i in range(n_dofs):
             stencil_i = set(neighbors[offsets[i] : offsets[i + 1]])
@@ -303,7 +304,7 @@ class TestStencilEnumeration:
         dmin = (0.0, 0.0, 0.0)
         dmax = (3.0, 3.0, 3.0)
         cells = _make_uniform_grid_cells(3, dmin, dmax)
-        offsets, neighbors = enumerate_stencils(cells, dmin, dmax, 3, 0)
+        offsets, neighbors, _ = enumerate_stencils(cells, dmin, dmax, 3, 0)
         # Cell (0,0,0) is DOF 0 (first in Morton order)
         stencil_0 = neighbors[offsets[0] : offsets[1]]
         # With a 5-wide stencil (offsets -2..+2), a 3^3 grid clips to
@@ -315,7 +316,7 @@ class TestStencilEnumeration:
         dmin = (0.0, 0.0, 0.0)
         dmax = (3.0, 3.0, 3.0)
         cells = _make_uniform_grid_cells(3, dmin, dmax)
-        offsets, neighbors = enumerate_stencils(cells, dmin, dmax, 3, 0)
+        offsets, neighbors, _ = enumerate_stencils(cells, dmin, dmax, 3, 0)
         # Find DOF for cell (1,1,1) — Morton index for (1,1,1)
         from meshmerizer.adaptive_core import morton_encode_3d
 
@@ -335,7 +336,7 @@ class TestStencilEnumeration:
         dmin = (0.0, 0.0, 0.0)
         dmax = (2.0, 2.0, 2.0)
         cells = _make_uniform_grid_cells(2, dmin, dmax)
-        offsets, neighbors = enumerate_stencils(cells, dmin, dmax, 2, 0)
+        offsets, neighbors, _ = enumerate_stencils(cells, dmin, dmax, 2, 0)
         n_dofs = len(offsets) - 1
         for i in range(n_dofs):
             stencil = neighbors[offsets[i] : offsets[i + 1]]
@@ -409,3 +410,115 @@ class TestDepthGroupedDof:
                 assert d2c[di] == ci
         for di, ci in enumerate(d2c):
             assert c2d[ci] == di
+
+
+class TestCrossDepthStencil:
+    """Tests for cross-depth stencil enumeration (Phase 21c)."""
+
+    def test_uniform_all_same_depth(self) -> None:
+        """On a uniform grid, all depth_deltas should be 0."""
+        dmin = (0.0, 0.0, 0.0)
+        dmax = (2.0, 2.0, 2.0)
+        cells = _make_uniform_grid_cells(2, dmin, dmax)
+        offsets, neighbors, dd = enumerate_stencils(cells, dmin, dmax, 2, 0)
+        assert all(d == 0 for d in dd)
+
+    def test_adaptive_cross_depth_found(self) -> None:
+        """An adaptive grid with depth-0 and depth-1 cells should
+        have cross-depth stencil entries."""
+        from meshmerizer.adaptive_core import morton_encode_3d
+
+        # 2x2x2 base grid (base_res=2, max_depth=1).
+        # All cells at depth 0 except one that is refined to 4
+        # children at depth 1.
+        # Cell (0,0,0) is refined: 8 children at depth 1.
+        # Remaining 7 cells at depth 0.
+        dmin = (0.0, 0.0, 0.0)
+        dmax = (2.0, 2.0, 2.0)
+        h0 = 1.0  # depth-0 cell width
+        h1 = 0.5  # depth-1 cell width
+
+        cells = []
+        # Depth-1 children of cell (0,0,0):
+        for ix in range(2):
+            for iy in range(2):
+                for iz in range(2):
+                    x0 = ix * h1
+                    y0 = iy * h1
+                    z0 = iz * h1
+                    cells.append(
+                        {
+                            "is_leaf": True,
+                            "depth": 1,
+                            "bounds_min": (x0, y0, z0),
+                            "bounds_max": (
+                                x0 + h1,
+                                y0 + h1,
+                                z0 + h1,
+                            ),
+                            "morton_key": morton_encode_3d(ix, iy, iz),
+                        }
+                    )
+        # Parent cell (0,0,0) at depth 0 — NOT a leaf
+        cells.append(
+            {
+                "is_leaf": False,
+                "depth": 0,
+                "bounds_min": (0.0, 0.0, 0.0),
+                "bounds_max": (1.0, 1.0, 1.0),
+                "morton_key": morton_encode_3d(0, 0, 0),
+            }
+        )
+        # Remaining 7 depth-0 cells (leaves)
+        for ix in range(2):
+            for iy in range(2):
+                for iz in range(2):
+                    if ix == 0 and iy == 0 and iz == 0:
+                        continue
+                    x0 = ix * h0
+                    y0 = iy * h0
+                    z0 = iz * h0
+                    cells.append(
+                        {
+                            "is_leaf": True,
+                            "depth": 0,
+                            "bounds_min": (x0, y0, z0),
+                            "bounds_max": (
+                                x0 + h0,
+                                y0 + h0,
+                                z0 + h0,
+                            ),
+                            "morton_key": morton_encode_3d(
+                                2 * ix, 2 * iy, 2 * iz
+                            ),
+                        }
+                    )
+
+        offsets, neighbors, dd = enumerate_stencils(cells, dmin, dmax, 2, 1)
+
+        # There should be cross-depth entries
+        has_cross = any(d != 0 for d in dd)
+        assert has_cross, (
+            "Expected cross-depth stencil entries in adaptive grid"
+        )
+
+        # Verify symmetry: if j in stencil(i), then i in stencil(j)
+        n_dofs = len(offsets) - 1
+        for i in range(n_dofs):
+            for k in range(offsets[i], offsets[i + 1]):
+                j = neighbors[k]
+                stencil_j = neighbors[offsets[j] : offsets[j + 1]]
+                assert i in stencil_j, (
+                    f"DOF {j} is in stencil of {i} but "
+                    f"{i} not in stencil of {j}"
+                )
+
+    def test_depth_delta_consistency(self) -> None:
+        """depth_delta should be consistent with actual cell depths."""
+        dmin = (0.0, 0.0, 0.0)
+        dmax = (2.0, 2.0, 2.0)
+        cells = _make_uniform_grid_cells(2, dmin, dmax)
+        offsets, neighbors, dd = enumerate_stencils(cells, dmin, dmax, 2, 0)
+        # All cells are depth 0, so all deltas must be 0
+        assert len(dd) == len(neighbors)
+        assert all(d == 0 for d in dd)

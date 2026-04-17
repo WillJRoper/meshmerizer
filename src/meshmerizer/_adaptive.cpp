@@ -2452,9 +2452,10 @@ static PyObject *enumerate_stencils_py(PyObject * /*self*/,
 
     std::vector<std::size_t> offsets;
     std::vector<std::int64_t> neighbors;
+    std::vector<int> depth_deltas;
     enumerate_stencils(cells, cell_to_dof, dof_to_cell,
                        domain, base_resolution, max_depth_val,
-                       offsets, neighbors);
+                       offsets, neighbors, &depth_deltas);
 
     PyObject *off_list = PyList_New(
         static_cast<Py_ssize_t>(offsets.size()));
@@ -2470,7 +2471,14 @@ static PyObject *enumerate_stencils_py(PyObject * /*self*/,
                         static_cast<Py_ssize_t>(i),
                         PyLong_FromLongLong(neighbors[i]));
     }
-    return Py_BuildValue("(OO)", off_list, nbr_list);
+    PyObject *dd_list = PyList_New(
+        static_cast<Py_ssize_t>(depth_deltas.size()));
+    for (std::size_t i = 0; i < depth_deltas.size(); ++i) {
+        PyList_SET_ITEM(dd_list,
+                        static_cast<Py_ssize_t>(i),
+                        PyLong_FromLong(depth_deltas[i]));
+    }
+    return Py_BuildValue("(OOO)", off_list, nbr_list, dd_list);
 }
 
 /**

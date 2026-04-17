@@ -772,7 +772,7 @@ def enumerate_stencils(
     domain_max: tuple[float, float, float],
     base_resolution: int,
     max_depth: int,
-) -> tuple[list[int], list[int]]:
+) -> tuple[list[int], list[int], list[int]]:
     """Enumerate DOF stencils (neighbor DOFs) for each DOF.
 
     Args:
@@ -785,7 +785,9 @@ def enumerate_stencils(
         max_depth: Maximum octree depth.
 
     Returns:
-        Tuple of (stencil_offsets, stencil_neighbors).
+        Tuple of (stencil_offsets, stencil_neighbors,
+        stencil_depth_deltas).  depth_deltas[k] is 0 for
+        same-depth, -1 for coarser neighbor, +1 for finer.
     """
     return _adaptive.enumerate_stencils(
         cells,

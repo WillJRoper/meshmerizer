@@ -545,37 +545,38 @@ struct PoissonLeafHash {
 };
 
 /**
- * @brief Enumerate the DOF stencil (neighbor DOFs) for each DOF.
+ * @brief Enumerate the DOF stencil (neighbor DOFs) for each DOF,
+ *        including cross-depth neighbors for the multi-depth
+ *        cascadic Poisson solver.
  *
- * For degree-2 B-splines, two basis functions overlap if their cell
- * centres are within two cell widths in each axis direction (the
- * supports touch at three cell widths, but only at a measure-zero set).
- * On a uniform grid this gives a 5^3 = 125 stencil (including self).
- * On an adaptive grid with 2:1 balance, the stencil can be smaller at
- * depth boundaries.
+ * For degree-2 B-splines, two basis functions at the **same depth**
+ * overlap if their cell centres are within two cell widths in each
+ * axis direction, giving a 5^3 = 125 stencil (including self).
  *
- * We use a spatial hash to look up neighbors efficiently.  For each
- * DOF, we probe the 125 positions offset by {-2, -1, 0, +1, +2} cell
- * widths along each axis from the cell centre.  Due to 2:1 balance, a
- * neighbor may be at the same depth or one level coarser.  Probing
- * at the fine grid level and using hierarchical lookup handles both
- * cases.
+ * For **cross-depth** interactions (parent at depth d-1, child at
+ * depth d), the parent-child B-spline overlap extends to ±4
+ * child-cell-widths in each axis (cf. Phase 21a integral tables).
  *
- * The output is a CSR-like pair of arrays:
+ * The output is a CSR-like triple of arrays:
  *
  * - `stencil_offsets[i]` .. `stencil_offsets[i+1]` gives the range
- *   of neighbor DOF indices for DOF `i`.
- * - `stencil_neighbors[stencil_offsets[i] .. stencil_offsets[i+1]]`
- *   contains the neighbor DOF indices.
+ *   of neighbor entries for DOF `i`.
+ * - `stencil_neighbors[k]` contains the neighbor DOF index.
+ * - `stencil_depth_deltas[k]` contains the depth difference:
+ *   0 = same depth, -1 = neighbor is coarser, +1 = neighbor is
+ *   finer.  Used by the operator to select the correct integral
+ *   table (same-depth CC vs cross-depth PC).
  *
- * @param cells            Full octree cell array.
- * @param cell_to_dof      Mapping from cell index to DOF index.
- * @param dof_to_cell      Mapping from DOF index to cell index.
- * @param domain           Simulation domain bounding box.
- * @param base_resolution  Top-level cells per axis.
- * @param max_depth        Maximum octree depth.
- * @param stencil_offsets  Output CSR offsets (size = n_dofs + 1).
- * @param stencil_neighbors Output neighbor DOF indices.
+ * @param cells              Full octree cell array.
+ * @param cell_to_dof        Mapping from cell index to DOF index.
+ * @param dof_to_cell        Mapping from DOF index to cell index.
+ * @param domain             Simulation domain bounding box.
+ * @param base_resolution    Top-level cells per axis.
+ * @param max_depth          Maximum octree depth.
+ * @param stencil_offsets    Output CSR offsets (size = n_dofs + 1).
+ * @param stencil_neighbors  Output neighbor DOF indices.
+ * @param stencil_depth_deltas  Output depth deltas (parallel to
+ *                              stencil_neighbors).
  */
 inline void enumerate_stencils(
     const std::vector<OctreeCell> &cells,
@@ -585,41 +586,51 @@ inline void enumerate_stencils(
     std::uint32_t base_resolution,
     std::uint32_t max_depth,
     std::vector<std::size_t> &stencil_offsets,
-    std::vector<std::int64_t> &stencil_neighbors) {
+    std::vector<std::int64_t> &stencil_neighbors,
+    std::vector<int> *stencil_depth_deltas = nullptr) {
     const std::size_t n_dofs = dof_to_cell.size();
     stencil_offsets.clear();
     stencil_offsets.reserve(n_dofs + 1);
     stencil_neighbors.clear();
-    /* Typical stencil has ~125 entries per DOF; pre-allocate
-     * conservatively. */
-    stencil_neighbors.reserve(n_dofs * 125);
+    stencil_neighbors.reserve(n_dofs * 130);
+    if (stencil_depth_deltas) {
+        stencil_depth_deltas->clear();
+        stencil_depth_deltas->reserve(n_dofs * 130);
+    }
 
     /* Build a spatial hash of leaf cells for neighbor lookup. */
     PoissonLeafHash hash;
     hash.build(cells, domain, max_depth, base_resolution);
-
-    /* Compute the finest cell width (at max_depth) for converting
-     * cell-width offsets to fine-grid offsets. */
-    const double domain_width_x =
-        domain.max.x - domain.min.x;
 
     for (std::size_t dof = 0; dof < n_dofs; ++dof) {
         stencil_offsets.push_back(stencil_neighbors.size());
 
         const std::size_t ci = dof_to_cell[dof];
         const OctreeCell &cell = cells[ci];
+        const std::uint32_t depth = cell.depth;
 
         /* The cell's span in fine-grid units. */
         const std::uint32_t span =
-            1U << (max_depth - cell.depth);
+            1U << (max_depth - depth);
 
         /* Quantize the cell's min corner to fine-grid coords. */
         std::uint32_t gx, gy, gz;
         hash.quantize(cell.bounds.min, gx, gy, gz);
 
-        /* Probe all 125 neighbor positions.
-         * Each offset is one cell-width step in fine-grid units
-         * (= span). */
+        /* Lambda to add a neighbor if not already present. */
+        auto try_add = [&](std::int64_t nbr_dof, int dd) {
+            const std::size_t start = stencil_offsets.back();
+            for (std::size_t k = start;
+                 k < stencil_neighbors.size(); ++k) {
+                if (stencil_neighbors[k] == nbr_dof) return;
+            }
+            stencil_neighbors.push_back(nbr_dof);
+            if (stencil_depth_deltas) {
+                stencil_depth_deltas->push_back(dd);
+            }
+        };
+
+        /* --- Same-depth neighbors: 5^3 probes at own span --- */
         for (int dx = -2; dx <= 2; ++dx) {
             for (int dy = -2; dy <= 2; ++dy) {
                 for (int dz = -2; dz <= 2; ++dz) {
@@ -636,7 +647,6 @@ inline void enumerate_stencils(
                         static_cast<std::int64_t>(dz) *
                             static_cast<std::int64_t>(span);
 
-                    /* Skip probes outside the domain. */
                     if (px < 0 || py < 0 || pz < 0) continue;
 
                     const std::size_t neighbor_ci =
@@ -644,31 +654,127 @@ inline void enumerate_stencils(
                             static_cast<std::uint32_t>(px),
                             static_cast<std::uint32_t>(py),
                             static_cast<std::uint32_t>(pz));
-
                     if (neighbor_ci == SIZE_MAX) continue;
 
                     const std::int64_t neighbor_dof =
                         cell_to_dof[neighbor_ci];
                     if (neighbor_dof < 0) continue;
 
-                    /* Avoid duplicate entries: only add if not
-                     * already present in this DOF's stencil.
-                     * Since the stencil is small (<=125), a
-                     * linear scan is fine. */
-                    const std::size_t start =
-                        stencil_offsets.back();
-                    bool found = false;
-                    for (std::size_t k = start;
-                         k < stencil_neighbors.size(); ++k) {
-                        if (stencil_neighbors[k] ==
-                            neighbor_dof) {
-                            found = true;
-                            break;
-                        }
+                    /* Determine depth delta. */
+                    const int ndepth =
+                        static_cast<int>(
+                            cells[neighbor_ci].depth);
+                    const int dd =
+                        ndepth - static_cast<int>(depth);
+                    try_add(neighbor_dof, dd);
+                }
+            }
+        }
+
+        /* --- Parent-depth neighbors (depth d-1): probe at
+         *     coarser spacing to find DOFs whose larger B-spline
+         *     supports overlap this DOF.
+         *
+         *     Parent cell width = 2 * span.  Parent-child overlap
+         *     extends to ±3 parent-widths = ±6 fine spans from
+         *     the parent centre.  We probe at ±{0..3} parent-
+         *     widths from this DOF's min corner. --- */
+        if (depth > 0) {
+            const std::uint32_t pspan = span * 2;
+            for (int dx = -3; dx <= 3; ++dx) {
+                for (int dy = -3; dy <= 3; ++dy) {
+                    for (int dz = -3; dz <= 3; ++dz) {
+                        const std::int64_t px =
+                            static_cast<std::int64_t>(gx) +
+                            static_cast<std::int64_t>(dx) *
+                                static_cast<std::int64_t>(pspan);
+                        const std::int64_t py =
+                            static_cast<std::int64_t>(gy) +
+                            static_cast<std::int64_t>(dy) *
+                                static_cast<std::int64_t>(pspan);
+                        const std::int64_t pz =
+                            static_cast<std::int64_t>(gz) +
+                            static_cast<std::int64_t>(dz) *
+                                static_cast<std::int64_t>(pspan);
+
+                        if (px < 0 || py < 0 || pz < 0) continue;
+
+                        const std::size_t neighbor_ci =
+                            hash.find_leaf_at(
+                                static_cast<std::uint32_t>(px),
+                                static_cast<std::uint32_t>(py),
+                                static_cast<std::uint32_t>(pz));
+                        if (neighbor_ci == SIZE_MAX) continue;
+
+                        /* Only accept if the neighbor is
+                         * actually coarser. */
+                        const uint32_t nd =
+                            cells[neighbor_ci].depth;
+                        if (nd >= depth) continue;
+
+                        const std::int64_t neighbor_dof =
+                            cell_to_dof[neighbor_ci];
+                        if (neighbor_dof < 0) continue;
+
+                        try_add(neighbor_dof, -1);
                     }
-                    if (!found) {
-                        stencil_neighbors.push_back(
-                            neighbor_dof);
+                }
+            }
+        }
+
+        /* --- Child-depth neighbors (depth d+1): probe at finer
+         *     spacing to find DOFs whose smaller B-spline supports
+         *     overlap this DOF.
+         *
+         *     Child cell width = span / 2.  Parent-child overlap
+         *     extends to ±4 child-widths from the parent centre.
+         *     From this DOF's min corner, probe at ±{0..4}
+         *     child-widths (= ±{0..4} * span/2 fine units). --- */
+        if (depth < max_depth) {
+            const std::uint32_t cspan = span / 2;
+            if (cspan > 0) {
+                for (int dx = -4; dx <= 4; ++dx) {
+                    for (int dy = -4; dy <= 4; ++dy) {
+                        for (int dz = -4; dz <= 4; ++dz) {
+                            const std::int64_t px =
+                                static_cast<std::int64_t>(gx) +
+                                static_cast<std::int64_t>(dx) *
+                                    static_cast<std::int64_t>(
+                                        cspan);
+                            const std::int64_t py =
+                                static_cast<std::int64_t>(gy) +
+                                static_cast<std::int64_t>(dy) *
+                                    static_cast<std::int64_t>(
+                                        cspan);
+                            const std::int64_t pz =
+                                static_cast<std::int64_t>(gz) +
+                                static_cast<std::int64_t>(dz) *
+                                    static_cast<std::int64_t>(
+                                        cspan);
+
+                            if (px < 0 || py < 0 || pz < 0)
+                                continue;
+
+                            const std::size_t neighbor_ci =
+                                hash.find_leaf_at(
+                                    static_cast<std::uint32_t>(px),
+                                    static_cast<std::uint32_t>(py),
+                                    static_cast<std::uint32_t>(
+                                        pz));
+                            if (neighbor_ci == SIZE_MAX) continue;
+
+                            /* Only accept if the neighbor is
+                             * actually finer. */
+                            const uint32_t nd =
+                                cells[neighbor_ci].depth;
+                            if (nd <= depth) continue;
+
+                            const std::int64_t neighbor_dof =
+                                cell_to_dof[neighbor_ci];
+                            if (neighbor_dof < 0) continue;
+
+                            try_add(neighbor_dof, +1);
+                        }
                     }
                 }
             }
