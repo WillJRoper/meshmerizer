@@ -270,14 +270,83 @@ inline Vector3d bspline3d_gradient(const Vector3d &point,
  * @param restrict_depth If >= 0, only assign DOFs to leaves at
  *                       exactly this depth.  If < 0 (default),
  *                       all leaves get DOFs (uniform-grid mode).
+ * @param depth_dof_start If non-null, filled with the starting DOF
+ *                        index for each depth d (0..max_depth).
+ *                        Entry d gives the first DOF index at depth d.
+ *                        Has (max_depth + 2) entries: the last entry
+ *                        is the total DOF count (sentinel).
+ *                        Only meaningful when restrict_depth < 0.
+ * @param max_depth_hint  Maximum depth in the octree.  Required when
+ *                        depth_dof_start is non-null.
  */
 inline void assign_dof_indices(
     const std::vector<OctreeCell> &cells,
     std::vector<std::int64_t> &cell_to_dof,
     std::vector<std::size_t> &dof_to_cell,
-    int restrict_depth = -1) {
+    int restrict_depth = -1,
+    std::vector<std::int64_t> *depth_dof_start = nullptr,
+    int max_depth_hint = 0) {
     cell_to_dof.assign(cells.size(), -1);
     dof_to_cell.clear();
+
+    /* If depth-ordered assignment is requested (restrict_depth < 0
+     * AND depth_dof_start is provided), we do a two-pass
+     * depth-grouped assignment so DOFs at depth 0 come first, then
+     * depth 1, etc.  This enables efficient depth-by-depth solving
+     * in the cascadic solver (Phase 21f).
+     *
+     * If restrict_depth >= 0, all DOFs are at the same depth so
+     * grouping is trivial. */
+    const bool depth_grouped =
+        (restrict_depth < 0 && depth_dof_start != nullptr);
+
+    if (depth_grouped) {
+        const int D = max_depth_hint;
+        depth_dof_start->assign(
+            static_cast<std::size_t>(D + 2), 0);
+
+        /* Count leaves per depth. */
+        std::vector<std::size_t> count_per_depth(
+            static_cast<std::size_t>(D + 1), 0);
+        for (const auto &c : cells) {
+            if (c.is_leaf && c.depth <= static_cast<uint32_t>(D)) {
+                ++count_per_depth[c.depth];
+            }
+        }
+
+        /* Build prefix sums for starting DOF index per depth. */
+        std::int64_t offset = 0;
+        for (int d = 0; d <= D; ++d) {
+            (*depth_dof_start)[static_cast<std::size_t>(d)] =
+                offset;
+            offset += static_cast<std::int64_t>(
+                count_per_depth[static_cast<std::size_t>(d)]);
+        }
+        (*depth_dof_start)[static_cast<std::size_t>(D + 1)] =
+            offset;
+
+        /* Allocate dof_to_cell with total count. */
+        const auto total = static_cast<std::size_t>(offset);
+        dof_to_cell.resize(total);
+
+        /* Assign DOFs depth-by-depth using running cursors. */
+        std::vector<std::int64_t> cursor(
+            depth_dof_start->begin(),
+            depth_dof_start->begin() + D + 1);
+        for (std::size_t i = 0; i < cells.size(); ++i) {
+            if (cells[i].is_leaf &&
+                cells[i].depth <= static_cast<uint32_t>(D)) {
+                const auto d = cells[i].depth;
+                const auto dof_idx = cursor[d];
+                cell_to_dof[i] = dof_idx;
+                dof_to_cell[static_cast<std::size_t>(dof_idx)] = i;
+                ++cursor[d];
+            }
+        }
+        return;
+    }
+
+    /* Original path: flat assignment (optionally restricted). */
 
     /* First pass: count eligible leaves so we can reserve. */
     std::size_t n_eligible = 0;
@@ -303,6 +372,26 @@ inline void assign_dof_indices(
                 ++next_dof;
             }
         }
+    }
+
+    /* Fill depth_dof_start for single-depth case if provided. */
+    if (depth_dof_start != nullptr && restrict_depth >= 0) {
+        const int D = max_depth_hint > 0
+                          ? max_depth_hint
+                          : restrict_depth;
+        depth_dof_start->assign(
+            static_cast<std::size_t>(D + 2), next_dof);
+        for (int d = 0; d <= D; ++d) {
+            if (d < restrict_depth) {
+                (*depth_dof_start)[static_cast<std::size_t>(d)] =
+                    0;
+            } else {
+                (*depth_dof_start)[static_cast<std::size_t>(d)] =
+                    (d == restrict_depth) ? 0 : next_dof;
+            }
+        }
+        (*depth_dof_start)[static_cast<std::size_t>(D + 1)] =
+            next_dof;
     }
 }
 

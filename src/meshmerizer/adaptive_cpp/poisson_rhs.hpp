@@ -169,7 +169,215 @@ inline double grad_value_integral_1d(int d) {
 }
 
 /* ===================================================================
- * Section 2: 3-D gradient inner product G_{ij}
+ * Section 1b: Parent-child cross-depth 1-D integrals (degree 2)
+ * ===================================================================
+ *
+ * These tables store the 1-D B-spline overlap integrals between a
+ * parent DOF at depth d-1 (cell width 2h) and a child DOF at depth d
+ * (cell width h).  The offset j is the distance from the parent centre
+ * to the child centre in units of h (the finer cell width).
+ *
+ * Raw integrals (before physical scaling):
+ *   M_pc(j) = int B2(u/2) * B2(u - j) du    (mass)
+ *   K_pc(j) = int B2'(u/2) * B2'(u - j) du  (stiffness)
+ *   S_pc(j) = int B2'(u/2) * B2(u - j) du   (gradient-value)
+ *
+ * Physical scaling to obtain Galerkin integrals in world coordinates:
+ *   Mass:        h * M_pc(j)       (volume element)
+ *   Stiffness:   (1 / (2h)) * K_pc(j)  (chain rules: 1/(2h) * 1/h * h)
+ *   Grad-Value:  (1 / 2) * S_pc(j)     (chain rule on parent: 1/(2h) * h)
+ *
+ * Nonzero for j in {-4, ..., +4} (9 entries).  The j = +/-4 entries
+ * are tiny (~1e-4) and can optionally be dropped, but we keep them for
+ * correctness.  In 3-D the full stencil is 9^3 = 729 entries.
+ *
+ * Verification checksums (cf. adaptive-plan.md Phase 21):
+ *   sum_j M_pc(j) = 2.0   (= integral of B2(u/2) du)
+ *   sum_j K_pc(j) = 0.0   (derivative identity)
+ *   S_pc(-j) = -S_pc(j)   (antisymmetry)
+ *
+ * References:
+ * - Kazhdan & Hoppe (ToG 2013), Section 4: multi-depth FEM stencils
+ *   with overlapping B-spline supports across resolution levels.
+ * - PoissonRecon source: BSplineData.inl, SystemCoefficients<2>.
+ */
+
+/**
+ * @brief Parent-child 1-D mass integral M_pc(j) for degree-2
+ *        B-splines with width ratio 2:1.
+ *
+ * M_pc(j) = int B2(u/2) * B2(u - j) du, where parent has width 2
+ * and child has width 1 in reference coordinates.
+ *
+ * @param j  Offset from parent centre to child centre in child-width
+ *           units (integer, -4..+4).
+ * @return Raw integral value (multiply by h for physical scaling).
+ */
+inline double pc_mass_integral_1d(int j) {
+    switch (j) {
+        case 0:
+            return 1761.0 / 2560.0;
+        case 1:
+        case -1:
+            return 31.0 / 64.0;
+        case 2:
+        case -2:
+            return 599.0 / 3840.0;
+        case 3:
+        case -3:
+            return 1.0 / 64.0;
+        case 4:
+        case -4:
+            return 1.0 / 15360.0;
+        default:
+            return 0.0;
+    }
+}
+
+/**
+ * @brief Parent-child 1-D stiffness integral K_pc(j) for degree-2
+ *        B-splines with width ratio 2:1.
+ *
+ * K_pc(j) = int B2'(u/2) * B2'(u - j) du.
+ *
+ * @param j  Offset in child-width units (-4..+4).
+ * @return Raw integral value (multiply by 1/(2h) for physical
+ *         scaling).
+ */
+inline double pc_stiffness_integral_1d(int j) {
+    switch (j) {
+        case 0:
+            return 15.0 / 16.0;
+        case 1:
+        case -1:
+            return 1.0 / 4.0;
+        case 2:
+        case -2:
+            return -11.0 / 24.0;
+        case 3:
+        case -3:
+            return -1.0 / 4.0;
+        case 4:
+        case -4:
+            return -1.0 / 96.0;
+        default:
+            return 0.0;
+    }
+}
+
+/**
+ * @brief Parent-child 1-D gradient-value integral S_pc(j) for
+ *        degree-2 B-splines with width ratio 2:1.
+ *
+ * S_pc(j) = int B2'(u/2) * B2(u - j) du.
+ * Antisymmetric: S_pc(-j) = -S_pc(j).
+ *
+ * @param j  Offset in child-width units (-4..+4).
+ * @return Raw integral value (multiply by 1/2 for physical scaling).
+ */
+inline double pc_grad_value_integral_1d(int j) {
+    switch (j) {
+        case 0:
+            return 0.0;
+        case 1:
+            return -89.0 / 128.0;
+        case -1:
+            return 89.0 / 128.0;
+        case 2:
+            return -191.0 / 384.0;
+        case -2:
+            return 191.0 / 384.0;
+        case 3:
+            return -13.0 / 128.0;
+        case -3:
+            return 13.0 / 128.0;
+        case 4:
+            return -1.0 / 768.0;
+        case -4:
+            return 1.0 / 768.0;
+        default:
+            return 0.0;
+    }
+}
+
+/**
+ * @brief Parent-child 3-D Laplacian (stiffness) stencil weight.
+ *
+ * For a parent DOF at depth d-1 and a child DOF at depth d with
+ * 3-D offset (dx, dy, dz) in child-width units:
+ *
+ *   L_pc = K_pc(dx)*M_pc(dy)*M_pc(dz)
+ *        + M_pc(dx)*K_pc(dy)*M_pc(dz)
+ *        + M_pc(dx)*M_pc(dy)*K_pc(dz)
+ *
+ * Physical scaling: multiply by 1/(2h) where h is the child cell
+ * width.
+ *
+ * @param dx  Offset in x (child-width units, -4..+4).
+ * @param dy  Offset in y.
+ * @param dz  Offset in z.
+ * @return Raw 3-D stiffness weight.
+ */
+inline double pc_laplacian_stencil_weight(int dx, int dy, int dz) {
+    const double mx = pc_mass_integral_1d(dx);
+    const double my = pc_mass_integral_1d(dy);
+    const double mz = pc_mass_integral_1d(dz);
+    const double kx = pc_stiffness_integral_1d(dx);
+    const double ky = pc_stiffness_integral_1d(dy);
+    const double kz = pc_stiffness_integral_1d(dz);
+    return kx * my * mz + mx * ky * mz + mx * my * kz;
+}
+
+/**
+ * @brief Parent-child 3-D mass stencil weight (for screening).
+ *
+ * M_pc_3D = M_pc(dx) * M_pc(dy) * M_pc(dz).
+ *
+ * Physical scaling: multiply by h (child cell width).
+ *
+ * @param dx  Offset in x (child-width units, -4..+4).
+ * @param dy  Offset in y.
+ * @param dz  Offset in z.
+ * @return Raw 3-D mass weight.
+ */
+inline double pc_mass_stencil_weight(int dx, int dy, int dz) {
+    return pc_mass_integral_1d(dx) * pc_mass_integral_1d(dy) *
+           pc_mass_integral_1d(dz);
+}
+
+/**
+ * @brief Parent-child 3-D gradient inner product vector.
+ *
+ * For RHS assembly with cross-depth DOF pairs:
+ *   G_pc.x = S_pc(dx) * M_pc(dy) * M_pc(dz)
+ *   G_pc.y = M_pc(dx) * S_pc(dy) * M_pc(dz)
+ *   G_pc.z = M_pc(dx) * M_pc(dy) * S_pc(dz)
+ *
+ * Physical scaling: multiply by h*h/2 where h is the child cell
+ * width.  (Volume element h^3, parent gradient 1/(2h), child
+ * value 1: net = h^3 / (2h) = h^2 / 2.)
+ *
+ * @param dx  Offset in x (child-width units, -4..+4).
+ * @param dy  Offset in y.
+ * @param dz  Offset in z.
+ * @return Gradient inner product vector (unscaled).
+ */
+inline Vector3d pc_gradient_inner_product(int dx, int dy, int dz) {
+    const double mx = pc_mass_integral_1d(dx);
+    const double my = pc_mass_integral_1d(dy);
+    const double mz = pc_mass_integral_1d(dz);
+    const double sx = pc_grad_value_integral_1d(dx);
+    const double sy = pc_grad_value_integral_1d(dy);
+    const double sz = pc_grad_value_integral_1d(dz);
+    return {
+        sx * my * mz,
+        mx * sy * mz,
+        mx * my * sz,
+    };
+}
+
+/* ===================================================================
+ * Section 2: 3-D gradient inner product G_{ij} (same-depth)
  * =================================================================== */
 
 /**

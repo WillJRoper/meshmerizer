@@ -2305,6 +2305,81 @@ static PyObject *assign_dof_indices_py(PyObject * /*self*/,
 }
 
 /**
+ * @brief assign_dof_indices_grouped(cells, max_depth)
+ *        -> (cell_to_dof, dof_to_cell, depth_dof_start)
+ *
+ * Depth-grouped DOF assignment.  DOFs at depth 0 come first,
+ * then depth 1, etc.  Returns depth_dof_start as a list of
+ * (max_depth + 2) entries where entry d is the first DOF index
+ * at depth d, and the last entry is the total DOF count.
+ *
+ * cells: list of dicts with keys 'is_leaf' and 'depth'.
+ * max_depth: maximum depth in the octree (integer).
+ */
+static PyObject *assign_dof_indices_grouped_py(
+    PyObject * /*self*/, PyObject *args) {
+    PyObject *cells_obj;
+    int max_depth_val;
+    if (!PyArg_ParseTuple(args, "Oi", &cells_obj,
+                          &max_depth_val)) {
+        return NULL;
+    }
+    PyObject *fast = PySequence_Fast(
+        cells_obj, "expected a sequence of cell dicts");
+    if (fast == NULL) return NULL;
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(fast);
+
+    std::vector<OctreeCell> cells(static_cast<std::size_t>(n));
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
+        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
+        PyObject *depth = PyDict_GetItemString(d, "depth");
+        if (leaf == NULL || depth == NULL) {
+            Py_DECREF(fast);
+            PyErr_SetString(
+                PyExc_KeyError,
+                "cell dict missing 'is_leaf' or 'depth'");
+            return NULL;
+        }
+        cells[static_cast<std::size_t>(i)].is_leaf =
+            PyObject_IsTrue(leaf) != 0;
+        cells[static_cast<std::size_t>(i)].depth =
+            static_cast<std::uint32_t>(PyLong_AsLong(depth));
+    }
+    Py_DECREF(fast);
+
+    std::vector<std::int64_t> cell_to_dof;
+    std::vector<std::size_t> dof_to_cell;
+    std::vector<std::int64_t> depth_dof_start;
+    assign_dof_indices(cells, cell_to_dof, dof_to_cell,
+                       /*restrict_depth=*/-1,
+                       &depth_dof_start, max_depth_val);
+
+    PyObject *c2d = PyList_New(
+        static_cast<Py_ssize_t>(cell_to_dof.size()));
+    for (std::size_t i = 0; i < cell_to_dof.size(); ++i) {
+        PyList_SET_ITEM(
+            c2d, static_cast<Py_ssize_t>(i),
+            PyLong_FromLongLong(cell_to_dof[i]));
+    }
+    PyObject *d2c = PyList_New(
+        static_cast<Py_ssize_t>(dof_to_cell.size()));
+    for (std::size_t i = 0; i < dof_to_cell.size(); ++i) {
+        PyList_SET_ITEM(
+            d2c, static_cast<Py_ssize_t>(i),
+            PyLong_FromSize_t(dof_to_cell[i]));
+    }
+    PyObject *dds = PyList_New(
+        static_cast<Py_ssize_t>(depth_dof_start.size()));
+    for (std::size_t i = 0; i < depth_dof_start.size(); ++i) {
+        PyList_SET_ITEM(
+            dds, static_cast<Py_ssize_t>(i),
+            PyLong_FromLongLong(depth_dof_start[i]));
+    }
+    return Py_BuildValue("(OOO)", c2d, d2c, dds);
+}
+
+/**
  * @brief enumerate_stencils_py(octree_result, domain_min,
  *            domain_max, base_resolution, max_depth)
  *        -> (stencil_offsets, stencil_neighbors)
@@ -2570,6 +2645,40 @@ static PyObject *laplacian_stencil_weight_py(PyObject * /*self*/,
     }
     return PyFloat_FromDouble(
         laplacian_stencil_weight(dx, dy, dz, h));
+}
+
+/**
+ * @brief pc_integrals_1d(j) -> (mass, stiffness, grad_value)
+ *
+ * Return the 1-D parent-child cross-depth B-spline integrals
+ * for offset j (integer, -4..+4).  Used for testing Phase 21a.
+ */
+static PyObject *pc_integrals_1d_py(PyObject * /*self*/,
+                                     PyObject *args) {
+    int j;
+    if (!PyArg_ParseTuple(args, "i", &j)) {
+        return NULL;
+    }
+    return Py_BuildValue(
+        "(ddd)",
+        pc_mass_integral_1d(j),
+        pc_stiffness_integral_1d(j),
+        pc_grad_value_integral_1d(j));
+}
+
+/**
+ * @brief pc_laplacian_weight(dx, dy, dz) -> float
+ *
+ * Return the raw 3-D parent-child Laplacian stencil weight.
+ */
+static PyObject *pc_laplacian_weight_py(PyObject * /*self*/,
+                                         PyObject *args) {
+    int dx, dy, dz;
+    if (!PyArg_ParseTuple(args, "iii", &dx, &dy, &dz)) {
+        return NULL;
+    }
+    return PyFloat_FromDouble(
+        pc_laplacian_stencil_weight(dx, dy, dz));
 }
 
 /**
@@ -3222,6 +3331,12 @@ static PyMethodDef adaptive_methods[] = {
         PyDoc_STR("Assign contiguous DOF indices to leaf cells."),
     },
     {
+        "assign_dof_indices_grouped",
+        assign_dof_indices_grouped_py,
+        METH_VARARGS,
+        PyDoc_STR("Depth-grouped DOF assignment."),
+    },
+    {
         "enumerate_stencils",
         enumerate_stencils_py,
         METH_VARARGS,
@@ -3238,6 +3353,18 @@ static PyMethodDef adaptive_methods[] = {
         laplacian_stencil_weight_py,
         METH_VARARGS,
         PyDoc_STR("Laplacian stencil weight for offset (dx,dy,dz)."),
+    },
+    {
+        "pc_integrals_1d",
+        pc_integrals_1d_py,
+        METH_VARARGS,
+        PyDoc_STR("Parent-child 1D integrals: (mass, stiff, gv)."),
+    },
+    {
+        "pc_laplacian_weight",
+        pc_laplacian_weight_py,
+        METH_VARARGS,
+        PyDoc_STR("Parent-child 3D Laplacian stencil weight."),
     },
     {
         "apply_poisson_operator",

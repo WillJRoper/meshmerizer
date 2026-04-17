@@ -5,6 +5,8 @@ import pytest
 
 from meshmerizer.adaptive_core import (
     morton_encode_3d,
+    pc_integrals_1d,
+    pc_laplacian_weight,
     splat_and_compute_rhs,
 )
 
@@ -224,3 +226,86 @@ class TestRHSAssembly:
             "RHS should have both positive and negative values "
             "for a point source normal field"
         )
+
+
+class TestParentChildIntegrals:
+    """Tests for Phase 21a: parent-child cross-depth 1-D integrals."""
+
+    # Expected values: (j, mass, stiffness, grad_value)
+    EXPECTED = [
+        (-4, 1 / 15360, -1 / 96, 1 / 768),
+        (-3, 1 / 64, -1 / 4, 13 / 128),
+        (-2, 599 / 3840, -11 / 24, 191 / 384),
+        (-1, 31 / 64, 1 / 4, 89 / 128),
+        (0, 1761 / 2560, 15 / 16, 0.0),
+        (1, 31 / 64, 1 / 4, -89 / 128),
+        (2, 599 / 3840, -11 / 24, -191 / 384),
+        (3, 1 / 64, -1 / 4, -13 / 128),
+        (4, 1 / 15360, -1 / 96, -1 / 768),
+    ]
+
+    @pytest.mark.parametrize(
+        "j,exp_m,exp_k,exp_s",
+        EXPECTED,
+        ids=[f"j={j}" for j, _, _, _ in EXPECTED],
+    )
+    def test_1d_values(
+        self, j: int, exp_m: float, exp_k: float, exp_s: float
+    ) -> None:
+        """Each 1-D integral matches the known rational value."""
+        m, k, s = pc_integrals_1d(j)
+        assert m == pytest.approx(exp_m, rel=1e-14)
+        assert k == pytest.approx(exp_k, rel=1e-14)
+        assert s == pytest.approx(exp_s, rel=1e-14)
+
+    def test_mass_sum(self) -> None:
+        """Sum of mass integrals = 2 (partition of unity)."""
+        total = sum(pc_integrals_1d(j)[0] for j in range(-4, 5))
+        assert total == pytest.approx(2.0, rel=1e-14)
+
+    def test_stiffness_sum(self) -> None:
+        """Sum of stiffness integrals = 0."""
+        total = sum(pc_integrals_1d(j)[1] for j in range(-4, 5))
+        assert total == pytest.approx(0.0, abs=1e-14)
+
+    def test_grad_value_antisymmetry(self) -> None:
+        """S_pc(-j) = -S_pc(j) (antisymmetry)."""
+        for j in range(-4, 5):
+            sp = pc_integrals_1d(j)[2]
+            sm = pc_integrals_1d(-j)[2]
+            assert sp == pytest.approx(-sm, abs=1e-15)
+
+    def test_mass_symmetry(self) -> None:
+        """M_pc(j) = M_pc(-j) (symmetry)."""
+        for j in range(-4, 5):
+            mp = pc_integrals_1d(j)[0]
+            mm = pc_integrals_1d(-j)[0]
+            assert mp == pytest.approx(mm, abs=1e-15)
+
+    def test_stiffness_symmetry(self) -> None:
+        """K_pc(j) = K_pc(-j) (symmetry)."""
+        for j in range(-4, 5):
+            kp = pc_integrals_1d(j)[1]
+            km = pc_integrals_1d(-j)[1]
+            assert kp == pytest.approx(km, abs=1e-15)
+
+    def test_out_of_range_zero(self) -> None:
+        """Offsets |j| > 4 return zero."""
+        for j in [-5, -10, 5, 10]:
+            m, k, s = pc_integrals_1d(j)
+            assert m == 0.0
+            assert k == 0.0
+            assert s == 0.0
+
+    def test_3d_laplacian_constant_is_zero(self) -> None:
+        """Sum of 3-D parent-child Laplacian weights = 0.
+
+        If all child DOFs have x=1, the Laplacian contribution
+        from the parent should vanish (Laplacian of constant = 0).
+        """
+        total = 0.0
+        for dx in range(-4, 5):
+            for dy in range(-4, 5):
+                for dz in range(-4, 5):
+                    total += pc_laplacian_weight(dx, dy, dz)
+        assert total == pytest.approx(0.0, abs=1e-12)

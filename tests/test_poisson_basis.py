@@ -4,6 +4,7 @@ import pytest
 
 from meshmerizer.adaptive_core import (
     assign_dof_indices,
+    assign_dof_indices_grouped,
     bspline1d_derivative,
     bspline1d_evaluate,
     bspline3d_evaluate,
@@ -339,3 +340,72 @@ class TestStencilEnumeration:
         for i in range(n_dofs):
             stencil = neighbors[offsets[i] : offsets[i + 1]]
             assert i in stencil
+
+
+class TestDepthGroupedDof:
+    """Tests for depth-grouped DOF assignment (Phase 21b)."""
+
+    def test_uniform_grid_single_depth(self) -> None:
+        """A uniform grid has all leaves at depth 0."""
+        cells = _make_uniform_grid_cells(2, (0.0, 0.0, 0.0), (2.0, 2.0, 2.0))
+        c2d, d2c, dds = assign_dof_indices_grouped(cells, 0)
+        assert len(d2c) == 8  # 2^3
+        # depth_dof_start: [0, 8] (depth 0 starts at 0, sentinel=8)
+        assert dds == [0, 8]
+
+    def test_mixed_depth_ordering(self) -> None:
+        """DOFs at depth 0 should come before depth 1."""
+        # Create cells: 4 at depth 0, 2 at depth 1
+        cells = [
+            {"is_leaf": True, "depth": 0},
+            {"is_leaf": True, "depth": 1},
+            {"is_leaf": True, "depth": 0},
+            {"is_leaf": True, "depth": 1},
+            {"is_leaf": False, "depth": 0},  # non-leaf, skipped
+            {"is_leaf": True, "depth": 0},
+        ]
+        c2d, d2c, dds = assign_dof_indices_grouped(cells, 1)
+
+        # 3 leaves at depth 0, 2 at depth 1 = 5 DOFs total
+        assert len(d2c) == 5
+        assert dds == [0, 3, 5]
+
+        # Depth 0 DOFs: indices 0, 1, 2
+        # Depth 1 DOFs: indices 3, 4
+        assert c2d[0] >= 0 and c2d[0] < 3  # depth 0 leaf
+        assert c2d[1] >= 3 and c2d[1] < 5  # depth 1 leaf
+        assert c2d[4] == -1  # non-leaf
+
+    def test_contiguous_within_depth(self) -> None:
+        """DOFs within each depth group are contiguous."""
+        cells = []
+        for d in range(3):
+            for _ in range(5):
+                cells.append({"is_leaf": True, "depth": d})
+        c2d, d2c, dds = assign_dof_indices_grouped(cells, 2)
+
+        assert len(d2c) == 15
+        assert dds == [0, 5, 10, 15]
+
+        # Verify each depth group is contiguous
+        for d in range(3):
+            start = dds[d]
+            end = dds[d + 1]
+            depth_dofs = [
+                c2d[i] for i in range(len(cells)) if cells[i]["depth"] == d
+            ]
+            assert sorted(depth_dofs) == list(range(start, end))
+
+    def test_roundtrip(self) -> None:
+        """dof_to_cell and cell_to_dof are consistent."""
+        cells = [
+            {"is_leaf": True, "depth": 0},
+            {"is_leaf": True, "depth": 1},
+            {"is_leaf": True, "depth": 2},
+        ]
+        c2d, d2c, dds = assign_dof_indices_grouped(cells, 2)
+        for ci, di in enumerate(c2d):
+            if di >= 0:
+                assert d2c[di] == ci
+        for di, ci in enumerate(d2c):
+            assert c2d[ci] == di

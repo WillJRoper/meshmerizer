@@ -744,6 +744,28 @@ def assign_dof_indices(
     return _adaptive.assign_dof_indices(cells)
 
 
+def assign_dof_indices_grouped(
+    cells: list[dict],
+    max_depth: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """Depth-grouped DOF assignment for multi-depth Poisson.
+
+    DOFs at depth 0 are assigned first, then depth 1, etc.
+    This enables efficient depth-by-depth cascadic solving.
+
+    Args:
+        cells: List of cell dicts with ``is_leaf`` and ``depth``.
+        max_depth: Maximum octree depth.
+
+    Returns:
+        Tuple of (cell_to_dof, dof_to_cell, depth_dof_start).
+        depth_dof_start has (max_depth + 2) entries where entry d
+        is the first DOF index at depth d, and the last entry is
+        the total DOF count.
+    """
+    return _adaptive.assign_dof_indices_grouped(cells, max_depth)
+
+
 def enumerate_stencils(
     cells: list[dict],
     domain_min: tuple[float, float, float],
@@ -851,6 +873,37 @@ def laplacian_stencil_weight(
         Stiffness integral value.
     """
     return _adaptive.laplacian_stencil_weight(dx, dy, dz, h)
+
+
+def pc_integrals_1d(j: int) -> tuple[float, float, float]:
+    """Return parent-child 1-D B-spline integrals for offset j.
+
+    Args:
+        j: Offset from parent centre to child centre in
+            child-width units (integer, -4..+4).
+
+    Returns:
+        Tuple of (mass, stiffness, gradient-value) raw integrals.
+    """
+    return _adaptive.pc_integrals_1d(j)
+
+
+def pc_laplacian_weight(
+    dx: int,
+    dy: int,
+    dz: int,
+) -> float:
+    """Return raw 3-D parent-child Laplacian stencil weight.
+
+    Args:
+        dx: Offset in x (child-width units, -4..+4).
+        dy: Offset in y.
+        dz: Offset in z.
+
+    Returns:
+        Raw stiffness weight (before 1/(2h) scaling).
+    """
+    return _adaptive.pc_laplacian_weight(dx, dy, dz)
 
 
 def apply_poisson_operator(
