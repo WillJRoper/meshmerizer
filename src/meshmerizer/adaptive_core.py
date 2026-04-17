@@ -772,3 +772,53 @@ def enumerate_stencils(
         base_resolution,
         max_depth,
     )
+
+
+def splat_and_compute_rhs(
+    positions: "numpy.ndarray",
+    normals: "numpy.ndarray",
+    cells: list[dict],
+    domain_min: tuple[float, float, float],
+    domain_max: tuple[float, float, float],
+    base_resolution: int,
+    max_depth: int,
+) -> tuple[list[float], list[float], list[float], list[float]]:
+    """Splat oriented normals and compute the Poisson RHS.
+
+    Performs two steps of the screened Poisson pipeline:
+
+    1. **Normal splatting** (SGP06 Sec 3): distributes each
+       sample's unit normal into the overlapping B-spline DOFs,
+       weighted by the trilinear basis value and a uniform area
+       weight (1/N).
+    2. **RHS assembly** (SGP06 Sec 3): computes
+       ``b_i = sum_j V_j . G_ij`` where ``G_ij`` is the
+       precomputed gradient inner product between B-spline
+       basis functions.
+
+    Args:
+        positions: (N, 3) float64 array of sample positions.
+        normals: (N, 3) float64 array of sample unit normals.
+        cells: List of cell dicts with keys ``is_leaf``,
+            ``depth``, ``bounds_min``, ``bounds_max``,
+            ``morton_key``.
+        domain_min: Lower corner of the domain.
+        domain_max: Upper corner of the domain.
+        base_resolution: Top-level cells per axis.
+        max_depth: Maximum octree depth.
+
+    Returns:
+        Tuple of (v_field_x, v_field_y, v_field_z, rhs) where
+        each is a list of floats with one entry per DOF.
+    """
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    nor = np.ascontiguousarray(normals, dtype=np.float64)
+    return _adaptive.splat_and_compute_rhs(
+        pos,
+        nor,
+        cells,
+        domain_min,
+        domain_max,
+        base_resolution,
+        max_depth,
+    )

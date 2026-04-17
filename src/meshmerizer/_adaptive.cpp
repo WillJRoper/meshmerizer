@@ -33,6 +33,7 @@
 #include "adaptive_cpp/faces.hpp"
 #include "adaptive_cpp/fof.hpp"
 #include "adaptive_cpp/poisson_basis.hpp"
+#include "adaptive_cpp/poisson_rhs.hpp"
 #include "adaptive_cpp/qef.hpp"
 
 /**
@@ -2394,6 +2395,163 @@ static PyObject *enumerate_stencils_py(PyObject * /*self*/,
 }
 
 /**
+ * @brief splat_and_compute_rhs(positions_arr, normals_arr, cells,
+ *            domain_min, domain_max, base_resolution, max_depth)
+ *        -> (v_field_x, v_field_y, v_field_z, rhs)
+ *
+ * Performs both normal splatting and RHS assembly in one call.
+ * positions_arr and normals_arr are (N,3) float64 NumPy arrays.
+ * cells is a list of dicts (same format as enumerate_stencils).
+ *
+ * Returns four lists:
+ *   v_field_x, v_field_y, v_field_z (per-DOF vector field)
+ *   rhs (per-DOF scalar RHS)
+ */
+static PyObject *splat_and_compute_rhs_py(PyObject * /*self*/,
+                                          PyObject *args) {
+    PyObject *pos_obj;
+    PyObject *nor_obj;
+    PyObject *cells_obj;
+    PyObject *dmin_obj;
+    PyObject *dmax_obj;
+    unsigned int base_resolution;
+    unsigned int max_depth_val;
+    if (!PyArg_ParseTuple(args, "OOOOOII",
+                          &pos_obj, &nor_obj, &cells_obj,
+                          &dmin_obj, &dmax_obj,
+                          &base_resolution, &max_depth_val)) {
+        return NULL;
+    }
+
+    /* Parse domain. */
+    Vector3d dmin{}, dmax{};
+    if (!parse_vector3d(dmin_obj, dmin)) return NULL;
+    if (!parse_vector3d(dmax_obj, dmax)) return NULL;
+    BoundingBox domain = {dmin, dmax};
+
+    /* Parse positions and normals from NumPy arrays. */
+    PyArrayObject *pos_arr = reinterpret_cast<PyArrayObject *>(
+        PyArray_FROM_OTF(pos_obj, NPY_DOUBLE,
+                         NPY_ARRAY_IN_ARRAY));
+    if (pos_arr == NULL) return NULL;
+    PyArrayObject *nor_arr = reinterpret_cast<PyArrayObject *>(
+        PyArray_FROM_OTF(nor_obj, NPY_DOUBLE,
+                         NPY_ARRAY_IN_ARRAY));
+    if (nor_arr == NULL) {
+        Py_DECREF(pos_arr);
+        return NULL;
+    }
+
+    const npy_intp n_samples = PyArray_DIM(pos_arr, 0);
+    const double *pos_data =
+        static_cast<double *>(PyArray_DATA(pos_arr));
+    const double *nor_data =
+        static_cast<double *>(PyArray_DATA(nor_arr));
+
+    /* Convert to Vector3d arrays. */
+    std::vector<Vector3d> positions(
+        static_cast<std::size_t>(n_samples));
+    std::vector<Vector3d> normals_vec(
+        static_cast<std::size_t>(n_samples));
+    for (npy_intp i = 0; i < n_samples; ++i) {
+        positions[static_cast<std::size_t>(i)] = {
+            pos_data[i * 3], pos_data[i * 3 + 1],
+            pos_data[i * 3 + 2]};
+        normals_vec[static_cast<std::size_t>(i)] = {
+            nor_data[i * 3], nor_data[i * 3 + 1],
+            nor_data[i * 3 + 2]};
+    }
+    Py_DECREF(pos_arr);
+    Py_DECREF(nor_arr);
+
+    /* Parse cells. */
+    PyObject *fast = PySequence_Fast(
+        cells_obj, "expected a sequence of cell dicts");
+    if (fast == NULL) return NULL;
+    const Py_ssize_t nc = PySequence_Fast_GET_SIZE(fast);
+
+    std::vector<OctreeCell> cells(
+        static_cast<std::size_t>(nc));
+    for (Py_ssize_t i = 0; i < nc; ++i) {
+        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
+        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
+        PyObject *depth = PyDict_GetItemString(d, "depth");
+        PyObject *bmin = PyDict_GetItemString(d, "bounds_min");
+        PyObject *bmax = PyDict_GetItemString(d, "bounds_max");
+        PyObject *mkey = PyDict_GetItemString(d, "morton_key");
+        if (!leaf || !depth || !bmin || !bmax || !mkey) {
+            Py_DECREF(fast);
+            PyErr_SetString(PyExc_KeyError,
+                            "cell dict missing required key");
+            return NULL;
+        }
+        auto &c = cells[static_cast<std::size_t>(i)];
+        c.is_leaf = PyObject_IsTrue(leaf) != 0;
+        c.depth = static_cast<std::uint32_t>(
+            PyLong_AsUnsignedLong(depth));
+        if (!parse_vector3d(bmin, c.bounds.min)) {
+            Py_DECREF(fast);
+            return NULL;
+        }
+        if (!parse_vector3d(bmax, c.bounds.max)) {
+            Py_DECREF(fast);
+            return NULL;
+        }
+        c.morton_key = PyLong_AsUnsignedLongLong(mkey);
+    }
+    Py_DECREF(fast);
+
+    /* Build DOF indexing. */
+    std::vector<std::int64_t> cell_to_dof;
+    std::vector<std::size_t> dof_to_cell;
+    assign_dof_indices(cells, cell_to_dof, dof_to_cell);
+    const std::size_t n_dofs = dof_to_cell.size();
+
+    /* Build spatial hash. */
+    PoissonLeafHash hash;
+    hash.build(cells, domain, max_depth_val, base_resolution);
+
+    /* Build stencils. */
+    std::vector<std::size_t> stencil_offsets;
+    std::vector<std::int64_t> stencil_neighbors;
+    enumerate_stencils(cells, cell_to_dof, dof_to_cell,
+                       domain, base_resolution, max_depth_val,
+                       stencil_offsets, stencil_neighbors);
+
+    /* Splat normals. */
+    std::vector<Vector3d> v_field;
+    splat_normals(positions.data(), normals_vec.data(),
+                  static_cast<std::size_t>(n_samples),
+                  hash, cells, cell_to_dof, n_dofs,
+                  base_resolution, v_field);
+
+    /* Compute RHS. */
+    std::vector<double> rhs;
+    compute_rhs(v_field, cells, cell_to_dof, dof_to_cell,
+                stencil_offsets, stencil_neighbors,
+                n_dofs, rhs);
+
+    /* Build result: 4 lists. */
+    PyObject *vx = PyList_New(static_cast<Py_ssize_t>(n_dofs));
+    PyObject *vy = PyList_New(static_cast<Py_ssize_t>(n_dofs));
+    PyObject *vz = PyList_New(static_cast<Py_ssize_t>(n_dofs));
+    PyObject *rhs_list = PyList_New(
+        static_cast<Py_ssize_t>(n_dofs));
+    for (std::size_t i = 0; i < n_dofs; ++i) {
+        const Py_ssize_t si = static_cast<Py_ssize_t>(i);
+        PyList_SET_ITEM(vx, si,
+                        PyFloat_FromDouble(v_field[i].x));
+        PyList_SET_ITEM(vy, si,
+                        PyFloat_FromDouble(v_field[i].y));
+        PyList_SET_ITEM(vz, si,
+                        PyFloat_FromDouble(v_field[i].z));
+        PyList_SET_ITEM(rhs_list, si,
+                        PyFloat_FromDouble(rhs[i]));
+    }
+    return Py_BuildValue("(OOOO)", vx, vy, vz, rhs_list);
+}
+
+/**
  * @brief Python methods exported by the adaptive extension.
  */
 static PyMethodDef adaptive_methods[] = {
@@ -2439,6 +2597,12 @@ static PyMethodDef adaptive_methods[] = {
         enumerate_stencils_py,
         METH_VARARGS,
         PyDoc_STR("Enumerate DOF stencils (neighbor DOFs)."),
+    },
+    {
+        "splat_and_compute_rhs",
+        splat_and_compute_rhs_py,
+        METH_VARARGS,
+        PyDoc_STR("Splat normals and compute Poisson RHS."),
     },
     {
         "adaptive_status",

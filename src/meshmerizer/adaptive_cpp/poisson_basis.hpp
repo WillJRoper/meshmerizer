@@ -3,7 +3,27 @@
  * @brief Degree-1 trilinear B-spline basis functions and DOF infrastructure
  *        for the screened Poisson surface reconstruction (Phase 20a).
  *
- * This header implements:
+ * @par References
+ * - Kazhdan, M., Bolitho, M. & Hoppe, H. "Poisson Surface
+ *   Reconstruction", *Proc. SGP* (2006).  Introduced the idea of
+ *   solving for an indicator function whose gradient matches the
+ *   smoothed normal field via a Poisson equation discretised
+ *   with compactly-supported B-spline basis functions.
+ * - Kazhdan, M. & Hoppe, H. "Screened Poisson Surface
+ *   Reconstruction", *ACM Trans. Graph.* 32(3), Art. 29 (2013).
+ *   Added a screening term that pulls the solution toward zero at
+ *   sample points, improving boundary behaviour and robustness.
+ * - Reference implementation: https://github.com/mkazhdan/PoissonRecon
+ *   (MIT licence).  Our degree-1 B-spline choice matches the
+ *   default `--degree 1` mode of this implementation.
+ *
+ * @par Algorithm context
+ * The indicator function is expanded as
+ *     chi(x) = sum_j  x_j  B_j(x)
+ * where B_j are trilinear (degree-1) tensor-product B-splines
+ * centred at octree leaf cell centres.  This file provides the
+ * basis evaluation, gradient, DOF indexing, and stencil structure
+ * needed to assemble and solve the resulting linear system.
  *
  * 1. **1-D degree-1 B-spline** evaluation and derivative.  The basis
  *    function is the standard hat function with support [-1, 1] in
