@@ -290,13 +290,14 @@ inline PipelineResult run_full_pipeline(
     // ================================================================
     // Step 4: Assign B-spline DOF indices on adaptive leaves.
     // ================================================================
-    // Each leaf cell gets one degree-of-freedom (DOF) for the
-    // degree-1 B-spline basis.  CRITICAL: we restrict DOFs to
-    // leaves at exactly max_depth.  This ensures all DOFs have
-    // the same cell width, making the Laplacian stencil exact.
-    // Coarser leaves (from 2:1 balancing) are excluded — they
-    // would introduce cross-scale B-spline interactions that
-    // the uniform stencil cannot handle correctly.
+    // Each leaf cell at max_depth gets one degree-of-freedom (DOF)
+    // for the degree-2 B-spline basis.  We restrict DOFs to
+    // max_depth leaves only because the Galerkin Laplacian stencil
+    // assumes uniform cell widths — mixing depths breaks operator
+    // symmetry and causes PCG divergence.  Max_depth leaves form
+    // a dense shell around the surface (from refinement) plus
+    // 2:1-balance neighbors, providing enough interior/exterior
+    // coverage for the indicator function.
 
     std::vector<std::int64_t> cell_to_dof;
     std::vector<std::size_t> dof_to_cell;
@@ -326,7 +327,7 @@ inline PipelineResult run_full_pipeline(
     // Step 6: Splat QEF normals into B-spline vector field.
     // ================================================================
     // Each QEF sample's unit normal is distributed into the
-    // overlapping B-spline DOFs weighted by the trilinear basis
+    // overlapping B-spline DOFs weighted by the degree-2 basis
     // value (SGP06 Sec 3).
 
     std::vector<Vector3d> v_field;
@@ -402,16 +403,16 @@ inline PipelineResult run_full_pipeline(
     // cells sharing a corner see the same chi value.
 
     std::vector<std::array<double, 8>> corner_values;
-    std::size_t n_md_leaves = 0;
+    std::size_t n_leaves = 0;
     for (const auto &c : all_cells) {
-        if (c.is_leaf && c.depth == max_depth) {
-            ++n_md_leaves;
+        if (c.is_leaf) {
+            ++n_leaves;
         }
     }
 
     evaluate_chi_at_corners(
         solution, all_cells, cell_to_dof, hash,
-        base_resolution, max_depth, n_md_leaves,
+        base_resolution, max_depth, n_leaves,
         corner_values);
 
     // ================================================================

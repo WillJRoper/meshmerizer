@@ -116,9 +116,10 @@ inline double vec_norm(const std::vector<double> &v,
 /**
  * @brief Extract the diagonal of the operator A = L + S.
  *
- * The diagonal of the Laplacian stencil at DOF i is
+ * The diagonal of the Galerkin Laplacian stencil at DOF i is
  * L(0,0,0,h_i) = h_i * 3 * K(0) * M(0) * M(0)
- *              = h_i * 3 * 2 * (2/3)^2 = h_i * 8/3.
+ * For degree-2 B-splines:
+ *   = h_i * 3 * 1 * (11/20)^2 = h_i * 363/400 ≈ 0.9075 h_i
  *
  * The screening diagonal is stored in screening.diagonal[i].
  *
@@ -138,9 +139,9 @@ inline void extract_diagonal(
     for (std::size_t i = 0; i < n_dofs; ++i) {
         const std::size_t ci = dof_to_cell[i];
         const double h = cells[ci].bounds.extent().x;
-        /* L(0,0,0,h) = h * (K(0)*M(0)*M(0) + M(0)*K(0)*M(0)
-         *            + M(0)*M(0)*K(0))
-         * = h * 3 * 2 * (2/3)^2 = h * 8/3  */
+        /* L(0,0,0,h) = h * 3 * K(0)*M(0)*M(0)
+         * For degree-2: h * 3 * (2/3) * (11/20)^2
+         *             = h * 363/400 ≈ 0.9075h */
         diag[i] = laplacian_stencil_weight(0, 0, 0, h)
                   + screening.diagonal[i];
     }

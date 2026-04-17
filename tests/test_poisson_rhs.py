@@ -47,7 +47,7 @@ class TestSplatNormals:
 
     def test_single_point_at_center(self) -> None:
         """A single point at the cell centre should splat into
-        that DOF with weight 1.0 (times area_weight = 1/1)."""
+        that DOF with weight B_3d(center) (times area_weight = 1/h)."""
         dmin = (0.0, 0.0, 0.0)
         dmax = (1.0, 1.0, 1.0)
         cells = _make_uniform_grid_cells(1, dmin, dmax)
@@ -59,17 +59,17 @@ class TestSplatNormals:
             pos, nor, cells, dmin, dmax, 1, 0
         )
 
-        # Single DOF, single sample, area_weight = 1/1 = 1.0
-        # B(center) = 1.0, so V = 1.0 * (0, 0, 1) * 1.0
+        # Single DOF, single sample, area_weight = 1/h = 1.0.
+        # For degree-2 B-splines, B_3d(center) = (3/4)^3 = 27/64.
         assert len(vx) == 1
         assert vx[0] == pytest.approx(0.0)
         assert vy[0] == pytest.approx(0.0)
-        assert vz[0] == pytest.approx(1.0)
+        assert vz[0] == pytest.approx(27.0 / 64.0)
 
     def test_partition_of_unity_preserves_total(self) -> None:
         """Total splatted normal magnitude should equal area weight
         times normal magnitude (partition of unity) for interior
-        points that have all 8 overlapping DOFs."""
+        points that have all overlapping DOFs."""
         dmin = (0.0, 0.0, 0.0)
         dmax = (3.0, 3.0, 3.0)
         cells = _make_uniform_grid_cells(3, dmin, dmax)
@@ -106,9 +106,9 @@ class TestSplatNormals:
             pos, nor, cells, dmin, dmax, 4, 0
         )
 
-        # Total z-component should sum to area_weight * N * 1.0
-        # = (1/N) * N * 1.0 = 1.0
-        assert sum(vz) == pytest.approx(1.0, abs=1e-10)
+        # Total z-component should sum to area_weight * N * 1.0.
+        # The implementation uses area_weight = 1/h; here h=1.
+        assert sum(vz) == pytest.approx(float(n), abs=1e-10)
 
     def test_symmetry(self) -> None:
         """Symmetric sample placement should produce symmetric V."""
@@ -142,11 +142,11 @@ class TestRHSAssembly:
         zero away from boundaries).
         """
         dmin = (0.0, 0.0, 0.0)
-        dmax = (4.0, 4.0, 4.0)
-        cells = _make_uniform_grid_cells(4, dmin, dmax)
+        dmax = (10.0, 10.0, 10.0)
+        cells = _make_uniform_grid_cells(10, dmin, dmax)
 
         # Place samples at every cell centre with uniform z-normal
-        n = 4
+        n = 10
         pos_list = []
         nor_list = []
         for ix in range(n):
@@ -163,18 +163,23 @@ class TestRHSAssembly:
         pos = np.array(pos_list)
         nor = np.array(nor_list)
 
-        _, _, _, rhs = splat_and_compute_rhs(pos, nor, cells, dmin, dmax, 4, 0)
+        _, _, _, rhs = splat_and_compute_rhs(
+            pos, nor, cells, dmin, dmax, 10, 0
+        )
 
         # Interior DOFs (cells not touching the boundary) should
         # have RHS very close to zero. Boundary DOFs may be
         # nonzero due to truncated stencils.
-        # In a 4x4x4 grid, interior cells are (1,1,1) to (2,2,2)
+        # With a 5-wide stencil (offsets -2..+2), interior cells must be
+        # far enough from the boundary that all stencil neighbors also
+        # have full support. A 10x10x10 grid has a clean interior at
+        # indices 4 and 5.
         interior_rhs = []
-        for ix in range(1, 3):
-            for iy in range(1, 3):
-                for iz in range(1, 3):
+        for ix in range(4, 6):
+            for iy in range(4, 6):
+                for iz in range(4, 6):
                     # Find the cell index (in our row-major order)
-                    idx = ix * 16 + iy * 4 + iz
+                    idx = ix * 100 + iy * 10 + iz
                     interior_rhs.append(rhs[idx])
 
         for val in interior_rhs:

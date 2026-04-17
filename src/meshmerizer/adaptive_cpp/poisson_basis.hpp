@@ -1,6 +1,6 @@
 /**
  * @file poisson_basis.hpp
- * @brief Degree-1 trilinear B-spline basis functions and DOF infrastructure
+ * @brief Degree-2 quadratic B-spline basis functions and DOF infrastructure
  *        for the screened Poisson surface reconstruction (Phase 20a).
  *
  * @par References
@@ -14,22 +14,25 @@
  *   Added a screening term that pulls the solution toward zero at
  *   sample points, improving boundary behaviour and robustness.
  * - Reference implementation: https://github.com/mkazhdan/PoissonRecon
- *   (MIT licence).  Our degree-1 B-spline choice matches the
- *   default `--degree 1` mode of this implementation.
+ *   (MIT licence).  Our degree-2 B-spline choice matches the
+ *   default `--degree 2` mode of this implementation.
  *
  * @par Algorithm context
  * The indicator function is expanded as
  *     chi(x) = sum_j  x_j  B_j(x)
- * where B_j are trilinear (degree-1) tensor-product B-splines
+ * where B_j are quadratic (degree-2) tensor-product B-splines
  * centred at octree leaf cell centres.  This file provides the
  * basis evaluation, gradient, DOF indexing, and stencil structure
  * needed to assemble and solve the resulting linear system.
  *
- * 1. **1-D degree-1 B-spline** evaluation and derivative.  The basis
- *    function is the standard hat function with support [-1, 1] in
- *    normalised coordinates:
+ * 1. **1-D degree-2 B-spline** evaluation and derivative.  The basis
+ *    function is the quadratic B-spline with unit knot spacing,
+ *    centred at 0 and with support [-3/2, 3/2] in normalised
+ *    coordinates:
  *
- *        B(t) = max(0, 1 - |t|)
+ *        B(t) = 3/4 - t^2                   for |t| <= 1/2
+ *        B(t) = (3/2 - |t|)^2 / 2           for 1/2 < |t| <= 3/2
+ *        B(t) = 0                           for |t| > 3/2
  *
  * 2. **3-D tensor-product** evaluation and gradient.  Given a cell
  *    centre `c` and cell width `w`, the 3-D basis at point `x` is:
@@ -50,7 +53,7 @@
  *    - `dof_to_cell[dof_index] -> cell_index`
  *
  * 4. **Stencil enumeration**.  For each DOF, we enumerate the (up to
- *    27) neighbouring DOFs whose B-spline supports overlap.  This is
+ *    125) neighbouring DOFs whose B-spline supports overlap.  This is
  *    the sparsity pattern of the stiffness matrix.
  *
  * All functions are inline / header-only, following the project convention.
@@ -72,16 +75,19 @@
 #include "vector3d.hpp"
 
 /* ===================================================================
- * Section 1: 1-D degree-1 B-spline
+ * Section 1: 1-D degree-2 B-spline
  * =================================================================== */
 
 /**
- * @brief Evaluate the 1-D degree-1 (hat) B-spline at normalised
- *        coordinate `t`.
+ * @brief Evaluate the 1-D degree-2 (quadratic) B-spline at normalised
+ *        coordinate @p t.
  *
- * The B-spline is centred at 0 with support on [-1, 1]:
+ * The B-spline is centred at 0 with unit knot spacing and has support
+ * on [-3/2, 3/2] [SGP06, ToG13]:
  *
- *     B(t) = max(0, 1 - |t|)
+ *     B(t) = 3/4 - t^2                   for |t| <= 1/2
+ *     B(t) = (3/2 - |t|)^2 / 2           for 1/2 < |t| <= 3/2
+ *     B(t) = 0                           for |t| > 3/2
  *
  * @param t Normalised coordinate (distance from centre in units of
  *          cell width).
@@ -89,35 +95,58 @@
  */
 inline double bspline1d_evaluate(double t) {
     const double abs_t = std::fabs(t);
-    if (abs_t >= 1.0) {
+
+    /* Quadratic B-spline with unit knot spacing.
+     * See Kazhdan et al. [SGP06] and Kazhdan & Hoppe [ToG13], and the
+     * PoissonRecon reference implementation for the degree-2 basis.
+     *
+     * The compact support is |t| <= 3/2.
+     * The function is C^1 (first-derivative continuous) and integrates
+     * to 1 over the real line. */
+    if (abs_t > 1.5) {
         return 0.0;
     }
-    return 1.0 - abs_t;
+    if (abs_t <= 0.5) {
+        return 0.75 - t * t;
+    }
+    const double u = 1.5 - abs_t;
+    return 0.5 * u * u;
 }
 
 /**
- * @brief Evaluate the derivative of the 1-D degree-1 B-spline at
- *        normalised coordinate `t`.
+ * @brief Evaluate the derivative of the 1-D degree-2 B-spline at
+ *        normalised coordinate @p t.
  *
- * The derivative is:
+ * The derivative (piecewise polynomial) is [SGP06, ToG13]:
  *
- *     B'(t) = -1  if  0 < t < 1
- *              1  if -1 < t < 0
- *              0  if |t| >= 1
+ *     B'(t) = -2t                        for |t| <= 1/2
+ *     B'(t) = t + 3/2                    for -3/2 < t < -1/2
+ *     B'(t) = t - 3/2                    for 1/2 < t < 3/2
+ *     B'(t) = 0                          for |t| >= 3/2
  *
- * At `t = 0` the hat function has a cusp; we return 0 (the average
- * of left and right derivatives) which is sufficient for Galerkin
- * integration where measure-zero points do not affect integrals.
+ * At the knot points (t = +/-1/2) the left and right formulas agree,
+ * so we can evaluate using <= without ambiguity.  At |t| = 3/2, the
+ * basis is identically zero, and we return 0.
  *
  * @param t Normalised coordinate.
- * @return Derivative value in {-1, 0, 1}.
+ * @return Derivative value.
  */
 inline double bspline1d_derivative(double t) {
     const double abs_t = std::fabs(t);
-    if (abs_t >= 1.0 || abs_t == 0.0) {
+
+    /* Outside the compact support, the derivative vanishes. */
+    if (abs_t >= 1.5) {
         return 0.0;
     }
-    return (t > 0.0) ? -1.0 : 1.0;
+
+    /* Within the central interval, the basis is 3/4 - t^2. */
+    if (abs_t <= 0.5) {
+        return -2.0 * t;
+    }
+
+    /* In the outer intervals, B(t) = (3/2 - |t|)^2 / 2.
+     * Differentiate accounting for the absolute value. */
+    return (t < 0.0) ? (t + 1.5) : (t - 1.5);
 }
 
 /* ===================================================================
@@ -125,14 +154,19 @@ inline double bspline1d_derivative(double t) {
  * =================================================================== */
 
 /**
- * @brief Evaluate the 3-D trilinear B-spline centred at `center`
+ * @brief Evaluate the 3-D degree-2 (quadratic) B-spline centred at
+ *        @p center
  *        with cell width `width`.
  *
- * The 3-D basis is the tensor product of three 1-D hat functions:
+ * The 3-D basis is the tensor product of three 1-D degree-2 B-splines
+ * [SGP06, ToG13]:
  *
  *     B_3d(x) = B((x.x - c.x) / w)
  *             * B((x.y - c.y) / w)
  *             * B((x.z - c.z) / w)
+ *
+ * Along each axis, the 1-D support is [-3/2, 3/2] in normalised
+ * coordinates, i.e. [-3/2 h, 3/2 h] in world space for cell width h.
  *
  * @param point   Evaluation point in world space.
  * @param center  Cell centre (B-spline centre).
@@ -142,10 +176,9 @@ inline double bspline1d_derivative(double t) {
 inline double bspline3d_evaluate(const Vector3d &point,
                                  const Vector3d &center,
                                  double width) {
-    /* Normalise each axis to the range [-1, 1] relative to the
-     * cell centre.  The B-spline has support width = 2 * cell_width
-     * (one cell on each side), so the normalised coordinate is
-     * (x - c) / w. */
+    /* Normalise each axis relative to the cell centre.
+     * For degree-2, the 1-D support is [-3/2 h, 3/2 h] (radius 1.5h),
+     * so the normalised coordinate remains (x - c) / h. */
     const double tx = (point.x - center.x) / width;
     const double ty = (point.y - center.y) / width;
     const double tz = (point.z - center.z) / width;
@@ -155,10 +188,10 @@ inline double bspline3d_evaluate(const Vector3d &point,
 }
 
 /**
- * @brief Evaluate the gradient of the 3-D trilinear B-spline.
+ * @brief Evaluate the gradient of the 3-D degree-2 B-spline.
  *
- * Using the product rule on the tensor product, the x-component
- * of the gradient is:
+ * Using the product rule on the tensor product [SGP06, ToG13], the
+ * x-component of the gradient is:
  *
  *     dB/dx = (1/w) * B'(tx) * B(ty) * B(tz)
  *
@@ -425,15 +458,16 @@ struct PoissonLeafHash {
 /**
  * @brief Enumerate the DOF stencil (neighbor DOFs) for each DOF.
  *
- * For degree-1 B-splines, two basis functions overlap if and only
- * if their cell centres are within one cell width in each axis
- * direction.  On a uniform grid this gives a 3^3 = 27 stencil
- * (including self).  On an adaptive grid with 2:1 balance, the
- * stencil can be smaller at depth boundaries.
+ * For degree-2 B-splines, two basis functions overlap if their cell
+ * centres are within two cell widths in each axis direction (the
+ * supports touch at three cell widths, but only at a measure-zero set).
+ * On a uniform grid this gives a 5^3 = 125 stencil (including self).
+ * On an adaptive grid with 2:1 balance, the stencil can be smaller at
+ * depth boundaries.
  *
  * We use a spatial hash to look up neighbors efficiently.  For each
- * DOF, we probe the 27 positions offset by {-1, 0, +1} cell widths
- * along each axis from the cell centre.  Due to 2:1 balance, a
+ * DOF, we probe the 125 positions offset by {-2, -1, 0, +1, +2} cell
+ * widths along each axis from the cell centre.  Due to 2:1 balance, a
  * neighbor may be at the same depth or one level coarser.  Probing
  * at the fine grid level and using hierarchical lookup handles both
  * cases.
@@ -467,9 +501,9 @@ inline void enumerate_stencils(
     stencil_offsets.clear();
     stencil_offsets.reserve(n_dofs + 1);
     stencil_neighbors.clear();
-    /* Typical stencil has ~27 entries per DOF; pre-allocate
+    /* Typical stencil has ~125 entries per DOF; pre-allocate
      * conservatively. */
-    stencil_neighbors.reserve(n_dofs * 27);
+    stencil_neighbors.reserve(n_dofs * 125);
 
     /* Build a spatial hash of leaf cells for neighbor lookup. */
     PoissonLeafHash hash;
@@ -494,11 +528,12 @@ inline void enumerate_stencils(
         std::uint32_t gx, gy, gz;
         hash.quantize(cell.bounds.min, gx, gy, gz);
 
-        /* Probe all 27 neighbor positions.  Each offset is one
-         * cell-width step in fine-grid units (= `span`). */
-        for (int dx = -1; dx <= 1; ++dx) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dz = -1; dz <= 1; ++dz) {
+        /* Probe all 125 neighbor positions.
+         * Each offset is one cell-width step in fine-grid units
+         * (= span). */
+        for (int dx = -2; dx <= 2; ++dx) {
+            for (int dy = -2; dy <= 2; ++dy) {
+                for (int dz = -2; dz <= 2; ++dz) {
                     const std::int64_t px =
                         static_cast<std::int64_t>(gx) +
                         static_cast<std::int64_t>(dx) *
@@ -529,7 +564,7 @@ inline void enumerate_stencils(
 
                     /* Avoid duplicate entries: only add if not
                      * already present in this DOF's stencil.
-                     * Since the stencil is small (<=27), a
+                     * Since the stencil is small (<=125), a
                      * linear scan is fine. */
                     const std::size_t start =
                         stencil_offsets.back();

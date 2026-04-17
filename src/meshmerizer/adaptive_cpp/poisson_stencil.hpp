@@ -1,68 +1,54 @@
 /**
  * @file poisson_stencil.hpp
- * @brief Laplacian stencil, screening, and matrix-free operator
- *        for the screened Poisson surface reconstruction
- *        (Phase 20c).
+ * @brief Laplacian stencil, screening, and matrix-free operator for
+ *        screened Poisson surface reconstruction (Phase 20c).
  *
  * @par References
  * - Kazhdan, M., Bolitho, M. & Hoppe, H. "Poisson Surface
- *   Reconstruction", *Proc. SGP* (2006), Section 4.  The
- *   Laplacian operator is discretised on the B-spline basis
- *   using the stiffness matrix L_ij = <grad B_i, grad B_j>.
+ *   Reconstruction", *Proc. SGP* (2006), Sec. 4.  The Laplacian is
+ *   discretised on a B-spline basis using the Galerkin stiffness
+ *   matrix L_ij = <grad B_i, grad B_j>. (SGP06)
  * - Kazhdan, M. & Hoppe, H. "Screened Poisson Surface
  *   Reconstruction", *ACM Trans. Graph.* 32(3), Art. 29 (2013),
- *   Section 4.3.  Screening adds a point-sampled mass term:
- *       S_ij = alpha * sum_s 2^{d_s} * B_i(p_s) * B_j(p_s)
- *   where d_s is the octree depth of the cell containing sample
- *   s, and alpha is the screening weight.
+ *   Sec. 4.3. Screening adds a point-sampled mass term
+ *   S_ij = alpha * sum_s 2^{d_s} * B_i(p_s) * B_j(p_s). (ToG13)
  * - Reference implementation: https://github.com/mkazhdan/PoissonRecon
- *   (MIT licence).
+ *   (MIT licence). (PoissonRecon)
  *
  * @par Algorithm
  * The full operator is A = L + S (Laplacian + screening).
  *
- * **Laplacian stencil (L):**
- * For degree-1 (hat) B-splines on a uniform grid with cell
- * width h, the 1-D integrals are:
+ * @par Laplacian stencil (Galerkin stiffness)
+ * We use **degree-2 (quadratic) B-splines**. On a uniform grid with
+ * cell width h, the 1-D integrals (normalised to unit spacing) are:
  *
- *   Stiffness: K(d) = integral B'(t) B'(t-d) dt
- *     K(0) = 2,  K(±1) = -1,  K(else) = 0
+ * - Mass/overlap: M(d) = ∫ B₂(t) B₂(t-d) dt
+ *     M(0)=11/20, M(±1)=13/60, M(±2)=1/120, else 0
+ * - Stiffness:    K(d) = ∫ B₂'(t) B₂'(t-d) dt
+ *     K(0)=1,     K(±1)=-1/3,   K(±2)=-1/6,   else 0
  *
- *   Mass: M(d) = integral B(t) B(t-d) dt
- *     M(0) = 2/3,  M(±1) = 1/6,  M(else) = 0
+ * The 3-D stiffness weight for relative offset (dx,dy,dz) is the sum
+ * of contributions from each axis:
  *
- * The 3-D stiffness for offset (dx, dy, dz) is the sum of
- * contributions from each axis:
- *   L(dx,dy,dz) = K(dx)*M(dy)*M(dz)
- *               + M(dx)*K(dy)*M(dz)
- *               + M(dx)*M(dy)*K(dz)
+ *   L(dx,dy,dz) = h * [ K(dx) M(dy) M(dz)
+ *                     + M(dx) K(dy) M(dz)
+ *                     + M(dx) M(dy) K(dz) ]
  *
- * Scaling: each 1-D integral is over the hat function with
- * support width h.  The substitution t -> x/h gives a factor
- * of h for the mass integral and 1/h for the stiffness integral
- * (two derivatives each contribute 1/h, volume contributes h).
- * In 3-D, each term has one stiffness factor (1/h) and two mass
- * factors (h each), plus the volume h^3, giving:
- *   h^3 * (1/h) * h * h = h^2  ... wait, let's be precise.
+ * Scaling: in each term there is one stiffness integral (1/h after
+ * change-of-variables, from the two derivatives) and two mass
+ * integrals (h each). Multiplying gives h overall, matching the weak
+ * form <grad B_i, grad B_j> integrated over volume. (SGP06)
  *
- * For a single axis (say x), the stiffness term is:
- *   integral B'_i(x) B'_j(x) dx = (1/h) * K(dx)
- * and the mass terms for the other axes are:
- *   integral B_i(y) B_j(y) dy = h * M(dy)
- *   integral B_i(z) B_j(z) dz = h * M(dz)
- * Combining: (1/h) * K(dx) * h * M(dy) * h * M(dz) = h * K(dx)*M(dy)*M(dz)
- * So the total 3-D scaling is h per term, giving L * h overall.
+ * Since degree-2 B-splines have support spanning 3 cells per axis,
+ * the stencil support is dx,dy,dz ∈ [-2,2], giving a 5³ = 125-point
+ * Galerkin stencil on a uniform grid. Importantly, the face-neighbor
+ * coupling L(1,0,0) is nonzero for degree-2, which avoids the
+ * even/odd (checkerboard) decoupling of lower-order stiffness.
+ * (PoissonRecon)
  *
- * **Screening stencil (S):**
- * For each sample point p_s at depth d_s:
- *   S_ij += alpha * 2^{d_s} * B_i(p_s) * B_j(p_s)
- * This is accumulated during a point-splatting pass similar to
- * the normal field splatting in Phase 20b.
- *
- * **Matrix-free operator:**
- * apply_A(x)[i] = sum_j L_ij * x[j] + sum_j S_ij * x[j]
- * The Laplacian part uses the precomputed 27-point stencil.
- * The screening part uses per-DOF sparse storage.
+ * @par Screening term
+ * Screening is a point-sampled mass term accumulated per sample:
+ *   S_ij += alpha * 2^{d_s} * B_i(p_s) * B_j(p_s). (ToG13)
  *
  * All functions are inline / header-only.
  */
@@ -84,94 +70,87 @@
 #include "vector3d.hpp"
 
 /* ===================================================================
- * Section 1: 1-D stiffness integral for degree-1 B-splines
+ * Section 1: 3-D Laplacian stencil
  * =================================================================== */
 
-/**
- * @brief 1-D stiffness integral K(d) for degree-1 B-splines.
- *
- * K(d) = integral_{-inf}^{inf} B'(t) B'(t - d) dt
- *
- * For the hat function B(t) = max(0, 1 − |t|):
- *   B'(t) = +1 for t in (-1, 0), -1 for t in (0, 1), 0 elsewhere.
- *
- * The convolution of B' with B' yields:
- *   K(0)  = 2
- *   K(±1) = -1
- *   K(else) = 0
- *
- * This is the familiar 1-D finite-difference Laplacian stencil
- * [-1, 2, -1], which arises naturally from integrating the
- * products of hat function derivatives.
- *
- * @param d Relative offset in cell-width units (-1, 0, +1).
- * @return Integral value.
- */
-inline double stiffness_integral_1d(int d) {
-    switch (d) {
-        case 0:
-            return 2.0;
-        case 1:
-        case -1:
-            return -1.0;
-        default:
-            return 0.0;
-    }
-}
-
-/* ===================================================================
- * Section 2: 3-D Laplacian stencil
- * =================================================================== */
+/* poisson_rhs.hpp provides the degree-2 1-D integrals:
+ * - mass_integral_1d(d)      -> M(d)
+ * - stiffness_integral_1d(d) -> K(d)
+ * used by the tensor-product Galerkin stiffness below. */
 
 /**
  * @brief Compute the 3-D Laplacian stencil weight for a given
  *        relative cell offset (dx, dy, dz) and cell width h.
  *
- * The Laplacian stencil L(dx, dy, dz) for degree-1 B-splines
- * is the integral of grad B_i · grad B_j over the domain:
+ * This is the **Galerkin stiffness** discretisation with degree-2
+ * (quadratic) B-splines, using the tensor-product factorisation of
+ * 1-D integrals:
  *
- *   L = integral grad B_i(x) · grad B_j(x) dx
+ *   L(dx,dy,dz) = h * [ K(dx) M(dy) M(dz)
+ *                     + M(dx) K(dy) M(dz)
+ *                     + M(dx) M(dy) K(dz) ]
  *
- * This factorises as the sum of three axis-aligned terms:
+ * where M and K are the degree-2 integrals (see file header).
  *
- *   L = (1/h) * K(dx) * h * M(dy) * h * M(dz)
- *     + h * M(dx) * (1/h) * K(dy) * h * M(dz)
- *     + h * M(dx) * h * M(dy) * (1/h) * K(dz)
+ * Support: for degree-2, both M(d) and K(d) are nonzero only for
+ * d ∈ {-2,-1,0,+1,+2}, hence the 125-point stencil. (SGP06)
  *
- *   = h * [ K(dx)*M(dy)*M(dz) + M(dx)*K(dy)*M(dz)
- *         + M(dx)*M(dy)*K(dz) ]
+ * Scaling: one stiffness term contributes 1/h after change-of-
+ * variables, two mass terms contribute h each, giving an overall
+ * factor of h. (SGP06)
  *
- * @param dx  Offset in x (integer: -1, 0, +1).
+ * @note Degree-2 yields nonzero face-neighbor coupling, e.g.
+ *   L(1,0,0) = h * [K(1)M(0)M(0) + M(1)K(0)M(0)
+ *                + M(1)M(0)K(0)]
+ *          ≈ 0.121 * h,
+ * which suppresses the checkerboard mode associated with lower-order
+ * stiffness discretisations. (PoissonRecon)
+ *
+ * @param dx  Offset in x (integer: -2..+2).
  * @param dy  Offset in y.
  * @param dz  Offset in z.
  * @param h   Cell width.
- * @return Stiffness integral value.
+ * @return Stiffness integral value (volume-weighted).
  */
 inline double laplacian_stencil_weight(int dx, int dy, int dz,
-                                       double h) {
-    const double kx = stiffness_integral_1d(dx);
-    const double ky = stiffness_integral_1d(dy);
-    const double kz = stiffness_integral_1d(dz);
+                                        double h) {
+    /* Degree-2 B-splines have support over offsets -2..+2 in each
+     * axis. For any offset outside this range, the basis functions do
+     * not overlap and the Galerkin stiffness is exactly zero. */
+    if (dx < -2 || dx > 2 ||
+        dy < -2 || dy > 2 ||
+        dz < -2 || dz > 2) {
+        return 0.0;
+    }
 
+    /* Pull degree-2 mass integrals from poisson_rhs.hpp.
+     * These are the 1-D overlap integrals M(d). */
     const double mx = mass_integral_1d(dx);
     const double my = mass_integral_1d(dy);
     const double mz = mass_integral_1d(dz);
 
+    /* Degree-2 stiffness integrals K(d) for each axis. */
+    const double kx = stiffness_integral_1d(dx);
+    const double ky = stiffness_integral_1d(dy);
+    const double kz = stiffness_integral_1d(dz);
+
+    /* Tensor-product Galerkin stiffness with the correct h scaling
+     * for the weak form <grad B_i, grad B_j>. */
     return h * (kx * my * mz + mx * ky * mz + mx * my * kz);
 }
 
 /* ===================================================================
- * Section 3: Screening accumulation
+ * Section 2: Screening accumulation
  * =================================================================== */
 
 /**
  * @brief Per-DOF screening data.
  *
  * For each DOF i, we store a list of (neighbor_dof, weight) pairs
- * representing the screening contribution S_ij.  For degree-1
- * B-splines, each sample point overlaps at most 8 DOFs, so each
- * sample contributes at most 8*8 = 64 pairs.  In practice, the
- * diagonal S_ii dominates.
+ * representing the screening contribution S_ij. For degree-2
+ * B-splines, each sample point overlaps at most 3^3 = 27 DOFs, so
+ * each sample contributes at most 27*27 = 729 pairs. In practice,
+ * the diagonal S_ii often dominates.
  *
  * We store screening in CSR-like format per DOF for efficient
  * matvec.  The diagonal is stored separately for quick access.
@@ -227,15 +206,16 @@ inline void accumulate_screening(
     std::size_t n_dofs,
     std::uint32_t base_resolution,
     ScreeningData &screening) {
-    /* We first accumulate into a dense per-DOF map of
-     * (neighbor -> weight).  For large grids, a hash map per DOF
-     * would be more memory-efficient, but for simplicity we use
-     * a flat vector of maps represented as sorted pairs.
+    /* We accumulate screening into per-DOF neighbor lists.
      *
-     * Actually, since the number of off-diagonal entries per DOF
-     * is bounded by 26 (3^3 - 1), we use a simpler approach:
-     * accumulate into a dense (n_dofs x 27) array indexed by
-     * the 27 stencil offsets, then compress to CSR. */
+     * For degree-2, a point overlaps at most 27 DOFs. Across many
+     * samples, a single DOF can couple to neighbors within a
+     * 5^3 support window, so the number of distinct off-diagonal
+     * entries per DOF is bounded by 5^3 - 1 = 124 on a uniform grid.
+     * (ToG13, PoissonRecon)
+     *
+     * We use a small-vector + linear scan approach because neighbor
+     * lists are short in typical PoissonRecon-like setups. */
 
     /* Per-DOF diagonal accumulator. */
     screening.diagonal.assign(n_dofs, 0.0);
@@ -253,8 +233,8 @@ inline void accumulate_screening(
 
     std::vector<std::int64_t> dof_indices;
     std::vector<double> bweights;
-    dof_indices.reserve(8);
-    bweights.reserve(8);
+    dof_indices.reserve(27);
+    bweights.reserve(27);
 
     for (std::size_t s = 0; s < n_samples; ++s) {
         find_overlapping_dofs(positions[s], hash, cells,
@@ -299,7 +279,7 @@ inline void accumulate_screening(
             1U << hash.max_depth);
         const double scale = alpha * depth_factor;
 
-        /* Accumulate S_ij for all pairs (i, j) in the
+        /* Accumulate S_ij for all 27×27 pairs (i, j) in the
          * overlapping DOF set. */
         const std::size_t nd = dof_indices.size();
         for (std::size_t a = 0; a < nd; ++a) {
@@ -362,7 +342,7 @@ inline void accumulate_screening(
 }
 
 /* ===================================================================
- * Section 4: Matrix-free operator apply_A
+ * Section 3: Matrix-free operator apply_A
  * =================================================================== */
 
 /**
@@ -372,9 +352,9 @@ inline void accumulate_screening(
  *           + S_ii * x[i]
  *           + sum_{j in screening_neighbors(i)} S_ij * x[j]
  *
- * The Laplacian part uses the analytic 27-point stencil computed
- * from the 1-D integrals.  The screening part uses the precomputed
- * CSR structure from accumulate_screening().
+ * The Laplacian part uses the analytic 125-point Galerkin stencil
+ * computed from degree-2 1-D integrals. The screening part uses the
+ * precomputed CSR structure from accumulate_screening().
  *
  * @param x                Input vector (size n_dofs).
  * @param cells            Full octree cell array.
@@ -426,10 +406,15 @@ inline void apply_operator(
             const int dz = static_cast<int>(
                 std::round((center_j.z - center_i.z) * inv_h));
 
-            /* Skip offsets outside the stencil range. */
-            if (dx < -1 || dx > 1 ||
-                dy < -1 || dy > 1 ||
-                dz < -1 || dz > 1) {
+            /* Skip offsets outside the degree-2 overlap range.
+             *
+             * Note: even if the neighbor enumeration probes a small
+             * set of nearby cells, adaptive depth transitions can
+             * yield relative centre offsets of magnitude 2 when
+             * measured in the fine cell's width units. */
+            if (dx < -2 || dx > 2 ||
+                dy < -2 || dy > 2 ||
+                dz < -2 || dz > 2) {
                 continue;
             }
 

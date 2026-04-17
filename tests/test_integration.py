@@ -126,7 +126,7 @@ def _run_pipeline(
     isovalue=0.01,
     max_depth=3,
     screening_weight=4.0,
-    max_iters=500,
+    max_iters=1000,
     tol=1e-5,
 ):
     """Run the full pipeline and return a trimesh + metadata."""
@@ -208,7 +208,7 @@ class TestSolidSphereIntegration:
                 isovalue=0.005,
                 max_depth=3,
                 screening_weight=4.0,
-                max_iters=500,
+                max_iters=1000,
                 tol=1e-5,
             )
             cls._result_cache = (mesh, meta)

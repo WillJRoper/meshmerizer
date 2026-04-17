@@ -8,7 +8,7 @@
  *
  * The screened Poisson solver (Kazhdan SGP06; Kazhdan & Hoppe ToG13)
  * produces the coefficient vector @p solution for an indicator function
- * \f$\chi\f$ expressed in a trilinear B-spline basis:
+ * \f$\chi\f$ expressed in a degree-2 (quadratic) B-spline basis:
  *
  * \f[ \chi(p) = \sum_j x_j B_j(p). \f]
  *
@@ -504,20 +504,17 @@ inline void evaluate_chi_at_corners(
 
     std::vector<std::int64_t> dof_indices;
     std::vector<double> weights;
-    dof_indices.reserve(8);
-    weights.reserve(8);
+    dof_indices.reserve(27);
+    weights.reserve(27);
 
     for (std::size_t ci = 0; ci < cells.size(); ++ci) {
         if (!cells[ci].is_leaf) {
             continue;
         }
-        /* Only evaluate chi at corners of max_depth leaves.
-         * These are the only cells with DOFs, so coarser leaves
-         * would produce meaningless chi values (no nearby DOFs
-         * at the right scale). */
-        if (cells[ci].depth != max_depth) {
-            continue;
-        }
+        /* Evaluate chi at all leaf cells (not just max_depth).
+         * The Poisson indicator function needs DOFs at all depths
+         * to produce a smooth field spanning the interior and
+         * exterior of the surface. */
         const OctreeCell &cell = cells[ci];
 
         // Decode cell origin in its own grid level, then scale to
@@ -619,8 +616,8 @@ inline double compute_isovalue(
 
     std::vector<std::int64_t> dof_indices;
     std::vector<double> weights;
-    dof_indices.reserve(8);
-    weights.reserve(8);
+    dof_indices.reserve(27);
+    weights.reserve(27);
 
     double accum = 0.0;
     for (std::size_t s = 0; s < n_samples; ++s) {
@@ -683,7 +680,7 @@ inline void extract_isosurface(
 
     std::size_t n_leaves = 0;
     for (const auto &c : cells) {
-        if (c.is_leaf && c.depth == max_depth) {
+        if (c.is_leaf) {
             ++n_leaves;
         }
     }
@@ -697,11 +694,9 @@ inline void extract_isosurface(
         if (!cells[ci].is_leaf) {
             continue;
         }
-        /* Only run MC on max_depth leaves — these are the cells
-         * with DOFs and valid chi corner values. */
-        if (cells[ci].depth != max_depth) {
-            continue;
-        }
+        /* Run MC on ALL leaf cells — chi corner values have been
+         * evaluated for all leaves, and the indicator function
+         * spans the full octree. */
         if (ci >= corner_values.size()) {
             progress.tick();
             continue;

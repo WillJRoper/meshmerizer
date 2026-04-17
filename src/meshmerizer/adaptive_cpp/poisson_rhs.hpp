@@ -1,61 +1,53 @@
 /**
  * @file poisson_rhs.hpp
- * @brief Vector field splatting and RHS assembly for the screened
- *        Poisson surface reconstruction (Phase 20b).
+ * @brief Vector field splatting and RHS assembly for screened Poisson
+ *        surface reconstruction using degree-2 (quadratic) B-splines.
  *
  * @par References
  * - Kazhdan, M., Bolitho, M. & Hoppe, H. "Poisson Surface
- *   Reconstruction", *Proc. SGP* (2006), Section 3.  The gradient
- *   of a smoothed indicator function equals the smoothed normal
- *   field: grad(chi) ≈ V.  The Poisson equation Laplacian(chi) =
- *   div(V) is obtained by taking the divergence of both sides.
- *   The weak-form RHS is b_i = <V, grad B_i>.
+ *   Reconstruction", *Proc. SGP* (2006), Section 3. The smoothed
+ *   normal field V approximates the gradient of the smoothed
+ *   indicator function: \f$\nabla\chi\approx\vec{V}\f$, yielding the
+ *   Poisson equation \f$\Delta\chi = \nabla\cdot\vec{V}\f$. The weak
+ *   form RHS is \f$b_i=\langle\vec{V},\nabla B_i\rangle\f$.
  * - Kazhdan, M. & Hoppe, H. "Screened Poisson Surface
  *   Reconstruction", *ACM Trans. Graph.* 32(3), Art. 29 (2013),
- *   Section 3.  The vector field V is built by splatting each
- *   oriented sample's normal into the B-spline basis, weighted by
- *   the sample's area contribution.
+ *   Section 3. The vector field V is built by splatting oriented
+ *   normals into the B-spline basis.
+ * - Unser, M. "Splines: A Perfect Fit for Signal and Image
+ *   Processing", *IEEE Signal Processing Magazine* 16(6), 22–38
+ *   (1999). (B-spline support properties and basic identities.)
+ * - de Boor, C. *A Practical Guide to Splines*, Revised Edition,
+ *   Springer (2001). (B-spline definitions and convolution support.)
  * - Reference implementation: https://github.com/mkazhdan/PoissonRecon
  *   (MIT licence).
  *
  * @par Algorithm
- * 1. **Splat normals** — For each oriented sample (p_s, n_s):
- *    - Find the leaf cell containing p_s via spatial hash.
- *    - Enumerate the (up to 8) overlapping DOFs whose B-spline
- *      support covers p_s.
- *    - For each such DOF j, accumulate:
- *          V_j += B_j(p_s) * n_s * area_weight_s
- *    where B_j is the trilinear B-spline centred at DOF j and
- *    area_weight_s is a per-sample area correction (default 1/N
- *    for uniformly distributed samples).
+ * 1. **Splat normals** — For each oriented sample \f$(p_s,n_s)\f$:
+ *    - Enumerate the (up to 27) overlapping DOFs whose quadratic
+ *      B-spline support covers \f$p_s\f$.
+ *    - For each overlapping DOF \f$j\f$, accumulate:
+ *      \f$\vec{V}_j \mathrel{+}= B_j(p_s)\,n_s\,w_s\f$.
  *
- * 2. **Assemble RHS** — The weak-form right-hand side is:
- *        b_i = <V, grad B_i> = integral V(x) · grad B_i(x) dx
- *    Because V is itself expressed in the B-spline basis as
- *    V(x) = sum_j V_j B_j(x), this becomes:
- *        b_i = sum_{j in stencil(i)} V_j · G_{ij}
- *    where G_{ij} = integral B_j(x) grad B_i(x) dx is a
- *    precomputable gradient inner product that depends only on the
- *    relative cell offset (i−j) and cell width h.
+ * 2. **Assemble RHS (Galerkin)** — With
+ *    \f$\vec{V}(x)=\sum_j \vec{V}_j B_j(x)\f$, the weak RHS becomes:
+ *    \f$b_i=\int \vec{V}(x)\cdot\nabla B_i(x)\,dx
+ *          =\sum_{j\in\mathrm{stencil}(i)} \vec{V}_j\cdot\vec{G}_{ij}\f$,
+ *    where \f$\vec{G}_{ij}=\int B_j(x)\,\nabla B_i(x)\,dx\f$ depends
+ *    only on the relative offset \f$(i-j)\f$ and the cell width \f$h\f$.
  *
- *    For degree-1 B-splines on a uniform grid with cell width h,
- *    the 1-D integrals factor as:
- *
- *    Overlap integral (mass):   M(d) = integral B(t) B(t−d) dt
- *        M(0) = 2/3,  M(±1) = 1/6,  M(else) = 0
- *
- *    Gradient–value integral:   S(d) = integral B'(t) B(t−d) dt
- *        S(0) = 0,  S(+1) = −1/2,  S(−1) = +1/2
- *
- *    The 3-D gradient inner product for offset (dx, dy, dz) is:
- *        G_x = S(dx) * M(dy) * M(dz) / h
- *        G_y = M(dx) * S(dy) * M(dz) / h
- *        G_z = M(dx) * M(dy) * S(dz) / h
- *
- *    (The 1/h comes from the chain rule: d/dx B(x/h) = B'(x/h)/h,
- *     and each integral is over the h-scaled domain so contributes
- *     a factor of h, giving h * (1/h) = 1 for the value-value
- *     part, but the gradient part has an extra 1/h.)
+ * For degree-2 tensor-product B-splines on a uniform grid (unit knot
+ * spacing in reference coordinates), the 1-D integrals factor and the
+ * 3-D gradient inner product is:
+ * \f[
+ *   G_x = S(dx)\,M(dy)\,M(dz)\,h^2,\quad
+ *   G_y = M(dx)\,S(dy)\,M(dz)\,h^2,\quad
+ *   G_z = M(dx)\,M(dy)\,S(dz)\,h^2,
+ * \f]
+ * where \f$M(d)=\int B_2(t)B_2(t-d)dt\f$ and
+ * \f$S(d)=\int B_2'(t)B_2(t-d)dt\f$. The \f$h^2\f$ arises from the
+ * volume element \f$h^3\f$ and the chain rule factor \f$1/h\f$ in the
+ * gradient.
  *
  * All functions are inline / header-only, following the project
  * convention.
@@ -77,46 +69,86 @@
 #include "vector3d.hpp"
 
 /* ===================================================================
- * Section 1: Precomputed 1-D integrals for degree-1 B-splines
+ * Section 1: Precomputed 1-D integrals for degree-2 B-splines
  * =================================================================== */
 
 /**
- * @brief 1-D mass (overlap) integral M(d) for degree-1 B-splines.
+ * @brief 1-D mass (overlap) integral \f$M(d)\f$ for quadratic
+ *        (degree-2) B-splines with unit knot spacing.
  *
- * M(d) = integral_{-inf}^{inf} B(t) B(t - d) dt
+ * \f$M(d)=\int_{-\infty}^{\infty} B_2(t)\,B_2(t-d)\,dt\f$.
  *
- * For the hat function B(t) = max(0, 1 − |t|):
- *   M(0)  = 2/3
- *   M(±1) = 1/6
- *   M(else) = 0
+ * Nonzero only for \f$d\in\{-2,-1,0,1,2\}\f$:
+ * - \f$M(0)=11/20\f$
+ * - \f$M(\pm1)=13/60\f$
+ * - \f$M(\pm2)=1/120\f$
  *
- * @param d Relative offset in cell-width units (integer: -1, 0, +1).
+ * These constants are the autocorrelation of the quadratic B-spline
+ * (cf. Unser 1999; de Boor 2001) evaluated at integer shifts.
+ *
+ * @param d Relative offset in cell-width units (integer).
  * @return Integral value.
  */
 inline double mass_integral_1d(int d) {
     switch (d) {
         case 0:
-            return 2.0 / 3.0;
+            return 11.0 / 20.0;
         case 1:
         case -1:
-            return 1.0 / 6.0;
+            return 13.0 / 60.0;
+        case 2:
+        case -2:
+            return 1.0 / 120.0;
         default:
             return 0.0;
     }
 }
 
 /**
- * @brief 1-D gradient-value integral S(d) for degree-1 B-splines.
+ * @brief 1-D stiffness (gradient-gradient) integral \f$K(d)\f$ for
+ *        quadratic (degree-2) B-splines with unit knot spacing.
  *
- * S(d) = integral_{-inf}^{inf} B'(t) B(t - d) dt
+ * \f$K(d)=\int_{-\infty}^{\infty} B_2'(t)\,B_2'(t-d)\,dt\f$.
  *
- * For the hat function:
- *   S(0)  = 0   (antisymmetric integrand cancels)
- *   S(+1) = -1/2
- *   S(-1) = +1/2
+ * Nonzero only for \f$d\in\{-2,-1,0,1,2\}\f$:
+ * - \f$K(0)=1\f$
+ * - \f$K(\pm1)=-1/3\f$
+ * - \f$K(\pm2)=-1/6\f$
  *
- * Note: S(d) = -S(-d), reflecting the antisymmetry of the
- * derivative operator.
+ * The sum over shifts vanishes
+ * \f$\sum_{d=-2}^{2} K(d)=0\f$, consistent with constants being in
+ * the nullspace of the gradient operator.
+ *
+ * @param d Relative offset in cell-width units.
+ * @return Integral value.
+ */
+inline double stiffness_integral_1d(int d) {
+    switch (d) {
+        case 0:
+            return 1.0;
+        case 1:
+        case -1:
+            return -1.0 / 3.0;
+        case 2:
+        case -2:
+            return -1.0 / 6.0;
+        default:
+            return 0.0;
+    }
+}
+
+/**
+ * @brief 1-D gradient–value integral \f$S(d)\f$ for quadratic
+ *        (degree-2) B-splines with unit knot spacing.
+ *
+ * \f$S(d)=\int_{-\infty}^{\infty} B_2'(t)\,B_2(t-d)\,dt\f$.
+ *
+ * Nonzero only for \f$d\in\{-2,-1,0,1,2\}\f$:
+ * - \f$S(0)=0\f$
+ * - \f$S(+1)=-5/12\f$, \f$S(-1)=+5/12\f$
+ * - \f$S(+2)=-1/24\f$, \f$S(-2)=+1/24\f$
+ *
+ * Note: \f$S(d)=-S(-d)\f$ (antisymmetry of the derivative).
  *
  * @param d Relative offset in cell-width units.
  * @return Integral value.
@@ -124,9 +156,13 @@ inline double mass_integral_1d(int d) {
 inline double grad_value_integral_1d(int d) {
     switch (d) {
         case 1:
-            return -0.5;
+            return -5.0 / 12.0;
         case -1:
-            return 0.5;
+            return 5.0 / 12.0;
+        case 2:
+            return -1.0 / 24.0;
+        case -2:
+            return 1.0 / 24.0;
         default:
             return 0.0;
     }
@@ -141,27 +177,29 @@ inline double grad_value_integral_1d(int d) {
  *        given relative cell offset (dx, dy, dz).
  *
  * G is a 3-component vector where:
- *   G.x = S(dx) * M(dy) * M(dz) / h
- *   G.y = M(dx) * S(dy) * M(dz) / h
- *   G.z = M(dx) * M(dy) * S(dz) / h
+ *   G.x = S(dx) * M(dy) * M(dz) * h^2
+ *   G.y = M(dx) * S(dy) * M(dz) * h^2
+ *   G.z = M(dx) * M(dy) * S(dz) * h^2
  *
  * This is the integral of B_j(x) * grad B_i(x) over the domain,
  * where cell j is offset from cell i by (dx, dy, dz) cell widths.
  *
- * The factor of h^3 from the volume element and the factor of
- * 1/h from the gradient chain rule combine to give h^2 overall.
- * Each 1-D integral is normalised to unit support width, so the
- * actual scaling is h^2 (three factors of h from the volume,
- * minus one factor of h from the gradient).
+ * For quadratic B-splines, overlaps are nonzero for offsets up to
+ * \f$\pm 2\f$ in each axis, corresponding to a \f$5^3=125\f$ stencil
+ * in 3-D (including edges/corners).
  *
- * @param dx  Offset in x (integer: -1, 0, +1).
+ * The factor of \f$h^3\f$ from the volume element and the factor of
+ * \f$1/h\f$ from the gradient chain rule combine to give \f$h^2\f$
+ * overall.
+ *
+ * @param dx  Offset in x (integer: -2..+2).
  * @param dy  Offset in y.
  * @param dz  Offset in z.
  * @param h   Cell width.
  * @return Gradient inner product vector.
  */
 inline Vector3d gradient_inner_product(int dx, int dy, int dz,
-                                       double h) {
+                                        double h) {
     /* Mass integrals for each axis. */
     const double mx = mass_integral_1d(dx);
     const double my = mass_integral_1d(dy);
@@ -173,9 +211,12 @@ inline Vector3d gradient_inner_product(int dx, int dy, int dz,
     const double sz = grad_value_integral_1d(dz);
 
     /* The volume element contributes h^3, and the gradient
-     * introduces a 1/h factor (chain rule on the B-spline
-     * argument x/h).  Net scaling is h^2.  We express this
-     * as h * h to keep the arithmetic transparent. */
+     * introduces a 1/h factor (chain rule on the B-spline argument
+     * x/h). Net scaling is h^2.
+     *
+     * We express this as h*h to keep the arithmetic transparent.
+     * (The remaining dimensionless factors come from the tabulated
+     * 1-D integrals on the unit grid.) */
     const double scale = h * h;
 
     return {
@@ -191,22 +232,23 @@ inline Vector3d gradient_inner_product(int dx, int dy, int dz,
 
 /**
  * @brief Find the DOFs whose B-spline supports overlap a query
- *        point and return their indices with trilinear weights.
+ *        point and return their indices with quadratic weights.
  *
- * For a degree-1 B-spline, the support extends one cell width in
- * each direction from the cell centre.  A point can overlap at
- * most 2^3 = 8 DOFs (the 8 cells whose centres bracket the point
- * on each axis).
+ * For a degree-2 B-spline, the 1-D support in reference coordinates
+ * is \f$[-3/2,\,3/2]\f$ (Unser 1999). In fine-grid index units, a cell
+ * with min-corner index \f$m\f$ has centre at \f$m+1/2\f$ and support
+ * over \f$[m-1,\,m+2]\f$. Therefore, a point can overlap at most
+ * \f$3^3=27\f$ DOFs.
  *
  * **Approach**: Rather than finding a "containing cell" first
  * (which fails when the hash quantization maps the point to a
  * grid coordinate that doesn't match any cell's min-corner key),
  * we directly compute which cell-aligned min-corner positions
- * could bracket the point.  For each axis, we convert the point
- * to fine-grid coordinates using the same formula as the hash's
- * `quantize()` for min-corners (i.e. floor, not round), then
- * probe the two bracketing positions {floor, floor - span}.
- * All 8 combinations are checked via the hash.
+ * could overlap the point. For each axis, we convert the point to
+ * fine-grid coordinates, then probe the three candidate min-corner
+ * indices \f$\{\lfloor t-1\rfloor,\lfloor t-1\rfloor+1,
+ * \lfloor t-1\rfloor+2\}\f$. All \f$3^3=27\f$ combinations are
+ * checked via the hash.
  *
  * @param point       Query point in world space.
  * @param hash        Spatial hash of leaf cells.
@@ -247,28 +289,31 @@ inline void find_overlapping_dofs(
     const double tz =
         (point.z - hash.domain_min.z) * hash.inv_cell_size_z;
 
-    /* For each axis, we need the two cell min-corner indices
-     * whose B-spline supports overlap the point.  A cell with
-     * min-corner index m has its centre at (m + 0.5) in fine-grid
-     * units, and its degree-1 B-spline support covers
-     * [m - 0.5, m + 1.5].  A point at fine-grid position t is
-     * covered iff |t - (m + 0.5)| < 1, i.e. t - 1.5 < m < t + 0.5.
-     * The two integer solutions are floor(t - 0.5) and
-     * floor(t - 0.5) + 1. */
+    /* For each axis, enumerate the three candidate cell min-corner
+     * indices whose quadratic B-spline supports can overlap the
+     * point.
+     *
+     * A cell with min-corner index m has centre at (m + 0.5) in
+     * fine-grid units. The quadratic B-spline support is
+     * |t - (m + 0.5)| < 3/2, i.e. t - 2 < m < t + 1.
+     *
+     * For non-integer t, the three integer solutions are:
+     *   m = floor(t - 1), floor(t - 1) + 1, floor(t - 1) + 2.
+     * This yields 3^3 = 27 candidates in 3-D. */
     const auto base_idx = [](double t) -> std::int64_t {
-        return static_cast<std::int64_t>(std::floor(t - 0.5));
+        return static_cast<std::int64_t>(std::floor(t - 1.0));
     };
 
     const std::int64_t ix0 = base_idx(tx);
     const std::int64_t iy0 = base_idx(ty);
     const std::int64_t iz0 = base_idx(tz);
 
-    /* Probe all 8 combinations of {ix0, ix0+1} x {iy0, iy0+1} x
-     * {iz0, iz0+1}.  These are the candidate cell min-corner
-     * positions in fine-grid coordinates. */
-    for (int ox = 0; ox <= 1; ++ox) {
-        for (int oy = 0; oy <= 1; ++oy) {
-            for (int oz = 0; oz <= 1; ++oz) {
+    /* Probe all 27 combinations of {ix0, ix0+1, ix0+2} x ... These
+     * are the candidate cell min-corner positions in fine-grid
+     * coordinates. */
+    for (int ox = 0; ox <= 2; ++ox) {
+        for (int oy = 0; oy <= 2; ++oy) {
+            for (int oz = 0; oz <= 2; ++oz) {
                 const std::int64_t px = ix0 + ox;
                 const std::int64_t py = iy0 + oy;
                 const std::int64_t pz = iz0 + oz;
@@ -296,7 +341,10 @@ inline void find_overlapping_dofs(
                 }
                 if (duplicate) continue;
 
-                /* Compute the B-spline weight. */
+                /* Compute the quadratic B-spline weight for this
+                 * candidate DOF. We evaluate in world space using
+                 * the cell center and width, matching the basis
+                 * used elsewhere in the Poisson system assembly. */
                 const Vector3d center =
                     cells[ci].bounds.center();
                 const Vector3d ext = cells[ci].bounds.extent();
@@ -345,26 +393,44 @@ inline void splat_normals(
     /* Initialise the vector field to zero. */
     v_field.assign(n_dofs, {0.0, 0.0, 0.0});
 
-    /* Uniform area weight: each sample represents 1/N of the
-     * total surface area (SGP06 assumption for uniformly
-     * distributed oriented points). */
-    const double area_weight = 1.0 / static_cast<double>(
-        n_samples > 0 ? n_samples : 1);
+    /* Area weight per sample.  Each sample represents an oriented
+     * surface element whose contribution to the B-spline divergence
+     * must be scaled to produce an O(1) indicator function.
+     *
+     * The key insight (SGP06 Sec 3.1, PoissonRecon implementation):
+     * the splatted vector field V_j should approximate the gradient
+     * of the indicator function, which is a surface delta function
+     * with magnitude O(1/h) where h is the cell width.  With N
+     * samples on the surface and ~N*h^2 ≈ Area samples per cell
+     * face, each sample contributes ~1 to V_j.  To get V_j ~ 1/h,
+     * we scale each sample by 1/h = 2^depth / domain_extent.
+     *
+     * Since all DOFs are at max_depth, h is the fine cell width.
+     * We approximate 1/h by fine_cells_per_axis / domain_extent,
+     * but since the hash uses normalised coords, we can simply
+     * use hash.inv_cell_size_x (which equals fine_per_axis /
+     * domain_extent_x).  For cubic domains this is 1/h. */
+    (void)n_samples;  /* Not used for weighting. */
+
+    /* Compute 1/h for the fine-grid cell width.  This scales
+     * the normal splatting so that V_j ~ O(1/h), producing an
+     * O(1) indicator function after solving the Poisson system. */
+    /* inv_cell_size_x = fine_per_axis / domain_extent_x = 1/h for
+     * cubic domains at the leaf resolution. */
+    const double inv_h = hash.inv_cell_size_x;
 
     ProgressBar progress("Splatting normals", n_samples);
 
-    /* Per-thread temporary vectors to avoid repeated allocation. */
-    /* Note: the splat is over samples (outer loop), and each
-     * sample touches at most 8 DOFs.  For thread safety without
-     * atomics, we accumulate into per-thread buffers and reduce
-     * afterward.  For simplicity in this first implementation,
-     * we use a serial loop.  OpenMP parallelism with atomic
-     * accumulation or thread-local buffers will be added if
-     * profiling shows this is a bottleneck. */
+    /* Per-sample temporary vectors to avoid repeated allocation.
+     *
+     * Note: each sample touches at most 27 DOFs for degree-2
+     * B-splines. This implementation is serial for simplicity;
+     * if profiling warrants, a parallel version should use atomics
+     * or thread-local buffers with reduction. */
     std::vector<std::int64_t> dof_indices;
     std::vector<double> bweights;
-    dof_indices.reserve(8);
-    bweights.reserve(8);
+    dof_indices.reserve(27);
+    bweights.reserve(27);
 
     for (std::size_t s = 0; s < n_samples; ++s) {
         find_overlapping_dofs(positions[s], hash, cells,
@@ -374,7 +440,7 @@ inline void splat_normals(
         for (std::size_t k = 0; k < dof_indices.size(); ++k) {
             const std::size_t dof =
                 static_cast<std::size_t>(dof_indices[k]);
-            const double w = bweights[k] * area_weight;
+            const double w = bweights[k] * inv_h;
             v_field[dof].x += w * normals[s].x;
             v_field[dof].y += w * normals[s].y;
             v_field[dof].z += w * normals[s].z;
@@ -390,16 +456,20 @@ inline void splat_normals(
  * =================================================================== */
 
 /**
- * @brief Compute the RHS vector b for the screened Poisson system.
+ * @brief Compute the RHS vector \f$b\f$ using the Galerkin gradient
+ *        inner product with degree-2 B-splines.
  *
- * b_i = sum_{j in stencil(i)}  V_j · G_{ij}
+ * The weak-form right-hand side (SGP06 Sec. 3) is
+ * \f$b_i=\langle\vec{V},\nabla B_i\rangle
+ *      =\int \vec{V}(x)\cdot\nabla B_i(x)\,dx\f$.
  *
- * where G_{ij} is the gradient inner product (integral of
- * B_j * grad B_i) and V_j is the splatted normal field.
+ * With \f$\vec{V}(x)=\sum_j \vec{V}_j B_j(x)\f$, we obtain
+ * \f$b_i=\sum_j \vec{V}_j\cdot\vec{G}_{ij}\f$, where
+ * \f$\vec{G}_{ij}=\int B_j(x)\,\nabla B_i(x)\,dx\f$.
  *
- * This function uses the precomputed stencil structure (CSR format)
- * from enumerate_stencils() and computes G on-the-fly from the
- * relative cell offsets.
+ * For quadratic B-splines, \f$\vec{G}_{ij}\f$ is nonzero only when
+ * the relative offset components satisfy \f$dx,dy,dz\in[-2,2]\f$,
+ * i.e. a \f$5^3=125\f$ neighborhood in the uniform-grid case.
  *
  * @param v_field           Splatted vector field (size n_dofs).
  * @param cells             Full octree cell array.
@@ -419,6 +489,11 @@ inline void compute_rhs(
     const std::vector<std::int64_t> &stencil_neighbors,
     std::size_t n_dofs,
     std::vector<double> &rhs) {
+    /* cell_to_dof is part of the shared assembly interface.
+     * It is not needed for RHS assembly when the stencil provides
+     * neighbor DOF indices directly. */
+    (void)cell_to_dof;
+
     rhs.assign(n_dofs, 0.0);
 
     ProgressBar progress("Assembling RHS", n_dofs);
@@ -429,9 +504,16 @@ inline void compute_rhs(
         const Vector3d center_i = cell_i.bounds.center();
         const double h_i = cell_i.bounds.extent().x;
 
-        /* Quantize cell i's min corner to fine-grid coords so
-         * we can compute the relative offset to neighbors. */
+        /* Galerkin RHS: accumulate contributions from the neighbor
+         * DOFs in the provided stencil.
+         *
+         * We compute integer offsets by comparing cell centers in
+         * units of the local cell width h_i. For the uniform-leaf
+         * case, offsets are exact integers; for adaptive boundaries,
+         * rounding combined with the [-2,2] guard prevents spurious
+         * far-field coupling. */
         double accum = 0.0;
+        const double inv_h = 1.0 / h_i;
 
         const std::size_t start = stencil_offsets[i];
         const std::size_t end = stencil_offsets[i + 1];
@@ -443,14 +525,6 @@ inline void compute_rhs(
             const OctreeCell &cell_j = cells[cj];
             const Vector3d center_j = cell_j.bounds.center();
 
-            /* Compute relative offset in cell-width units.
-             * On a uniform grid (or between same-depth cells),
-             * this gives exact integers {-1, 0, +1}.  For
-             * depth-boundary neighbors (2:1 balance), we round
-             * to the nearest integer — the stencil integrals
-             * are only exact for same-depth pairs but this
-             * approximation is standard in adaptive FEM. */
-            const double inv_h = 1.0 / h_i;
             const int dx = static_cast<int>(
                 std::round((center_j.x - center_i.x) * inv_h));
             const int dy = static_cast<int>(
@@ -458,39 +532,26 @@ inline void compute_rhs(
             const int dz = static_cast<int>(
                 std::round((center_j.z - center_i.z) * inv_h));
 
-            /* Skip offsets outside the stencil range.  This can
-             * happen at depth boundaries where the rounded offset
-             * exceeds ±1 due to different cell sizes. */
-            if (dx < -1 || dx > 1 ||
-                dy < -1 || dy > 1 ||
-                dz < -1 || dz > 1) {
+            /* Quadratic B-spline overlaps extend out to ±2 cells
+             * in each axis. Neighbors outside this range have zero
+             * contribution by construction of the 1-D tables. */
+            if (dx < -2 || dx > 2 ||
+                dy < -2 || dy > 2 ||
+                dz < -2 || dz > 2) {
                 continue;
             }
 
-            /* G_{ij} is the integral of B_j(x) * grad B_i(x).
-             * Note: the gradient is of B_i, not B_j.  The offset
-             * from i to j is (dx, dy, dz), so the gradient inner
-             * product uses offset (-dx, -dy, -dz) because G is
-             * defined as integral B_j grad B_i and we tabulate
-             * by the offset of the *value* function relative to
-             * the *gradient* function.
-             *
-             * Actually, let's be precise.  We have:
-             *   G_{ij} = integral B_j(x) grad_B_i(x) dx
-             * With B_j centred at c_j and B_i centred at c_i,
-             * and d = c_j - c_i = (dx, dy, dz) * h:
-             *   G_{ij}.x = S(-dx) * M(-dy) * M(-dz) / h * h^3
-             *            = h^2 * S(-dx) * M(dy) * M(dz)
-             * since M is symmetric and S is antisymmetric.
-             * So: G_{ij} = gradient_inner_product(-dx,-dy,-dz,h)
-             */
-            const Vector3d G = gradient_inner_product(
-                -dx, -dy, -dz, h_i);
-
-            /* b_i += V_j · G_{ij} */
             const Vector3d &Vj = v_field[
                 static_cast<std::size_t>(j_dof)];
-            accum += Vj.dot(G);
+
+            /* \f$\vec{G}_{ij}\f$ is a vector-valued inner product.
+             * Accumulate \f$\vec{V}_j\cdot\vec{G}_{ij}\f$.
+             *
+             * The returned G already includes the \f$h^2\f$ scaling
+             * from the Jacobian and chain rule. */
+            const Vector3d G =
+                gradient_inner_product(dx, dy, dz, h_i);
+            accum += Vj.x * G.x + Vj.y * G.y + Vj.z * G.z;
         }
 
         rhs[i] = accum;

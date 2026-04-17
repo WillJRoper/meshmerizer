@@ -44,54 +44,46 @@ def _make_uniform_grid_cells(
 
 
 class TestLaplacianStencil:
-    """Tests for the 27-point Laplacian stencil weights."""
+    """Tests for the 5^3 (125-point) Laplacian stencil weights."""
 
     def test_center_weight(self) -> None:
-        """L(0,0,0) for h=1 should be 3 * K(0)*M(0)*M(0)
-        = 3 * 2 * (2/3) * (2/3) = 8/3."""
+        """L(0,0,0) for h=1 should be 363/400."""
         w = laplacian_stencil_weight(0, 0, 0, 1.0)
-        assert w == pytest.approx(8.0 / 3.0)
+        assert w == pytest.approx(363.0 / 400.0)
 
     def test_face_neighbor_weight(self) -> None:
-        """L(1,0,0) = K(1)*M(0)*M(0) + M(1)*K(0)*M(0)
-                     + M(1)*M(0)*K(0)
-        = (-1)*(2/3)*(2/3) + (1/6)*2*(2/3) + (1/6)*(2/3)*2
-        = -4/9 + 2/9 + 2/9 = 0."""
+        """L(1,0,0) for h=1 should be 11/80."""
         w = laplacian_stencil_weight(1, 0, 0, 1.0)
-        assert w == pytest.approx(0.0, abs=1e-15)
+        assert w == pytest.approx(11.0 / 80.0)
 
     def test_edge_neighbor_weight(self) -> None:
-        """L(1,1,0) = K(1)*M(1)*M(0) + M(1)*K(1)*M(0)
-                     + M(1)*M(1)*K(0)
-        = (-1)*(1/6)*(2/3) + (1/6)*(-1)*(2/3)
-          + (1/6)*(1/6)*2
-        = -1/9 - 1/9 + 1/18 = -1/6."""
+        """L(1,1,0) for h=1 should be -13/400."""
         w = laplacian_stencil_weight(1, 1, 0, 1.0)
-        assert w == pytest.approx(-1.0 / 6.0)
+        assert w == pytest.approx(-13.0 / 400.0)
 
     def test_corner_neighbor_weight(self) -> None:
-        """L(1,1,1) = 3 * K(1)*M(1)*M(1)
-        = 3 * (-1) * (1/6) * (1/6) = -1/12."""
+        """L(1,1,1) for h=1 should be -169/3600."""
         w = laplacian_stencil_weight(1, 1, 1, 1.0)
-        assert w == pytest.approx(-1.0 / 12.0)
+        assert w == pytest.approx(-169.0 / 3600.0)
 
     def test_symmetry(self) -> None:
         """Stencil should be symmetric: L(d) = L(-d)."""
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                for dz in [-1, 0, 1]:
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                for dz in range(-2, 3):
                     a = laplacian_stencil_weight(dx, dy, dz, 1.0)
                     b = laplacian_stencil_weight(-dx, -dy, -dz, 1.0)
                     assert a == pytest.approx(b, abs=1e-15)
 
-    def test_stencil_sums_to_zero(self) -> None:
-        """Sum of all 27 stencil weights should be zero
+    def test_stencil_row_sum(self) -> None:
+        """Sum of all 5^3 stencil weights should be zero
         (Laplacian of a constant is zero)."""
+        h = 1.0
         total = 0.0
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                for dz in [-1, 0, 1]:
-                    total += laplacian_stencil_weight(dx, dy, dz, 1.0)
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                for dz in range(-2, 3):
+                    total += laplacian_stencil_weight(dx, dy, dz, h)
         assert total == pytest.approx(0.0, abs=1e-14)
 
     def test_h_scaling(self) -> None:
@@ -104,49 +96,51 @@ class TestLaplacianStencil:
 class TestOperator:
     """Tests for the screened Poisson operator."""
 
-    def test_laplacian_of_constant_is_zero(self) -> None:
+    def test_operator_preserves_constants_when_alpha_zero(
+        self,
+    ) -> None:
         """A*ones should be zero when alpha=0 (pure Laplacian)
         for interior DOFs on a large enough grid."""
         dmin = (0.0, 0.0, 0.0)
-        dmax = (4.0, 4.0, 4.0)
-        cells = _make_uniform_grid_cells(4, dmin, dmax)
+        dmax = (6.0, 6.0, 6.0)
+        cells = _make_uniform_grid_cells(6, dmin, dmax)
 
-        # Dummy positions (not used for alpha=0)
-        pos = np.array([[2.0, 2.0, 2.0]])
-        n_dofs = 64  # 4^3
+        # Dummy positions (screening not used for alpha=0)
+        pos = np.array([[3.0, 3.0, 3.0]])
+        n_dofs = 216  # 6^3
         x = [1.0] * n_dofs
 
-        result = apply_poisson_operator(pos, cells, dmin, dmax, 4, 0, 0.0, x)
+        result = apply_poisson_operator(pos, cells, dmin, dmax, 6, 0, 0.0, x)
 
-        # Interior DOFs (not touching boundary) should be ~0
-        for ix in range(1, 3):
-            for iy in range(1, 3):
-                for iz in range(1, 3):
-                    idx = ix * 16 + iy * 4 + iz
+        for ix in range(2, 4):
+            for iy in range(2, 4):
+                for iz in range(2, 4):
+                    idx = ix * 36 + iy * 6 + iz
                     assert result[idx] == pytest.approx(0.0, abs=1e-10)
 
-    def test_laplacian_of_linear_is_zero(self) -> None:
-        """Laplacian of a linear function x[i] = center_i.x
-        should be zero for interior DOFs."""
+    def test_operator_preserves_linear_when_alpha_zero(
+        self,
+    ) -> None:
+        """Laplacian of a linear function should be zero
+        for interior DOFs."""
         dmin = (0.0, 0.0, 0.0)
-        dmax = (4.0, 4.0, 4.0)
-        cells = _make_uniform_grid_cells(4, dmin, dmax)
-        pos = np.array([[2.0, 2.0, 2.0]])
+        dmax = (6.0, 6.0, 6.0)
+        cells = _make_uniform_grid_cells(6, dmin, dmax)
+        pos = np.array([[3.0, 3.0, 3.0]])
 
-        # x = x-coordinate of cell centre
+        # x = x-coordinate of cell centre.
         x = []
-        for ix in range(4):
-            for iy in range(4):
-                for iz in range(4):
+        for ix in range(6):
+            for iy in range(6):
+                for iz in range(6):
                     x.append(ix + 0.5)
 
-        result = apply_poisson_operator(pos, cells, dmin, dmax, 4, 0, 0.0, x)
+        result = apply_poisson_operator(pos, cells, dmin, dmax, 6, 0, 0.0, x)
 
-        # Interior DOFs
-        for ix in range(1, 3):
-            for iy in range(1, 3):
-                for iz in range(1, 3):
-                    idx = ix * 16 + iy * 4 + iz
+        for ix in range(2, 4):
+            for iy in range(2, 4):
+                for iz in range(2, 4):
+                    idx = ix * 36 + iy * 6 + iz
                     assert result[idx] == pytest.approx(0.0, abs=1e-10)
 
     def test_operator_is_spd(self) -> None:
