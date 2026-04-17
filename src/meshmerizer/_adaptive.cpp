@@ -32,6 +32,7 @@
 #include "adaptive_cpp/progress_bar.hpp"
 #include "adaptive_cpp/faces.hpp"
 #include "adaptive_cpp/fof.hpp"
+#include "adaptive_cpp/poisson_basis.hpp"
 #include "adaptive_cpp/qef.hpp"
 
 /**
@@ -2172,6 +2173,226 @@ static PyObject *fof_cluster_py(PyObject * /* self */,
     return result;
 }
 
+/* ===================================================================
+ * Poisson basis bindings (Phase 20a)
+ * =================================================================== */
+
+/**
+ * @brief bspline1d_evaluate(t) -> float
+ */
+static PyObject *bspline1d_evaluate_py(PyObject * /*self*/,
+                                       PyObject *args) {
+    double t;
+    if (!PyArg_ParseTuple(args, "d", &t)) {
+        return NULL;
+    }
+    return PyFloat_FromDouble(bspline1d_evaluate(t));
+}
+
+/**
+ * @brief bspline1d_derivative(t) -> float
+ */
+static PyObject *bspline1d_derivative_py(PyObject * /*self*/,
+                                         PyObject *args) {
+    double t;
+    if (!PyArg_ParseTuple(args, "d", &t)) {
+        return NULL;
+    }
+    return PyFloat_FromDouble(bspline1d_derivative(t));
+}
+
+/**
+ * @brief bspline3d_evaluate(point, center, width) -> float
+ *
+ * point and center are (x, y, z) tuples.
+ */
+static PyObject *bspline3d_evaluate_py(PyObject * /*self*/,
+                                       PyObject *args) {
+    PyObject *point_obj;
+    PyObject *center_obj;
+    double width;
+    if (!PyArg_ParseTuple(args, "OOd", &point_obj,
+                          &center_obj, &width)) {
+        return NULL;
+    }
+    Vector3d point{}, center{};
+    if (!parse_vector3d(point_obj, point)) return NULL;
+    if (!parse_vector3d(center_obj, center)) return NULL;
+    return PyFloat_FromDouble(
+        bspline3d_evaluate(point, center, width));
+}
+
+/**
+ * @brief bspline3d_gradient(point, center, width) -> (dx, dy, dz)
+ */
+static PyObject *bspline3d_gradient_py(PyObject * /*self*/,
+                                       PyObject *args) {
+    PyObject *point_obj;
+    PyObject *center_obj;
+    double width;
+    if (!PyArg_ParseTuple(args, "OOd", &point_obj,
+                          &center_obj, &width)) {
+        return NULL;
+    }
+    Vector3d point{}, center{};
+    if (!parse_vector3d(point_obj, point)) return NULL;
+    if (!parse_vector3d(center_obj, center)) return NULL;
+    Vector3d grad = bspline3d_gradient(point, center, width);
+    return Py_BuildValue("(ddd)", grad.x, grad.y, grad.z);
+}
+
+/**
+ * @brief assign_dof_indices(cells_data) -> (cell_to_dof, dof_to_cell)
+ *
+ * cells_data is a list of dicts with keys:
+ *   "is_leaf" (bool)
+ * Returns two lists: cell_to_dof (int, -1 for non-leaves),
+ *                    dof_to_cell (int).
+ */
+static PyObject *assign_dof_indices_py(PyObject * /*self*/,
+                                       PyObject *args) {
+    PyObject *cells_obj;
+    if (!PyArg_ParseTuple(args, "O", &cells_obj)) {
+        return NULL;
+    }
+    PyObject *fast = PySequence_Fast(
+        cells_obj, "expected a sequence of cell dicts");
+    if (fast == NULL) return NULL;
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(fast);
+
+    /* Build a minimal vector of OctreeCells — we only need
+     * is_leaf for DOF assignment. */
+    std::vector<OctreeCell> cells(static_cast<std::size_t>(n));
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
+        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
+        if (leaf == NULL) {
+            Py_DECREF(fast);
+            PyErr_SetString(
+                PyExc_KeyError, "cell dict missing 'is_leaf'");
+            return NULL;
+        }
+        cells[static_cast<std::size_t>(i)].is_leaf =
+            PyObject_IsTrue(leaf) != 0;
+    }
+    Py_DECREF(fast);
+
+    std::vector<std::int64_t> cell_to_dof;
+    std::vector<std::size_t> dof_to_cell;
+    assign_dof_indices(cells, cell_to_dof, dof_to_cell);
+
+    /* Build Python lists. */
+    PyObject *c2d = PyList_New(
+        static_cast<Py_ssize_t>(cell_to_dof.size()));
+    for (std::size_t i = 0; i < cell_to_dof.size(); ++i) {
+        PyList_SET_ITEM(
+            c2d, static_cast<Py_ssize_t>(i),
+            PyLong_FromLongLong(cell_to_dof[i]));
+    }
+    PyObject *d2c = PyList_New(
+        static_cast<Py_ssize_t>(dof_to_cell.size()));
+    for (std::size_t i = 0; i < dof_to_cell.size(); ++i) {
+        PyList_SET_ITEM(
+            d2c, static_cast<Py_ssize_t>(i),
+            PyLong_FromSize_t(dof_to_cell[i]));
+    }
+    return Py_BuildValue("(OO)", c2d, d2c);
+}
+
+/**
+ * @brief enumerate_stencils_py(octree_result, domain_min,
+ *            domain_max, base_resolution, max_depth)
+ *        -> (stencil_offsets, stencil_neighbors)
+ *
+ * octree_result is the tuple returned by run_octree_pipeline
+ * (positions, normals) — but we need the raw cells. Instead,
+ * we accept the cells as a list of dicts with keys:
+ *   is_leaf, depth, bounds_min (tuple), bounds_max (tuple),
+ *   morton_key
+ *
+ * Returns two lists:
+ *   stencil_offsets  (list of int, length n_dofs + 1)
+ *   stencil_neighbors (list of int)
+ */
+static PyObject *enumerate_stencils_py(PyObject * /*self*/,
+                                       PyObject *args) {
+    PyObject *cells_obj;
+    PyObject *domain_min_obj;
+    PyObject *domain_max_obj;
+    unsigned int base_resolution;
+    unsigned int max_depth_val;
+    if (!PyArg_ParseTuple(args, "OOOII", &cells_obj,
+                          &domain_min_obj, &domain_max_obj,
+                          &base_resolution, &max_depth_val)) {
+        return NULL;
+    }
+    Vector3d dmin{}, dmax{};
+    if (!parse_vector3d(domain_min_obj, dmin)) return NULL;
+    if (!parse_vector3d(domain_max_obj, dmax)) return NULL;
+    BoundingBox domain = {dmin, dmax};
+
+    PyObject *fast = PySequence_Fast(
+        cells_obj, "expected a sequence of cell dicts");
+    if (fast == NULL) return NULL;
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(fast);
+
+    std::vector<OctreeCell> cells(static_cast<std::size_t>(n));
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
+        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
+        PyObject *depth = PyDict_GetItemString(d, "depth");
+        PyObject *bmin = PyDict_GetItemString(d, "bounds_min");
+        PyObject *bmax = PyDict_GetItemString(d, "bounds_max");
+        PyObject *mkey = PyDict_GetItemString(d, "morton_key");
+        if (!leaf || !depth || !bmin || !bmax || !mkey) {
+            Py_DECREF(fast);
+            PyErr_SetString(PyExc_KeyError,
+                            "cell dict missing required key");
+            return NULL;
+        }
+        auto &c = cells[static_cast<std::size_t>(i)];
+        c.is_leaf = PyObject_IsTrue(leaf) != 0;
+        c.depth = static_cast<std::uint32_t>(
+            PyLong_AsUnsignedLong(depth));
+        if (!parse_vector3d(bmin, c.bounds.min)) {
+            Py_DECREF(fast);
+            return NULL;
+        }
+        if (!parse_vector3d(bmax, c.bounds.max)) {
+            Py_DECREF(fast);
+            return NULL;
+        }
+        c.morton_key = PyLong_AsUnsignedLongLong(mkey);
+    }
+    Py_DECREF(fast);
+
+    std::vector<std::int64_t> cell_to_dof;
+    std::vector<std::size_t> dof_to_cell;
+    assign_dof_indices(cells, cell_to_dof, dof_to_cell);
+
+    std::vector<std::size_t> offsets;
+    std::vector<std::int64_t> neighbors;
+    enumerate_stencils(cells, cell_to_dof, dof_to_cell,
+                       domain, base_resolution, max_depth_val,
+                       offsets, neighbors);
+
+    PyObject *off_list = PyList_New(
+        static_cast<Py_ssize_t>(offsets.size()));
+    for (std::size_t i = 0; i < offsets.size(); ++i) {
+        PyList_SET_ITEM(off_list,
+                        static_cast<Py_ssize_t>(i),
+                        PyLong_FromSize_t(offsets[i]));
+    }
+    PyObject *nbr_list = PyList_New(
+        static_cast<Py_ssize_t>(neighbors.size()));
+    for (std::size_t i = 0; i < neighbors.size(); ++i) {
+        PyList_SET_ITEM(nbr_list,
+                        static_cast<Py_ssize_t>(i),
+                        PyLong_FromLongLong(neighbors[i]));
+    }
+    return Py_BuildValue("(OO)", off_list, nbr_list);
+}
+
 /**
  * @brief Python methods exported by the adaptive extension.
  */
@@ -2182,6 +2403,42 @@ static PyMethodDef adaptive_methods[] = {
         METH_VARARGS,
         PyDoc_STR(
             "Run FOF clustering on vertex positions."),
+    },
+    {
+        "bspline1d_evaluate",
+        bspline1d_evaluate_py,
+        METH_VARARGS,
+        PyDoc_STR("Evaluate 1-D degree-1 B-spline at t."),
+    },
+    {
+        "bspline1d_derivative",
+        bspline1d_derivative_py,
+        METH_VARARGS,
+        PyDoc_STR("Evaluate derivative of 1-D degree-1 B-spline at t."),
+    },
+    {
+        "bspline3d_evaluate",
+        bspline3d_evaluate_py,
+        METH_VARARGS,
+        PyDoc_STR("Evaluate 3-D trilinear B-spline at point."),
+    },
+    {
+        "bspline3d_gradient",
+        bspline3d_gradient_py,
+        METH_VARARGS,
+        PyDoc_STR("Evaluate gradient of 3-D trilinear B-spline."),
+    },
+    {
+        "assign_dof_indices",
+        assign_dof_indices_py,
+        METH_VARARGS,
+        PyDoc_STR("Assign contiguous DOF indices to leaf cells."),
+    },
+    {
+        "enumerate_stencils",
+        enumerate_stencils_py,
+        METH_VARARGS,
+        PyDoc_STR("Enumerate DOF stencils (neighbor DOFs)."),
     },
     {
         "adaptive_status",

@@ -664,3 +664,111 @@ def fof_cluster(
     pos = np.ascontiguousarray(positions, dtype=np.float64)
     labels = _adaptive.fof_cluster(pos, domain_min, domain_max, linking_factor)
     return labels
+
+
+# ---- Poisson basis functions (Phase 20a) --------------------------
+
+
+def bspline1d_evaluate(t: float) -> float:
+    """Evaluate the 1-D degree-1 (hat) B-spline at normalised t.
+
+    Args:
+        t: Normalised coordinate (distance from centre in units
+            of cell width).
+
+    Returns:
+        B-spline value in [0, 1].
+    """
+    return _adaptive.bspline1d_evaluate(t)
+
+
+def bspline1d_derivative(t: float) -> float:
+    """Evaluate the derivative of the 1-D degree-1 B-spline at t.
+
+    Args:
+        t: Normalised coordinate.
+
+    Returns:
+        Derivative value in {-1, 0, 1}.
+    """
+    return _adaptive.bspline1d_derivative(t)
+
+
+def bspline3d_evaluate(
+    point: tuple[float, float, float],
+    center: tuple[float, float, float],
+    width: float,
+) -> float:
+    """Evaluate the 3-D trilinear B-spline.
+
+    Args:
+        point: Evaluation point (x, y, z).
+        center: Cell centre (x, y, z).
+        width: Cell width.
+
+    Returns:
+        Basis function value in [0, 1].
+    """
+    return _adaptive.bspline3d_evaluate(point, center, width)
+
+
+def bspline3d_gradient(
+    point: tuple[float, float, float],
+    center: tuple[float, float, float],
+    width: float,
+) -> tuple[float, float, float]:
+    """Evaluate the gradient of the 3-D trilinear B-spline.
+
+    Args:
+        point: Evaluation point (x, y, z).
+        center: Cell centre (x, y, z).
+        width: Cell width.
+
+    Returns:
+        Gradient tuple (dB/dx, dB/dy, dB/dz).
+    """
+    return _adaptive.bspline3d_gradient(point, center, width)
+
+
+def assign_dof_indices(
+    cells: list[dict],
+) -> tuple[list[int], list[int]]:
+    """Assign contiguous DOF indices to leaf cells.
+
+    Args:
+        cells: List of cell dicts, each with an ``"is_leaf"`` key.
+
+    Returns:
+        Tuple of (cell_to_dof, dof_to_cell) lists.
+    """
+    return _adaptive.assign_dof_indices(cells)
+
+
+def enumerate_stencils(
+    cells: list[dict],
+    domain_min: tuple[float, float, float],
+    domain_max: tuple[float, float, float],
+    base_resolution: int,
+    max_depth: int,
+) -> tuple[list[int], list[int]]:
+    """Enumerate DOF stencils (neighbor DOFs) for each DOF.
+
+    Args:
+        cells: List of cell dicts with keys ``is_leaf``,
+            ``depth``, ``bounds_min``, ``bounds_max``,
+            ``morton_key``.
+        domain_min: Lower corner of the domain.
+        domain_max: Upper corner of the domain.
+        base_resolution: Top-level cells per axis.
+        max_depth: Maximum octree depth.
+
+    Returns:
+        Tuple of (stencil_offsets, stencil_neighbors).
+    """
+    return _adaptive.enumerate_stencils(
+        cells,
+        domain_min,
+        domain_max,
+        base_resolution,
+        max_depth,
+    )
