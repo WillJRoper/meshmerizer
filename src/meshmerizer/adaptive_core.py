@@ -894,3 +894,53 @@ def apply_poisson_operator(
         alpha,
         x,
     )
+
+
+def solve_poisson(
+    positions: "numpy.ndarray",
+    cells: list[dict],
+    domain_min: tuple[float, float, float],
+    domain_max: tuple[float, float, float],
+    base_resolution: int,
+    max_depth: int,
+    alpha: float,
+    b: list[float],
+    max_iters: int = 1000,
+    tol: float = 1e-10,
+) -> tuple[list[float], int, float, bool]:
+    """Solve the screened Poisson system Ax = b with PCG.
+
+    Builds the operator (Laplacian + screening) and solves
+    using preconditioned Conjugate Gradients with Jacobi
+    preconditioning.
+
+    Args:
+        positions: (N, 3) float64 array of sample positions
+            (used for screening accumulation).
+        cells: List of cell dicts.
+        domain_min: Lower corner of the domain.
+        domain_max: Upper corner of the domain.
+        base_resolution: Top-level cells per axis.
+        max_depth: Maximum octree depth.
+        alpha: Screening weight (0.0 for pure Laplacian).
+        b: Right-hand side vector (length = n_dofs).
+        max_iters: Maximum CG iterations.
+        tol: Relative residual tolerance.
+
+    Returns:
+        Tuple of (solution, iterations, residual_norm,
+        converged) where solution is a list of floats.
+    """
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    return _adaptive.solve_poisson(
+        pos,
+        cells,
+        domain_min,
+        domain_max,
+        base_resolution,
+        max_depth,
+        alpha,
+        b,
+        max_iters,
+        tol,
+    )

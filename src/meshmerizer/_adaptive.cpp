@@ -35,6 +35,7 @@
 #include "adaptive_cpp/poisson_basis.hpp"
 #include "adaptive_cpp/poisson_rhs.hpp"
 #include "adaptive_cpp/poisson_stencil.hpp"
+#include "adaptive_cpp/poisson_solver.hpp"
 #include "adaptive_cpp/qef.hpp"
 
 /**
@@ -2722,6 +2723,131 @@ static PyObject *apply_poisson_operator_py(PyObject * /*self*/,
 }
 
 /**
+ * @brief solve_poisson(positions_arr, cells, domain_min,
+ *            domain_max, base_resolution, max_depth, alpha,
+ *            b_vec, max_iters, tol)
+ *        -> (solution_list, iterations, residual, converged)
+ *
+ * Solves the screened Poisson system A x = b using PCG.
+ */
+static PyObject *solve_poisson_py(PyObject * /*self*/,
+                                  PyObject *args) {
+    PyObject *pos_obj;
+    PyObject *cells_obj;
+    PyObject *dmin_obj;
+    PyObject *dmax_obj;
+    unsigned int base_resolution;
+    unsigned int max_depth_val;
+    double alpha;
+    PyObject *b_obj;
+    unsigned int max_iters;
+    double tol;
+    if (!PyArg_ParseTuple(args, "OOOOIIdOId",
+                          &pos_obj, &cells_obj,
+                          &dmin_obj, &dmax_obj,
+                          &base_resolution, &max_depth_val,
+                          &alpha, &b_obj,
+                          &max_iters, &tol)) {
+        return NULL;
+    }
+
+    /* Parse domain. */
+    Vector3d dmin{}, dmax{};
+    if (!parse_vector3d(dmin_obj, dmin)) return NULL;
+    if (!parse_vector3d(dmax_obj, dmax)) return NULL;
+    BoundingBox domain = {dmin, dmax};
+
+    /* Parse positions. */
+    PyArrayObject *pos_arr = reinterpret_cast<PyArrayObject *>(
+        PyArray_FROM_OTF(pos_obj, NPY_DOUBLE,
+                         NPY_ARRAY_IN_ARRAY));
+    if (pos_arr == NULL) return NULL;
+    const npy_intp n_samples = PyArray_DIM(pos_arr, 0);
+    const double *pos_data =
+        static_cast<double *>(PyArray_DATA(pos_arr));
+    std::vector<Vector3d> positions(
+        static_cast<std::size_t>(n_samples));
+    for (npy_intp i = 0; i < n_samples; ++i) {
+        positions[static_cast<std::size_t>(i)] = {
+            pos_data[i * 3], pos_data[i * 3 + 1],
+            pos_data[i * 3 + 2]};
+    }
+    Py_DECREF(pos_arr);
+
+    /* Parse cells. */
+    PyObject *fast = PySequence_Fast(
+        cells_obj, "expected a sequence of cell dicts");
+    if (fast == NULL) return NULL;
+    const Py_ssize_t nc = PySequence_Fast_GET_SIZE(fast);
+    std::vector<OctreeCell> cells(
+        static_cast<std::size_t>(nc));
+    for (Py_ssize_t i = 0; i < nc; ++i) {
+        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
+        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
+        PyObject *depth = PyDict_GetItemString(d, "depth");
+        PyObject *bmin_d = PyDict_GetItemString(d, "bounds_min");
+        PyObject *bmax_d = PyDict_GetItemString(d, "bounds_max");
+        PyObject *mkey = PyDict_GetItemString(d, "morton_key");
+        if (!leaf || !depth || !bmin_d || !bmax_d || !mkey) {
+            Py_DECREF(fast);
+            PyErr_SetString(PyExc_KeyError,
+                            "cell dict missing required key");
+            return NULL;
+        }
+        auto &c = cells[static_cast<std::size_t>(i)];
+        c.is_leaf = PyObject_IsTrue(leaf) != 0;
+        c.depth = static_cast<std::uint32_t>(
+            PyLong_AsUnsignedLong(depth));
+        if (!parse_vector3d(bmin_d, c.bounds.min)) {
+            Py_DECREF(fast);
+            return NULL;
+        }
+        if (!parse_vector3d(bmax_d, c.bounds.max)) {
+            Py_DECREF(fast);
+            return NULL;
+        }
+        c.morton_key = PyLong_AsUnsignedLongLong(mkey);
+    }
+    Py_DECREF(fast);
+
+    /* Parse b vector. */
+    PyObject *b_fast = PySequence_Fast(
+        b_obj, "expected a sequence for b");
+    if (b_fast == NULL) return NULL;
+    const Py_ssize_t b_len = PySequence_Fast_GET_SIZE(b_fast);
+    std::vector<double> b_vec(
+        static_cast<std::size_t>(b_len));
+    for (Py_ssize_t i = 0; i < b_len; ++i) {
+        b_vec[static_cast<std::size_t>(i)] =
+            PyFloat_AsDouble(
+                PySequence_Fast_GET_ITEM(b_fast, i));
+    }
+    Py_DECREF(b_fast);
+
+    /* Solve. */
+    std::vector<double> x;
+    SolverResult sr = solve_poisson(
+        positions.data(),
+        static_cast<std::size_t>(n_samples),
+        cells, domain, base_resolution, max_depth_val,
+        alpha, b_vec,
+        static_cast<std::size_t>(max_iters), tol, x);
+
+    /* Build result. */
+    const std::size_t n_dofs = x.size();
+    PyObject *x_list = PyList_New(
+        static_cast<Py_ssize_t>(n_dofs));
+    for (std::size_t i = 0; i < n_dofs; ++i) {
+        PyList_SET_ITEM(x_list, static_cast<Py_ssize_t>(i),
+                        PyFloat_FromDouble(x[i]));
+    }
+    return Py_BuildValue("(OIdO)", x_list,
+                         static_cast<int>(sr.iterations),
+                         sr.residual_norm,
+                         sr.converged ? Py_True : Py_False);
+}
+
+/**
  * @brief Python methods exported by the adaptive extension.
  */
 static PyMethodDef adaptive_methods[] = {
@@ -2785,6 +2911,12 @@ static PyMethodDef adaptive_methods[] = {
         apply_poisson_operator_py,
         METH_VARARGS,
         PyDoc_STR("Apply screened Poisson operator A*x."),
+    },
+    {
+        "solve_poisson",
+        solve_poisson_py,
+        METH_VARARGS,
+        PyDoc_STR("Solve screened Poisson system with PCG."),
     },
     {
         "adaptive_status",
