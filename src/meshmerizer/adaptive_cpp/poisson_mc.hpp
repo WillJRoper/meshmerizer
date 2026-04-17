@@ -511,6 +511,13 @@ inline void evaluate_chi_at_corners(
         if (!cells[ci].is_leaf) {
             continue;
         }
+        /* Only evaluate chi at corners of max_depth leaves.
+         * These are the only cells with DOFs, so coarser leaves
+         * would produce meaningless chi values (no nearby DOFs
+         * at the right scale). */
+        if (cells[ci].depth != max_depth) {
+            continue;
+        }
         const OctreeCell &cell = cells[ci];
 
         // Decode cell origin in its own grid level, then scale to
@@ -676,7 +683,7 @@ inline void extract_isosurface(
 
     std::size_t n_leaves = 0;
     for (const auto &c : cells) {
-        if (c.is_leaf) {
+        if (c.is_leaf && c.depth == max_depth) {
             ++n_leaves;
         }
     }
@@ -688,6 +695,11 @@ inline void extract_isosurface(
 
     for (std::size_t ci = 0; ci < cells.size(); ++ci) {
         if (!cells[ci].is_leaf) {
+            continue;
+        }
+        /* Only run MC on max_depth leaves — these are the cells
+         * with DOFs and valid chi corner values. */
+        if (cells[ci].depth != max_depth) {
             continue;
         }
         if (ci >= corner_values.size()) {

@@ -200,51 +200,75 @@ inline Vector3d bspline3d_gradient(const Vector3d &point,
  * =================================================================== */
 
 /**
- * @brief Assign contiguous DOF indices to all leaf cells in the
- *        octree.
+ * @brief Assign contiguous DOF indices to leaf cells in the octree.
  *
- * Every leaf cell gets a DOF.  The Poisson solve needs basis
- * functions everywhere the solution could be nonzero, which
- * includes all leaves in the balanced octree (the narrow-band
- * halo is handled by the octree refinement + balance steps that
- * already ran).
+ * By default (restrict_depth < 0), every leaf cell gets a DOF.
+ * When restrict_depth >= 0, only leaves at exactly that depth get
+ * DOFs — this is the correct mode for adaptive octrees where the
+ * Poisson stencil assumes uniform cell widths.
  *
  * The function builds two mappings:
  *
  * - `cell_to_dof`: for each cell index, the DOF index (-1 if the
- *   cell is not a leaf).
+ *   cell is not a leaf or is excluded by restrict_depth).
  * - `dof_to_cell`: for each DOF index, the cell index.
  *
  * DOF indices are assigned in cell-array order, which is
  * deterministic (breadth-first refinement order).
  *
- * @param cells        The full octree cell array.
- * @param cell_to_dof  Output mapping (resized to cells.size()).
- * @param dof_to_cell  Output mapping (resized to number of leaves).
+ * When @p restrict_depth is non-negative, only leaves whose depth
+ * equals @p restrict_depth receive DOFs.  This is critical for
+ * correctness on adaptive octrees: the Poisson stencil assumes
+ * uniform cell sizes (all 1-D B-spline integrals are tabulated for
+ * same-scale hat functions).  Cells near the isosurface are already
+ * refined to max_depth by `refine_octree`, and 2:1 balancing adds
+ * neighbors at most one level coarser.  By restricting DOFs to
+ * max_depth leaves only, all stencil interactions use the same cell
+ * width h, making the discrete Laplacian exact.
+ *
+ * Coarser leaves far from the surface simply get cell_to_dof = -1
+ * and are skipped by all downstream functions (find_overlapping_dofs,
+ * splat_normals, accumulate_screening, apply_operator, etc.).
+ *
+ * @param cells          The full octree cell array.
+ * @param cell_to_dof    Output mapping (resized to cells.size()).
+ * @param dof_to_cell    Output mapping (resized to number of DOF
+ *                       leaves).
+ * @param restrict_depth If >= 0, only assign DOFs to leaves at
+ *                       exactly this depth.  If < 0 (default),
+ *                       all leaves get DOFs (uniform-grid mode).
  */
 inline void assign_dof_indices(
     const std::vector<OctreeCell> &cells,
     std::vector<std::int64_t> &cell_to_dof,
-    std::vector<std::size_t> &dof_to_cell) {
+    std::vector<std::size_t> &dof_to_cell,
+    int restrict_depth = -1) {
     cell_to_dof.assign(cells.size(), -1);
     dof_to_cell.clear();
 
-    /* First pass: count leaves so we can reserve. */
-    std::size_t n_leaves = 0;
+    /* First pass: count eligible leaves so we can reserve. */
+    std::size_t n_eligible = 0;
     for (const auto &c : cells) {
         if (c.is_leaf) {
-            ++n_leaves;
+            if (restrict_depth < 0 ||
+                static_cast<int>(c.depth) == restrict_depth) {
+                ++n_eligible;
+            }
         }
     }
-    dof_to_cell.reserve(n_leaves);
+    dof_to_cell.reserve(n_eligible);
 
     /* Second pass: assign indices. */
     std::int64_t next_dof = 0;
     for (std::size_t i = 0; i < cells.size(); ++i) {
         if (cells[i].is_leaf) {
-            cell_to_dof[i] = next_dof;
-            dof_to_cell.push_back(i);
-            ++next_dof;
+            if (restrict_depth < 0 ||
+                static_cast<int>(cells[i].depth) ==
+                    restrict_depth) {
+                cell_to_dof[i] = next_dof;
+                dof_to_cell.push_back(i);
+                ++next_dof;
+            }
         }
     }
 }

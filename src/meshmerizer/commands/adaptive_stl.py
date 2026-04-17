@@ -402,9 +402,6 @@ def run_adaptive(args) -> None:
             # If FOF is enabled, cluster particles first and
             # reconstruct each group independently.
             screening_weight = getattr(args, "screening_weight", 4.0)
-            poisson_depth = (
-                args.poisson_depth if args.poisson_depth is not None else 9
-            )
 
             if getattr(args, "fof", False):
                 log_status(
@@ -437,7 +434,7 @@ def run_adaptive(args) -> None:
                 "Pipeline",
                 f"Running C++ full pipeline: "
                 f"base_resolution={base_resolution}, "
-                f"max_depth={poisson_depth}, "
+                f"max_depth={max_depth}, "
                 f"isovalue={isovalue}, "
                 f"screening={screening_weight}",
             )
@@ -450,7 +447,7 @@ def run_adaptive(args) -> None:
                 domain_max,
                 base_resolution,
                 isovalue,
-                poisson_depth,
+                max_depth,
                 group_labels=group_labels,
                 screening_weight=screening_weight,
             )
