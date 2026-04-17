@@ -219,6 +219,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     adaptive.add_argument(
+        "--screening-weight",
+        type=float,
+        default=4.0,
+        help=(
+            "Poisson screening weight alpha. Higher values "
+            "produce tighter fit to data points, lower values "
+            "produce smoother surfaces. Default: 4.0"
+        ),
+    )
+    adaptive.add_argument(
         "--remove-islands-fraction",
         type=float,
         default=None,

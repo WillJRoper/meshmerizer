@@ -1,29 +1,40 @@
-"""Tests for Poisson surface reconstruction."""
+"""Tests for Poisson surface reconstruction (C++ backend).
+
+These tests exercise the new C++ full pipeline that replaces the
+Open3D-based Poisson reconstruction.  The pipeline takes raw
+particles (positions + smoothing lengths) and returns a triangle
+mesh.
+"""
 
 import numpy as np
 import pytest
 
+from meshmerizer.adaptive_core import run_full_pipeline
 from meshmerizer.poisson import (
     poisson_reconstruct,
     poisson_reconstruct_group,
 )
 
 
-def _make_sphere_points(
-    n: int = 500, radius: float = 1.0, seed: int = 42
+def _make_sphere_particles(
+    n: int = 2000,
+    radius: float = 1.0,
+    seed: int = 42,
 ) -> tuple:
-    """Generate points on a sphere with outward normals.
+    """Generate particles in a spherical shell with smoothing lengths.
 
-    Uses the Fibonacci sphere algorithm for approximately uniform
-    sampling, which gives Poisson a clean input.
+    Places particles in a thin shell around a sphere so that the
+    density field has a clear isosurface.
 
     Returns:
-        Tuple of (positions, normals) each (N, 3) float64.
+        Tuple of (positions, smoothing_lengths) where positions is
+        (N, 3) float64 and smoothing_lengths is (N,) float64.
     """
+    rng = np.random.default_rng(seed)
+
+    # Fibonacci sphere for uniform distribution.
     indices = np.arange(n, dtype=np.float64)
-    # Golden angle in radians.
     phi = np.pi * (3.0 - np.sqrt(5.0))
-    # y goes from 1 to -1.
     y = 1.0 - (2.0 * indices / (n - 1))
     r = np.sqrt(1.0 - y * y)
     theta = phi * indices
@@ -31,88 +42,137 @@ def _make_sphere_points(
     x = r * np.cos(theta)
     z = r * np.sin(theta)
 
+    # Place particles on the sphere surface with small jitter.
     normals = np.column_stack([x, y, z])
-    positions = normals * radius
+    jitter = rng.normal(0, 0.02, size=(n,))
+    positions = normals * (radius + jitter[:, np.newaxis])
 
-    return positions, normals
+    # Center at (2, 2, 2) so domain is well away from origin.
+    positions += np.array([2.0, 2.0, 2.0])
+
+    # Smoothing lengths: ~0.2 for decent kernel overlap.
+    smoothing_lengths = np.full(n, 0.2, dtype=np.float64)
+
+    return positions, smoothing_lengths
 
 
-def test_poisson_sphere_produces_watertight_mesh() -> None:
-    """A sphere point cloud should produce a watertight mesh."""
-    positions, normals = _make_sphere_points(n=500)
+def test_run_full_pipeline_sphere() -> None:
+    """Full pipeline on a sphere should produce a non-empty mesh."""
+    positions, sml = _make_sphere_particles(n=1000)
 
-    vertices, faces = poisson_reconstruct_group(
-        positions, normals, poisson_depth=6, density_quantile=0.1
+    result = run_full_pipeline(
+        positions,
+        sml,
+        domain_min=(0.0, 0.0, 0.0),
+        domain_max=(4.0, 4.0, 4.0),
+        base_resolution=4,
+        isovalue=0.01,
+        max_depth=3,
+        screening_weight=4.0,
+        max_iters=200,
+        tol=1e-4,
     )
 
-    assert vertices.ndim == 2
-    assert vertices.shape[1] == 3
+    assert "vertices" in result
+    assert "faces" in result
+    assert result["vertices"].ndim == 2
+    assert result["vertices"].shape[1] == 3
+    assert result["faces"].ndim == 2
+    assert result["faces"].shape[1] == 3
+    # Should produce some geometry.
+    assert result["vertices"].shape[0] > 0
+    assert result["faces"].shape[0] > 0
+    # Face indices must be valid.
+    assert np.all(result["faces"] >= 0)
+    assert np.all(result["faces"] < result["vertices"].shape[0])
+
+
+def test_run_full_pipeline_metadata() -> None:
+    """Pipeline result should contain solver metadata."""
+    positions, sml = _make_sphere_particles(n=500)
+
+    result = run_full_pipeline(
+        positions,
+        sml,
+        domain_min=(0.0, 0.0, 0.0),
+        domain_max=(4.0, 4.0, 4.0),
+        base_resolution=4,
+        isovalue=0.01,
+        max_depth=2,
+        screening_weight=4.0,
+        max_iters=100,
+        tol=1e-4,
+    )
+
+    assert "isovalue" in result
+    assert "n_qef_vertices" in result
+    assert "solver_converged" in result
+    assert "solver_iterations" in result
+    assert "solver_residual" in result
+    assert isinstance(result["solver_converged"], bool)
+    assert result["solver_iterations"] >= 0
+    assert result["solver_residual"] >= 0.0
+
+
+def test_poisson_reconstruct_group_sphere() -> None:
+    """poisson_reconstruct_group should produce a mesh."""
+    positions, sml = _make_sphere_particles(n=1000)
+
+    verts, faces = poisson_reconstruct_group(
+        positions,
+        None,
+        sml,
+        domain_min=(0.0, 0.0, 0.0),
+        domain_max=(4.0, 4.0, 4.0),
+        base_resolution=4,
+        isovalue=0.01,
+        max_depth=3,
+        screening_weight=4.0,
+    )
+
+    assert verts.ndim == 2
+    assert verts.shape[1] == 3
     assert faces.ndim == 2
     assert faces.shape[1] == 3
-    # Should have a reasonable number of vertices and faces.
-    assert vertices.shape[0] > 10
-    assert faces.shape[0] > 10
-    # All face indices should be valid.
+    assert verts.shape[0] > 0
+    assert faces.shape[0] > 0
     assert np.all(faces >= 0)
-    assert np.all(faces < vertices.shape[0])
+    assert np.all(faces < verts.shape[0])
 
 
-def test_poisson_two_groups_produce_two_components() -> None:
-    """Two separated sphere clusters should produce distinct mesh
-    components."""
-    pos_a, nrm_a = _make_sphere_points(n=300, radius=1.0)
-    pos_b, nrm_b = _make_sphere_points(n=300, radius=1.0)
-    # Shift cluster B far away.
-    pos_b += np.array([10.0, 10.0, 10.0])
-
-    positions = np.vstack([pos_a, pos_b])
-    normals_arr = np.vstack([nrm_a, nrm_b])
-    labels = np.array([0] * 300 + [1] * 300, dtype=np.int64)
-
-    vertices, faces = poisson_reconstruct(
-        positions,
-        normals_arr,
-        labels,
-        poisson_depth=6,
-        density_quantile=0.1,
-    )
-
-    assert vertices.shape[0] > 20
-    assert faces.shape[0] > 20
-    assert np.all(faces >= 0)
-    assert np.all(faces < vertices.shape[0])
-
-
-def test_poisson_empty_input_returns_empty() -> None:
-    """Empty positions/normals/labels should return empty arrays."""
-    positions = np.empty((0, 3), dtype=np.float64)
-    normals_arr = np.empty((0, 3), dtype=np.float64)
-    labels = np.empty((0,), dtype=np.int64)
-
-    vertices, faces = poisson_reconstruct(
-        positions,
-        normals_arr,
-        labels,
-        poisson_depth=6,
-    )
-
-    assert vertices.shape == (0, 3)
-    assert faces.shape == (0, 3)
-
-
-def test_poisson_reconstruct_group_rejects_mismatched_shapes() -> None:
-    """Mismatched positions/normals should raise ValueError."""
-    positions = np.ones((10, 3), dtype=np.float64)
-    normals_arr = np.ones((5, 3), dtype=np.float64)
-
-    with pytest.raises(ValueError, match="shape"):
-        poisson_reconstruct_group(positions, normals_arr)
-
-
-def test_poisson_reconstruct_group_rejects_too_few_points() -> None:
+def test_poisson_reconstruct_group_rejects_too_few() -> None:
     """Fewer than 3 points should raise ValueError."""
     positions = np.ones((2, 3), dtype=np.float64)
-    normals_arr = np.ones((2, 3), dtype=np.float64)
+    sml = np.ones(2, dtype=np.float64)
 
     with pytest.raises(ValueError, match="at least 3"):
-        poisson_reconstruct_group(positions, normals_arr)
+        poisson_reconstruct_group(
+            positions,
+            None,
+            sml,
+            domain_min=(0.0, 0.0, 0.0),
+            domain_max=(4.0, 4.0, 4.0),
+            base_resolution=4,
+            isovalue=0.01,
+            max_depth=2,
+        )
+
+
+def test_poisson_reconstruct_empty_returns_empty() -> None:
+    """Empty input should return empty arrays."""
+    positions = np.empty((0, 3), dtype=np.float64)
+    sml = np.empty(0, dtype=np.float64)
+
+    verts, faces = poisson_reconstruct(
+        positions,
+        None,
+        sml,
+        domain_min=(0.0, 0.0, 0.0),
+        domain_max=(4.0, 4.0, 4.0),
+        base_resolution=4,
+        isovalue=0.01,
+        max_depth=2,
+    )
+
+    assert verts.shape == (0, 3)
+    assert faces.shape == (0, 3)

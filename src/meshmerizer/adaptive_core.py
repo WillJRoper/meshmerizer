@@ -989,3 +989,57 @@ def extract_poisson_mesh(
         max_depth,
         sol,
     )
+
+
+def run_full_pipeline(
+    positions: np.ndarray,
+    smoothing_lengths: np.ndarray,
+    domain_min: tuple,
+    domain_max: tuple,
+    base_resolution: int,
+    isovalue: float,
+    max_depth: int,
+    screening_weight: float = 4.0,
+    max_iters: int = 1000,
+    tol: float = 1e-6,
+) -> dict:
+    """Run the full particles-to-mesh pipeline in C++.
+
+    Combines octree construction, QEF vertex solving, Poisson
+    surface reconstruction, and Marching Cubes isosurface
+    extraction into a single C++ call.  No intermediate data
+    is returned to Python.
+
+    Args:
+        positions: (N, 3) float64 array of particle positions.
+        smoothing_lengths: (N,) float64 array of smoothing lengths.
+        domain_min: (x, y, z) lower corner of the domain.
+        domain_max: (x, y, z) upper corner of the domain.
+        base_resolution: Number of top-level cells per axis.
+        isovalue: Density isovalue for octree refinement.
+        max_depth: Maximum octree refinement depth.
+        screening_weight: Poisson screening weight alpha.
+            Higher values produce tighter fit to data points.
+        max_iters: Maximum PCG iterations.
+        tol: PCG relative residual tolerance.
+
+    Returns:
+        Dict with keys ``vertices`` (V, 3) float64 ndarray,
+        ``faces`` (F, 3) uint32 ndarray, ``isovalue`` float,
+        ``n_qef_vertices`` int, ``solver_converged`` bool,
+        ``solver_iterations`` int, ``solver_residual`` float.
+    """
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
+    return _adaptive.run_full_pipeline(
+        pos,
+        sml,
+        tuple(domain_min),
+        tuple(domain_max),
+        base_resolution,
+        isovalue,
+        max_depth,
+        screening_weight,
+        max_iters,
+        tol,
+    )

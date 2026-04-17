@@ -19,7 +19,6 @@ from meshmerizer.adaptive_core import (
     create_top_level_cells_with_contributors,
     fof_cluster,
     refine_octree,
-    run_octree_pipeline,
     solve_vertices,
 )
 from meshmerizer.logging import log_status, record_elapsed
@@ -398,31 +397,125 @@ def run_adaptive(args) -> None:
                 operation="Meshing",
             )
         else:
-            # Fast path: run the octree pipeline in C++ without
-            # round-tripping octree cells through Python dicts.
-            # Returns QEF vertices only; face generation is done
-            # via FOF + Poisson in Python below.
+            # Fast path: run the full particles-to-mesh pipeline
+            # in C++ (octree + QEF + Poisson + Marching Cubes).
+            # If FOF is enabled, cluster particles first and
+            # reconstruct each group independently.
+            screening_weight = getattr(args, "screening_weight", 4.0)
+            poisson_depth = (
+                args.poisson_depth if args.poisson_depth is not None else 9
+            )
+
+            if getattr(args, "fof", False):
+                log_status(
+                    "Clustering",
+                    f"Running FOF clustering "
+                    f"(linking_factor={args.linking_factor})"
+                    f"...",
+                )
+                cluster_start = time.perf_counter()
+                group_labels = fof_cluster(
+                    positions,
+                    domain_min,
+                    domain_max,
+                    args.linking_factor,
+                )
+                n_groups = len(set(group_labels.tolist()))
+                record_elapsed(
+                    "FOF clustering",
+                    cluster_start,
+                    operation="Clustering",
+                )
+                log_status(
+                    "Clustering",
+                    f"Found {n_groups} group(s).",
+                )
+            else:
+                group_labels = None
+
             log_status(
                 "Pipeline",
-                f"Running C++ octree pipeline: "
+                f"Running C++ full pipeline: "
                 f"base_resolution={base_resolution}, "
-                f"max_depth={max_depth}, isovalue={isovalue}",
+                f"max_depth={poisson_depth}, "
+                f"isovalue={isovalue}, "
+                f"screening={screening_weight}",
             )
             pipeline_start = time.perf_counter()
-            vert_positions, vert_normals = run_octree_pipeline(
+            mesh_verts, mesh_faces = poisson_reconstruct(
                 positions,
+                None,
                 smoothing_lengths,
                 domain_min,
                 domain_max,
                 base_resolution,
                 isovalue,
-                max_depth,
+                poisson_depth,
+                group_labels=group_labels,
+                screening_weight=screening_weight,
             )
             record_elapsed(
-                "Octree pipeline",
+                "Full pipeline",
                 pipeline_start,
                 operation="Pipeline",
             )
+
+            n_mesh_verts = len(mesh_verts)
+            n_tris = len(mesh_faces)
+            log_status(
+                "Meshing",
+                f"Mesh: {n_mesh_verts} vertices, {n_tris} triangles.",
+            )
+
+            if n_tris == 0:
+                print(
+                    "Warning: Pipeline produced no "
+                    "triangles. Check isovalue and "
+                    "domain selection.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            # Translate back to world-space and build Mesh.
+            mesh_verts += origin
+
+            mesh = Mesh(
+                vertices=mesh_verts,
+                faces=mesh_faces,
+            )
+
+            # Remove small disconnected islands if requested.
+            mesh = _remove_islands(mesh, args.remove_islands_fraction)
+
+            # Scale the mesh to physical print size.
+            if args.target_size is not None:
+                log_status(
+                    "Cleaning",
+                    f"Scaling mesh to {args.target_size} cm...",
+                )
+                mesh = scale_mesh_to_print(mesh, args.target_size)
+
+            # Save the STL.
+            output_path = args.output
+            if output_path is None:
+                output_path = args.filename.with_suffix(".stl")
+
+            log_status(
+                "Saving",
+                f"Writing STL to {output_path}...",
+            )
+            mesh.save(str(output_path))
+
+            record_elapsed(
+                "Total pipeline",
+                total_start,
+                operation="Done",
+            )
+            log_status(
+                "Done",
+                f"Adaptive mesh saved to {output_path}",
+            )
+            return
 
     # ------------------------------------------------------------------
     # Step 3: Optionally save the octree state (load-octree path).
@@ -524,19 +617,26 @@ def run_adaptive(args) -> None:
         group_labels = np.zeros(len(vert_positions), dtype=np.int64)
 
     # Run Poisson reconstruction per group and merge.
+    screening_weight = getattr(args, "screening_weight", 4.0)
+    poisson_depth = args.poisson_depth if args.poisson_depth is not None else 9
     log_status(
         "Meshing",
         f"Running Poisson reconstruction "
         f"(depth={poisson_depth}, "
-        f"quantile={args.density_quantile})...",
+        f"screening={screening_weight})...",
     )
     poisson_start = time.perf_counter()
     mesh_verts, mesh_faces = poisson_reconstruct(
-        vert_positions,
+        positions,
         vert_normals,
-        group_labels,
-        poisson_depth=poisson_depth,
-        density_quantile=args.density_quantile,
+        smoothing_lengths,
+        domain_min,
+        domain_max,
+        base_resolution,
+        isovalue,
+        poisson_depth,
+        group_labels=group_labels,
+        screening_weight=screening_weight,
     )
     record_elapsed(
         "Poisson reconstruction",

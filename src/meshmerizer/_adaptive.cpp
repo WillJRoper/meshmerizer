@@ -37,6 +37,7 @@
 #include "adaptive_cpp/poisson_stencil.hpp"
 #include "adaptive_cpp/poisson_solver.hpp"
 #include "adaptive_cpp/poisson_mc.hpp"
+#include "adaptive_cpp/poisson_pipeline.hpp"
 #include "adaptive_cpp/qef.hpp"
 
 /**
@@ -3027,6 +3028,158 @@ static PyObject *extract_poisson_mesh_py(PyObject * /*self*/,
 }
 
 /**
+ * @brief Python binding for the full particles-to-mesh pipeline.
+ *
+ * Args (positional):
+ *   positions         – (N, 3) float64 array
+ *   smoothing_lengths – (N,) float64 array
+ *   domain_min        – 3-tuple
+ *   domain_max        – 3-tuple
+ *   base_resolution   – unsigned int
+ *   isovalue          – double
+ *   max_depth         – unsigned int
+ *   screening_weight  – double
+ *   max_iters         – unsigned int
+ *   tol               – double
+ *
+ * Returns a dict with keys:
+ *   vertices       – (V, 3) float64 ndarray
+ *   faces          – (F, 3) uint32 ndarray
+ *   isovalue       – float
+ *   n_qef_vertices – int
+ *   solver_converged  – bool
+ *   solver_iterations – int
+ *   solver_residual   – float
+ */
+static PyObject *run_full_pipeline_py(
+        PyObject * /*self*/, PyObject *args) {
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    PyObject *domain_min_object = NULL;
+    PyObject *domain_max_object = NULL;
+    unsigned int base_resolution = 0U;
+    double isovalue = 0.0;
+    unsigned int max_depth = 0U;
+    double screening_weight = 4.0;
+    unsigned int max_iters = 1000U;
+    double tol = 1e-6;
+
+    if (!PyArg_ParseTuple(args, "OOOOIdIdId",
+                          &positions_object,
+                          &smoothing_object,
+                          &domain_min_object,
+                          &domain_max_object,
+                          &base_resolution,
+                          &isovalue,
+                          &max_depth,
+                          &screening_weight,
+                          &max_iters,
+                          &tol)) {
+        return NULL;
+    }
+
+    // Parse particle data.
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    BoundingBox domain{};
+
+    if (!parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths)) {
+        return NULL;
+    }
+    if (positions.size() != smoothing_lengths.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing lengths "
+                        "must match in size");
+        return NULL;
+    }
+    if (!parse_vector3d(domain_min_object, domain.min) ||
+        !parse_vector3d(domain_max_object, domain.max)) {
+        return NULL;
+    }
+    if (base_resolution == 0U) {
+        PyErr_SetString(PyExc_ValueError,
+                        "base_resolution must be > 0");
+        return NULL;
+    }
+
+    // Release GIL and run the entire pipeline in C++.
+    PipelineResult result;
+
+    Py_BEGIN_ALLOW_THREADS
+
+    result = run_full_pipeline(
+        positions, smoothing_lengths, domain,
+        static_cast<std::uint32_t>(base_resolution),
+        isovalue,
+        static_cast<std::uint32_t>(max_depth),
+        screening_weight,
+        static_cast<std::size_t>(max_iters),
+        tol);
+
+    Py_END_ALLOW_THREADS
+
+    // Build output NumPy arrays.
+    const std::size_t nv = result.vertices.size();
+    const std::size_t nf = result.triangles.size();
+
+    npy_intp vdims[2] = {
+        static_cast<npy_intp>(nv), 3};
+    PyObject *v_arr =
+        PyArray_SimpleNew(2, vdims, NPY_DOUBLE);
+    if (v_arr == NULL) return NULL;
+    double *v_data = static_cast<double *>(
+        PyArray_DATA(
+            reinterpret_cast<PyArrayObject *>(v_arr)));
+    for (std::size_t i = 0; i < nv; ++i) {
+        v_data[i * 3] = result.vertices[i].x;
+        v_data[i * 3 + 1] = result.vertices[i].y;
+        v_data[i * 3 + 2] = result.vertices[i].z;
+    }
+
+    npy_intp fdims[2] = {
+        static_cast<npy_intp>(nf), 3};
+    PyObject *f_arr =
+        PyArray_SimpleNew(2, fdims, NPY_UINT32);
+    if (f_arr == NULL) {
+        Py_DECREF(v_arr);
+        return NULL;
+    }
+    std::uint32_t *f_data = static_cast<std::uint32_t *>(
+        PyArray_DATA(
+            reinterpret_cast<PyArrayObject *>(f_arr)));
+    for (std::size_t i = 0; i < nf; ++i) {
+        f_data[i * 3] = result.triangles[i][0];
+        f_data[i * 3 + 1] = result.triangles[i][1];
+        f_data[i * 3 + 2] = result.triangles[i][2];
+    }
+
+    // Build result dict.
+    PyObject *dict = PyDict_New();
+    if (dict == NULL) {
+        Py_DECREF(v_arr);
+        Py_DECREF(f_arr);
+        return NULL;
+    }
+    PyDict_SetItemString(dict, "vertices", v_arr);
+    PyDict_SetItemString(dict, "faces", f_arr);
+    Py_DECREF(v_arr);
+    Py_DECREF(f_arr);
+    PyDict_SetItemString(dict, "isovalue",
+        PyFloat_FromDouble(result.isovalue));
+    PyDict_SetItemString(dict, "n_qef_vertices",
+        PyLong_FromSize_t(result.n_qef_vertices));
+    PyDict_SetItemString(dict, "solver_converged",
+        PyBool_FromLong(result.solver_converged ? 1 : 0));
+    PyDict_SetItemString(dict, "solver_iterations",
+        PyLong_FromSize_t(result.solver_iterations));
+    PyDict_SetItemString(dict, "solver_residual",
+        PyFloat_FromDouble(result.solver_residual));
+
+    return dict;
+}
+
+/**
  * @brief Python methods exported by the adaptive extension.
  */
 static PyMethodDef adaptive_methods[] = {
@@ -3255,6 +3408,16 @@ static PyMethodDef adaptive_methods[] = {
             "Run the octree pipeline in C++ "
             "(build + refine + solve vertices) "
             "and return (positions, normals)."),
+    },
+    {
+        "run_full_pipeline",
+        run_full_pipeline_py,
+        METH_VARARGS,
+        PyDoc_STR(
+            "Run the full particles-to-mesh pipeline "
+            "(octree + Poisson + Marching Cubes) in C++ "
+            "and return a dict with vertices, faces, and "
+            "solver metadata."),
     },
     {NULL, NULL, 0, NULL},
 };
