@@ -2799,9 +2799,11 @@ static PyObject *apply_poisson_operator_py(PyObject * /*self*/,
     /* Build stencils. */
     std::vector<std::size_t> stencil_offsets;
     std::vector<std::int64_t> stencil_neighbors;
+    std::vector<int> stencil_depth_deltas;
     enumerate_stencils(cells, cell_to_dof, dof_to_cell,
                        domain, base_resolution, max_depth_val,
-                       stencil_offsets, stencil_neighbors);
+                       stencil_offsets, stencil_neighbors,
+                       &stencil_depth_deltas);
 
     /* Accumulate screening. */
     ScreeningData screening;
@@ -2833,8 +2835,9 @@ static PyObject *apply_poisson_operator_py(PyObject * /*self*/,
     /* Apply operator. */
     std::vector<double> result;
     apply_operator(x_vec, cells, cell_to_dof, dof_to_cell,
-                   stencil_offsets, stencil_neighbors,
-                   screening, n_dofs, result);
+                    stencil_offsets, stencil_neighbors,
+                    stencil_depth_deltas,
+                    screening, n_dofs, result);
 
     /* Build result list. */
     PyObject *out = PyList_New(static_cast<Py_ssize_t>(n_dofs));

@@ -371,6 +371,7 @@ inline void accumulate_screening(
  * @param dof_to_cell      DOF-to-cell mapping.
  * @param stencil_offsets  CSR offsets from enumerate_stencils().
  * @param stencil_neighbors CSR neighbors from enumerate_stencils().
+ * @param stencil_depth_deltas Depth deltas from enumerate_stencils().
  * @param screening        Screening data from accumulate_screening().
  * @param n_dofs           Number of DOFs.
  * @param result           Output vector (size n_dofs).
@@ -382,6 +383,7 @@ inline void apply_operator(
     const std::vector<std::size_t> &dof_to_cell,
     const std::vector<std::size_t> &stencil_offsets,
     const std::vector<std::int64_t> &stencil_neighbors,
+    const std::vector<int> &stencil_depth_deltas,
     const ScreeningData &screening,
     std::size_t n_dofs,
     std::vector<double> &result) {
@@ -406,29 +408,115 @@ inline void apply_operator(
             const OctreeCell &cell_j = cells[cj];
             const Vector3d center_j = cell_j.bounds.center();
 
-            /* Relative offset in cell-width units. */
-            const double inv_h = 1.0 / h_i;
-            const int dx = static_cast<int>(
-                std::round((center_j.x - center_i.x) * inv_h));
-            const int dy = static_cast<int>(
-                std::round((center_j.y - center_i.y) * inv_h));
-            const int dz = static_cast<int>(
-                std::round((center_j.z - center_i.z) * inv_h));
-
-            /* Skip offsets outside the degree-2 overlap range.
+            /* --------------------------------------------------------
+             * Adaptive Laplacian coupling (same-depth CC vs cross-depth
+             * PC).
              *
-             * Note: even if the neighbor enumeration probes a small
-             * set of nearby cells, adaptive depth transitions can
-             * yield relative centre offsets of magnitude 2 when
-             * measured in the fine cell's width units. */
-            if (dx < -2 || dx > 2 ||
-                dy < -2 || dy > 2 ||
-                dz < -2 || dz > 2) {
-                continue;
+             * In the adaptive Poisson formulation (ToG13; PoissonRecon
+             * reference code in BSplineData.inl), the Laplace operator
+             * couples basis functions across depth transitions.
+             * enumerate_stencils() records a per-neighbour depth delta:
+             *   0  : same depth (cell-centred CC stencil)
+             *  -1  : neighbour is coarser (parent of i)
+             *  +1  : neighbour is finer   (child  of i)
+             *
+             * We branch here to select the correct integral table and
+             * physical scaling, keeping A symmetric by careful sign
+             * conventions for parent-child offsets.
+             * -------------------------------------------------------- */
+            const int depth_delta = stencil_depth_deltas[k];
+
+            double L_ij;
+            if (depth_delta == 0) {
+                /* Same-depth: integer offsets in h_i units.
+                 *
+                 * Two degree-2 B-spline basis functions overlap iff
+                 * their centres are within ±2 cell widths along each
+                 * axis (a 5^3 stencil). */
+                const double inv_h = 1.0 / h_i;
+                const int dx = static_cast<int>(
+                    std::round(
+                        (center_j.x - center_i.x) * inv_h));
+                const int dy = static_cast<int>(
+                    std::round(
+                        (center_j.y - center_i.y) * inv_h));
+                const int dz = static_cast<int>(
+                    std::round(
+                        (center_j.z - center_i.z) * inv_h));
+                if (dx < -2 || dx > 2 ||
+                    dy < -2 || dy > 2 ||
+                    dz < -2 || dz > 2) {
+                    continue;
+                }
+                L_ij = laplacian_stencil_weight(dx, dy, dz, h_i);
+            } else if (depth_delta == -1) {
+                /* Neighbour j is coarser (parent of i).
+                 *
+                 * Child i has width h_i, parent j has width 2*h_i.
+                 * The parent-child (PC) Laplacian stencil is tabulated
+                 * in *child-width units* (Phase 21a tables). The
+                 * PoissonRecon convention uses offsets from parent
+                 * centre to child centre:
+                 *   j_pc = (center_i - center_j) / h_i
+                 *
+                 * With raw_offset = (center_j - center_i) / h_i, we get
+                 * j_pc = -raw_offset, hence the explicit sign flip.
+                 *
+                 * Physical scaling: 1/(2*h_i) * raw_weight.
+                 * (ToG13 Sec 4; PoissonRecon BSplineData.inl) */
+                const double inv_h = 1.0 / h_i;
+                const int dx = static_cast<int>(
+                    std::round(
+                        (center_j.x - center_i.x) * inv_h));
+                const int dy = static_cast<int>(
+                    std::round(
+                        (center_j.y - center_i.y) * inv_h));
+                const int dz = static_cast<int>(
+                    std::round(
+                        (center_j.z - center_i.z) * inv_h));
+                if (dx < -4 || dx > 4 ||
+                    dy < -4 || dy > 4 ||
+                    dz < -4 || dz > 4) {
+                    continue;
+                }
+
+                /* Symmetry: L_{child,parent} = L_{parent,child}.
+                 * pc_laplacian_stencil_weight expects parent->child
+                 * offsets, so we negate (dx,dy,dz) because dx is
+                 * (parent - child)/h_child here. */
+                const double raw = pc_laplacian_stencil_weight(
+                    -dx, -dy, -dz);
+                L_ij = raw / (2.0 * h_i);
+            } else {
+                /* depth_delta == +1: neighbour j is finer (child of i).
+                 *
+                 * Parent i has width h_i, child j has width h_j = h_i/2.
+                 * Offsets are measured in child-width units:
+                 *   (center_j - center_i) / h_j
+                 *
+                 * Physical scaling: 1/(2*h_j) * raw_weight.
+                 * (ToG13 Sec 4) */
+                const double h_j = cell_j.bounds.extent().x;
+                const double inv_hj = 1.0 / h_j;
+                const int dx = static_cast<int>(
+                    std::round(
+                        (center_j.x - center_i.x) * inv_hj));
+                const int dy = static_cast<int>(
+                    std::round(
+                        (center_j.y - center_i.y) * inv_hj));
+                const int dz = static_cast<int>(
+                    std::round(
+                        (center_j.z - center_i.z) * inv_hj));
+                if (dx < -4 || dx > 4 ||
+                    dy < -4 || dy > 4 ||
+                    dz < -4 || dz > 4) {
+                    continue;
+                }
+                const double raw = pc_laplacian_stencil_weight(
+                    dx, dy, dz);
+                L_ij = raw / (2.0 * h_j);
             }
 
-            const double L_ij =
-                laplacian_stencil_weight(dx, dy, dz, h_i);
             accum += L_ij * x[static_cast<std::size_t>(j_dof)];
         }
 

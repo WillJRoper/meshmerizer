@@ -388,6 +388,7 @@ inline PipelineResult run_full_pipeline(
     SolverResult solver = solve_pcg(
         rhs, all_cells, cell_to_dof, dof_to_cell,
         stencil_offsets, stencil_neighbors,
+        stencil_depth_deltas,
         screening, n_dofs, max_iters, tol, solution);
 
     result.solver_converged = solver.converged;

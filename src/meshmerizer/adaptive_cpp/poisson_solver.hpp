@@ -198,6 +198,7 @@ inline void apply_jacobi(
  * @param dof_to_cell       DOF-to-cell mapping.
  * @param stencil_offsets   CSR offsets.
  * @param stencil_neighbors CSR neighbors.
+ * @param stencil_depth_deltas CSR depth deltas (0,-1,+1).
  * @param screening         Screening data.
  * @param diag              Diagonal of A.
  * @param n_dofs            Number of DOFs.
@@ -210,6 +211,7 @@ inline void gauss_seidel_sweep(
     const std::vector<std::size_t> &dof_to_cell,
     const std::vector<std::size_t> &stencil_offsets,
     const std::vector<std::int64_t> &stencil_neighbors,
+    const std::vector<int> &stencil_depth_deltas,
     const ScreeningData &screening,
     const std::vector<double> &diag,
     std::size_t n_dofs) {
@@ -233,27 +235,91 @@ inline void gauss_seidel_sweep(
             if (j == i) continue;  /* skip diagonal */
 
             const std::size_t cj = dof_to_cell[j];
-            const Vector3d center_j = cells[cj].bounds.center();
-            const double inv_h = 1.0 / h_i;
-            const int dx = static_cast<int>(
-                std::round(
-                    (center_j.x - center_i.x) * inv_h));
-            const int dy = static_cast<int>(
-                std::round(
-                    (center_j.y - center_i.y) * inv_h));
-            const int dz = static_cast<int>(
-                std::round(
-                    (center_j.z - center_i.z) * inv_h));
+            const OctreeCell &cell_j = cells[cj];
+            const Vector3d center_j = cell_j.bounds.center();
 
-            if (dx < -1 || dx > 1 ||
-                dy < -1 || dy > 1 ||
-                dz < -1 || dz > 1) {
-                continue;
+            /* --------------------------------------------------------
+             * Adaptive Laplacian off-diagonal (same-depth CC vs
+             * cross-depth PC).
+             *
+             * IMPORTANT: This must mirror apply_operator() exactly.
+             * If the smoother uses a different A_ij, Gauss-Seidel can
+             * diverge or destroy PCG convergence.
+             *
+             * BUGFIX (Phase 21e): same-depth overlap radius is ±2 for
+             * degree-2 B-splines (5^3 stencil), not ±1.
+             * -------------------------------------------------------- */
+            const int depth_delta = stencil_depth_deltas[k];
+
+            double L_ij;
+            if (depth_delta == 0) {
+                /* Same-depth: integer offsets in h_i units (±2). */
+                const double inv_h = 1.0 / h_i;
+                const int dx = static_cast<int>(
+                    std::round(
+                        (center_j.x - center_i.x) * inv_h));
+                const int dy = static_cast<int>(
+                    std::round(
+                        (center_j.y - center_i.y) * inv_h));
+                const int dz = static_cast<int>(
+                    std::round(
+                        (center_j.z - center_i.z) * inv_h));
+                if (dx < -2 || dx > 2 ||
+                    dy < -2 || dy > 2 ||
+                    dz < -2 || dz > 2) {
+                    continue;
+                }
+                L_ij = laplacian_stencil_weight(dx, dy, dz, h_i);
+            } else if (depth_delta == -1) {
+                /* Neighbour j is coarser (parent of i).
+                 *
+                 * The PC Laplacian table is indexed in child-width
+                 * units, and physical scaling is 1/(2*h_child).
+                 * (ToG13 Sec 4; PoissonRecon BSplineData.inl) */
+                const double inv_h = 1.0 / h_i;
+                const int dx = static_cast<int>(
+                    std::round(
+                        (center_j.x - center_i.x) * inv_h));
+                const int dy = static_cast<int>(
+                    std::round(
+                        (center_j.y - center_i.y) * inv_h));
+                const int dz = static_cast<int>(
+                    std::round(
+                        (center_j.z - center_i.z) * inv_h));
+                if (dx < -4 || dx > 4 ||
+                    dy < -4 || dy > 4 ||
+                    dz < -4 || dz > 4) {
+                    continue;
+                }
+                const double raw = pc_laplacian_stencil_weight(
+                    -dx, -dy, -dz);
+                L_ij = raw / (2.0 * h_i);
+            } else {
+                /* depth_delta == +1: neighbour j is finer (child of i).
+                 * Scale is 1/(2*h_child) with offsets in child units.
+                 * (ToG13 Sec 4) */
+                const double h_j = cell_j.bounds.extent().x;
+                const double inv_hj = 1.0 / h_j;
+                const int dx = static_cast<int>(
+                    std::round(
+                        (center_j.x - center_i.x) * inv_hj));
+                const int dy = static_cast<int>(
+                    std::round(
+                        (center_j.y - center_i.y) * inv_hj));
+                const int dz = static_cast<int>(
+                    std::round(
+                        (center_j.z - center_i.z) * inv_hj));
+                if (dx < -4 || dx > 4 ||
+                    dy < -4 || dy > 4 ||
+                    dz < -4 || dz > 4) {
+                    continue;
+                }
+                const double raw = pc_laplacian_stencil_weight(
+                    dx, dy, dz);
+                L_ij = raw / (2.0 * h_j);
             }
 
-            off_diag_sum +=
-                laplacian_stencil_weight(dx, dy, dz, h_i)
-                * x[j];
+            off_diag_sum += L_ij * x[j];
         }
 
         /* Screening off-diagonal. */
@@ -304,6 +370,7 @@ struct SolverResult {
  * @param dof_to_cell       DOF-to-cell mapping.
  * @param stencil_offsets   CSR offsets.
  * @param stencil_neighbors CSR neighbors.
+ * @param stencil_depth_deltas CSR depth deltas (0,-1,+1).
  * @param screening         Screening data.
  * @param n_dofs            Number of DOFs.
  * @param max_iters         Maximum CG iterations.
@@ -319,6 +386,7 @@ inline SolverResult solve_pcg(
     const std::vector<std::size_t> &dof_to_cell,
     const std::vector<std::size_t> &stencil_offsets,
     const std::vector<std::int64_t> &stencil_neighbors,
+    const std::vector<int> &stencil_depth_deltas,
     const ScreeningData &screening,
     std::size_t n_dofs,
     std::size_t max_iters,
@@ -336,6 +404,7 @@ inline SolverResult solve_pcg(
     std::vector<double> Ax;
     apply_operator(x, cells, cell_to_dof, dof_to_cell,
                    stencil_offsets, stencil_neighbors,
+                   stencil_depth_deltas,
                    screening, n_dofs, Ax);
 
     std::vector<double> r;
@@ -371,6 +440,7 @@ inline SolverResult solve_pcg(
         /* q = A * p. */
         apply_operator(p, cells, cell_to_dof, dof_to_cell,
                        stencil_offsets, stencil_neighbors,
+                       stencil_depth_deltas,
                        screening, n_dofs, q);
 
         /* alpha = (r · z) / (p · q). */
@@ -462,9 +532,11 @@ inline SolverResult solve_poisson(
     /* Build stencils. */
     std::vector<std::size_t> stencil_offsets;
     std::vector<std::int64_t> stencil_neighbors;
+    std::vector<int> stencil_depth_deltas;
     enumerate_stencils(cells, cell_to_dof, dof_to_cell,
                        domain, base_resolution, max_depth,
-                       stencil_offsets, stencil_neighbors);
+                       stencil_offsets, stencil_neighbors,
+                       &stencil_depth_deltas);
 
     /* Accumulate screening. */
     ScreeningData screening;
@@ -478,6 +550,7 @@ inline SolverResult solve_poisson(
     /* Solve with PCG. */
     return solve_pcg(b, cells, cell_to_dof, dof_to_cell,
                      stencil_offsets, stencil_neighbors,
+                     stencil_depth_deltas,
                      screening, n_dofs, max_iters, tol, x);
 }
 
