@@ -469,7 +469,7 @@ inline SolverResult solve_poisson(
     /* Accumulate screening. */
     ScreeningData screening;
     accumulate_screening(positions, n_samples, alpha,
-                         hash, cells, cell_to_dof,
+                         hash, cells, cell_to_dof, dof_to_cell,
                          n_dofs, base_resolution, screening);
 
     /* Initialise x to zero. */

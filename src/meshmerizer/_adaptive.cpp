@@ -2601,21 +2601,24 @@ static PyObject *splat_and_compute_rhs_py(PyObject * /*self*/,
     /* Build stencils. */
     std::vector<std::size_t> stencil_offsets;
     std::vector<std::int64_t> stencil_neighbors;
+    std::vector<int> stencil_depth_deltas;
     enumerate_stencils(cells, cell_to_dof, dof_to_cell,
                        domain, base_resolution, max_depth_val,
-                       stencil_offsets, stencil_neighbors);
+                       stencil_offsets, stencil_neighbors,
+                       &stencil_depth_deltas);
 
     /* Splat normals. */
     std::vector<Vector3d> v_field;
     splat_normals(positions.data(), normals_vec.data(),
                   static_cast<std::size_t>(n_samples),
-                  hash, cells, cell_to_dof, n_dofs,
+                  hash, cells, cell_to_dof, dof_to_cell, n_dofs,
                   base_resolution, v_field);
 
     /* Compute RHS. */
     std::vector<double> rhs;
     compute_rhs(v_field, cells, cell_to_dof, dof_to_cell,
                 stencil_offsets, stencil_neighbors,
+                stencil_depth_deltas,
                 n_dofs, rhs);
 
     /* Build result: 4 lists. */
@@ -2805,7 +2808,8 @@ static PyObject *apply_poisson_operator_py(PyObject * /*self*/,
     accumulate_screening(positions.data(),
                          static_cast<std::size_t>(n_samples),
                          alpha, hash, cells, cell_to_dof,
-                         n_dofs, base_resolution, screening);
+                         dof_to_cell, n_dofs,
+                         base_resolution, screening);
 
     /* Parse input vector x. */
     PyObject *x_fast = PySequence_Fast(

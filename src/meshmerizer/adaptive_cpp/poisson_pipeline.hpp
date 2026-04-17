@@ -334,7 +334,7 @@ inline PipelineResult run_full_pipeline(
     splat_normals(
         qef_positions.data(), qef_normals.data(),
         n_samples, hash, all_cells, cell_to_dof,
-        n_dofs, base_resolution, v_field);
+        dof_to_cell, n_dofs, base_resolution, v_field);
 
     // ================================================================
     // Step 7: Enumerate stencils and assemble Poisson RHS.
@@ -344,15 +344,18 @@ inline PipelineResult run_full_pipeline(
 
     std::vector<std::size_t> stencil_offsets;
     std::vector<std::int64_t> stencil_neighbors;
+    std::vector<int> stencil_depth_deltas;
     enumerate_stencils(
         all_cells, cell_to_dof, dof_to_cell,
         domain, base_resolution, max_depth,
-        stencil_offsets, stencil_neighbors);
+        stencil_offsets, stencil_neighbors,
+        &stencil_depth_deltas);
 
     std::vector<double> rhs;
     compute_rhs(
         v_field, all_cells, cell_to_dof, dof_to_cell,
-        stencil_offsets, stencil_neighbors, n_dofs, rhs);
+        stencil_offsets, stencil_neighbors, stencil_depth_deltas,
+        n_dofs, rhs);
 
     // Free the vector field — no longer needed after RHS assembly.
     { std::vector<Vector3d>().swap(v_field); }
@@ -368,7 +371,7 @@ inline PipelineResult run_full_pipeline(
     accumulate_screening(
         qef_positions.data(), n_samples,
         screening_weight,
-        hash, all_cells, cell_to_dof,
+        hash, all_cells, cell_to_dof, dof_to_cell,
         n_dofs, base_resolution, screening);
 
     // ================================================================

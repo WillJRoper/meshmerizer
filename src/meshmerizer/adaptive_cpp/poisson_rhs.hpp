@@ -445,8 +445,13 @@ inline Vector3d gradient_inner_product(int dx, int dy, int dz,
  * For a degree-2 B-spline, the 1-D support in reference coordinates
  * is \f$[-3/2,\,3/2]\f$ (Unser 1999). In fine-grid index units, a cell
  * with min-corner index \f$m\f$ has centre at \f$m+1/2\f$ and support
- * over \f$[m-1,\,m+2]\f$. Therefore, a point can overlap at most
- * \f$3^3=27\f$ DOFs.
+ * over \f$[m-1,\,m+2]\f$.
+ *
+ * On an **adaptive** octree, DOFs can exist at multiple depths.
+ * At each depth, the same 1-D support argument holds (in that
+ * depth's cell-width units), so a point can overlap at most
+ * \f$27\f$ DOFs *per depth*. We therefore probe each depth level
+ * separately and de-duplicate.
  *
  * **Approach**: Rather than finding a "containing cell" first
  * (which fails when the hash quantization maps the point to a
@@ -457,6 +462,17 @@ inline Vector3d gradient_inner_product(int dx, int dy, int dz,
  * indices \f$\{\lfloor t-1\rfloor,\lfloor t-1\rfloor+1,
  * \lfloor t-1\rfloor+2\}\f$. All \f$3^3=27\f$ combinations are
  * checked via the hash.
+ *
+ * **Multi-depth extension (Phase 21d)**: the 27-probe loop above
+ * finds overlapping DOFs only at the finest scale because the
+ * candidate min-corner indices are enumerated in *fine-grid* units
+ * with step 1.  Coarser B-splines (cells with span > 1 fine unit)
+ * can overlap the query point even when their min-corner indices
+ * are not among these unit-step candidates.
+ *
+ * To capture these, we repeat the same logic at each coarser depth
+ * \f$d\f$ by probing the three cell-aligned min-corner positions per
+ * axis whose quadratic supports could contain the query point.
  *
  * @param point       Query point in world space.
  * @param hash        Spatial hash of leaf cells.
@@ -566,6 +582,100 @@ inline void find_overlapping_dofs(
             }
         }
     }
+
+    /* --- Multi-depth probes: find DOFs at coarser depths whose
+     *     B-spline supports contain the query point.
+     *
+     * The fine-grid probes above enumerate candidate min-corners in
+     * steps of 1 fine unit.  For a coarser cell at depth d, the
+     * min-corner must be aligned to multiples of span = 2^(D-d)
+     * fine units (where D = max_depth).  We therefore repeat the
+     * 3-candidate-per-axis logic at each depth d < D.
+     *
+     * At depth d, a cell min-corner m has centre at (m + span/2) in
+     * fine-grid units.  A quadratic (degree-2) B-spline has support
+     * radius 1.5 * span about this centre, i.e. the point overlaps if
+     *
+     *   |t - (m + span/2)| < 1.5 * span
+     *        => t - 2*span < m < t + span
+     *
+     * For non-integer t, the three aligned solutions are:
+     *   m0 = floor((t - span) / span) * span
+     *   m0, m0 + span, m0 + 2*span.
+     *
+     * We probe these candidates and keep only those whose leaf cell
+     * is actually at the requested depth (a finer leaf may cover the
+     * same region in a refined subtree). */
+    for (std::uint32_t d = hash.max_depth; d-- > 0;) {
+        const std::uint32_t span = 1U << (hash.max_depth - d);
+        const double dspan = static_cast<double>(span);
+
+        /* Base aligned min-corner (fine-grid units). */
+        const auto coarse_base = [&](double t) -> std::int64_t {
+            return static_cast<std::int64_t>(
+                       std::floor((t - dspan) / dspan)) *
+                   static_cast<std::int64_t>(span);
+        };
+
+        const std::int64_t cx0 = coarse_base(tx);
+        const std::int64_t cy0 = coarse_base(ty);
+        const std::int64_t cz0 = coarse_base(tz);
+
+        for (int ox = 0; ox <= 2; ++ox) {
+            for (int oy = 0; oy <= 2; ++oy) {
+                for (int oz = 0; oz <= 2; ++oz) {
+                    const std::int64_t px =
+                        cx0 + static_cast<std::int64_t>(ox) *
+                                  static_cast<std::int64_t>(span);
+                    const std::int64_t py =
+                        cy0 + static_cast<std::int64_t>(oy) *
+                                  static_cast<std::int64_t>(span);
+                    const std::int64_t pz =
+                        cz0 + static_cast<std::int64_t>(oz) *
+                                  static_cast<std::int64_t>(span);
+
+                    if (px < 0 || py < 0 || pz < 0) continue;
+
+                    const std::size_t ci = hash.find_leaf_at(
+                        static_cast<std::uint32_t>(px),
+                        static_cast<std::uint32_t>(py),
+                        static_cast<std::uint32_t>(pz));
+                    if (ci == SIZE_MAX) continue;
+
+                    /* Only accept if this leaf cell really lives at
+                     * the probed depth. */
+                    if (cells[ci].depth != d) continue;
+
+                    const std::int64_t dof = cell_to_dof[ci];
+                    if (dof < 0) continue;
+
+                    /* Duplicate check: points near adaptive
+                     * boundaries may hit the same cell through
+                     * multiple probes and/or multiple depths. */
+                    bool duplicate = false;
+                    for (std::int64_t existing : dof_indices) {
+                        if (existing == dof) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (duplicate) continue;
+
+                    const Vector3d center =
+                        cells[ci].bounds.center();
+                    const Vector3d ext =
+                        cells[ci].bounds.extent();
+                    const double w = ext.x;
+                    const double bval =
+                        bspline3d_evaluate(point, center, w);
+                    if (bval > 0.0) {
+                        dof_indices.push_back(dof);
+                        weights.push_back(bval);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -585,7 +695,9 @@ inline void find_overlapping_dofs(
  * @param hash         Spatial hash of leaf cells.
  * @param cells        Full octree cell array.
  * @param cell_to_dof  Cell-to-DOF mapping.
+ * @param dof_to_cell  DOF-to-cell mapping.
  * @param n_dofs       Total number of DOFs.
+ * @param base_resolution Top-level cells per axis.
  * @param v_field      Output vector field (size n_dofs, zeroed on entry).
  */
 inline void splat_normals(
@@ -595,6 +707,7 @@ inline void splat_normals(
     const PoissonLeafHash &hash,
     const std::vector<OctreeCell> &cells,
     const std::vector<std::int64_t> &cell_to_dof,
+    const std::vector<std::size_t> &dof_to_cell,
     std::size_t n_dofs,
     std::uint32_t base_resolution,
     std::vector<Vector3d> &v_field) {
@@ -613,19 +726,14 @@ inline void splat_normals(
      * face, each sample contributes ~1 to V_j.  To get V_j ~ 1/h,
      * we scale each sample by 1/h = 2^depth / domain_extent.
      *
-     * Since all DOFs are at max_depth, h is the fine cell width.
-     * We approximate 1/h by fine_cells_per_axis / domain_extent,
-     * but since the hash uses normalised coords, we can simply
-     * use hash.inv_cell_size_x (which equals fine_per_axis /
-     * domain_extent_x).  For cubic domains this is 1/h. */
-    (void)n_samples;  /* Not used for weighting. */
-
-    /* Compute 1/h for the fine-grid cell width.  This scales
-     * the normal splatting so that V_j ~ O(1/h), producing an
-     * O(1) indicator function after solving the Poisson system. */
-    /* inv_cell_size_x = fine_per_axis / domain_extent_x = 1/h for
-     * cubic domains at the leaf resolution. */
-    const double inv_h = hash.inv_cell_size_x;
+     * In the adaptive, multi-depth setting, different DOFs live on
+     * different cell widths h_j.  We therefore apply the 1/h scaling
+     * **per DOF** using that DOF's associated cell width.
+     *
+     * This matches the intuition that finer DOFs (smaller h) should
+     * receive proportionally larger splat magnitudes so that the
+     * reconstructed indicator function remains O(1) across levels
+     * (SGP06 Sec 3.1; PoissonRecon). */
 
     ProgressBar progress("Splatting normals", n_samples);
 
@@ -637,22 +745,27 @@ inline void splat_normals(
      * or thread-local buffers with reduction. */
     std::vector<std::int64_t> dof_indices;
     std::vector<double> bweights;
-    dof_indices.reserve(27);
-    bweights.reserve(27);
+     const std::size_t max_per_sample =
+         27ULL * (static_cast<std::size_t>(hash.max_depth) + 1ULL);
+     dof_indices.reserve(max_per_sample);
+     bweights.reserve(max_per_sample);
 
     for (std::size_t s = 0; s < n_samples; ++s) {
         find_overlapping_dofs(positions[s], hash, cells,
                               cell_to_dof, dof_indices,
                               bweights, base_resolution);
 
-        for (std::size_t k = 0; k < dof_indices.size(); ++k) {
-            const std::size_t dof =
-                static_cast<std::size_t>(dof_indices[k]);
-            const double w = bweights[k] * inv_h;
-            v_field[dof].x += w * normals[s].x;
-            v_field[dof].y += w * normals[s].y;
-            v_field[dof].z += w * normals[s].z;
-        }
+         for (std::size_t k = 0; k < dof_indices.size(); ++k) {
+             const std::size_t dof =
+                 static_cast<std::size_t>(dof_indices[k]);
+             const std::size_t ci_dof = dof_to_cell[dof];
+             const double h_d =
+                 cells[ci_dof].bounds.extent().x;
+             const double w = bweights[k] / h_d;
+             v_field[dof].x += w * normals[s].x;
+             v_field[dof].y += w * normals[s].y;
+             v_field[dof].z += w * normals[s].z;
+         }
 
         progress.tick();
     }
@@ -685,6 +798,8 @@ inline void splat_normals(
  * @param dof_to_cell       DOF-to-cell mapping.
  * @param stencil_offsets   CSR offsets (size n_dofs + 1).
  * @param stencil_neighbors CSR neighbor DOF indices.
+ * @param stencil_depth_deltas Per-neighbor depth deltas (parallel to
+ *                             stencil_neighbors).
  * @param n_dofs            Number of DOFs.
  * @param rhs               Output RHS vector (size n_dofs).
  */
@@ -695,6 +810,7 @@ inline void compute_rhs(
     const std::vector<std::size_t> &dof_to_cell,
     const std::vector<std::size_t> &stencil_offsets,
     const std::vector<std::int64_t> &stencil_neighbors,
+    const std::vector<int> &stencil_depth_deltas,
     std::size_t n_dofs,
     std::vector<double> &rhs) {
     /* cell_to_dof is part of the shared assembly interface.
@@ -733,32 +849,95 @@ inline void compute_rhs(
             const OctreeCell &cell_j = cells[cj];
             const Vector3d center_j = cell_j.bounds.center();
 
-            const int dx = static_cast<int>(
-                std::round((center_j.x - center_i.x) * inv_h));
-            const int dy = static_cast<int>(
-                std::round((center_j.y - center_i.y) * inv_h));
-            const int dz = static_cast<int>(
-                std::round((center_j.z - center_i.z) * inv_h));
+            /* The stencil provides a depth-delta per neighbor entry.
+             * This tells us which analytic table to use:
+             *
+             *  - dd =  0 : same-depth cell-cell (CC) integral table.
+             *  - dd = -1 : neighbor j is coarser (parent of i).
+             *  - dd = +1 : neighbor j is finer (child of i).
+             *
+             * See Phase 21a/21d notes and the PoissonRecon repo for
+             * the corresponding parent-child (PC) integral tables. */
+            const int depth_delta = stencil_depth_deltas[k];
 
-            /* Quadratic B-spline overlaps extend out to ±2 cells
-             * in each axis. Neighbors outside this range have zero
-             * contribution by construction of the 1-D tables. */
-            if (dx < -2 || dx > 2 ||
-                dy < -2 || dy > 2 ||
-                dz < -2 || dz > 2) {
+            Vector3d G{0.0, 0.0, 0.0};
+            if (depth_delta == 0) {
+                /* Same-depth: integer offsets in h_i units. */
+                const int dx = static_cast<int>(
+                    std::round((center_j.x - center_i.x) * inv_h));
+                const int dy = static_cast<int>(
+                    std::round((center_j.y - center_i.y) * inv_h));
+                const int dz = static_cast<int>(
+                    std::round((center_j.z - center_i.z) * inv_h));
+
+                /* Quadratic B-spline overlaps extend out to ±2 cells
+                 * in each axis at the same depth. */
+                if (dx < -2 || dx > 2 ||
+                    dy < -2 || dy > 2 ||
+                    dz < -2 || dz > 2) {
+                    continue;
+                }
+                G = gradient_inner_product(dx, dy, dz, h_i);
+            } else if (depth_delta == -1) {
+                /* Neighbor j is coarser (parent). i is child.
+                 *
+                 * Offsets are computed in child-width (h_i) units.
+                 * Parent-child overlap extends to ±4 in each axis
+                 * (Phase 21a). */
+                const int dx = static_cast<int>(std::round(
+                    (center_j.x - center_i.x) * inv_h));
+                const int dy = static_cast<int>(std::round(
+                    (center_j.y - center_i.y) * inv_h));
+                const int dz = static_cast<int>(std::round(
+                    (center_j.z - center_i.z) * inv_h));
+                if (dx < -4 || dx > 4 ||
+                    dy < -4 || dy > 4 ||
+                    dz < -4 || dz > 4) {
+                    continue;
+                }
+
+                /* We need G_ij = int B_j(parent) * grad B_i(child).
+                 * Our PC tables are stored as "gradient on parent,
+                 * value on child".  By integration by parts, the
+                 * "gradient on child" version is the negative of the
+                 * parent-gradient version, and the physical scaling is
+                 * (h_i^2 / 2) for child width h_i. */
+                const Vector3d Gpc = pc_gradient_inner_product(
+                    -dx, -dy, -dz);
+                const double scale = -(h_i * h_i * 0.5);
+                G = {Gpc.x * scale, Gpc.y * scale, Gpc.z * scale};
+            } else if (depth_delta == 1) {
+                /* Neighbor j is finer (child). i is coarser (parent).
+                 *
+                 * For PC integrals, offsets are always expressed in
+                 * child-width units.  Here, the relevant child width
+                 * is h_j (the neighbor's width). */
+                const double h_j =
+                    cells[cj].bounds.extent().x;
+                const double inv_hj = 1.0 / h_j;
+                const int dx = static_cast<int>(std::round(
+                    (center_j.x - center_i.x) * inv_hj));
+                const int dy = static_cast<int>(std::round(
+                    (center_j.y - center_i.y) * inv_hj));
+                const int dz = static_cast<int>(std::round(
+                    (center_j.z - center_i.z) * inv_hj));
+                if (dx < -4 || dx > 4 ||
+                    dy < -4 || dy > 4 ||
+                    dz < -4 || dz > 4) {
+                    continue;
+                }
+                const Vector3d Gpc =
+                    pc_gradient_inner_product(dx, dy, dz);
+                const double scale = h_j * h_j * 0.5;
+                G = {Gpc.x * scale, Gpc.y * scale, Gpc.z * scale};
+            } else {
+                /* Defensive guard: with 2:1 balancing we expect
+                 * depth_delta in {-1, 0, +1}. */
                 continue;
             }
 
             const Vector3d &Vj = v_field[
                 static_cast<std::size_t>(j_dof)];
-
-            /* \f$\vec{G}_{ij}\f$ is a vector-valued inner product.
-             * Accumulate \f$\vec{V}_j\cdot\vec{G}_{ij}\f$.
-             *
-             * The returned G already includes the \f$h^2\f$ scaling
-             * from the Jacobian and chain rule. */
-            const Vector3d G =
-                gradient_inner_product(dx, dy, dz, h_i);
             accum += Vj.x * G.x + Vj.y * G.y + Vj.z * G.z;
         }
 

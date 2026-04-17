@@ -192,6 +192,10 @@ struct ScreeningData {
  * @param hash           Spatial hash of leaf cells.
  * @param cells          Full octree cell array.
  * @param cell_to_dof    Cell-to-DOF mapping.
+ * @param dof_to_cell    DOF-to-cell mapping (not currently needed
+ *                        for screening depth lookup, but included
+ *                        to keep the assembly interface consistent
+ *                        with other multi-depth operators).
  * @param n_dofs         Total number of DOFs.
  * @param base_resolution Top-level cells per axis.
  * @param screening      Output screening data.
@@ -203,9 +207,11 @@ inline void accumulate_screening(
     const PoissonLeafHash &hash,
     const std::vector<OctreeCell> &cells,
     const std::vector<std::int64_t> &cell_to_dof,
+    const std::vector<std::size_t> &dof_to_cell,
     std::size_t n_dofs,
     std::uint32_t base_resolution,
     ScreeningData &screening) {
+    (void)dof_to_cell;
     /* We accumulate screening into per-DOF neighbor lists.
      *
      * For degree-2, a point overlaps at most 27 DOFs. Across many
@@ -246,37 +252,40 @@ inline void accumulate_screening(
             continue;
         }
 
-        /* Find the depth of the containing cell.  We use the
-         * first overlapping DOF's cell depth as a proxy (on a
-         * uniform grid, all cells have the same depth). */
-        const std::size_t first_ci = static_cast<std::size_t>(
-            dof_indices[0]);
-        /* Actually we need the cell index, not the DOF index.
-         * The DOF-to-cell mapping isn't available here, so we
-         * look up from the hash instead.  For the first DOF
-         * found, the cell depth is cells[ci].depth where ci
-         * is the cell containing the point.  Since we have the
-         * dof_indices and the B-spline weights, the depth of
-         * the nearest cell (highest weight) is a good proxy.
-         * On a uniform grid all depths are equal. */
-        /* Simpler: find the cell index for the first DOF by
-         * searching cell_to_dof.  But that's O(N).  Instead,
-         * we'll use a different approach: re-query the hash for
-         * the point itself. */
-        /* Actually the most robust approach: for each DOF in
-         * dof_indices, look up the cell via a reverse search.
-         * But we don't have dof_to_cell here.  Let's just
-         * iterate the cells array to find the cell for the
-         * first DOF.  This is O(n_cells) per sample, which is
-         * too slow.
+        /* Find the depth of the leaf cell containing this sample.
          *
-         * Better: since all cells at max_depth have depth =
-         * max_depth, and uniform grids have constant depth,
-         * we use max_depth as the depth for screening.  On
-         * adaptive grids, a more precise lookup would be needed,
-         * but for Phase 20c we target uniform grids. */
+         * The screening term (ToG13 Sec 4.3) uses a per-sample depth
+         * factor 2^{d_s}, where d_s is the depth at which the sample
+         * is considered.  In PoissonRecon, this is effectively the
+         * depth of the finest cell containing the sample position.
+         *
+         * The hash's find_leaf_at() probes from finest to coarsest,
+         * so it returns the finest leaf that covers the query.
+         * (If the point is outside the domain due to numerical
+         * roundoff, we fall back to max_depth.) */
+        const double sx_q =
+            (positions[s].x - hash.domain_min.x) *
+            hash.inv_cell_size_x;
+        const double sy_q =
+            (positions[s].y - hash.domain_min.y) *
+            hash.inv_cell_size_y;
+        const double sz_q =
+            (positions[s].z - hash.domain_min.z) *
+            hash.inv_cell_size_z;
+
+        std::size_t sample_ci = SIZE_MAX;
+        if (sx_q >= 0.0 && sy_q >= 0.0 && sz_q >= 0.0) {
+            sample_ci = hash.find_leaf_at(
+                static_cast<std::uint32_t>(sx_q + 0.5),
+                static_cast<std::uint32_t>(sy_q + 0.5),
+                static_cast<std::uint32_t>(sz_q + 0.5));
+        }
+        const std::uint32_t sample_depth =
+            (sample_ci != SIZE_MAX)
+                ? cells[sample_ci].depth
+                : hash.max_depth;
         const double depth_factor = static_cast<double>(
-            1U << hash.max_depth);
+            1U << sample_depth);
         const double scale = alpha * depth_factor;
 
         /* Accumulate S_ij for all 27×27 pairs (i, j) in the
