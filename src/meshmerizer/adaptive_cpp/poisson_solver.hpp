@@ -486,6 +486,506 @@ inline SolverResult solve_pcg(
     return result;
 }
 
+/* ===================================================================
+ * Section 5: Cascadic depth-by-depth solver (ToG13 Algorithm 1)
+ * =================================================================== */
+
+/**
+ * @brief Apply the same-depth-only operator block A_dd.
+ *
+ * This helper applies the restriction of the full screened Poisson
+ * operator A = L + S to a single octree depth d (a contiguous DOF
+ * range [dof_begin, dof_end)).  The resulting local mat-vec is:
+ *
+ *   (A_dd x_d)[i] = sum_{j in depth d} L_ij x_d[j]
+ *                + S_ii x_d[i]
+ *                + sum_{j in depth d} S_ij x_d[j]
+ *
+ * where we keep:
+ * - Laplacian stencil entries with depth_delta == 0 (same depth), and
+ * - screening entries whose neighbor DOF j is also in [dof_begin, dof_end).
+ *
+ * Cross-depth couplings (parent-child Laplacian and screening between
+ * depths) are *intentionally omitted* here; in the cascadic solver
+ * (Kazhdan & Hoppe, ToG13, Algorithm 1) they are handled by moving
+ * already-solved coarser contributions to the right-hand side.
+ *
+ * @note This must mirror apply_operator() for the retained entries.
+ *
+ * @par References
+ * - Kazhdan, M. & Hoppe, H. (2013). Screened Poisson Surface
+ *   Reconstruction. ACM Trans. Graph. (ToG13), Algorithm 1.
+ * - Kazhdan, M., Bolitho, M. & Hoppe, H. (2006). Poisson Surface
+ *   Reconstruction. SGP06.
+ * - PoissonRecon reference implementation:
+ *   https://github.com/mkazhdan/PoissonRecon
+ */
+inline void apply_operator_depth(
+    const std::vector<double> &x_local,
+    const std::vector<OctreeCell> &cells,
+    const std::vector<std::int64_t> &cell_to_dof,
+    const std::vector<std::size_t> &dof_to_cell,
+    const std::vector<std::size_t> &stencil_offsets,
+    const std::vector<std::int64_t> &stencil_neighbors,
+    const std::vector<int> &stencil_depth_deltas,
+    const ScreeningData &screening,
+    std::size_t dof_begin,
+    std::size_t dof_end,
+    std::vector<double> &result_local) {
+
+    /* cell_to_dof is part of the standard operator signature even
+     * though the current mat-vec only needs dof_to_cell. */
+    (void)cell_to_dof;
+
+    const std::size_t n_local = dof_end - dof_begin;
+    result_local.assign(n_local, 0.0);
+
+    for (std::size_t i_global = dof_begin; i_global < dof_end; ++i_global) {
+        const std::size_t i_local = i_global - dof_begin;
+
+        const std::size_t ci = dof_to_cell[i_global];
+        const OctreeCell &cell_i = cells[ci];
+        const Vector3d center_i = cell_i.bounds.center();
+        const double h_i = cell_i.bounds.extent().x;
+
+        double accum = 0.0;
+
+        /* ---- Laplacian part (same depth only) ----
+         *
+         * We keep only stencil entries with depth_delta == 0 and with
+         * the neighbour DOF also inside the local range.
+         *
+         * This is the A_dd block in ToG13's cascadic solver: it is the
+         * operator induced by basis functions at a fixed depth.
+         */
+        const std::size_t start = stencil_offsets[i_global];
+        const std::size_t end = stencil_offsets[i_global + 1];
+
+        for (std::size_t k = start; k < end; ++k) {
+            if (stencil_depth_deltas[k] != 0) {
+                /* Parent-child coupling is not part of A_dd. */
+                continue;
+            }
+
+            const std::int64_t j_dof = stencil_neighbors[k];
+            if (j_dof < 0) continue;
+            const std::size_t j_global = static_cast<std::size_t>(j_dof);
+
+            /* Restrict to same-depth unknowns. */
+            if (j_global < dof_begin || j_global >= dof_end) {
+                continue;
+            }
+            const std::size_t j_local = j_global - dof_begin;
+
+            const std::size_t cj = dof_to_cell[j_global];
+            const OctreeCell &cell_j = cells[cj];
+            const Vector3d center_j = cell_j.bounds.center();
+
+            /* Same-depth overlap for degree-2 B-splines is ±2 cell
+             * widths per axis (5^3 stencil). */
+            const double inv_h = 1.0 / h_i;
+            const int dx = static_cast<int>(
+                std::round((center_j.x - center_i.x) * inv_h));
+            const int dy = static_cast<int>(
+                std::round((center_j.y - center_i.y) * inv_h));
+            const int dz = static_cast<int>(
+                std::round((center_j.z - center_i.z) * inv_h));
+            if (dx < -2 || dx > 2 || dy < -2 || dy > 2 || dz < -2 ||
+                dz > 2) {
+                continue;
+            }
+
+            const double L_ij =
+                laplacian_stencil_weight(dx, dy, dz, h_i);
+            accum += L_ij * x_local[j_local];
+        }
+
+        /* ---- Screening diagonal ----
+         *
+         * The screening diagonal S_ii is depth-local by definition.
+         */
+        accum += screening.diagonal[i_global] * x_local[i_local];
+
+        /* ---- Screening off-diagonal (restricted) ----
+         *
+         * The screening neighbor list can include cross-depth pairs.
+         * For A_dd, we retain only neighbours also in the local range.
+         */
+        const std::size_t s_start = screening.offsets[i_global];
+        const std::size_t s_end = screening.offsets[i_global + 1];
+        for (std::size_t k = s_start; k < s_end; ++k) {
+            const std::int64_t j_dof = screening.neighbors[k];
+            if (j_dof < 0) continue;
+            const std::size_t j_global = static_cast<std::size_t>(j_dof);
+            if (j_global < dof_begin || j_global >= dof_end) {
+                continue;
+            }
+            const std::size_t j_local = j_global - dof_begin;
+            accum += screening.weights[k] * x_local[j_local];
+        }
+
+        result_local[i_local] = accum;
+    }
+}
+
+/**
+ * @brief Cascadic depth-by-depth solve for adaptive octrees.
+ *
+ * This implements the depth-by-depth cascadic solver recommended in
+ * Kazhdan & Hoppe (ToG13, Algorithm 1) for adaptive Poisson surface
+ * reconstruction.
+ *
+ * The key idea is to avoid solving the full multi-depth system in one
+ * go.  Instead, we iterate depths d = 0..max_depth and at each depth:
+ *
+ *  1. Treat already-solved coarser unknowns (depth < d) as fixed
+ *     constraints, moving their contribution A_{i,<d} x_{<d} to the
+ *     right-hand side.
+ *  2. Solve the restricted same-depth system A_dd x_d = rhs_eff using
+ *     PCG, where A_dd includes:
+ *       - same-depth Laplacian stencil (depth_delta == 0)
+ *       - screening diagonal and same-depth screening off-diagonal.
+ *
+ * This produces a good initialisation for finer levels and matches the
+ * cascadic scheme used in PoissonRecon for adaptive octrees.
+ *
+ * @par References
+ * - Kazhdan, M. & Hoppe, H. (2013). Screened Poisson Surface
+ *   Reconstruction. ACM Trans. Graph. (ToG13), Algorithm 1.
+ * - PoissonRecon reference implementation:
+ *   https://github.com/mkazhdan/PoissonRecon
+ */
+inline SolverResult solve_cascadic(
+    const std::vector<double> &b,
+    const std::vector<OctreeCell> &cells,
+    const std::vector<std::int64_t> &cell_to_dof,
+    const std::vector<std::size_t> &dof_to_cell,
+    const std::vector<std::size_t> &stencil_offsets,
+    const std::vector<std::int64_t> &stencil_neighbors,
+    const std::vector<int> &stencil_depth_deltas,
+    const ScreeningData &screening,
+    const std::vector<std::int64_t> &depth_dof_start,
+    std::uint32_t max_depth,
+    std::size_t n_dofs,
+    std::size_t max_iters_per_depth,
+    double tol,
+    std::vector<double> &x) {
+
+    SolverResult result = {0, 0.0, true};
+
+    if (n_dofs == 0) {
+        /* Degenerate case: empty system. */
+        x.clear();
+        result.residual_norm = 0.0;
+        result.converged = true;
+        return result;
+    }
+
+    /* Ensure x has the correct size. We do not overwrite the existing
+     * contents, so callers may provide an initial guess (typically the
+     * cascadic scheme uses x=0 at start). */
+    if (x.size() != n_dofs) {
+        x.assign(n_dofs, 0.0);
+    }
+
+    /* --------------------------------------------------------------
+     * Depth-by-depth loop.
+     *
+     * depth_dof_start has size max_depth+2, and provides contiguous
+     * DOF ranges by depth:
+     *   [depth_dof_start[d], depth_dof_start[d+1])
+     *
+     * This ordering is required for the cascadic algorithm.
+     * -------------------------------------------------------------- */
+    for (std::uint32_t d = 0U; d <= max_depth; ++d) {
+        const std::size_t dof_begin = static_cast<std::size_t>(
+            depth_dof_start[static_cast<std::size_t>(d)]);
+        const std::size_t dof_end = static_cast<std::size_t>(
+            depth_dof_start[static_cast<std::size_t>(d + 1U)]);
+
+        if (dof_begin >= dof_end) {
+            /* No unknowns at this depth. */
+            continue;
+        }
+
+        const std::size_t n_local = dof_end - dof_begin;
+
+        /* Depth-0 typically has only a handful of DOFs (1-8 in many
+         * reconstructions).  We can afford a tighter tolerance here to
+         * reduce error propagation to finer levels (ToG13's cascadic
+         * scheme relies on accurate coarse solutions). */
+        const double tol_d = (d == 0U && tol > 1e-12) ? 1e-12 : tol;
+
+        /* ----------------------------------------------------------
+         * Step 1: Compute coarser-depth constraint term.
+         *
+         * For each i at depth d, compute:
+         *   constraint[i] = sum_{j depth < d} A_ij * x[j]
+         *
+         * This uses:
+         * - cross-depth Laplacian entries (parent-child couplings), and
+         * - screening off-diagonal entries to already-solved DOFs.
+         *
+         * These contributions are then subtracted from b to form the
+         * effective RHS for the depth-d restricted solve.
+         * ---------------------------------------------------------- */
+        std::vector<double> rhs_eff(n_local, 0.0);
+        for (std::size_t i_global = dof_begin; i_global < dof_end;
+             ++i_global) {
+            const std::size_t i_local = i_global - dof_begin;
+
+            const std::size_t ci = dof_to_cell[i_global];
+            const OctreeCell &cell_i = cells[ci];
+            const Vector3d center_i = cell_i.bounds.center();
+            const double h_i = cell_i.bounds.extent().x;
+
+            double constraint = 0.0;
+
+            /* ---- Cross-depth Laplacian couplings ----
+             *
+             * We iterate the full CSR stencil for i, but keep only
+             * entries with depth_delta != 0 and with neighbour depth
+             * strictly smaller than d (already solved).
+             */
+            const std::size_t start = stencil_offsets[i_global];
+            const std::size_t end = stencil_offsets[i_global + 1];
+
+            for (std::size_t k = start; k < end; ++k) {
+                if (stencil_depth_deltas[k] == 0) {
+                    /* Same-depth terms belong to A_dd. */
+                    continue;
+                }
+
+                const std::int64_t j_dof = stencil_neighbors[k];
+                if (j_dof < 0) continue;
+                const std::size_t j_global =
+                    static_cast<std::size_t>(j_dof);
+
+                const std::size_t cj = dof_to_cell[j_global];
+                const OctreeCell &cell_j = cells[cj];
+
+                /* Only move contributions from already-solved DOFs. */
+                if (cell_j.depth >= d) {
+                    continue;
+                }
+
+                const Vector3d center_j = cell_j.bounds.center();
+
+                /* The Laplacian coupling weight must match
+                 * apply_operator() exactly for symmetry/consistency.
+                 * (ToG13; PoissonRecon BSplineData.inl) */
+                const int depth_delta = stencil_depth_deltas[k];
+
+                double L_ij;
+                if (depth_delta == -1) {
+                    /* Neighbour j is coarser (parent of i).
+                     *
+                     * Offset is measured in child-width units:
+                     *   (center_j - center_i) / h_i
+                     * and the table expects parent->child, so we flip
+                     * sign (see apply_operator()). */
+                    const double inv_h = 1.0 / h_i;
+                    const int dx = static_cast<int>(
+                        std::round((center_j.x - center_i.x) * inv_h));
+                    const int dy = static_cast<int>(
+                        std::round((center_j.y - center_i.y) * inv_h));
+                    const int dz = static_cast<int>(
+                        std::round((center_j.z - center_i.z) * inv_h));
+                    if (dx < -4 || dx > 4 || dy < -4 || dy > 4 ||
+                        dz < -4 || dz > 4) {
+                        continue;
+                    }
+                    const double raw = pc_laplacian_stencil_weight(
+                        -dx, -dy, -dz);
+                    L_ij = raw / (2.0 * h_i);
+                } else {
+                    /* depth_delta == +1 (neighbour is finer) cannot be
+                     * a coarser-depth constraint for the current depth,
+                     * but we keep the general form for completeness.
+                     */
+                    const double h_j = cell_j.bounds.extent().x;
+                    const double inv_hj = 1.0 / h_j;
+                    const int dx = static_cast<int>(
+                        std::round((center_j.x - center_i.x) * inv_hj));
+                    const int dy = static_cast<int>(
+                        std::round((center_j.y - center_i.y) * inv_hj));
+                    const int dz = static_cast<int>(
+                        std::round((center_j.z - center_i.z) * inv_hj));
+                    if (dx < -4 || dx > 4 || dy < -4 || dy > 4 ||
+                        dz < -4 || dz > 4) {
+                        continue;
+                    }
+                    const double raw = pc_laplacian_stencil_weight(
+                        dx, dy, dz);
+                    L_ij = raw / (2.0 * h_j);
+                }
+
+                constraint += L_ij * x[j_global];
+            }
+
+            /* ---- Screening cross-depth couplings ----
+             *
+             * Screening is assembled as a sparse mass-like term and can
+             * couple DOFs across depths (via overlapping B-spline
+             * supports).  We treat already-solved coarser neighbours as
+             * fixed and move them to the RHS.
+             */
+            const std::size_t s_start = screening.offsets[i_global];
+            const std::size_t s_end = screening.offsets[i_global + 1];
+            for (std::size_t k = s_start; k < s_end; ++k) {
+                const std::int64_t j_dof = screening.neighbors[k];
+                if (j_dof < 0) continue;
+                const std::size_t j_global =
+                    static_cast<std::size_t>(j_dof);
+
+                const std::size_t cj = dof_to_cell[j_global];
+                if (cells[cj].depth >= d) {
+                    continue;
+                }
+                constraint += screening.weights[k] * x[j_global];
+            }
+
+            /* Step 2: Effective RHS for depth d. */
+            rhs_eff[i_local] = b[i_global] - constraint;
+        }
+
+        /* ----------------------------------------------------------
+         * Step 3: Solve the same-depth system A_dd x_d = rhs_eff.
+         *
+         * We use a local PCG solve with a Jacobi preconditioner.
+         * The mat-vec is the restricted apply_operator_depth().
+         *
+         * This is the depth-local PCG inner loop of ToG13 Algorithm 1.
+         * ---------------------------------------------------------- */
+        std::vector<double> x_local(n_local, 0.0);
+        for (std::size_t i_local = 0; i_local < n_local; ++i_local) {
+            x_local[i_local] = x[dof_begin + i_local];
+        }
+
+        /* Build the Jacobi diagonal for A_dd.
+         *
+         * The Laplacian diagonal is L(0,0,0,h_i) and the screening
+         * diagonal is stored in screening.diagonal[i].
+         */
+        std::vector<double> diag_local(n_local, 0.0);
+        for (std::size_t i_global = dof_begin; i_global < dof_end;
+             ++i_global) {
+            const std::size_t i_local = i_global - dof_begin;
+            const std::size_t ci = dof_to_cell[i_global];
+            const double h = cells[ci].bounds.extent().x;
+            diag_local[i_local] =
+                laplacian_stencil_weight(0, 0, 0, h) +
+                screening.diagonal[i_global];
+        }
+
+        /* Initial residual r = rhs_eff - A_dd * x_local. */
+        std::vector<double> Ax_local;
+        apply_operator_depth(x_local, cells, cell_to_dof, dof_to_cell,
+                             stencil_offsets, stencil_neighbors,
+                             stencil_depth_deltas, screening,
+                             dof_begin, dof_end, Ax_local);
+
+        std::vector<double> r_local(n_local, 0.0);
+        for (std::size_t i = 0; i < n_local; ++i) {
+            r_local[i] = rhs_eff[i] - Ax_local[i];
+        }
+
+        const double rhs_norm = vec_norm(rhs_eff, n_local);
+        const double abs_tol =
+            (rhs_norm > 1e-30) ? tol_d * rhs_norm : tol_d;
+
+        double r_norm = vec_norm(r_local, n_local);
+        if (r_norm >= abs_tol && max_iters_per_depth > 0) {
+            /* Preconditioned residual z = M^{-1} r. */
+            std::vector<double> z_local;
+            apply_jacobi(r_local, diag_local, z_local, n_local);
+
+            /* Search direction p = z. */
+            std::vector<double> p_local = z_local;
+            double rz = vec_dot(r_local, z_local, n_local);
+
+            std::vector<double> q_local;
+
+            bool depth_converged = false;
+            for (std::size_t iter = 0; iter < max_iters_per_depth; ++iter) {
+                /* q = A_dd * p. */
+                apply_operator_depth(p_local, cells, cell_to_dof,
+                                     dof_to_cell, stencil_offsets,
+                                     stencil_neighbors,
+                                     stencil_depth_deltas, screening,
+                                     dof_begin, dof_end, q_local);
+
+                /* alpha = (r·z) / (p·q). */
+                const double pq = vec_dot(p_local, q_local, n_local);
+                if (std::abs(pq) < 1e-30) {
+                    /* Numerical breakdown (should be rare for SPD). */
+                    break;
+                }
+                const double alpha = rz / pq;
+
+                /* x += alpha * p. */
+                vec_axpy(x_local, alpha, p_local, n_local);
+
+                /* r -= alpha * q. */
+                vec_axpy(r_local, -alpha, q_local, n_local);
+
+                r_norm = vec_norm(r_local, n_local);
+                result.iterations += 1;
+                if (r_norm < abs_tol) {
+                    depth_converged = true;
+                    break;
+                }
+
+                /* z = M^{-1} r. */
+                apply_jacobi(r_local, diag_local, z_local, n_local);
+
+                /* beta = (r·z_new) / (r·z_old). */
+                const double rz_new = vec_dot(r_local, z_local, n_local);
+                const double beta =
+                    (std::abs(rz) > 1e-30) ? rz_new / rz : 0.0;
+
+                /* p = z + beta * p. */
+                for (std::size_t i = 0; i < n_local; ++i) {
+                    p_local[i] = z_local[i] + beta * p_local[i];
+                }
+                rz = rz_new;
+            }
+
+            if (!depth_converged) {
+                /* We keep going even if one depth fails to converge,
+                 * but we report the overall solve as non-converged.
+                 * (ToG13 recommends cascadic iterations; Phase 21f
+                 * implements a single pass depth-by-depth.) */
+                result.converged = false;
+            }
+        }
+
+        /* Write back the solved depth-d values into the global x. */
+        for (std::size_t i_local = 0; i_local < n_local; ++i_local) {
+            x[dof_begin + i_local] = x_local[i_local];
+        }
+    }
+
+    /* --------------------------------------------------------------
+     * Report a global residual norm for the final x.
+     *
+     * Even though we solved per-depth blocks, users care about the
+     * residual of the full operator A.
+     * -------------------------------------------------------------- */
+    std::vector<double> Ax;
+    apply_operator(x, cells, cell_to_dof, dof_to_cell, stencil_offsets,
+                   stencil_neighbors, stencil_depth_deltas, screening,
+                   n_dofs, Ax);
+
+    std::vector<double> r;
+    compute_residual(Ax, b, r, n_dofs);
+    const double b_norm = vec_norm(b, n_dofs);
+    const double r_global_norm = vec_norm(r, n_dofs);
+    result.residual_norm = r_global_norm / (b_norm + 1e-30);
+
+    return result;
+}
+
 /**
  * @brief High-level solve: builds operator and solves Ax = b.
  *
