@@ -172,37 +172,71 @@ def _load_particles_for_adaptive(args):
     return positions, smoothing_lengths, domain_min, domain_max, origin
 
 
-def _visualize_vertices(vert_positions) -> None:
-    """Open a 3D scatter plot of QEF vertex positions.
+def _visualize_vertices(vert_positions, output_path: str) -> None:
+    """Save a 6-panel figure showing QEF vertices from each face.
+
+    Each panel is a 2D scatter plot of the vertex positions
+    projected along one of the six axis-aligned directions
+    (+X, -X, +Y, -Y, +Z, -Z), giving a complete view of the
+    vertex distribution from every side of the bounding box.
+    All panels use equal aspect ratio so the geometry is not
+    distorted.
 
     Args:
         vert_positions: (N, 3) float64 array of vertex positions.
+        output_path: File path to save the figure to (e.g.
+            ``"qef_vertices.png"``).
     """
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         print(
-            "Error: matplotlib is required for --visualize. "
+            "Error: matplotlib is required for --visualise-verts. "
             "Install it with: pip install matplotlib",
             file=sys.stderr,
         )
         return
 
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.scatter(
-        vert_positions[:, 0],
-        vert_positions[:, 1],
-        vert_positions[:, 2],
-        s=1,
-        alpha=0.6,
+    # Define the six face views.  Each entry is:
+    #   (title, horizontal_axis_index, vertical_axis_index,
+    #    horizontal_label, vertical_label)
+    # The axis indices select columns from the Nx3 positions array.
+    views = [
+        ("+X face (Y-Z)", 1, 2, "Y", "Z"),
+        ("-X face (Y-Z)", 1, 2, "Y", "Z"),
+        ("+Y face (X-Z)", 0, 2, "X", "Z"),
+        ("-Y face (X-Z)", 0, 2, "X", "Z"),
+        ("+Z face (X-Y)", 0, 1, "X", "Y"),
+        ("-Z face (X-Y)", 0, 1, "X", "Y"),
+    ]
+
+    n_pts = len(vert_positions)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle(
+        f"QEF Vertices ({n_pts:,} points)",
+        fontsize=14,
+        fontweight="bold",
     )
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-    ax.set_title(f"QEF Vertices ({len(vert_positions)} points)")
+
+    for ax, (title, hi, vi, hlabel, vlabel) in zip(axes.flat, views):
+        ax.scatter(
+            vert_positions[:, hi],
+            vert_positions[:, vi],
+            s=0.5,
+            alpha=0.4,
+            color="C0",
+            edgecolors="none",
+            rasterized=True,
+        )
+        ax.set_xlabel(hlabel)
+        ax.set_ylabel(vlabel)
+        ax.set_title(title)
+        ax.set_aspect("equal")
+
     plt.tight_layout()
-    plt.show()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved vertex visualisation to {output_path}")
 
 
 def run_adaptive(args) -> None:
@@ -448,9 +482,9 @@ def run_adaptive(args) -> None:
         f"Solved {n_verts} QEF vertices.",
     )
 
-    # Optionally visualize QEF vertices as a 3D scatter plot.
-    if getattr(args, "visualise_verts", False):
-        _visualize_vertices(vert_positions)
+    # Optionally save a 6-panel vertex visualisation figure.
+    if getattr(args, "visualise_verts", None):
+        _visualize_vertices(vert_positions, args.visualise_verts)
 
     if n_verts == 0:
         print(
@@ -461,28 +495,33 @@ def run_adaptive(args) -> None:
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # Step 5: FOF clustering + Poisson surface reconstruction.
+    # Step 5: Optional FOF clustering + Poisson surface reconstruction.
     # ------------------------------------------------------------------
     poisson_depth = args.poisson_depth if args.poisson_depth is not None else 9
 
-    # Cluster QEF vertices into distinct objects.
-    log_status(
-        "Clustering",
-        f"Running FOF clustering (linking_factor={args.linking_factor})...",
-    )
-    cluster_start = time.perf_counter()
-    group_labels = fof_cluster(
-        vert_positions,
-        domain_min,
-        domain_max,
-        args.linking_factor,
-    )
-    n_groups = len(set(group_labels.tolist()))
-    record_elapsed("FOF clustering", cluster_start, operation="Clustering")
-    log_status(
-        "Clustering",
-        f"Found {n_groups} group(s).",
-    )
+    if getattr(args, "fof", False):
+        # Cluster QEF vertices into distinct objects.
+        log_status(
+            "Clustering",
+            f"Running FOF clustering "
+            f"(linking_factor={args.linking_factor})...",
+        )
+        cluster_start = time.perf_counter()
+        group_labels = fof_cluster(
+            vert_positions,
+            domain_min,
+            domain_max,
+            args.linking_factor,
+        )
+        n_groups = len(set(group_labels.tolist()))
+        record_elapsed("FOF clustering", cluster_start, operation="Clustering")
+        log_status(
+            "Clustering",
+            f"Found {n_groups} group(s).",
+        )
+    else:
+        # Single group — treat all vertices as one object.
+        group_labels = np.zeros(len(vert_positions), dtype=np.int64)
 
     # Run Poisson reconstruction per group and merge.
     log_status(

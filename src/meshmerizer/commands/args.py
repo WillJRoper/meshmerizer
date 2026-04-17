@@ -198,13 +198,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     adaptive.add_argument(
+        "--fof",
+        action="store_true",
+        help=(
+            "Run Friends-of-Friends clustering before Poisson "
+            "reconstruction.  Required when the scene contains "
+            "multiple distinct objects to prevent thin bridges "
+            "between them.  Off by default for single-object "
+            "scenes."
+        ),
+    )
+    adaptive.add_argument(
         "--linking-factor",
         type=float,
         default=1.5,
         help=(
             "FOF linking factor: multiplier on mean inter-point "
             "separation for clustering vertices into distinct "
-            "objects. Default: 1.5"
+            "objects.  Only used when --fof is set. Default: 1.5"
         ),
     )
     adaptive.add_argument(
@@ -250,10 +261,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     adaptive.add_argument(
         "--visualise-verts",
-        action="store_true",
+        nargs="?",
+        const="qef_vertices.png",
+        default=None,
+        metavar="PATH",
         help=(
-            "Open a 3D scatter plot of QEF vertices after meshing "
-            "(requires matplotlib)."
+            "Save a 6-panel figure of QEF vertex projections "
+            "(one per face of the bounding box). Optionally "
+            "provide an output path; defaults to "
+            "'qef_vertices.png'."
         ),
     )
     adaptive.add_argument(
