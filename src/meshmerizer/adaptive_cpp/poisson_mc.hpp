@@ -552,8 +552,10 @@ inline double evaluate_chi_at_point(
  *        boundary cells to close the mesh.
  *
  * For each max_depth leaf, we evaluate chi(p) = sum_j x_j B_j(p) at
- * the 8 cube corners.  A global corner cache ensures shared corners
- * produce identical values.
+ * the 8 cube corners.  The multi-depth find_overlapping_dofs (Phase
+ * 21d) ensures chi sums B-spline contributions from DOFs at ALL
+ * depths, not just max_depth.  A global corner cache ensures shared
+ * corners produce identical values.
  *
  * After evaluating real leaves, we identify boundary faces -- faces
  * of max_depth leaves where the neighbor is a coarser cell (or domain
