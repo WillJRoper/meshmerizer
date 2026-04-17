@@ -25,15 +25,15 @@ def poisson_reconstruct_group(
     positions: np.ndarray,
     normals: np.ndarray,
     poisson_depth: int = 9,
-    density_quantile: float = 0.02,
+    density_quantile: float = 0.0,
     scale: float = 1.2,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct a watertight mesh from oriented points via Poisson.
 
     Constructs an Open3D point cloud from the given positions and
-    normals, runs screened Poisson surface reconstruction, and trims
-    low-density vertices to remove spurious geometry far from the
-    input points.
+    normals, runs screened Poisson surface reconstruction, and
+    optionally trims low-density vertices to remove spurious
+    geometry far from the input points.
 
     Args:
         positions: (N, 3) float64 array of point positions.
@@ -43,11 +43,11 @@ def poisson_reconstruct_group(
             values produce finer detail but take longer.  Typical
             range is 6--12.
         density_quantile: Fraction of lowest-density vertices to
-            remove after reconstruction.  A value of 0.02 discards
-            the bottom 2% of the density distribution, which
-            removes only the thinnest extrapolated membranes
-            without cutting into boundary geometry.  Set to 0.0 to
-            keep everything.
+            remove after reconstruction.  Disabled by default
+            (0.0) because even small values can clip legitimate
+            boundary geometry where points naturally have lower
+            Poisson density.  Set to e.g. 0.02 to trim the bottom
+            2% if spurious membranes are a problem.
         scale: Ratio of the Poisson solver bounding box to the
             input point cloud bounding box.  Values above 1.0 add
             padding so the reconstructed surface is not clipped at
@@ -171,7 +171,7 @@ def poisson_reconstruct(
     normals: np.ndarray,
     group_labels: np.ndarray,
     poisson_depth: int = 9,
-    density_quantile: float = 0.02,
+    density_quantile: float = 0.0,
     scale: float = 1.2,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct meshes for all FOF groups and merge them.

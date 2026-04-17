@@ -190,11 +190,11 @@ def build_parser() -> argparse.ArgumentParser:
     adaptive.add_argument(
         "--density-quantile",
         type=float,
-        default=0.02,
+        default=0.0,
         help=(
             "Fraction of lowest-density vertices to trim after "
-            "Poisson reconstruction. Removes spurious membranes. "
-            "Default: 0.02"
+            "Poisson reconstruction. Disabled by default (0.0). "
+            "Set to e.g. 0.02 to trim spurious membranes."
         ),
     )
     adaptive.add_argument(
