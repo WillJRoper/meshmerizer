@@ -822,3 +822,75 @@ def splat_and_compute_rhs(
         base_resolution,
         max_depth,
     )
+
+
+def laplacian_stencil_weight(
+    dx: int,
+    dy: int,
+    dz: int,
+    h: float,
+) -> float:
+    """Compute the 3-D Laplacian stencil weight for a given offset.
+
+    For degree-1 B-splines, the Laplacian stencil weight at
+    offset (dx, dy, dz) with cell width h is:
+
+        L = h * [K(dx)*M(dy)*M(dz) + M(dx)*K(dy)*M(dz)
+              + M(dx)*M(dy)*K(dz)]
+
+    where K is the 1-D stiffness integral and M is the 1-D mass
+    integral.
+
+    Args:
+        dx: Offset in x (-1, 0, +1).
+        dy: Offset in y (-1, 0, +1).
+        dz: Offset in z (-1, 0, +1).
+        h: Cell width.
+
+    Returns:
+        Stiffness integral value.
+    """
+    return _adaptive.laplacian_stencil_weight(dx, dy, dz, h)
+
+
+def apply_poisson_operator(
+    positions: "numpy.ndarray",
+    cells: list[dict],
+    domain_min: tuple[float, float, float],
+    domain_max: tuple[float, float, float],
+    base_resolution: int,
+    max_depth: int,
+    alpha: float,
+    x: list[float],
+) -> list[float]:
+    """Apply the screened Poisson operator A*x.
+
+    Builds the Laplacian stencil and screening term, then
+    computes A*x = (L + S)*x where L is the Laplacian and
+    S is the point-sampled screening matrix.
+
+    Args:
+        positions: (N, 3) float64 array of sample positions
+            (used for screening accumulation).
+        cells: List of cell dicts.
+        domain_min: Lower corner of the domain.
+        domain_max: Upper corner of the domain.
+        base_resolution: Top-level cells per axis.
+        max_depth: Maximum octree depth.
+        alpha: Screening weight (0.0 for pure Laplacian).
+        x: Input vector (length = n_dofs).
+
+    Returns:
+        List of floats: the result A*x.
+    """
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    return _adaptive.apply_poisson_operator(
+        pos,
+        cells,
+        domain_min,
+        domain_max,
+        base_resolution,
+        max_depth,
+        alpha,
+        x,
+    )

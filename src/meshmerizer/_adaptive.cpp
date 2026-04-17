@@ -34,6 +34,7 @@
 #include "adaptive_cpp/fof.hpp"
 #include "adaptive_cpp/poisson_basis.hpp"
 #include "adaptive_cpp/poisson_rhs.hpp"
+#include "adaptive_cpp/poisson_stencil.hpp"
 #include "adaptive_cpp/qef.hpp"
 
 /**
@@ -2552,6 +2553,175 @@ static PyObject *splat_and_compute_rhs_py(PyObject * /*self*/,
 }
 
 /**
+ * @brief laplacian_stencil_weight(dx, dy, dz, h) -> float
+ *
+ * Returns the 3-D Laplacian stencil weight for offset (dx,dy,dz)
+ * at cell width h.
+ */
+static PyObject *laplacian_stencil_weight_py(PyObject * /*self*/,
+                                             PyObject *args) {
+    int dx, dy, dz;
+    double h;
+    if (!PyArg_ParseTuple(args, "iiid", &dx, &dy, &dz, &h)) {
+        return NULL;
+    }
+    return PyFloat_FromDouble(
+        laplacian_stencil_weight(dx, dy, dz, h));
+}
+
+/**
+ * @brief apply_poisson_operator(positions_arr, cells, domain_min,
+ *            domain_max, base_resolution, max_depth, alpha, x_vec)
+ *        -> list[float]
+ *
+ * Builds the screened Poisson operator (Laplacian + screening)
+ * and applies it to the input vector x.  Returns A * x as a list.
+ *
+ * positions_arr: (N, 3) float64 NumPy array of sample positions
+ *   (used for screening accumulation only).
+ * cells: list of cell dicts.
+ * alpha: screening weight (0.0 for pure Laplacian).
+ * x_vec: list of floats (length = n_dofs).
+ */
+static PyObject *apply_poisson_operator_py(PyObject * /*self*/,
+                                           PyObject *args) {
+    PyObject *pos_obj;
+    PyObject *cells_obj;
+    PyObject *dmin_obj;
+    PyObject *dmax_obj;
+    unsigned int base_resolution;
+    unsigned int max_depth_val;
+    double alpha;
+    PyObject *x_obj;
+    if (!PyArg_ParseTuple(args, "OOOOIIdO",
+                          &pos_obj, &cells_obj,
+                          &dmin_obj, &dmax_obj,
+                          &base_resolution, &max_depth_val,
+                          &alpha, &x_obj)) {
+        return NULL;
+    }
+
+    /* Parse domain. */
+    Vector3d dmin{}, dmax{};
+    if (!parse_vector3d(dmin_obj, dmin)) return NULL;
+    if (!parse_vector3d(dmax_obj, dmax)) return NULL;
+    BoundingBox domain = {dmin, dmax};
+
+    /* Parse positions from NumPy array. */
+    PyArrayObject *pos_arr = reinterpret_cast<PyArrayObject *>(
+        PyArray_FROM_OTF(pos_obj, NPY_DOUBLE,
+                         NPY_ARRAY_IN_ARRAY));
+    if (pos_arr == NULL) return NULL;
+
+    const npy_intp n_samples = PyArray_DIM(pos_arr, 0);
+    const double *pos_data =
+        static_cast<double *>(PyArray_DATA(pos_arr));
+
+    std::vector<Vector3d> positions(
+        static_cast<std::size_t>(n_samples));
+    for (npy_intp i = 0; i < n_samples; ++i) {
+        positions[static_cast<std::size_t>(i)] = {
+            pos_data[i * 3], pos_data[i * 3 + 1],
+            pos_data[i * 3 + 2]};
+    }
+    Py_DECREF(pos_arr);
+
+    /* Parse cells. */
+    PyObject *fast = PySequence_Fast(
+        cells_obj, "expected a sequence of cell dicts");
+    if (fast == NULL) return NULL;
+    const Py_ssize_t nc = PySequence_Fast_GET_SIZE(fast);
+
+    std::vector<OctreeCell> cells(
+        static_cast<std::size_t>(nc));
+    for (Py_ssize_t i = 0; i < nc; ++i) {
+        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
+        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
+        PyObject *depth = PyDict_GetItemString(d, "depth");
+        PyObject *bmin = PyDict_GetItemString(d, "bounds_min");
+        PyObject *bmax = PyDict_GetItemString(d, "bounds_max");
+        PyObject *mkey = PyDict_GetItemString(d, "morton_key");
+        if (!leaf || !depth || !bmin || !bmax || !mkey) {
+            Py_DECREF(fast);
+            PyErr_SetString(PyExc_KeyError,
+                            "cell dict missing required key");
+            return NULL;
+        }
+        auto &c = cells[static_cast<std::size_t>(i)];
+        c.is_leaf = PyObject_IsTrue(leaf) != 0;
+        c.depth = static_cast<std::uint32_t>(
+            PyLong_AsUnsignedLong(depth));
+        if (!parse_vector3d(bmin, c.bounds.min)) {
+            Py_DECREF(fast);
+            return NULL;
+        }
+        if (!parse_vector3d(bmax, c.bounds.max)) {
+            Py_DECREF(fast);
+            return NULL;
+        }
+        c.morton_key = PyLong_AsUnsignedLongLong(mkey);
+    }
+    Py_DECREF(fast);
+
+    /* Build DOF indexing. */
+    std::vector<std::int64_t> cell_to_dof;
+    std::vector<std::size_t> dof_to_cell;
+    assign_dof_indices(cells, cell_to_dof, dof_to_cell);
+    const std::size_t n_dofs = dof_to_cell.size();
+
+    /* Build spatial hash. */
+    PoissonLeafHash hash;
+    hash.build(cells, domain, max_depth_val, base_resolution);
+
+    /* Build stencils. */
+    std::vector<std::size_t> stencil_offsets;
+    std::vector<std::int64_t> stencil_neighbors;
+    enumerate_stencils(cells, cell_to_dof, dof_to_cell,
+                       domain, base_resolution, max_depth_val,
+                       stencil_offsets, stencil_neighbors);
+
+    /* Accumulate screening. */
+    ScreeningData screening;
+    accumulate_screening(positions.data(),
+                         static_cast<std::size_t>(n_samples),
+                         alpha, hash, cells, cell_to_dof,
+                         n_dofs, base_resolution, screening);
+
+    /* Parse input vector x. */
+    PyObject *x_fast = PySequence_Fast(
+        x_obj, "expected a sequence for x");
+    if (x_fast == NULL) return NULL;
+    const Py_ssize_t x_len = PySequence_Fast_GET_SIZE(x_fast);
+    if (static_cast<std::size_t>(x_len) != n_dofs) {
+        Py_DECREF(x_fast);
+        PyErr_SetString(PyExc_ValueError,
+                        "x length must equal n_dofs");
+        return NULL;
+    }
+    std::vector<double> x_vec(n_dofs);
+    for (Py_ssize_t i = 0; i < x_len; ++i) {
+        x_vec[static_cast<std::size_t>(i)] =
+            PyFloat_AsDouble(
+                PySequence_Fast_GET_ITEM(x_fast, i));
+    }
+    Py_DECREF(x_fast);
+
+    /* Apply operator. */
+    std::vector<double> result;
+    apply_operator(x_vec, cells, cell_to_dof, dof_to_cell,
+                   stencil_offsets, stencil_neighbors,
+                   screening, n_dofs, result);
+
+    /* Build result list. */
+    PyObject *out = PyList_New(static_cast<Py_ssize_t>(n_dofs));
+    for (std::size_t i = 0; i < n_dofs; ++i) {
+        PyList_SET_ITEM(out, static_cast<Py_ssize_t>(i),
+                        PyFloat_FromDouble(result[i]));
+    }
+    return out;
+}
+
+/**
  * @brief Python methods exported by the adaptive extension.
  */
 static PyMethodDef adaptive_methods[] = {
@@ -2603,6 +2773,18 @@ static PyMethodDef adaptive_methods[] = {
         splat_and_compute_rhs_py,
         METH_VARARGS,
         PyDoc_STR("Splat normals and compute Poisson RHS."),
+    },
+    {
+        "laplacian_stencil_weight",
+        laplacian_stencil_weight_py,
+        METH_VARARGS,
+        PyDoc_STR("Laplacian stencil weight for offset (dx,dy,dz)."),
+    },
+    {
+        "apply_poisson_operator",
+        apply_poisson_operator_py,
+        METH_VARARGS,
+        PyDoc_STR("Apply screened Poisson operator A*x."),
     },
     {
         "adaptive_status",
