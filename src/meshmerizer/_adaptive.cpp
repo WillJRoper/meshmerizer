@@ -2977,9 +2977,10 @@ static PyObject *extract_poisson_mesh_py(PyObject * /*self*/,
         if (c.is_leaf) ++n_leaves;
     }
     std::vector<std::array<double, 8>> corner_values;
+    std::vector<VirtualCell> virtual_cells;
     evaluate_chi_at_corners(solution, cells, cell_to_dof, hash,
                             base_resolution, max_depth_val, n_leaves,
-                            corner_values);
+                            domain, corner_values, virtual_cells);
 
     /* Step 2: Compute isovalue from sample positions. */
     double isovalue = compute_isovalue(
@@ -2991,9 +2992,9 @@ static PyObject *extract_poisson_mesh_py(PyObject * /*self*/,
     /* Step 3: Extract isosurface. */
     std::vector<Vector3d> vertices;
     std::vector<std::array<std::uint32_t, 3>> triangles;
-    extract_isosurface(cells, corner_values, isovalue, domain,
-                       base_resolution, max_depth_val,
-                       vertices, triangles);
+    extract_isosurface(cells, corner_values, virtual_cells,
+                       isovalue, domain, base_resolution,
+                       max_depth_val, vertices, triangles);
 
     /* Build output arrays. */
     const std::size_t nv = vertices.size();

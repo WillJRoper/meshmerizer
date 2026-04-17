@@ -456,31 +456,122 @@ struct MCEdgeKeyHash {
 };
 
 /* =======================================================================
+ * Virtual boundary cell for closing the adaptive MC mesh.
+ *
+ * When DOFs are restricted to max_depth, the max_depth leaves form an
+ * incomplete region surrounded by coarser cells.  Running MC only on
+ * max_depth leaves produces a mesh with open boundary faces where the
+ * fine region borders coarser cells.
+ *
+ * To close the mesh, we create "virtual" max_depth-sized cells just
+ * outside each boundary face.  These virtual cells have chi evaluated
+ * at their corners via the B-spline field (which decays smoothly to ~0
+ * outside the DOF region), so MC can properly generate the closing
+ * surface.  This adds O(N^{2/3}) cells -- a thin shell, not a full
+ * uniform grid.
+ *
+ * Cf. Kazhdan & Hoppe (ToG13) FEMTree.LevelSet.3D.inl, where corner
+ * values are propagated from fine leaves to coarse ancestors, and
+ * coarse faces accumulate iso-edge fragments from fine cells.  Our
+ * approach achieves the same effect more simply by materializing
+ * virtual cells at the boundary.
+ * ======================================================================= */
+
+/**
+ * @brief A virtual max_depth-sized cell created at the boundary of
+ *        the fine-leaf region to close the MC mesh.
+ */
+struct VirtualCell {
+    BoundingBox bounds;
+    std::array<double, 8> corner_values;
+    /** Fine-grid min-corner coordinates (for edge key generation). */
+    std::uint32_t gx0, gy0, gz0;
+};
+
+/* =======================================================================
  * Public API
  * ======================================================================= */
 
 /**
- * @brief Evaluate the Poisson indicator function \f$\chi\f$ at the eight
- *        corners of each leaf cell.
+ * @brief Evaluate chi at a single world-space corner position.
  *
- * For each leaf cell, we evaluate
- * \f$\chi(p) = \sum_j x_j B_j(p)\f$ at the 8 cube corners. The set of
- * overlapping DOFs j is found efficiently via find_overlapping_dofs().
+ * Uses the B-spline field chi(p) = sum_j x_j B_j(p) with DOF lookup
+ * via find_overlapping_dofs().  Results are cached in @p corner_cache
+ * so each unique grid corner is evaluated exactly once.
  *
- * To ensure that adjacent cells sharing a grid corner produce identical
- * chi values (avoiding MC sign disagreements that cause non-manifold
- * edges), we maintain a global corner cache keyed by packed fine-grid
- * coordinates.  Each unique corner is evaluated exactly once.
+ * @param corner World-space corner position.
+ * @param packed Packed fine-grid coordinate key.
+ * @param solution Solution vector.
+ * @param cells Octree cells.
+ * @param cell_to_dof Cell-to-DOF mapping.
+ * @param hash Poisson leaf hash.
+ * @param base_resolution Top-level grid resolution.
+ * @param corner_cache Global cache (packed coord -> chi value).
+ * @param dof_indices Scratch buffer (reused across calls).
+ * @param weights Scratch buffer (reused across calls).
+ * @return Chi value at the corner.
+ */
+inline double evaluate_chi_at_point(
+    const Vector3d &corner,
+    std::uint64_t packed,
+    const std::vector<double> &solution,
+    const std::vector<OctreeCell> &cells,
+    const std::vector<std::int64_t> &cell_to_dof,
+    const PoissonLeafHash &hash,
+    std::uint32_t base_resolution,
+    std::unordered_map<std::uint64_t, double> &corner_cache,
+    std::vector<std::int64_t> &dof_indices,
+    std::vector<double> &weights) {
+    auto it = corner_cache.find(packed);
+    if (it != corner_cache.end()) {
+        return it->second;
+    }
+
+    find_overlapping_dofs(corner, hash, cells, cell_to_dof,
+                          dof_indices, weights, base_resolution);
+
+    double chi = 0.0;
+    for (std::size_t k = 0; k < dof_indices.size(); ++k) {
+        const std::int64_t dof = dof_indices[k];
+        if (dof < 0) {
+            continue;
+        }
+        const std::size_t idx = static_cast<std::size_t>(dof);
+        if (idx >= solution.size()) {
+            continue;
+        }
+        chi += solution[idx] * weights[k];
+    }
+    corner_cache.emplace(packed, chi);
+    return chi;
+}
+
+/**
+ * @brief Evaluate the Poisson indicator function chi at the eight
+ *        corners of each max_depth leaf cell, then create virtual
+ *        boundary cells to close the mesh.
+ *
+ * For each max_depth leaf, we evaluate chi(p) = sum_j x_j B_j(p) at
+ * the 8 cube corners.  A global corner cache ensures shared corners
+ * produce identical values.
+ *
+ * After evaluating real leaves, we identify boundary faces -- faces
+ * of max_depth leaves where the neighbor is a coarser cell (or domain
+ * boundary).  For each such face we create a virtual max_depth cell
+ * on the outside, evaluate chi at its corners, and append it to the
+ * output.  This closes the MC mesh without allocating a full uniform
+ * grid (Kazhdan & Hoppe ToG13 section 4).
  *
  * @param solution Solution vector x (size = n_dofs).
  * @param cells Full octree cell array.
  * @param cell_to_dof Mapping from cell index to DOF index.
- * @param hash Spatial hash of leaf cells (built at max_depth).
+ * @param hash Spatial hash of leaf cells.
  * @param base_resolution Top-level cells per axis.
- * @param max_depth Maximum octree depth (for fine-grid coord packing).
- * @param n_cells Number of leaf cells (for progress reporting).
- * @param corner_values Output per-cell corner values (resized to
- *     cells.size()). Non-leaf entries are left as zeros.
+ * @param max_depth Maximum octree depth.
+ * @param n_cells Number of leaf cells (progress reporting).
+ * @param domain Domain bounding box.
+ * @param corner_values Output per-cell corner values.
+ * @param virtual_cells Output virtual boundary cells.
  */
 inline void evaluate_chi_at_corners(
     const std::vector<double> &solution,
@@ -490,63 +581,75 @@ inline void evaluate_chi_at_corners(
     std::uint32_t base_resolution,
     std::uint32_t max_depth,
     std::size_t n_cells,
-    std::vector<std::array<double, 8>> &corner_values) {
+    const BoundingBox &domain,
+    std::vector<std::array<double, 8>> &corner_values,
+    std::vector<VirtualCell> &virtual_cells) {
     corner_values.assign(cells.size(), std::array<double, 8>{});
+    virtual_cells.clear();
 
     ProgressBar progress("Evaluating chi corners",
                          n_cells > 0 ? n_cells : 1);
 
     // Global corner cache: packed fine-grid coordinate -> chi value.
-    // This ensures each unique grid corner is evaluated exactly once,
-    // so adjacent cells sharing a corner see the same chi value.
     std::unordered_map<std::uint64_t, double> corner_cache;
-    corner_cache.reserve(n_cells * 4);  // Rough estimate.
+    corner_cache.reserve(n_cells * 4);
 
     std::vector<std::int64_t> dof_indices;
     std::vector<double> weights;
     dof_indices.reserve(27);
     weights.reserve(27);
 
+    // Compute fine-grid cell width in world space.
+    const double fine_cells_per_axis =
+        static_cast<double>(base_resolution) *
+        static_cast<double>(1U << max_depth);
+    const double cell_width_x =
+        (domain.max.x - domain.min.x) / fine_cells_per_axis;
+    const double cell_width_y =
+        (domain.max.y - domain.min.y) / fine_cells_per_axis;
+    const double cell_width_z =
+        (domain.max.z - domain.min.z) / fine_cells_per_axis;
+
+    // Max fine-grid coordinate.
+    const std::uint32_t max_fine_coord =
+        base_resolution * (1U << max_depth);
+
+    // Collect max_depth leaf fine-grid positions for boundary
+    // detection (set of occupied fine-grid positions).
+    std::unordered_map<std::uint64_t, std::size_t> fine_leaf_map;
+    fine_leaf_map.reserve(n_cells);
+
+    // Pass 1: Evaluate chi at max_depth leaf corners.
     for (std::size_t ci = 0; ci < cells.size(); ++ci) {
         if (!cells[ci].is_leaf) {
             continue;
         }
-        /* Evaluate chi at all leaf cells (not just max_depth).
-         * The Poisson indicator function needs DOFs at all depths
-         * to produce a smooth field spanning the interior and
-         * exterior of the surface. */
+        if (cells[ci].depth != max_depth) {
+            continue;
+        }
         const OctreeCell &cell = cells[ci];
 
-        // Decode cell origin in its own grid level, then scale to
-        // fine-grid coordinates.
         std::uint32_t cell_x = 0U, cell_y = 0U, cell_z = 0U;
         morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
-        const std::uint32_t span =
-            1U << (max_depth - cell.depth);
-        const std::uint32_t gx0 = cell_x * span;
-        const std::uint32_t gy0 = cell_y * span;
-        const std::uint32_t gz0 = cell_z * span;
+        // At max_depth, span = 1.
+        const std::uint32_t gx0 = cell_x;
+        const std::uint32_t gy0 = cell_y;
+        const std::uint32_t gz0 = cell_z;
+
+        // Register in fine_leaf_map for boundary detection.
+        fine_leaf_map[PoissonLeafHash::pack(gx0, gy0, gz0)] = ci;
 
         std::array<double, 8> values;
         for (std::size_t corner_index = 0; corner_index < 8;
              ++corner_index) {
-            // Fine-grid coordinate of this corner.
             std::uint32_t ox, oy, oz;
             mc_corner_offset_bits(corner_index, ox, oy, oz);
+            const std::uint32_t gx = gx0 + ox;
+            const std::uint32_t gy = gy0 + oy;
+            const std::uint32_t gz = gz0 + oz;
             const std::uint64_t packed =
-                PoissonLeafHash::pack(
-                    gx0 + ox * span,
-                    gy0 + oy * span,
-                    gz0 + oz * span);
+                PoissonLeafHash::pack(gx, gy, gz);
 
-            // Check cache first.
-            auto it = corner_cache.find(packed);
-            if (it != corner_cache.end()) {
-                values[corner_index] = it->second;
-                continue;
-            }
-
-            // Not cached — evaluate chi at this corner.
             const Vector3d corner = {
                 (corner_index & 1U) ? cell.bounds.max.x
                                     : cell.bounds.min.x,
@@ -556,31 +659,135 @@ inline void evaluate_chi_at_corners(
                                     : cell.bounds.min.z,
             };
 
-            find_overlapping_dofs(corner, hash, cells, cell_to_dof,
-                                  dof_indices, weights,
-                                  base_resolution);
-
-            double chi = 0.0;
-            for (std::size_t k = 0; k < dof_indices.size(); ++k) {
-                const std::int64_t dof = dof_indices[k];
-                if (dof < 0) {
-                    continue;
-                }
-                const std::size_t idx =
-                    static_cast<std::size_t>(dof);
-                if (idx >= solution.size()) {
-                    continue;
-                }
-                chi += solution[idx] * weights[k];
-            }
-            values[corner_index] = chi;
-            corner_cache.emplace(packed, chi);
+            values[corner_index] = evaluate_chi_at_point(
+                corner, packed, solution, cells, cell_to_dof,
+                hash, base_resolution, corner_cache,
+                dof_indices, weights);
         }
 
         corner_values[ci] = values;
         progress.tick();
     }
     progress.finish();
+
+    // Pass 2: Create virtual boundary cells.
+    // For each max_depth leaf, check 6 face neighbors.  If the
+    // neighbor position is NOT occupied by another max_depth leaf,
+    // create a virtual cell there.
+    //
+    // Direction offsets: +X, -X, +Y, -Y, +Z, -Z
+    static const std::int32_t DIR_DX[6] = {1, -1, 0, 0, 0, 0};
+    static const std::int32_t DIR_DY[6] = {0, 0, 1, -1, 0, 0};
+    static const std::int32_t DIR_DZ[6] = {0, 0, 0, 0, 1, -1};
+
+    // Track which virtual cells we've already created to avoid
+    // duplicates (keyed by packed fine-grid min-corner).
+    std::unordered_map<std::uint64_t, std::size_t>
+        virtual_cell_map;
+    virtual_cell_map.reserve(n_cells / 4);  // Rough estimate.
+
+    ProgressBar virt_progress(
+        "Creating virtual boundary cells", n_cells > 0 ? n_cells : 1);
+
+    for (const auto &entry : fine_leaf_map) {
+        const std::size_t ci = entry.second;
+        const OctreeCell &cell = cells[ci];
+
+        std::uint32_t cell_x = 0U, cell_y = 0U, cell_z = 0U;
+        morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
+
+        for (int dir = 0; dir < 6; ++dir) {
+            const std::int32_t nx =
+                static_cast<std::int32_t>(cell_x) + DIR_DX[dir];
+            const std::int32_t ny =
+                static_cast<std::int32_t>(cell_y) + DIR_DY[dir];
+            const std::int32_t nz =
+                static_cast<std::int32_t>(cell_z) + DIR_DZ[dir];
+
+            // Skip if out of domain bounds.
+            if (nx < 0 || ny < 0 || nz < 0) {
+                continue;
+            }
+            if (static_cast<std::uint32_t>(nx) >= max_fine_coord ||
+                static_cast<std::uint32_t>(ny) >= max_fine_coord ||
+                static_cast<std::uint32_t>(nz) >= max_fine_coord) {
+                continue;
+            }
+
+            const std::uint32_t ngx =
+                static_cast<std::uint32_t>(nx);
+            const std::uint32_t ngy =
+                static_cast<std::uint32_t>(ny);
+            const std::uint32_t ngz =
+                static_cast<std::uint32_t>(nz);
+            const std::uint64_t npacked =
+                PoissonLeafHash::pack(ngx, ngy, ngz);
+
+            // Skip if a real max_depth leaf exists there.
+            if (fine_leaf_map.count(npacked)) {
+                continue;
+            }
+
+            // Skip if we already created a virtual cell there.
+            if (virtual_cell_map.count(npacked)) {
+                continue;
+            }
+
+            // Create a virtual cell at this position.
+            VirtualCell vc;
+            vc.gx0 = ngx;
+            vc.gy0 = ngy;
+            vc.gz0 = ngz;
+
+            // Compute world-space bounds.
+            vc.bounds.min = {
+                domain.min.x +
+                    static_cast<double>(ngx) * cell_width_x,
+                domain.min.y +
+                    static_cast<double>(ngy) * cell_width_y,
+                domain.min.z +
+                    static_cast<double>(ngz) * cell_width_z,
+            };
+            vc.bounds.max = {
+                vc.bounds.min.x + cell_width_x,
+                vc.bounds.min.y + cell_width_y,
+                vc.bounds.min.z + cell_width_z,
+            };
+
+            // Evaluate chi at the 8 corners.
+            for (std::size_t corner_index = 0;
+                 corner_index < 8; ++corner_index) {
+                std::uint32_t ox, oy, oz;
+                mc_corner_offset_bits(corner_index, ox, oy, oz);
+                const std::uint32_t gx = ngx + ox;
+                const std::uint32_t gy = ngy + oy;
+                const std::uint32_t gz = ngz + oz;
+                const std::uint64_t cpacked =
+                    PoissonLeafHash::pack(gx, gy, gz);
+
+                const Vector3d corner = {
+                    (corner_index & 1U) ? vc.bounds.max.x
+                                        : vc.bounds.min.x,
+                    (corner_index & 2U) ? vc.bounds.max.y
+                                        : vc.bounds.min.y,
+                    (corner_index & 4U) ? vc.bounds.max.z
+                                        : vc.bounds.min.z,
+                };
+
+                vc.corner_values[corner_index] =
+                    evaluate_chi_at_point(
+                        corner, cpacked, solution, cells,
+                        cell_to_dof, hash, base_resolution,
+                        corner_cache, dof_indices, weights);
+            }
+
+            virtual_cell_map[npacked] = virtual_cells.size();
+            virtual_cells.push_back(vc);
+        }
+
+        virt_progress.tick();
+    }
+    virt_progress.finish();
 }
 
 /**
@@ -643,161 +850,205 @@ inline double compute_isovalue(
 }
 
 /**
- * @brief Extract an isosurface using Marching Cubes over leaf cells.
+ * @brief Run Marching Cubes on a single cell given its bounds, corner
+ *        values, and fine-grid min-corner coordinates.
  *
- * The function walks all leaf cells, determines the MC case index from
- * precomputed corner samples, interpolates vertices on intersected edges,
- * and emits triangles using the classic 256-case lookup tables.
+ * This is a shared helper used for both real max_depth leaves and
+ * virtual boundary cells.
  *
- * To reduce duplicate vertices, we cache vertices per unique grid edge.
- * The edge key is derived from the two fine-grid corner coordinates
- * (packed as 64-bit integers).
+ * @param bounds Cell bounding box.
+ * @param vals Corner chi values.
+ * @param gx0 Fine-grid min-corner X.
+ * @param gy0 Fine-grid min-corner Y.
+ * @param gz0 Fine-grid min-corner Z.
+ * @param isovalue Isosurface level.
+ * @param edge_cache Shared edge vertex cache.
+ * @param vertices Output vertex positions.
+ * @param triangles Output triangle index triplets.
+ */
+inline void mc_process_cell(
+    const BoundingBox &bounds,
+    const std::array<double, 8> &vals,
+    std::uint32_t gx0,
+    std::uint32_t gy0,
+    std::uint32_t gz0,
+    double isovalue,
+    std::unordered_map<MCEdgeKey, std::uint32_t,
+                       MCEdgeKeyHash> &edge_cache,
+    std::vector<Vector3d> &vertices,
+    std::vector<std::array<std::uint32_t, 3>> &triangles) {
+    // Compute cube case index.
+    std::uint8_t cube_index = 0U;
+    for (std::size_t corner_index = 0; corner_index < 8;
+         ++corner_index) {
+        if (vals[corner_index] > isovalue) {
+            cube_index |=
+                static_cast<std::uint8_t>(1U << corner_index);
+        }
+    }
+
+    const std::uint16_t edge_mask = MC_EDGE_TABLE[cube_index];
+    if (edge_mask == 0U) {
+        return;
+    }
+
+    // Corner positions in world space.
+    Vector3d corner_pos[8];
+    for (std::size_t ci = 0; ci < 8; ++ci) {
+        corner_pos[ci] = {
+            (ci & 1U) ? bounds.max.x : bounds.min.x,
+            (ci & 2U) ? bounds.max.y : bounds.min.y,
+            (ci & 4U) ? bounds.max.z : bounds.min.z,
+        };
+    }
+
+    // Fine-grid packed coordinates for the 8 corners.
+    // At max_depth, span = 1.
+    std::uint64_t packed_corner[8];
+    for (std::size_t ci = 0; ci < 8; ++ci) {
+        std::uint32_t ox, oy, oz;
+        mc_corner_offset_bits(ci, ox, oy, oz);
+        packed_corner[ci] = PoissonLeafHash::pack(
+            gx0 + ox, gy0 + oy, gz0 + oz);
+    }
+
+    // For each intersected edge, create/reuse the vertex.
+    std::uint32_t edge_vertex_index[12] = {0};
+    for (std::size_t e = 0; e < 12; ++e) {
+        if ((edge_mask & (1U << e)) == 0U) {
+            continue;
+        }
+
+        std::uint8_t c0, c1;
+        mc_edge_corners(e, c0, c1);
+        const MCEdgeKey key =
+            mc_edge_key(packed_corner[c0], packed_corner[c1]);
+
+        auto it = edge_cache.find(key);
+        if (it != edge_cache.end()) {
+            edge_vertex_index[e] = it->second;
+            continue;
+        }
+
+        const Vector3d p = mc_interpolate_vertex(
+            corner_pos[c0], corner_pos[c1],
+            vals[c0], vals[c1], isovalue);
+
+        const std::uint32_t new_index =
+            static_cast<std::uint32_t>(vertices.size());
+        vertices.push_back(p);
+        edge_cache.emplace(key, new_index);
+        edge_vertex_index[e] = new_index;
+    }
+
+    // Emit triangles.
+    for (std::size_t t = 0; t < 16; t += 3) {
+        const std::int8_t e0 = MC_TRI_TABLE[cube_index][t];
+        if (e0 < 0) {
+            break;
+        }
+        const std::int8_t e1 = MC_TRI_TABLE[cube_index][t + 1];
+        const std::int8_t e2 = MC_TRI_TABLE[cube_index][t + 2];
+        triangles.push_back({
+            edge_vertex_index[static_cast<std::size_t>(e0)],
+            edge_vertex_index[static_cast<std::size_t>(e1)],
+            edge_vertex_index[static_cast<std::size_t>(e2)],
+        });
+    }
+}
+
+/**
+ * @brief Extract an isosurface using Marching Cubes over max_depth
+ *        leaf cells plus virtual boundary cells.
+ *
+ * Runs classic MC (Lorensen & Cline 1987) on:
+ * 1. All real max_depth leaf cells (from @p corner_values).
+ * 2. Virtual boundary cells (from @p virtual_cells) that close the
+ *    mesh at the boundary of the fine-leaf region.
+ *
+ * Edge vertices are shared between cells via a collision-free edge
+ * cache keyed by fine-grid corner coordinates.
  *
  * @param cells Full octree cell array.
- * @param corner_values Per-cell corner samples (aligned with @p cells).
+ * @param corner_values Per-cell corner samples (aligned with cells).
+ * @param virtual_cells Virtual boundary cells from evaluate_chi.
  * @param isovalue Surface level.
- * @param domain Global domain bounding box (used for coordinate
- *     interpretation only).
+ * @param domain Global domain bounding box.
  * @param base_resolution Number of top-level cells per axis.
- * @param max_depth Maximum octree depth (defines the finest grid used for
- *     edge hashing).
+ * @param max_depth Maximum octree depth.
  * @param vertices Output vertex positions.
  * @param triangles Output triangle index triplets.
  */
 inline void extract_isosurface(
     const std::vector<OctreeCell> &cells,
     const std::vector<std::array<double, 8>> &corner_values,
+    const std::vector<VirtualCell> &virtual_cells,
     double isovalue,
     const BoundingBox &domain,
     std::uint32_t base_resolution,
     std::uint32_t max_depth,
     std::vector<Vector3d> &vertices,
     std::vector<std::array<std::uint32_t, 3>> &triangles) {
-    (void)domain;  // Domain bounds are implicit in cell bounds.
+    (void)domain;
+    (void)base_resolution;
 
     vertices.clear();
     triangles.clear();
 
     std::size_t n_leaves = 0;
     for (const auto &c : cells) {
-        if (c.is_leaf) {
+        if (c.is_leaf && c.depth == max_depth) {
             ++n_leaves;
         }
     }
 
-    ProgressBar progress("Marching Cubes", n_leaves > 0 ? n_leaves : 1);
+    const std::size_t total =
+        n_leaves + virtual_cells.size();
+    ProgressBar progress(
+        "Marching Cubes", total > 0 ? total : 1);
 
-    std::unordered_map<MCEdgeKey, std::uint32_t, MCEdgeKeyHash> edge_cache;
-    edge_cache.reserve(n_leaves * 6);
+    std::unordered_map<MCEdgeKey, std::uint32_t,
+                       MCEdgeKeyHash> edge_cache;
+    edge_cache.reserve(total * 6);
 
+    // Pass 1: Real max_depth leaf cells.
     for (std::size_t ci = 0; ci < cells.size(); ++ci) {
         if (!cells[ci].is_leaf) {
             continue;
         }
-        /* Run MC on ALL leaf cells — chi corner values have been
-         * evaluated for all leaves, and the indicator function
-         * spans the full octree. */
+        if (cells[ci].depth != max_depth) {
+            continue;
+        }
         if (ci >= corner_values.size()) {
             progress.tick();
             continue;
         }
 
         const OctreeCell &cell = cells[ci];
-        const std::array<double, 8> &vals = corner_values[ci];
 
-        // Compute cube case index: bit i set when corner i is above isovalue.
-        std::uint8_t cube_index = 0U;
-        for (std::size_t corner_index = 0; corner_index < 8;
-             ++corner_index) {
-            if (vals[corner_index] > isovalue) {
-                cube_index |= static_cast<std::uint8_t>(1U << corner_index);
-            }
-        }
+        std::uint32_t cell_x = 0U, cell_y = 0U, cell_z = 0U;
+        morton_decode_3d(cell.morton_key, cell_x, cell_y,
+                         cell_z);
+        // At max_depth, span = 1.
 
-        const std::uint16_t edge_mask = MC_EDGE_TABLE[cube_index];
-        if (edge_mask == 0U) {
-            progress.tick();
-            continue;
-        }
-
-        // Compute cell corner positions in world space.
-        Vector3d corner_pos[8];
-        for (std::size_t corner_index = 0; corner_index < 8;
-             ++corner_index) {
-            corner_pos[corner_index] = {
-                (corner_index & 1U) ? cell.bounds.max.x : cell.bounds.min.x,
-                (corner_index & 2U) ? cell.bounds.max.y : cell.bounds.min.y,
-                (corner_index & 4U) ? cell.bounds.max.z : cell.bounds.min.z,
-            };
-        }
-
-        // Compute fine-grid coordinates for the 8 corners.
-        std::uint32_t cell_x = 0U;
-        std::uint32_t cell_y = 0U;
-        std::uint32_t cell_z = 0U;
-        morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
-        const std::uint32_t span = 1U << (max_depth - cell.depth);
-        const std::uint32_t gx0 = cell_x * span;
-        const std::uint32_t gy0 = cell_y * span;
-        const std::uint32_t gz0 = cell_z * span;
-
-        std::uint64_t packed_corner[8];
-        for (std::size_t corner_index = 0; corner_index < 8;
-             ++corner_index) {
-            std::uint32_t ox, oy, oz;
-            mc_corner_offset_bits(corner_index, ox, oy, oz);
-            const std::uint32_t gx = gx0 + ox * span;
-            const std::uint32_t gy = gy0 + oy * span;
-            const std::uint32_t gz = gz0 + oz * span;
-            packed_corner[corner_index] =
-                PoissonLeafHash::pack(gx, gy, gz);
-        }
-
-        // For each intersected edge, create/reuse the vertex.
-        std::uint32_t edge_vertex_index[12] = {0};
-        for (std::size_t e = 0; e < 12; ++e) {
-            if ((edge_mask & (1U << e)) == 0U) {
-                continue;
-            }
-
-            std::uint8_t c0, c1;
-            mc_edge_corners(e, c0, c1);
-            const MCEdgeKey key =
-                mc_edge_key(packed_corner[c0], packed_corner[c1]);
-
-            auto it = edge_cache.find(key);
-            if (it != edge_cache.end()) {
-                edge_vertex_index[e] = it->second;
-                continue;
-            }
-
-            const Vector3d p = mc_interpolate_vertex(
-                corner_pos[c0], corner_pos[c1],
-                vals[c0], vals[c1], isovalue);
-
-            const std::uint32_t new_index =
-                static_cast<std::uint32_t>(vertices.size());
-            vertices.push_back(p);
-            edge_cache.emplace(key, new_index);
-            edge_vertex_index[e] = new_index;
-        }
-
-        // Emit triangles.
-        for (std::size_t t = 0; t < 16; t += 3) {
-            const std::int8_t e0 = MC_TRI_TABLE[cube_index][t];
-            if (e0 < 0) {
-                break;
-            }
-            const std::int8_t e1 = MC_TRI_TABLE[cube_index][t + 1];
-            const std::int8_t e2 = MC_TRI_TABLE[cube_index][t + 2];
-            const std::uint32_t v0 = edge_vertex_index[static_cast<std::size_t>(e0)];
-            const std::uint32_t v1 = edge_vertex_index[static_cast<std::size_t>(e1)];
-            const std::uint32_t v2 = edge_vertex_index[static_cast<std::size_t>(e2)];
-            triangles.push_back({v0, v1, v2});
-        }
+        mc_process_cell(
+            cell.bounds, corner_values[ci],
+            cell_x, cell_y, cell_z,
+            isovalue, edge_cache, vertices, triangles);
 
         progress.tick();
     }
+
+    // Pass 2: Virtual boundary cells.
+    for (const auto &vc : virtual_cells) {
+        mc_process_cell(
+            vc.bounds, vc.corner_values,
+            vc.gx0, vc.gy0, vc.gz0,
+            isovalue, edge_cache, vertices, triangles);
+
+        progress.tick();
+    }
+
     progress.finish();
 }
 

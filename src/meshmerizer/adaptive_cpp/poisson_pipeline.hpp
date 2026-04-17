@@ -403,6 +403,7 @@ inline PipelineResult run_full_pipeline(
     // cells sharing a corner see the same chi value.
 
     std::vector<std::array<double, 8>> corner_values;
+    std::vector<VirtualCell> virtual_cells;
     std::size_t n_leaves = 0;
     for (const auto &c : all_cells) {
         if (c.is_leaf) {
@@ -413,7 +414,7 @@ inline PipelineResult run_full_pipeline(
     evaluate_chi_at_corners(
         solution, all_cells, cell_to_dof, hash,
         base_resolution, max_depth, n_leaves,
-        corner_values);
+        domain, corner_values, virtual_cells);
 
     // ================================================================
     // Step 11: Compute isovalue from QEF positions.
@@ -427,7 +428,8 @@ inline PipelineResult run_full_pipeline(
         solution, all_cells, cell_to_dof, hash,
         base_resolution);
 
-    // Free the solution vector — chi corners have been evaluated.
+    // Free the solution vector — chi corners have been evaluated
+    // and virtual cell corners have been computed.
     { std::vector<double>().swap(solution); }
 
     // ================================================================
@@ -435,9 +437,12 @@ inline PipelineResult run_full_pipeline(
     // ================================================================
     // Classic MC (Lorensen & Cline 1987) with collision-free edge
     // caching to ensure shared vertices across adjacent cells.
+    // Virtual boundary cells close the mesh at the boundary of
+    // the fine-leaf region (see poisson_mc.hpp for details).
 
     extract_isosurface(
-        all_cells, corner_values, result.isovalue,
+        all_cells, corner_values, virtual_cells,
+        result.isovalue,
         domain, base_resolution, max_depth,
         result.vertices, result.triangles);
 
