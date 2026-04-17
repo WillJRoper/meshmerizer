@@ -944,3 +944,48 @@ def solve_poisson(
         max_iters,
         tol,
     )
+
+
+def extract_poisson_mesh(
+    positions: np.ndarray,
+    cells,
+    domain_min,
+    domain_max,
+    base_resolution: int,
+    max_depth: int,
+    solution,
+):
+    """Extract an isosurface from a Poisson solution via Marching Cubes.
+
+    Evaluates the indicator function chi at leaf-cell corners, computes
+    the isovalue as the mean chi at sample positions, and runs classic
+    Marching Cubes (Lorensen & Cline 1987) to extract the isosurface.
+
+    Args:
+        positions: (N, 3) float64 array of sample positions (used to
+            compute the isovalue).
+        cells: List of cell dicts with keys ``is_leaf``, ``depth``,
+            ``bounds_min``, ``bounds_max``, ``morton_key``.
+        domain_min: (3,) lower corner of the domain bounding box.
+        domain_max: (3,) upper corner of the domain bounding box.
+        base_resolution: Number of top-level cells per axis.
+        max_depth: Maximum octree depth.
+        solution: Poisson solution vector (list or array of floats,
+            length = n_dofs).
+
+    Returns:
+        Tuple of (vertices, triangles, isovalue) where vertices is a
+        (V, 3) float64 ndarray, triangles is a (F, 3) uint32 ndarray,
+        and isovalue is a float.
+    """
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    sol = list(solution)
+    return _adaptive.extract_poisson_mesh(
+        pos,
+        cells,
+        domain_min,
+        domain_max,
+        base_resolution,
+        max_depth,
+        sol,
+    )

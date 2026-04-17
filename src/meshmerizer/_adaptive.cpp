@@ -36,6 +36,7 @@
 #include "adaptive_cpp/poisson_rhs.hpp"
 #include "adaptive_cpp/poisson_stencil.hpp"
 #include "adaptive_cpp/poisson_solver.hpp"
+#include "adaptive_cpp/poisson_mc.hpp"
 #include "adaptive_cpp/qef.hpp"
 
 /**
@@ -2848,6 +2849,184 @@ static PyObject *solve_poisson_py(PyObject * /*self*/,
 }
 
 /**
+ * @brief Extract an isosurface from the Poisson solution using Marching
+ *        Cubes (Phase 20e).
+ *
+ * Arguments:
+ *   positions  -- (N, 3) float64 array of sample positions (for isovalue).
+ *   cells      -- list of cell dicts (is_leaf, depth, bounds_min, bounds_max,
+ *                 morton_key).
+ *   domain_min -- (3,) lower corner of domain.
+ *   domain_max -- (3,) upper corner of domain.
+ *   base_resolution -- uint, top-level cells per axis.
+ *   max_depth  -- uint, maximum octree depth.
+ *   solution   -- list of floats, Poisson solution vector.
+ *
+ * Returns:
+ *   (vertices, triangles) where vertices is (V, 3) float64 ndarray and
+ *   triangles is (F, 3) uint32 ndarray.
+ *
+ * @par References
+ * - Lorensen & Cline, SIGGRAPH 1987.
+ * - Kazhdan, Bolitho & Hoppe, SGP 2006.
+ * - Kazhdan & Hoppe, ToG 2013.
+ */
+static PyObject *extract_poisson_mesh_py(PyObject * /*self*/,
+                                         PyObject *args) {
+    PyObject *pos_obj;
+    PyObject *cells_obj;
+    PyObject *dmin_obj;
+    PyObject *dmax_obj;
+    unsigned int base_resolution;
+    unsigned int max_depth_val;
+    PyObject *sol_obj;
+    if (!PyArg_ParseTuple(args, "OOOOIIO",
+                          &pos_obj, &cells_obj,
+                          &dmin_obj, &dmax_obj,
+                          &base_resolution, &max_depth_val,
+                          &sol_obj)) {
+        return NULL;
+    }
+
+    /* Parse domain. */
+    Vector3d dmin{}, dmax{};
+    if (!parse_vector3d(dmin_obj, dmin)) return NULL;
+    if (!parse_vector3d(dmax_obj, dmax)) return NULL;
+    BoundingBox domain = {dmin, dmax};
+
+    /* Parse positions. */
+    PyArrayObject *pos_arr = reinterpret_cast<PyArrayObject *>(
+        PyArray_FROM_OTF(pos_obj, NPY_DOUBLE,
+                         NPY_ARRAY_IN_ARRAY));
+    if (pos_arr == NULL) return NULL;
+    const npy_intp n_samples = PyArray_DIM(pos_arr, 0);
+    const double *pos_data =
+        static_cast<double *>(PyArray_DATA(pos_arr));
+    std::vector<Vector3d> positions(
+        static_cast<std::size_t>(n_samples));
+    for (npy_intp i = 0; i < n_samples; ++i) {
+        positions[static_cast<std::size_t>(i)] = {
+            pos_data[i * 3], pos_data[i * 3 + 1],
+            pos_data[i * 3 + 2]};
+    }
+    Py_DECREF(pos_arr);
+
+    /* Parse cells. */
+    PyObject *fast = PySequence_Fast(
+        cells_obj, "expected a sequence of cell dicts");
+    if (fast == NULL) return NULL;
+    const Py_ssize_t nc = PySequence_Fast_GET_SIZE(fast);
+    std::vector<OctreeCell> cells(
+        static_cast<std::size_t>(nc));
+    for (Py_ssize_t i = 0; i < nc; ++i) {
+        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
+        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
+        PyObject *depth = PyDict_GetItemString(d, "depth");
+        PyObject *bmin_d = PyDict_GetItemString(d, "bounds_min");
+        PyObject *bmax_d = PyDict_GetItemString(d, "bounds_max");
+        PyObject *mkey = PyDict_GetItemString(d, "morton_key");
+        if (!leaf || !depth || !bmin_d || !bmax_d || !mkey) {
+            Py_DECREF(fast);
+            PyErr_SetString(PyExc_KeyError,
+                            "cell dict missing required key");
+            return NULL;
+        }
+        auto &c = cells[static_cast<std::size_t>(i)];
+        c.is_leaf = PyObject_IsTrue(leaf) != 0;
+        c.depth = static_cast<std::uint32_t>(
+            PyLong_AsUnsignedLong(depth));
+        if (!parse_vector3d(bmin_d, c.bounds.min)) {
+            Py_DECREF(fast);
+            return NULL;
+        }
+        if (!parse_vector3d(bmax_d, c.bounds.max)) {
+            Py_DECREF(fast);
+            return NULL;
+        }
+        c.morton_key = PyLong_AsUnsignedLongLong(mkey);
+    }
+    Py_DECREF(fast);
+
+    /* Parse solution vector. */
+    PyObject *sol_fast = PySequence_Fast(
+        sol_obj, "expected a sequence for solution");
+    if (sol_fast == NULL) return NULL;
+    const Py_ssize_t sol_len =
+        PySequence_Fast_GET_SIZE(sol_fast);
+    std::vector<double> solution(
+        static_cast<std::size_t>(sol_len));
+    for (Py_ssize_t i = 0; i < sol_len; ++i) {
+        solution[static_cast<std::size_t>(i)] =
+            PyFloat_AsDouble(
+                PySequence_Fast_GET_ITEM(sol_fast, i));
+    }
+    Py_DECREF(sol_fast);
+
+    /* Build DOF indexing and spatial hash. */
+    std::vector<std::int64_t> cell_to_dof;
+    std::vector<std::size_t> dof_to_cell;
+    assign_dof_indices(cells, cell_to_dof, dof_to_cell);
+
+    PoissonLeafHash hash;
+    hash.build(cells, domain, max_depth_val, base_resolution);
+
+    /* Step 1: Evaluate chi at corners. */
+    std::size_t n_leaves = 0;
+    for (const auto &c : cells) {
+        if (c.is_leaf) ++n_leaves;
+    }
+    std::vector<std::array<double, 8>> corner_values;
+    evaluate_chi_at_corners(solution, cells, cell_to_dof, hash,
+                            base_resolution, max_depth_val, n_leaves,
+                            corner_values);
+
+    /* Step 2: Compute isovalue from sample positions. */
+    double isovalue = compute_isovalue(
+        positions.data(),
+        static_cast<std::size_t>(n_samples),
+        solution, cells, cell_to_dof, hash,
+        base_resolution);
+
+    /* Step 3: Extract isosurface. */
+    std::vector<Vector3d> vertices;
+    std::vector<std::array<std::uint32_t, 3>> triangles;
+    extract_isosurface(cells, corner_values, isovalue, domain,
+                       base_resolution, max_depth_val,
+                       vertices, triangles);
+
+    /* Build output arrays. */
+    const std::size_t nv = vertices.size();
+    const std::size_t nf = triangles.size();
+
+    npy_intp vdims[2] = {static_cast<npy_intp>(nv), 3};
+    PyObject *v_arr = PyArray_SimpleNew(2, vdims, NPY_DOUBLE);
+    if (v_arr == NULL) return NULL;
+    double *v_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(v_arr)));
+    for (std::size_t i = 0; i < nv; ++i) {
+        v_data[i * 3] = vertices[i].x;
+        v_data[i * 3 + 1] = vertices[i].y;
+        v_data[i * 3 + 2] = vertices[i].z;
+    }
+
+    npy_intp fdims[2] = {static_cast<npy_intp>(nf), 3};
+    PyObject *f_arr = PyArray_SimpleNew(2, fdims, NPY_UINT32);
+    if (f_arr == NULL) {
+        Py_DECREF(v_arr);
+        return NULL;
+    }
+    std::uint32_t *f_data = static_cast<std::uint32_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(f_arr)));
+    for (std::size_t i = 0; i < nf; ++i) {
+        f_data[i * 3] = triangles[i][0];
+        f_data[i * 3 + 1] = triangles[i][1];
+        f_data[i * 3 + 2] = triangles[i][2];
+    }
+
+    return Py_BuildValue("(OOd)", v_arr, f_arr, isovalue);
+}
+
+/**
  * @brief Python methods exported by the adaptive extension.
  */
 static PyMethodDef adaptive_methods[] = {
@@ -2917,6 +3096,12 @@ static PyMethodDef adaptive_methods[] = {
         solve_poisson_py,
         METH_VARARGS,
         PyDoc_STR("Solve screened Poisson system with PCG."),
+    },
+    {
+        "extract_poisson_mesh",
+        extract_poisson_mesh_py,
+        METH_VARARGS,
+        PyDoc_STR("Extract isosurface from Poisson solution via MC."),
     },
     {
         "adaptive_status",
