@@ -33,6 +33,8 @@ def poisson_reconstruct_group(
     screening_weight: float = 4.0,
     max_iters: int = 1000,
     tol: float = 1e-6,
+    smoothing_iterations: int = 0,
+    smoothing_strength: float = 0.5,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct a mesh from particles via Poisson in C++.
 
@@ -52,6 +54,9 @@ def poisson_reconstruct_group(
         screening_weight: Poisson screening weight alpha.
         max_iters: Maximum PCG iterations.
         tol: PCG relative residual tolerance.
+        smoothing_iterations: Number of Laplacian smoothing
+            iterations (0 = disabled).
+        smoothing_strength: Smoothing lambda in (0, 1].
 
     Returns:
         Tuple of ``(vertices, faces)`` where ``vertices`` is an
@@ -81,6 +86,8 @@ def poisson_reconstruct_group(
         screening_weight=screening_weight,
         max_iters=max_iters,
         tol=tol,
+        smoothing_iterations=smoothing_iterations,
+        smoothing_strength=smoothing_strength,
     )
 
     verts = result["vertices"]
@@ -102,6 +109,8 @@ def poisson_reconstruct(
     screening_weight: float = 4.0,
     max_iters: int = 1000,
     tol: float = 1e-6,
+    smoothing_iterations: int = 0,
+    smoothing_strength: float = 0.5,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct meshes for all FOF groups and merge them.
 
@@ -120,6 +129,9 @@ def poisson_reconstruct(
         screening_weight: Poisson screening weight alpha.
         max_iters: Maximum PCG iterations.
         tol: PCG relative residual tolerance.
+        smoothing_iterations: Number of Laplacian smoothing
+            iterations (0 = disabled).
+        smoothing_strength: Smoothing lambda in (0, 1].
 
     Returns:
         Tuple of ``(vertices, faces)`` merged across all groups.
@@ -155,6 +167,8 @@ def poisson_reconstruct(
             screening_weight=screening_weight,
             max_iters=max_iters,
             tol=tol,
+            smoothing_iterations=smoothing_iterations,
+            smoothing_strength=smoothing_strength,
         )
 
         if verts.shape[0] == 0:

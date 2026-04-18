@@ -450,6 +450,8 @@ def run_adaptive(args) -> None:
                 max_depth,
                 group_labels=group_labels,
                 screening_weight=screening_weight,
+                smoothing_iterations=getattr(args, "smoothing_iterations", 0),
+                smoothing_strength=getattr(args, "smoothing_strength", 0.5),
             )
             record_elapsed(
                 "Full pipeline",
@@ -634,6 +636,8 @@ def run_adaptive(args) -> None:
         poisson_depth,
         group_labels=group_labels,
         screening_weight=screening_weight,
+        smoothing_iterations=getattr(args, "smoothing_iterations", 0),
+        smoothing_strength=getattr(args, "smoothing_strength", 0.5),
     )
     record_elapsed(
         "Poisson reconstruction",

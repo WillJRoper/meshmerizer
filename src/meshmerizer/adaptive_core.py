@@ -1057,13 +1057,15 @@ def run_full_pipeline(
     screening_weight: float = 4.0,
     max_iters: int = 1000,
     tol: float = 1e-6,
+    smoothing_iterations: int = 0,
+    smoothing_strength: float = 0.5,
 ) -> dict:
     """Run the full particles-to-mesh pipeline in C++.
 
-    Combines octree construction, QEF vertex solving, Poisson
-    surface reconstruction, and Marching Cubes isosurface
-    extraction into a single C++ call.  No intermediate data
-    is returned to Python.
+    Combines octree construction, QEF vertex solving, optional
+    Laplacian smoothing, and Dual Contouring face generation
+    into a single C++ call.  No intermediate data is returned
+    to Python.
 
     Args:
         positions: (N, 3) float64 array of particle positions.
@@ -1073,10 +1075,16 @@ def run_full_pipeline(
         base_resolution: Number of top-level cells per axis.
         isovalue: Density isovalue for octree refinement.
         max_depth: Maximum octree refinement depth.
-        screening_weight: Poisson screening weight alpha.
-            Higher values produce tighter fit to data points.
-        max_iters: Maximum PCG iterations.
-        tol: PCG relative residual tolerance.
+        screening_weight: Poisson screening weight alpha
+            (legacy, unused by DC pipeline).
+        max_iters: Maximum PCG iterations
+            (legacy, unused by DC pipeline).
+        tol: PCG relative residual tolerance
+            (legacy, unused by DC pipeline).
+        smoothing_iterations: Number of Laplacian smoothing
+            iterations.  0 disables smoothing (default).
+        smoothing_strength: Smoothing lambda in (0, 1].
+            0.0 = no movement, 1.0 = snap to neighbor centroid.
 
     Returns:
         Dict with keys ``vertices`` (V, 3) float64 ndarray,
@@ -1097,4 +1105,6 @@ def run_full_pipeline(
         screening_weight,
         max_iters,
         tol,
+        smoothing_iterations,
+        smoothing_strength,
     )

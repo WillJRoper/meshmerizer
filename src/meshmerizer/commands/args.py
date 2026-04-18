@@ -179,6 +179,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Post-processing.
     adaptive.add_argument(
+        "--smoothing-iterations",
+        type=int,
+        default=0,
+        help=(
+            "Number of Laplacian smoothing iterations applied "
+            "to QEF vertices before face generation. 0 disables "
+            "smoothing. Default: 0"
+        ),
+    )
+    adaptive.add_argument(
+        "--smoothing-strength",
+        type=float,
+        default=0.5,
+        help=(
+            "Laplacian smoothing strength lambda in (0, 1]. "
+            "0.0 = no movement, 1.0 = snap to neighbor centroid. "
+            "Only effective when --smoothing-iterations > 0. "
+            "Default: 0.5"
+        ),
+    )
+    adaptive.add_argument(
         "--poisson-depth",
         type=int,
         default=None,

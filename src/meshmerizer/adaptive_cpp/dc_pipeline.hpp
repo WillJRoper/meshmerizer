@@ -38,6 +38,8 @@
 #include "progress_bar.hpp"
 #include "qef.hpp"
 #include "vector3d.hpp"
+#include "vertex_adjacency.hpp"
+#include "vertex_smooth.hpp"
 
 #include <array>
 #include <cstdint>
@@ -78,6 +80,9 @@ struct DCPipelineResult {
  * @param isovalue          Density isovalue for octree refinement
  *                          (determines which cells are "active").
  * @param max_depth         Maximum octree refinement depth.
+ * @param smoothing_iterations Number of Laplacian smoothing
+ *                          iterations (0 = disabled).
+ * @param smoothing_strength   Smoothing lambda in (0, 1].
  * @return DCPipelineResult containing the output mesh.
  */
 inline DCPipelineResult run_dc_pipeline(
@@ -86,7 +91,9 @@ inline DCPipelineResult run_dc_pipeline(
     const BoundingBox &domain,
     std::uint32_t base_resolution,
     double isovalue,
-    std::uint32_t max_depth) {
+    std::uint32_t max_depth,
+    std::uint32_t smoothing_iterations,
+    double smoothing_strength) {
 
     DCPipelineResult result;
     result.isovalue = isovalue;
@@ -200,6 +207,26 @@ inline DCPipelineResult run_dc_pipeline(
     LeafSpatialIndex spatial_index;
     spatial_index.build(all_cells, domain, max_depth,
                         base_resolution);
+
+    // ================================================================
+    // Step 4b: Optional Laplacian smoothing of QEF vertices.
+    // ================================================================
+    // If smoothing is enabled (iterations > 0), build a vertex
+    // adjacency structure from the octree leaf connectivity and
+    // apply iterative Laplacian smoothing to regularize vertex
+    // positions.  This reduces jitter and improves triangle
+    // quality, especially in regions with noisy Hermite data.
+    // Smoothing runs BEFORE face generation so that the DC faces
+    // connect the smoothed positions.
+
+    if (smoothing_iterations > 0) {
+        VertexAdjacency adjacency = build_vertex_adjacency(
+            all_cells, spatial_index, max_depth,
+            qef_vertices.size());
+        laplacian_smooth_vertices(
+            qef_vertices, adjacency,
+            smoothing_iterations, smoothing_strength);
+    }
 
     // ================================================================
     // Step 5: Generate dual contour faces.
