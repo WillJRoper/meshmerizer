@@ -44,6 +44,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 /**
@@ -225,12 +226,20 @@ inline DCPipelineResult run_dc_pipeline(
     // connect the smoothed positions.
 
     if (smoothing_iterations > 0) {
+        std::fprintf(stdout,
+            "Smoothing     : %u iterations, lambda=%.2f "
+            "(%zu vertices)\n",
+            smoothing_iterations, smoothing_strength,
+            qef_vertices.size());
+        std::fflush(stdout);
         VertexAdjacency adjacency = build_vertex_adjacency(
             all_cells, spatial_index, max_depth,
             qef_vertices.size());
         laplacian_smooth_vertices(
             qef_vertices, adjacency,
             smoothing_iterations, smoothing_strength);
+        std::fprintf(stdout, "Smoothing     : done\n");
+        std::fflush(stdout);
     }
 
     // ================================================================
@@ -258,12 +267,28 @@ inline DCPipelineResult run_dc_pipeline(
     // placed QEF vertices.  Always active (default ratio = 1.5).
 
     if (max_edge_ratio > 0.0 && !dc_triangles.empty()) {
+        const std::size_t tris_before = dc_triangles.size();
+        const std::size_t verts_before = qef_vertices.size();
+        std::fprintf(stdout,
+            "Gap filling   : ratio=%.2f (%zu triangles, "
+            "%zu vertices)\n",
+            max_edge_ratio, tris_before, verts_before);
+        std::fflush(stdout);
         std::vector<double> cell_sizes =
             compute_vertex_cell_sizes(
                 all_cells, qef_vertices.size());
         subdivide_long_edges(
             qef_vertices, dc_triangles,
             cell_sizes, max_edge_ratio);
+        const std::size_t new_verts =
+            qef_vertices.size() - verts_before;
+        const std::size_t new_tris =
+            dc_triangles.size() - tris_before;
+        std::fprintf(stdout,
+            "Gap filling   : done (+%zu vertices, "
+            "+%zu triangles)\n",
+            new_verts, new_tris);
+        std::fflush(stdout);
     }
 
     // ================================================================
