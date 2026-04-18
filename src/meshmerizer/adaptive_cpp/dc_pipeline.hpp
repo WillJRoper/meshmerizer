@@ -29,6 +29,7 @@
  */
 
 #include "bounding_box.hpp"
+#include "edge_subdiv.hpp"
 #include "faces.hpp"
 #include "mesh.hpp"
 #include "morton.hpp"
@@ -83,6 +84,9 @@ struct DCPipelineResult {
  * @param smoothing_iterations Number of Laplacian smoothing
  *                          iterations (0 = disabled).
  * @param smoothing_strength   Smoothing lambda in (0, 1].
+ * @param max_edge_ratio    Maximum edge length as a multiple of
+ *                          local cell size for gap filling.
+ *                          Default 1.5.  Always active.
  * @return DCPipelineResult containing the output mesh.
  */
 inline DCPipelineResult run_dc_pipeline(
@@ -93,7 +97,8 @@ inline DCPipelineResult run_dc_pipeline(
     double isovalue,
     std::uint32_t max_depth,
     std::uint32_t smoothing_iterations,
-    double smoothing_strength) {
+    double smoothing_strength,
+    double max_edge_ratio) {
 
     DCPipelineResult result;
     result.isovalue = isovalue;
@@ -242,6 +247,24 @@ inline DCPipelineResult run_dc_pipeline(
         generate_dual_contour_faces(
             all_cells, qef_vertices, spatial_index,
             max_depth, base_resolution, isovalue);
+
+    // ================================================================
+    // Step 5b: Gap filling via edge subdivision.
+    // ================================================================
+    // Identify triangle edges that are longer than max_edge_ratio
+    // times the local cell size, insert intermediate vertices by
+    // linear interpolation, and re-triangulate affected faces.
+    // This fills gaps caused by large depth transitions or poorly
+    // placed QEF vertices.  Always active (default ratio = 1.5).
+
+    if (max_edge_ratio > 0.0 && !dc_triangles.empty()) {
+        std::vector<double> cell_sizes =
+            compute_vertex_cell_sizes(
+                all_cells, qef_vertices.size());
+        subdivide_long_edges(
+            qef_vertices, dc_triangles,
+            cell_sizes, max_edge_ratio);
+    }
 
     // ================================================================
     // Step 6: Convert to output format.

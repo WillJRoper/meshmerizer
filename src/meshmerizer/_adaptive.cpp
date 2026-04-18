@@ -3169,6 +3169,7 @@ static PyObject *extract_poisson_mesh_py(PyObject * /*self*/,
  *   tol               – double
  *   smoothing_iterations – unsigned int (default 0)
  *   smoothing_strength   – double (default 0.5)
+ *   max_edge_ratio       – double (default 1.5)
  *
  * Returns a dict with keys:
  *   vertices       – (V, 3) float64 ndarray
@@ -3193,8 +3194,9 @@ static PyObject *run_full_pipeline_py(
     double tol = 1e-6;
     unsigned int smoothing_iterations = 0U;
     double smoothing_strength = 0.5;
+    double max_edge_ratio = 1.5;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdIdId|Id",
+    if (!PyArg_ParseTuple(args, "OOOOIdIdId|Idd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -3206,7 +3208,8 @@ static PyObject *run_full_pipeline_py(
                           &max_iters,
                           &tol,
                           &smoothing_iterations,
-                          &smoothing_strength)) {
+                          &smoothing_strength,
+                          &max_edge_ratio)) {
         return NULL;
     }
 
@@ -3246,7 +3249,8 @@ static PyObject *run_full_pipeline_py(
         isovalue,
         static_cast<std::uint32_t>(max_depth),
         static_cast<std::uint32_t>(smoothing_iterations),
-        smoothing_strength);
+        smoothing_strength,
+        max_edge_ratio);
 
     Py_END_ALLOW_THREADS
 

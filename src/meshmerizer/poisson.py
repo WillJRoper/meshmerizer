@@ -35,6 +35,7 @@ def poisson_reconstruct_group(
     tol: float = 1e-6,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
+    max_edge_ratio: float = 1.5,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct a mesh from particles via Poisson in C++.
 
@@ -57,6 +58,8 @@ def poisson_reconstruct_group(
         smoothing_iterations: Number of Laplacian smoothing
             iterations (0 = disabled).
         smoothing_strength: Smoothing lambda in (0, 1].
+        max_edge_ratio: Maximum edge length as a multiple of
+            local cell size for gap filling.  Default 1.5.
 
     Returns:
         Tuple of ``(vertices, faces)`` where ``vertices`` is an
@@ -88,6 +91,7 @@ def poisson_reconstruct_group(
         tol=tol,
         smoothing_iterations=smoothing_iterations,
         smoothing_strength=smoothing_strength,
+        max_edge_ratio=max_edge_ratio,
     )
 
     verts = result["vertices"]
@@ -111,6 +115,7 @@ def poisson_reconstruct(
     tol: float = 1e-6,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
+    max_edge_ratio: float = 1.5,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct meshes for all FOF groups and merge them.
 
@@ -132,6 +137,8 @@ def poisson_reconstruct(
         smoothing_iterations: Number of Laplacian smoothing
             iterations (0 = disabled).
         smoothing_strength: Smoothing lambda in (0, 1].
+        max_edge_ratio: Maximum edge length as a multiple of
+            local cell size for gap filling.  Default 1.5.
 
     Returns:
         Tuple of ``(vertices, faces)`` merged across all groups.
@@ -169,6 +176,7 @@ def poisson_reconstruct(
             tol=tol,
             smoothing_iterations=smoothing_iterations,
             smoothing_strength=smoothing_strength,
+            max_edge_ratio=max_edge_ratio,
         )
 
         if verts.shape[0] == 0:

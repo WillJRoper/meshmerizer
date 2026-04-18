@@ -452,6 +452,7 @@ def run_adaptive(args) -> None:
                 screening_weight=screening_weight,
                 smoothing_iterations=getattr(args, "smoothing_iterations", 0),
                 smoothing_strength=getattr(args, "smoothing_strength", 0.5),
+                max_edge_ratio=getattr(args, "max_edge_ratio", 1.5),
             )
             record_elapsed(
                 "Full pipeline",
@@ -638,6 +639,7 @@ def run_adaptive(args) -> None:
         screening_weight=screening_weight,
         smoothing_iterations=getattr(args, "smoothing_iterations", 0),
         smoothing_strength=getattr(args, "smoothing_strength", 0.5),
+        max_edge_ratio=getattr(args, "max_edge_ratio", 1.5),
     )
     record_elapsed(
         "Poisson reconstruction",

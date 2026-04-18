@@ -1059,6 +1059,7 @@ def run_full_pipeline(
     tol: float = 1e-6,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
+    max_edge_ratio: float = 1.5,
 ) -> dict:
     """Run the full particles-to-mesh pipeline in C++.
 
@@ -1085,6 +1086,9 @@ def run_full_pipeline(
             iterations.  0 disables smoothing (default).
         smoothing_strength: Smoothing lambda in (0, 1].
             0.0 = no movement, 1.0 = snap to neighbor centroid.
+        max_edge_ratio: Maximum edge length as a multiple of
+            the local cell size for gap filling.  Default 1.5.
+            Always active.
 
     Returns:
         Dict with keys ``vertices`` (V, 3) float64 ndarray,
@@ -1107,4 +1111,5 @@ def run_full_pipeline(
         tol,
         smoothing_iterations,
         smoothing_strength,
+        max_edge_ratio,
     )

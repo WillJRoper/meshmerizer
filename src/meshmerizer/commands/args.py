@@ -200,6 +200,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     adaptive.add_argument(
+        "--max-edge-ratio",
+        type=float,
+        default=1.5,
+        help=(
+            "Maximum triangle edge length as a multiple of the "
+            "local octree cell size. Edges longer than this are "
+            "subdivided to fill gaps. Default: 1.5"
+        ),
+    )
+    adaptive.add_argument(
         "--poisson-depth",
         type=int,
         default=None,
