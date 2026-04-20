@@ -424,6 +424,7 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
             vertices.push_back(per_cell_vertex[cell_idx]);
         } else {
             cell.representative_vertex_index = -1;
+            cell.is_active = false;
         }
     }
 

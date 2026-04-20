@@ -861,6 +861,23 @@ def test_solve_vertices_mixed_depth() -> None:
     assert vert_positions.shape[1] == 3
 
 
+def test_refine_octree_quality_stop_preserves_mixed_leaf_depths() -> None:
+    """Quality-based stopping should permit mixed leaf depths."""
+    cells, _, _, _, _, _, _, max_depth, _ = _build_sphere_octree(
+        base_resolution=4,
+        max_depth=3,
+    )
+    surface_leaf_depths = [
+        cell["depth"]
+        for cell in cells
+        if cell.get("is_leaf") and cell.get("has_surface")
+    ]
+
+    assert surface_leaf_depths, "Expected at least one surface leaf"
+    assert any(depth < max_depth for depth in surface_leaf_depths)
+    assert len(set(surface_leaf_depths)) > 1
+
+
 # ---------------------------------------------------------------------------
 # NumPy buffer-protocol tests
 # ---------------------------------------------------------------------------
@@ -1062,3 +1079,60 @@ def test_fof_empty_input() -> None:
     )
     assert labels.shape == (0,)
     assert labels.dtype == np.int64
+
+
+def test_fof_cluster_sizes_support_small_cluster_filtering() -> None:
+    """FOF labels should allow thresholding away tiny detached clusters."""
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    main_cluster = rng.uniform(0.0, 0.2, size=(40, 3))
+    fluff_cluster = rng.uniform(4.9, 5.0, size=(3, 3))
+    positions = np.vstack([main_cluster, fluff_cluster])
+
+    labels = fof_cluster(
+        positions,
+        (0.0, 0.0, 0.0),
+        (5.0, 5.0, 5.0),
+        1.5,
+    )
+
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    cluster_sizes = sorted(counts.tolist())
+
+    assert len(unique_labels) == 2
+    assert cluster_sizes == [3, 40]
+
+
+def test_fof_uses_tight_particle_bounds_for_linking_scale() -> None:
+    """FOF should not depend on a much larger enclosing domain."""
+    import numpy as np
+
+    positions = np.array(
+        [
+            [0.00, 0.00, 0.00],
+            [0.08, 0.06, 0.04],
+            [0.15, 0.10, 0.09],
+            [1.20, 0.00, 0.00],
+            [1.28, 0.05, 0.06],
+            [1.35, 0.11, 0.10],
+        ],
+        dtype=np.float64,
+    )
+
+    labels_small_domain = fof_cluster(
+        positions,
+        (0.0, 0.0, 0.0),
+        (2.0, 1.0, 1.0),
+        0.9,
+    )
+    labels_huge_domain = fof_cluster(
+        positions,
+        (0.0, 0.0, 0.0),
+        (200.0, 100.0, 100.0),
+        0.9,
+    )
+
+    assert len(set(labels_small_domain.tolist())) == 2
+    assert len(set(labels_huge_domain.tolist())) == 2
+    np.testing.assert_array_equal(labels_small_domain, labels_huge_domain)

@@ -38,6 +38,7 @@
 
 #include "mesh.hpp"
 #include "octree_cell.hpp"
+#include "omp_config.hpp"
 #include "vector3d.hpp"
 
 /**
@@ -169,119 +170,109 @@ inline void subdivide_long_edges(
     // intermediate vertices.
     // ============================================================
 
-    // Map from canonical edge key to subdivision info.
-    std::unordered_map<EdgeKey, SubdividedEdge, EdgeKeyHash>
-        edge_subdivisions;
+    struct EdgeSubdivisionRequest {
+        EdgeKey key;
+        std::size_t n_segments;
+    };
 
-    // Scan all triangle edges.  Each edge is visited potentially
-    // twice (once per adjacent triangle), but the canonical key
-    // ensures we only subdivide once.
-    for (const auto &tri : triangles) {
+    const int n_threads = omp_get_max_threads();
+    std::vector<std::vector<EdgeSubdivisionRequest>> thread_requests(
+        static_cast<std::size_t>(n_threads));
+
+#pragma omp parallel for schedule(dynamic)
+    for (std::int64_t tri_index = 0;
+         tri_index < static_cast<std::int64_t>(triangles.size()); ++tri_index) {
+        const auto &tri = triangles[static_cast<std::size_t>(tri_index)];
+        auto &local_requests = thread_requests[
+            static_cast<std::size_t>(omp_get_thread_num())];
         for (int e = 0; e < 3; ++e) {
             const std::size_t va = tri.vertex_indices[e];
-            const std::size_t vb =
-                tri.vertex_indices[(e + 1) % 3];
+            const std::size_t vb = tri.vertex_indices[(e + 1) % 3];
+            const EdgeKey key(va, vb);
 
-            EdgeKey key(va, vb);
-
-            // Skip if already processed.
-            if (edge_subdivisions.count(key) > 0) {
-                continue;
-            }
-
-            // Compute edge length.
             const Vector3d &pa = vertices[va].position;
             const Vector3d &pb = vertices[vb].position;
             const double dx = pb.x - pa.x;
             const double dy = pb.y - pa.y;
             const double dz = pb.z - pa.z;
-            const double edge_len =
-                std::sqrt(dx * dx + dy * dy + dz * dz);
+            const double edge_len = std::sqrt(dx * dx + dy * dy + dz * dz);
 
-            // Local threshold: ratio * min(cell_size_a, cell_size_b).
-            // Use cell_sizes for original vertices.  For vertices
-            // added by earlier subdivision passes (if any), use a
-            // fallback of 0 which would make the threshold 0 and
-            // always trigger subdivision — but since we only run
-            // one pass, all vertices here are original QEF vertices.
-            const double cs_a =
-                (va < cell_sizes.size()) ? cell_sizes[va] : 0.0;
-            const double cs_b =
-                (vb < cell_sizes.size()) ? cell_sizes[vb] : 0.0;
-            const double local_cell_size =
-                std::min(cs_a, cs_b);
-
-            // Guard: if either cell size is zero (shouldn't happen
-            // for valid QEF vertices), skip subdivision for this
-            // edge to avoid division by zero.
+            const double cs_a = (va < cell_sizes.size()) ? cell_sizes[va] : 0.0;
+            const double cs_b = (vb < cell_sizes.size()) ? cell_sizes[vb] : 0.0;
+            const double local_cell_size = std::min(cs_a, cs_b);
             if (local_cell_size <= 0.0) {
                 continue;
             }
 
-            const double threshold =
-                max_edge_ratio * local_cell_size;
-
+            const double threshold = max_edge_ratio * local_cell_size;
             if (edge_len <= threshold) {
-                continue;  // Edge is short enough, no subdivision.
+                continue;
             }
 
-            // Number of segments to split the edge into.
-            // ceil(edge_len / threshold) ensures each segment
-            // is at most `threshold` long.
-            const std::size_t n_segments =
-                static_cast<std::size_t>(
-                    std::ceil(edge_len / threshold));
+            const std::size_t n_segments = static_cast<std::size_t>(
+                std::ceil(edge_len / threshold));
             if (n_segments <= 1) {
-                continue;  // Rounding: edge is just barely over.
+                continue;
             }
-
-            // Insert intermediate vertices.  Positions and normals
-            // are linearly interpolated from the endpoints.  We
-            // interpolate from v_lo to v_hi (canonical order).
-            const Vector3d &p_lo =
-                vertices[key.v_lo].position;
-            const Vector3d &p_hi =
-                vertices[key.v_hi].position;
-            const Vector3d &n_lo =
-                vertices[key.v_lo].normal;
-            const Vector3d &n_hi =
-                vertices[key.v_hi].normal;
-
-            SubdividedEdge sub;
-            sub.intermediate_indices.reserve(n_segments - 1);
-
-            for (std::size_t m = 1; m < n_segments; ++m) {
-                const double t =
-                    static_cast<double>(m) /
-                    static_cast<double>(n_segments);
-
-                // Linearly interpolated position.
-                Vector3d pos = {
-                    p_lo.x + t * (p_hi.x - p_lo.x),
-                    p_lo.y + t * (p_hi.y - p_lo.y),
-                    p_lo.z + t * (p_hi.z - p_lo.z)};
-
-                // Linearly interpolated normal (renormalized).
-                Vector3d nrm = {
-                    n_lo.x + t * (n_hi.x - n_lo.x),
-                    n_lo.y + t * (n_hi.y - n_lo.y),
-                    n_lo.z + t * (n_hi.z - n_lo.z)};
-                const double nrm_len = std::sqrt(
-                    nrm.x * nrm.x + nrm.y * nrm.y +
-                    nrm.z * nrm.z);
-                if (nrm_len > 1e-15) {
-                    nrm.x /= nrm_len;
-                    nrm.y /= nrm_len;
-                    nrm.z /= nrm_len;
-                }
-
-                const std::size_t new_idx = vertices.size();
-                vertices.push_back({pos, nrm});
-                sub.intermediate_indices.push_back(new_idx);
-            }
-
-            edge_subdivisions[key] = std::move(sub);
+            local_requests.push_back({key, n_segments});
         }
+    }
+
+    std::unordered_map<EdgeKey, std::size_t, EdgeKeyHash> requested_segments;
+    for (const auto &thread_vec : thread_requests) {
+        for (const auto &request : thread_vec) {
+            auto it = requested_segments.find(request.key);
+            if (it == requested_segments.end() ||
+                request.n_segments > it->second) {
+                requested_segments[request.key] = request.n_segments;
+            }
+        }
+    }
+
+    std::unordered_map<EdgeKey, SubdividedEdge, EdgeKeyHash>
+        edge_subdivisions;
+
+    for (const auto &entry : requested_segments) {
+        const EdgeKey &key = entry.first;
+        const std::size_t n_segments = entry.second;
+
+        const Vector3d &p_lo = vertices[key.v_lo].position;
+        const Vector3d &p_hi = vertices[key.v_hi].position;
+        const Vector3d &n_lo = vertices[key.v_lo].normal;
+        const Vector3d &n_hi = vertices[key.v_hi].normal;
+
+        SubdividedEdge sub;
+        sub.intermediate_indices.reserve(n_segments - 1);
+
+        for (std::size_t m = 1; m < n_segments; ++m) {
+            const double t =
+                static_cast<double>(m) /
+                static_cast<double>(n_segments);
+
+            Vector3d pos = {
+                p_lo.x + t * (p_hi.x - p_lo.x),
+                p_lo.y + t * (p_hi.y - p_lo.y),
+                p_lo.z + t * (p_hi.z - p_lo.z)};
+
+            Vector3d nrm = {
+                n_lo.x + t * (n_hi.x - n_lo.x),
+                n_lo.y + t * (n_hi.y - n_lo.y),
+                n_lo.z + t * (n_hi.z - n_lo.z)};
+            const double nrm_len = std::sqrt(
+                nrm.x * nrm.x + nrm.y * nrm.y +
+                nrm.z * nrm.z);
+            if (nrm_len > 1e-15) {
+                nrm.x /= nrm_len;
+                nrm.y /= nrm_len;
+                nrm.z /= nrm_len;
+            }
+
+            const std::size_t new_idx = vertices.size();
+            vertices.push_back({pos, nrm});
+            sub.intermediate_indices.push_back(new_idx);
+        }
+
+        edge_subdivisions[key] = std::move(sub);
     }
 
     // If no edges were subdivided, nothing to do.

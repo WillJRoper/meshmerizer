@@ -88,6 +88,13 @@ struct DCPipelineResult {
  * @param max_edge_ratio    Maximum edge length as a multiple of
  *                          local cell size for gap filling.
  *                          Default 1.5.  Always active.
+ * @param minimum_usable_hermite_samples Minimum number of usable Hermite
+ *                          samples required before a corner-crossing cell is
+ *                          allowed to stop refining.
+ * @param max_qef_rms_residual_ratio Maximum allowed RMS QEF plane residual as
+ *                          a fraction of the local cell radius.
+ * @param min_normal_alignment_threshold Minimum allowed alignment between
+ *                          usable Hermite normals and their mean direction.
  * @return DCPipelineResult containing the output mesh.
  */
 inline DCPipelineResult run_dc_pipeline(
@@ -99,7 +106,10 @@ inline DCPipelineResult run_dc_pipeline(
     std::uint32_t max_depth,
     std::uint32_t smoothing_iterations,
     double smoothing_strength,
-    double max_edge_ratio) {
+    double max_edge_ratio,
+    std::uint32_t minimum_usable_hermite_samples = 3U,
+    double max_qef_rms_residual_ratio = 0.1,
+    double min_normal_alignment_threshold = 0.97) {
 
     DCPipelineResult result;
     result.isovalue = isovalue;
@@ -184,7 +194,10 @@ inline DCPipelineResult run_dc_pipeline(
         isovalue,
         max_depth,
         domain,
-        base_resolution);
+        base_resolution,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold);
 
     // ================================================================
     // Step 3: Solve QEF vertices + normals on active leaves.
@@ -313,6 +326,8 @@ inline DCPipelineResult run_dc_pipeline(
             new_verts, new_tris);
         std::fflush(stdout);
     }
+
+    print_octree_structure_summary(all_cells);
 
     // ================================================================
     // Step 6: Convert to output format.

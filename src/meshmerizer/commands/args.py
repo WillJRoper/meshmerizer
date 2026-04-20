@@ -176,6 +176,39 @@ def build_parser() -> argparse.ArgumentParser:
             "Default: 5.0"
         ),
     )
+    adaptive.add_argument(
+        "--min-usable-hermite-samples",
+        type=int,
+        default=3,
+        help=(
+            "Minimum number of usable Hermite samples required before "
+            "a corner-crossing cell is allowed to stop refining. Cells "
+            "with fewer usable samples keep refining until this support "
+            "improves or --max-depth is reached. Default: 3"
+        ),
+    )
+    adaptive.add_argument(
+        "--max-qef-rms-residual-ratio",
+        type=float,
+        default=0.1,
+        help=(
+            "Maximum RMS QEF plane residual as a fraction of the local "
+            "cell radius before a corner-crossing cell is forced to "
+            "refine further. Lower values refine more aggressively. "
+            "Default: 0.1"
+        ),
+    )
+    adaptive.add_argument(
+        "--min-normal-alignment-threshold",
+        type=float,
+        default=0.97,
+        help=(
+            "Minimum alignment between usable Hermite normals and their "
+            "mean direction before a corner-crossing cell is considered "
+            "well represented. Lower values tolerate more curvature; "
+            "higher values refine more aggressively. Default: 0.97"
+        ),
+    )
 
     # Post-processing.
     adaptive.add_argument(
@@ -232,21 +265,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--fof",
         action="store_true",
         help=(
-            "Run Friends-of-Friends clustering before Poisson "
-            "reconstruction.  Required when the scene contains "
-            "multiple distinct objects to prevent thin bridges "
-            "between them.  Off by default for single-object "
-            "scenes."
+            "Run Friends-of-Friends clustering before reconstruction "
+            "and mesh each cluster independently. Off by default. "
+            "Prefer --min-fof-cluster-size when the goal is simply "
+            "to discard small fluff populations before meshing."
+        ),
+    )
+    adaptive.add_argument(
+        "--min-fof-cluster-size",
+        type=int,
+        default=None,
+        help=(
+            "Discard particle FOF clusters smaller than this many "
+            "particles before octree construction and meshing. "
+            "This removes small detached fluff populations without "
+            "splitting the remaining scene into separate meshes. "
+            "Disabled by default."
         ),
     )
     adaptive.add_argument(
         "--linking-factor",
         type=float,
-        default=1.5,
+        default=0.2,
         help=(
             "FOF linking factor: multiplier on mean inter-point "
-            "separation for clustering vertices into distinct "
-            "objects.  Only used when --fof is set. Default: 1.5"
+            "separation for clustering particles into FOF groups. "
+            "Used by --fof and --min-fof-cluster-size. Default: 0.2"
         ),
     )
     adaptive.add_argument(

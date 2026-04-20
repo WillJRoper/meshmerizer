@@ -160,6 +160,16 @@ struct QEFAccumulator {
 };
 
 /**
+ * @brief Diagnostics for a provisional leaf QEF solve.
+ */
+struct QEFLeafDiagnostics {
+    MeshVertex vertex;
+    std::uint32_t usable_sample_count;
+    bool used_fallback;
+    double rms_plane_residual;
+};
+
+/**
  * @brief Solve a 3x3 linear system using Gaussian elimination with
  * partial pivoting.
  *
@@ -264,9 +274,10 @@ inline bool solve_3x3_system(
  *     well-constrained vertices.
  * @return Representative mesh vertex for this leaf.
  */
-inline MeshVertex solve_qef_for_leaf(const std::vector<HermiteSample> &samples,
-                                     const BoundingBox &bounds,
-                                     double regularization_weight = 0.1) {
+inline QEFLeafDiagnostics analyze_qef_for_leaf(
+    const std::vector<HermiteSample> &samples,
+    const BoundingBox &bounds,
+    double regularization_weight = 0.1) {
     // Assemble the normal equations.
     QEFAccumulator accumulator;
     for (const HermiteSample &sample : samples) {
@@ -275,7 +286,12 @@ inline MeshVertex solve_qef_for_leaf(const std::vector<HermiteSample> &samples,
 
     // Degenerate leaf: no usable samples at all.
     if (accumulator.sample_count == 0U) {
-        return {bounds.center(), {0.0, 0.0, 0.0}};
+        return {
+            {bounds.center(), {0.0, 0.0, 0.0}},
+            0U,
+            true,
+            0.0,
+        };
     }
 
     // Apply Tikhonov regularization: add lambda * I to A^T A and
@@ -325,7 +341,36 @@ inline MeshVertex solve_qef_for_leaf(const std::vector<HermiteSample> &samples,
         : position.z > bounds.max.z ? bounds.max.z
         : position.z;
 
-    return {position, accumulator.mean_normal()};
+    double residual_sum_sq = 0.0;
+    for (const HermiteSample &sample : samples) {
+        const double nx = sample.normal.x;
+        const double ny = sample.normal.y;
+        const double nz = sample.normal.z;
+        if (nx == 0.0 && ny == 0.0 && nz == 0.0) {
+            continue;
+        }
+        const double plane_distance =
+            nx * (position.x - sample.position.x) +
+            ny * (position.y - sample.position.y) +
+            nz * (position.z - sample.position.z);
+        residual_sum_sq += plane_distance * plane_distance;
+    }
+    const double rms_plane_residual = std::sqrt(
+        residual_sum_sq / static_cast<double>(accumulator.sample_count));
+
+    return {
+        {position, accumulator.mean_normal()},
+        accumulator.sample_count,
+        !solved,
+        rms_plane_residual,
+    };
+}
+
+inline MeshVertex solve_qef_for_leaf(const std::vector<HermiteSample> &samples,
+                                     const BoundingBox &bounds,
+                                     double regularization_weight = 0.1) {
+    return analyze_qef_for_leaf(
+        samples, bounds, regularization_weight).vertex;
 }
 
 #endif  // MESHMERIZER_ADAPTIVE_CPP_QEF_HPP_

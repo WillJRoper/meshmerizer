@@ -382,6 +382,9 @@ def refine_octree(
     max_depth: int,
     domain: tuple[tuple[float, float, float], tuple[float, float, float]],
     base_resolution: int,
+    minimum_usable_hermite_samples: int = 3,
+    max_qef_rms_residual_ratio: float = 0.1,
+    min_normal_alignment_threshold: float = 0.97,
 ) -> tuple[tuple[dict[str, object], ...], tuple[int, ...]]:
     """Refine the octree using breadth-first refinement.
 
@@ -394,6 +397,15 @@ def refine_octree(
         domain: Bounding box of the simulation domain as
             ``((min_x, min_y, min_z), (max_x, max_y, max_z))``.
         base_resolution: Number of top-level cells per axis.
+        minimum_usable_hermite_samples: Minimum usable Hermite sample
+            count required before a corner-crossing cell may stop
+            refining.
+        max_qef_rms_residual_ratio: Maximum RMS QEF plane residual as
+            a fraction of the local cell radius before a split is
+            required.
+        min_normal_alignment_threshold: Minimum alignment between
+            usable Hermite normals and their mean direction before a
+            split is required.
 
     Returns:
         Tuple of (all_cells, all_contributors) where cells store indices
@@ -407,6 +419,9 @@ def refine_octree(
         max_depth,
         domain,
         base_resolution,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
     )
 
 
@@ -545,6 +560,9 @@ def run_octree_pipeline(
     base_resolution: int,
     isovalue: float,
     max_depth: int,
+    minimum_usable_hermite_samples: int = 3,
+    max_qef_rms_residual_ratio: float = 0.1,
+    min_normal_alignment_threshold: float = 0.97,
 ) -> tuple["numpy.ndarray", "numpy.ndarray"]:
     """Run the octree pipeline in C++ and return QEF vertices.
 
@@ -561,6 +579,15 @@ def run_octree_pipeline(
         base_resolution: Number of top-level cells per axis.
         isovalue: Target surface level.
         max_depth: Maximum octree refinement depth.
+        minimum_usable_hermite_samples: Minimum usable Hermite sample
+            count required before a corner-crossing cell may stop
+            refining.
+        max_qef_rms_residual_ratio: Maximum RMS QEF plane residual as
+            a fraction of the local cell radius before a split is
+            required.
+        min_normal_alignment_threshold: Minimum alignment between
+            usable Hermite normals and their mean direction before a
+            split is required.
 
     Returns:
         Tuple of ``(vert_positions, vert_normals)`` where
@@ -576,6 +603,9 @@ def run_octree_pipeline(
         base_resolution,
         isovalue,
         max_depth,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
     )
 
 
@@ -640,8 +670,9 @@ def fof_cluster(
 
     Groups 3-D positions into connected components where any two
     points within a linking length of each other belong to the same
-    group.  The linking length is derived from the mean inter-point
-    separation scaled by ``linking_factor``.
+    group. The linking length is derived from the mean inter-point
+    separation measured over the tight bounding box of the supplied
+    points, then scaled by ``linking_factor``.
 
     This is used before Poisson surface reconstruction to identify
     distinct objects (e.g. separate galaxies or halos) so that each
@@ -650,10 +681,12 @@ def fof_cluster(
 
     Args:
         positions: (N, 3) float64 array of point positions.
-        domain_min: Lower corner of the spatial domain as
-            ``(x_min, y_min, z_min)``.
-        domain_max: Upper corner of the spatial domain as
-            ``(x_max, y_max, z_max)``.
+        domain_min: Lower corner of the nominal spatial domain as
+            ``(x_min, y_min, z_min)``. Used as a fallback only if the
+            occupied point cloud has zero volume.
+        domain_max: Upper corner of the nominal spatial domain as
+            ``(x_max, y_max, z_max)``. Used as a fallback only if the
+            occupied point cloud has zero volume.
         linking_factor: Multiplicative factor applied to the mean
             inter-point separation to obtain the linking length.
             Default is 1.5.
@@ -1060,6 +1093,9 @@ def run_full_pipeline(
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
     max_edge_ratio: float = 1.5,
+    minimum_usable_hermite_samples: int = 3,
+    max_qef_rms_residual_ratio: float = 0.1,
+    min_normal_alignment_threshold: float = 0.97,
 ) -> dict:
     """Run the full particles-to-mesh pipeline in C++.
 
@@ -1089,6 +1125,15 @@ def run_full_pipeline(
         max_edge_ratio: Maximum edge length as a multiple of
             the local cell size for gap filling.  Default 1.5.
             Always active.
+        minimum_usable_hermite_samples: Minimum usable Hermite sample
+            count required before a corner-crossing cell may stop
+            refining.
+        max_qef_rms_residual_ratio: Maximum RMS QEF plane residual as
+            a fraction of the local cell radius before a split is
+            required.
+        min_normal_alignment_threshold: Minimum alignment between
+            usable Hermite normals and their mean direction before a
+            split is required.
 
     Returns:
         Dict with keys ``vertices`` (V, 3) float64 ndarray,
@@ -1112,4 +1157,7 @@ def run_full_pipeline(
         smoothing_iterations,
         smoothing_strength,
         max_edge_ratio,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
     )

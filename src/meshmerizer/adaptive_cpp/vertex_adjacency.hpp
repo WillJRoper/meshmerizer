@@ -121,8 +121,10 @@ inline VertexAdjacency build_vertex_adjacency(
     //   -Z face: probe at (cx + j, cy + k, cz - 1)
     // where j, k iterate over [0, span) to cover the full face.
 
-    for (std::size_t ci = 0; ci < all_cells.size(); ++ci) {
-        const OctreeCell &cell = all_cells[ci];
+#pragma omp parallel for schedule(dynamic)
+    for (std::int64_t ci = 0;
+         ci < static_cast<std::int64_t>(all_cells.size()); ++ci) {
+        const OctreeCell &cell = all_cells[static_cast<std::size_t>(ci)];
 
         // Skip non-leaf, non-active cells.
         if (!cell.is_leaf || !cell.is_active) {
@@ -255,8 +257,10 @@ inline VertexAdjacency build_vertex_adjacency(
     adj.offsets.resize(n_vertices + 1, 0);
 
     // Sort and deduplicate each per-vertex neighbor list.
-    for (std::size_t vi = 0; vi < n_vertices; ++vi) {
-        auto &nbrs = per_vertex_neighbors[vi];
+#pragma omp parallel for schedule(dynamic)
+    for (std::int64_t vi = 0;
+         vi < static_cast<std::int64_t>(n_vertices); ++vi) {
+        auto &nbrs = per_vertex_neighbors[static_cast<std::size_t>(vi)];
         std::sort(nbrs.begin(), nbrs.end());
         nbrs.erase(
             std::unique(nbrs.begin(), nbrs.end()),

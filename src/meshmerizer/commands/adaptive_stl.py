@@ -1,15 +1,17 @@
 """Adaptive meshing CLI command.
 
 This module implements the ``adaptive`` subcommand which runs the new
-adaptive octree pipeline from a SWIFT snapshot to an STL file.  QEF
-vertices are solved in C++, then clustered via FOF and reconstructed
-into a watertight mesh via Poisson surface reconstruction.
+adaptive octree pipeline from a SWIFT snapshot to an STL file.  It can
+optionally use particle-level FOF clustering either to reconstruct
+distinct objects independently or to discard small detached fluff
+clusters before meshing.
 """
 
 from __future__ import annotations
 
 import sys
 import time
+from collections import Counter
 from typing import Optional
 
 import numpy as np
@@ -171,6 +173,68 @@ def _load_particles_for_adaptive(args):
     return positions, smoothing_lengths, domain_min, domain_max, origin
 
 
+def _filter_small_particle_fof_clusters(
+    positions: np.ndarray,
+    smoothing_lengths: np.ndarray,
+    domain_min: tuple[float, float, float],
+    domain_max: tuple[float, float, float],
+    linking_factor: float,
+    min_cluster_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Discard particle FOF clusters smaller than ``min_cluster_size``.
+
+    Args:
+        positions: Particle positions as an ``(N, 3)`` float64 array.
+        smoothing_lengths: Per-particle smoothing lengths as ``(N,)``.
+        domain_min: Lower corner of the working domain.
+        domain_max: Upper corner of the working domain.
+        linking_factor: FOF linking factor.
+        min_cluster_size: Minimum number of particles required for a
+            cluster to be retained.
+
+    Returns:
+        Tuple of filtered ``(positions, smoothing_lengths)`` arrays.
+
+    Raises:
+        ValueError: If ``min_cluster_size`` is not positive.
+    """
+    if min_cluster_size <= 0:
+        raise ValueError(
+            f"min_cluster_size must be positive, got {min_cluster_size}"
+        )
+
+    if len(positions) == 0:
+        return positions, smoothing_lengths
+
+    labels = fof_cluster(positions, domain_min, domain_max, linking_factor)
+    counts = Counter(labels.tolist())
+    kept_labels = sorted(
+        label for label, count in counts.items() if count >= min_cluster_size
+    )
+
+    n_groups = len(counts)
+    n_kept_groups = len(kept_labels)
+    n_removed_groups = n_groups - n_kept_groups
+    kept_mask = np.isin(labels, np.asarray(kept_labels, dtype=np.int64))
+    n_kept_particles = int(np.count_nonzero(kept_mask))
+    n_removed_particles = int(len(positions) - n_kept_particles)
+
+    log_status(
+        "Clustering",
+        (
+            f"FOF particle filtering: kept {n_kept_groups}/{n_groups} groups "
+            f"and {n_kept_particles}/{len(positions)} particles "
+            f"(removed {n_removed_groups} groups, {n_removed_particles} "
+            f"particles; min size = {min_cluster_size})."
+        ),
+    )
+
+    if n_kept_particles == 0:
+        return positions[:0], smoothing_lengths[:0]
+
+    return positions[kept_mask], smoothing_lengths[kept_mask]
+
+
 def _visualize_vertices(vert_positions, output_path: str) -> None:
     """Save a 6-panel figure showing QEF vertices from each face.
 
@@ -238,6 +302,76 @@ def _visualize_vertices(vert_positions, output_path: str) -> None:
     print(f"Saved vertex visualisation to {output_path}")
 
 
+def _emit_tree_structure_summary(cells) -> None:
+    """Log a concise per-depth summary of the octree structure.
+
+    Args:
+        cells: Iterable of octree cell dictionaries.
+    """
+    if not cells:
+        log_status(
+            "Tree",
+            "Summary:\n"
+            "total=0 leaf=0 internal=0 active=0 inactive=0 surface=0",
+        )
+        return
+
+    max_depth = max(int(cell.get("depth", 0)) for cell in cells)
+    per_depth = [
+        {
+            "total": 0,
+            "leaf": 0,
+            "active": 0,
+            "surface": 0,
+        }
+        for _ in range(max_depth + 1)
+    ]
+
+    total_leaf = 0
+    total_active = 0
+    total_surface = 0
+
+    for cell in cells:
+        depth = int(cell.get("depth", 0))
+        summary = per_depth[depth]
+        summary["total"] += 1
+        is_leaf = bool(cell.get("is_leaf", False))
+        is_active = bool(cell.get("is_active", False))
+        has_surface = bool(cell.get("has_surface", False))
+        if is_leaf:
+            summary["leaf"] += 1
+            total_leaf += 1
+        if is_active:
+            summary["active"] += 1
+            total_active += 1
+        if has_surface:
+            summary["surface"] += 1
+            total_surface += 1
+
+    lines = [
+        "Summary:",
+        (
+            f"total={len(cells)} leaf={total_leaf} "
+            f"internal={len(cells) - total_leaf} "
+            f"active={total_active} inactive={len(cells) - total_active} "
+            f"surface={total_surface}"
+        ),
+    ]
+    for depth, summary in enumerate(per_depth):
+        lines.append(
+            (
+                f"depth {depth}: total={summary['total']} "
+                f"leaf={summary['leaf']} "
+                f"internal={summary['total'] - summary['leaf']} "
+                f"active={summary['active']} "
+                f"inactive={summary['total'] - summary['active']} "
+                f"surface={summary['surface']}"
+            )
+        )
+
+    log_status("Tree", "\n".join(lines))
+
+
 def run_adaptive(args) -> None:
     """Run the adaptive meshing pipeline from CLI arguments.
 
@@ -288,6 +422,40 @@ def run_adaptive(args) -> None:
         positions, smoothing_lengths, domain_min, domain_max, origin = (
             _load_particles_for_adaptive(args)
         )
+
+        min_fof_cluster_size = getattr(args, "min_fof_cluster_size", None)
+        if min_fof_cluster_size is not None:
+            log_status(
+                "Clustering",
+                (
+                    "Running particle FOF filtering "
+                    f"(linking_factor={args.linking_factor}, "
+                    f"min_cluster_size={min_fof_cluster_size})..."
+                ),
+            )
+            cluster_start = time.perf_counter()
+            positions, smoothing_lengths = _filter_small_particle_fof_clusters(
+                positions,
+                smoothing_lengths,
+                domain_min,
+                domain_max,
+                args.linking_factor,
+                min_fof_cluster_size,
+            )
+            record_elapsed(
+                "Particle FOF filtering",
+                cluster_start,
+                operation="Clustering",
+            )
+            if len(positions) == 0:
+                print(
+                    "Error: Particle FOF filtering removed all particles. "
+                    "Lower --min-fof-cluster-size or adjust "
+                    "--linking-factor.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
         max_depth = args.max_depth
         base_resolution = args.base_resolution
 
@@ -340,6 +508,15 @@ def run_adaptive(args) -> None:
                 max_depth,
                 domain=(domain_min, domain_max),
                 base_resolution=base_resolution,
+                minimum_usable_hermite_samples=getattr(
+                    args, "min_usable_hermite_samples", 3
+                ),
+                max_qef_rms_residual_ratio=getattr(
+                    args, "max_qef_rms_residual_ratio", 0.1
+                ),
+                min_normal_alignment_threshold=getattr(
+                    args, "min_normal_alignment_threshold", 0.97
+                ),
             )
             record_elapsed(
                 "Octree construction",
@@ -453,6 +630,15 @@ def run_adaptive(args) -> None:
                 smoothing_iterations=getattr(args, "smoothing_iterations", 0),
                 smoothing_strength=getattr(args, "smoothing_strength", 0.5),
                 max_edge_ratio=getattr(args, "max_edge_ratio", 1.5),
+                minimum_usable_hermite_samples=getattr(
+                    args, "min_usable_hermite_samples", 3
+                ),
+                max_qef_rms_residual_ratio=getattr(
+                    args, "max_qef_rms_residual_ratio", 0.1
+                ),
+                min_normal_alignment_threshold=getattr(
+                    args, "min_normal_alignment_threshold", 0.97
+                ),
             )
             record_elapsed(
                 "Full pipeline",
@@ -640,6 +826,15 @@ def run_adaptive(args) -> None:
         smoothing_iterations=getattr(args, "smoothing_iterations", 0),
         smoothing_strength=getattr(args, "smoothing_strength", 0.5),
         max_edge_ratio=getattr(args, "max_edge_ratio", 1.5),
+        minimum_usable_hermite_samples=getattr(
+            args, "min_usable_hermite_samples", 3
+        ),
+        max_qef_rms_residual_ratio=getattr(
+            args, "max_qef_rms_residual_ratio", 0.1
+        ),
+        min_normal_alignment_threshold=getattr(
+            args, "min_normal_alignment_threshold", 0.97
+        ),
     )
     record_elapsed(
         "Poisson reconstruction",
@@ -694,6 +889,9 @@ def run_adaptive(args) -> None:
 
     log_status("Saving", f"Writing STL to {output_path}...")
     mesh.save(str(output_path))
+
+    if args.load_octree is not None or args.save_octree is not None:
+        _emit_tree_structure_summary(cells)
 
     record_elapsed("Total pipeline", total_start, operation="Done")
     log_status("Done", f"Adaptive mesh saved to {output_path}")

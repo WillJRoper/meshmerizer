@@ -1026,14 +1026,20 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
     unsigned int base_resolution = 0U;
+    unsigned int minimum_usable_hermite_samples = 3U;
+    double max_qef_rms_residual_ratio = 0.1;
+    double min_normal_alignment_threshold = 0.97;
     std::vector<Vector3d> positions;
     std::vector<double> smoothing_lengths;
     std::vector<OctreeCell> initial_cells;
     (void)self;
 
-    if (!PyArg_ParseTuple(args, "OOOdIOI", &initial_cells_object,
+    if (!PyArg_ParseTuple(args, "OOOdIOI|Idd", &initial_cells_object,
                           &positions_object, &smoothing_object, &isovalue,
-                          &max_depth, &domain_object, &base_resolution)) {
+                          &max_depth, &domain_object, &base_resolution,
+                          &minimum_usable_hermite_samples,
+                          &max_qef_rms_residual_ratio,
+                          &min_normal_alignment_threshold)) {
         return NULL;
     }
     if (!parse_positions(positions_object, positions) ||
@@ -1122,7 +1128,10 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
         isovalue,
         max_depth,
         domain,
-        static_cast<std::uint32_t>(base_resolution));
+        static_cast<std::uint32_t>(base_resolution),
+        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold);
 
     PyObject *result = PyTuple_New(2);
     if (result == NULL) {
@@ -1980,16 +1989,22 @@ static PyObject *run_octree_pipeline_py(
     unsigned int base_resolution = 0U;
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
+    unsigned int minimum_usable_hermite_samples = 3U;
+    double max_qef_rms_residual_ratio = 0.1;
+    double min_normal_alignment_threshold = 0.97;
     (void)self;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdI",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|Idd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
                           &domain_max_object,
                           &base_resolution,
                           &isovalue,
-                          &max_depth)) {
+                          &max_depth,
+                          &minimum_usable_hermite_samples,
+                          &max_qef_rms_residual_ratio,
+                          &min_normal_alignment_threshold)) {
         return NULL;
     }
 
@@ -2094,7 +2109,10 @@ static PyObject *run_octree_pipeline_py(
         isovalue,
         static_cast<std::uint32_t>(max_depth),
         domain,
-        static_cast<std::uint32_t>(base_resolution));
+        static_cast<std::uint32_t>(base_resolution),
+        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold);
 
     // -- Step 3: Solve QEF vertices for active leaf cells --
     vertices = solve_all_leaf_vertices(
@@ -3195,8 +3213,11 @@ static PyObject *run_full_pipeline_py(
     unsigned int smoothing_iterations = 0U;
     double smoothing_strength = 0.5;
     double max_edge_ratio = 1.5;
+    unsigned int minimum_usable_hermite_samples = 3U;
+    double max_qef_rms_residual_ratio = 0.1;
+    double min_normal_alignment_threshold = 0.97;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdIdId|Idd",
+    if (!PyArg_ParseTuple(args, "OOOOIdIdId|IddIdd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -3209,7 +3230,10 @@ static PyObject *run_full_pipeline_py(
                           &tol,
                           &smoothing_iterations,
                           &smoothing_strength,
-                          &max_edge_ratio)) {
+                          &max_edge_ratio,
+                          &minimum_usable_hermite_samples,
+                          &max_qef_rms_residual_ratio,
+                          &min_normal_alignment_threshold)) {
         return NULL;
     }
 
@@ -3250,7 +3274,10 @@ static PyObject *run_full_pipeline_py(
         static_cast<std::uint32_t>(max_depth),
         static_cast<std::uint32_t>(smoothing_iterations),
         smoothing_strength,
-        max_edge_ratio);
+        max_edge_ratio,
+        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold);
 
     Py_END_ALLOW_THREADS
 

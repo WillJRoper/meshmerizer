@@ -36,6 +36,9 @@ def poisson_reconstruct_group(
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
     max_edge_ratio: float = 1.5,
+    minimum_usable_hermite_samples: int = 3,
+    max_qef_rms_residual_ratio: float = 0.1,
+    min_normal_alignment_threshold: float = 0.97,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct a mesh from particles via Poisson in C++.
 
@@ -60,7 +63,15 @@ def poisson_reconstruct_group(
         smoothing_strength: Smoothing lambda in (0, 1].
         max_edge_ratio: Maximum edge length as a multiple of
             local cell size for gap filling.  Default 1.5.
-
+        minimum_usable_hermite_samples: Minimum usable Hermite sample
+            count required before a corner-crossing cell may stop
+            refining.
+        max_qef_rms_residual_ratio: Maximum RMS QEF plane residual as
+            a fraction of the local cell radius before a split is
+            required.
+        min_normal_alignment_threshold: Minimum alignment between
+            usable Hermite normals and their mean direction before a
+            split is required.
     Returns:
         Tuple of ``(vertices, faces)`` where ``vertices`` is an
         (V, 3) float64 array and ``faces`` is an (F, 3) int64
@@ -92,6 +103,9 @@ def poisson_reconstruct_group(
         smoothing_iterations=smoothing_iterations,
         smoothing_strength=smoothing_strength,
         max_edge_ratio=max_edge_ratio,
+        minimum_usable_hermite_samples=minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold=min_normal_alignment_threshold,
     )
 
     verts = result["vertices"]
@@ -116,6 +130,9 @@ def poisson_reconstruct(
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
     max_edge_ratio: float = 1.5,
+    minimum_usable_hermite_samples: int = 3,
+    max_qef_rms_residual_ratio: float = 0.1,
+    min_normal_alignment_threshold: float = 0.97,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct meshes for all FOF groups and merge them.
 
@@ -139,7 +156,15 @@ def poisson_reconstruct(
         smoothing_strength: Smoothing lambda in (0, 1].
         max_edge_ratio: Maximum edge length as a multiple of
             local cell size for gap filling.  Default 1.5.
-
+        minimum_usable_hermite_samples: Minimum usable Hermite sample
+            count required before a corner-crossing cell may stop
+            refining.
+        max_qef_rms_residual_ratio: Maximum RMS QEF plane residual as
+            a fraction of the local cell radius before a split is
+            required.
+        min_normal_alignment_threshold: Minimum alignment between
+            usable Hermite normals and their mean direction before a
+            split is required.
     Returns:
         Tuple of ``(vertices, faces)`` merged across all groups.
     """
@@ -177,6 +202,9 @@ def poisson_reconstruct(
             smoothing_iterations=smoothing_iterations,
             smoothing_strength=smoothing_strength,
             max_edge_ratio=max_edge_ratio,
+            minimum_usable_hermite_samples=minimum_usable_hermite_samples,
+            max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
+            min_normal_alignment_threshold=min_normal_alignment_threshold,
         )
 
         if verts.shape[0] == 0:

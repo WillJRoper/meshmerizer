@@ -8,9 +8,9 @@
  * acceleration structure.
  *
  * The linking length is computed automatically from the mean inter-point
- * separation:
+ * separation measured over the tight bounding box of the input points:
  *
- *     mean_sep = (domain_volume / n_points) ^ (1/3)
+ *     mean_sep = (tight_bbox_volume / n_points) ^ (1/3)
  *     linking_length = linking_factor * mean_sep
  *
  * where ``linking_factor`` is a tunable parameter (default 1.5).
@@ -176,8 +176,8 @@ struct FofGridKeyHash {
  * contiguous labels starting from 0.
  *
  * @param positions     Array of N 3-D positions (QEF vertices).
- * @param domain_min    Minimum corner of the domain bounding box.
- * @param domain_max    Maximum corner of the domain bounding box.
+ * @param domain_min    Minimum corner of the nominal domain bounding box.
+ * @param domain_max    Maximum corner of the nominal domain bounding box.
  * @param linking_factor Multiplier for the mean inter-point separation.
  *     Default 1.5.  Larger values merge more aggressively.
  * @return Vector of N group labels (contiguous integers from 0).
@@ -199,14 +199,41 @@ inline std::vector<std::int64_t> fof_cluster(
         return {0};
     }
 
-    // Compute the linking length from the domain volume and point
-    // count.  The mean inter-point separation is the cube root of the
-    // volume per point.
-    const double domain_vol =
-        (domain_max.x - domain_min.x) *
-        (domain_max.y - domain_min.y) *
-        (domain_max.z - domain_min.z);
-    const double mean_sep = std::cbrt(domain_vol / static_cast<double>(n));
+    // Compute a tight bounding box over the occupied points. Using the
+    // full selected domain can dramatically overestimate the mean
+    // separation when the particles occupy only a small sub-volume,
+    // which in turn makes the linking length far too large and slows
+    // the clustering step.
+    Vector3d tight_min = positions[0];
+    Vector3d tight_max = positions[0];
+    for (std::size_t i = 1; i < n; ++i) {
+        tight_min.x = std::min(tight_min.x, positions[i].x);
+        tight_min.y = std::min(tight_min.y, positions[i].y);
+        tight_min.z = std::min(tight_min.z, positions[i].z);
+        tight_max.x = std::max(tight_max.x, positions[i].x);
+        tight_max.y = std::max(tight_max.y, positions[i].y);
+        tight_max.z = std::max(tight_max.z, positions[i].z);
+    }
+
+    const double extent_x = std::max(tight_max.x - tight_min.x, 0.0);
+    const double extent_y = std::max(tight_max.y - tight_min.y, 0.0);
+    const double extent_z = std::max(tight_max.z - tight_min.z, 0.0);
+    double occupied_vol = extent_x * extent_y * extent_z;
+
+    // If the occupied extent is degenerate along one or more axes,
+    // fall back to the nominal domain bounds so the linking length
+    // remains finite and the hash still has a sensible scale.
+    if (!(occupied_vol > 0.0)) {
+        occupied_vol =
+            std::max(domain_max.x - domain_min.x, 0.0) *
+            std::max(domain_max.y - domain_min.y, 0.0) *
+            std::max(domain_max.z - domain_min.z, 0.0);
+    }
+    if (!(occupied_vol > 0.0)) {
+        occupied_vol = 1.0;
+    }
+
+    const double mean_sep = std::cbrt(occupied_vol / static_cast<double>(n));
     const double linking_length = linking_factor * mean_sep;
     const double linking_length_sq = linking_length * linking_length;
 
@@ -221,11 +248,11 @@ inline std::vector<std::int64_t> fof_cluster(
     std::vector<FofGridKey> point_bins(n);
     for (std::size_t i = 0; i < n; ++i) {
         const std::int32_t bx = static_cast<std::int32_t>(
-            std::floor((positions[i].x - domain_min.x) * inv_ll));
+            std::floor((positions[i].x - tight_min.x) * inv_ll));
         const std::int32_t by = static_cast<std::int32_t>(
-            std::floor((positions[i].y - domain_min.y) * inv_ll));
+            std::floor((positions[i].y - tight_min.y) * inv_ll));
         const std::int32_t bz = static_cast<std::int32_t>(
-            std::floor((positions[i].z - domain_min.z) * inv_ll));
+            std::floor((positions[i].z - tight_min.z) * inv_ll));
         point_bins[i] = {bx, by, bz};
         grid[point_bins[i]].push_back(i);
     }

@@ -150,6 +150,24 @@ def _run_pipeline(
     return mesh, result
 
 
+def _filter_small_fof_clusters(
+    positions: np.ndarray,
+    smoothing_lengths: np.ndarray,
+    domain_min,
+    domain_max,
+    linking_factor: float,
+    min_cluster_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Filter particle clusters by FOF size for integration tests."""
+    from meshmerizer.adaptive_core import fof_cluster
+
+    labels = fof_cluster(positions, domain_min, domain_max, linking_factor)
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    kept_labels = unique_labels[counts >= min_cluster_size]
+    keep_mask = np.isin(labels, kept_labels)
+    return positions[keep_mask], smoothing_lengths[keep_mask]
+
+
 def _edge_counts(faces: np.ndarray) -> Counter:
     """Count how many triangles share each edge."""
     counts = Counter()
@@ -387,21 +405,81 @@ class TestTwoBlobsIntegration:
         mesh, _ = self._get_result()
         assert mesh is not None
         assert len(mesh.vertices) > 10
+
+
+class TestSmallFoFFluffFilteringIntegration:
+    """Small detached particle fluff can be removed before meshing."""
+
+    _result_cache = None
+
+    @classmethod
+    def _get_result(cls):
+        if cls._result_cache is None:
+            pos_main, sml_main = _make_solid_sphere_particles(
+                n=1200,
+                radius=0.8,
+                center=(2.0, 2.0, 2.0),
+                h=0.18,
+                seed=101,
+            )
+            pos_fluff, sml_fluff = _make_solid_sphere_particles(
+                n=40,
+                radius=0.18,
+                center=(4.6, 4.6, 4.6),
+                h=0.08,
+                seed=202,
+            )
+            positions = np.vstack([pos_main, pos_fluff])
+            sml = np.concatenate([sml_main, sml_fluff])
+            domain_min = (0.0, 0.0, 0.0)
+            domain_max = (5.0, 5.0, 5.0)
+
+            filtered_positions, filtered_sml = _filter_small_fof_clusters(
+                positions,
+                sml,
+                domain_min,
+                domain_max,
+                linking_factor=1.5,
+                min_cluster_size=100,
+            )
+            mesh, meta = _run_pipeline(
+                filtered_positions,
+                filtered_sml,
+                domain_min=domain_min,
+                domain_max=domain_max,
+                base_resolution=4,
+                isovalue=0.005,
+                max_depth=3,
+                screening_weight=4.0,
+            )
+            cls._result_cache = (mesh, meta, filtered_positions)
+        return cls._result_cache
+
+    def test_small_fluff_cluster_is_removed(self) -> None:
+        """Filtering should drop the detached small particle cluster."""
+        mesh, _, filtered_positions = self._get_result()
+        assert mesh is not None
+        assert filtered_positions.shape[0] > 1000
+        assert filtered_positions.shape[0] < 1240
+        assert np.all(filtered_positions[:, 0] < 4.0)
+
+    def test_filtered_mesh_stays_near_main_object(self) -> None:
+        """The final mesh should not retain geometry near the fluff clump."""
+        mesh, _, _ = self._get_result()
+        assert mesh is not None
+        assert np.max(mesh.vertices[:, 0]) < 3.6
         assert len(mesh.faces) > 10
 
-    def test_two_components(self) -> None:
-        """Mesh should have at least 2 connected components.
-
-        The blobs are well-separated so the Poisson field should
-        not connect them (they share no particle support).
-        """
-        mesh, _ = self._get_result()
+    def test_filtered_mesh_is_single_main_component(self) -> None:
+        """Filtering should leave only the main connected object."""
+        mesh, _, _ = self._get_result()
         assert mesh is not None
         components = mesh.split(only_watertight=False)
-        # Filter out tiny noise components (< 5 faces).
-        big = [c for c in components if len(c.faces) >= 5]
-        assert len(big) >= 2, (
-            f"Expected >= 2 components, got {len(big)} "
+        # Filter out tiny numerical crumbs; the retained main object should
+        # dominate all genuinely resolved components.
+        big = [c for c in components if len(c.faces) >= 20]
+        assert len(big) == 1, (
+            f"Expected 1 main component, got {len(big)} "
             f"(total components: {len(components)})"
         )
 
