@@ -579,9 +579,15 @@ inline bool sign_at_fine_vertex(
         return cell.corner_values[0] >= isovalue;
     }
 
-    // Quantize the cell's own min corner to fine-grid coordinates.
-    std::uint32_t cx = 0U, cy = 0U, cz = 0U;
-    spatial_index.quantize_min_corner(cell.bounds.min, cx, cy, cz);
+    // Use the octree lattice coordinates encoded by the Morton key rather than
+    // re-quantizing world-space bounds. This matches the previously working
+    // implementation more closely and avoids rounding mismatches between the
+    // octree lattice and world-space quantization.
+    std::uint32_t cell_x = 0U, cell_y = 0U, cell_z = 0U;
+    morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
+    const std::uint32_t cx = cell_x << (max_depth - cell.depth);
+    const std::uint32_t cy = cell_y << (max_depth - cell.depth);
+    const std::uint32_t cz = cell_z << (max_depth - cell.depth);
 
     // corner_values are at the 8 corners of the cell bounding box:
     //   corner 0 = (cx, cy, cz),  corner 7 = (cx+span, cy+span, cz+span).
@@ -621,6 +627,393 @@ inline bool sign_at_fine_vertex(
     const double value = vxy_0 + fz * (vxy_1 - vxy_0);
 
     return value >= isovalue;
+}
+
+/**
+ * @brief Gather contributor indices for one cell.
+ */
+inline std::vector<std::size_t> gather_face_cell_contributors(
+    const OctreeCell &cell,
+    const std::vector<std::size_t> &all_contributors) {
+    if (cell.contributor_begin < 0 ||
+        cell.contributor_end <= cell.contributor_begin) {
+        return {};
+    }
+    const auto begin_idx = static_cast<std::size_t>(cell.contributor_begin);
+    const auto end_idx = static_cast<std::size_t>(cell.contributor_end);
+    if (end_idx > all_contributors.size()) {
+        return {};
+    }
+    return {
+        all_contributors.begin() + static_cast<std::ptrdiff_t>(begin_idx),
+        all_contributors.begin() + static_cast<std::ptrdiff_t>(end_idx),
+    };
+}
+
+/**
+ * @brief Collect leaves incident to sign-changing fine-grid edges that still
+ *        lack representative vertices.
+ */
+inline std::vector<std::size_t> collect_missing_incident_cells(
+    const std::vector<OctreeCell> &all_cells,
+    const LeafSpatialIndex &spatial_index,
+    std::uint32_t max_depth,
+    std::uint32_t base_resolution,
+    double isovalue) {
+    if (max_depth >= 21U) {
+        throw std::overflow_error(
+            "max_depth >= 21 would overflow grid coordinates");
+    }
+    const std::uint64_t fine_res_wide =
+        static_cast<std::uint64_t>(base_resolution) *
+        (1ULL << max_depth);
+    constexpr std::uint64_t MAX_COORD_FACE = (1ULL << 21U) - 1U;
+    if (fine_res_wide > MAX_COORD_FACE) {
+        throw std::overflow_error(
+            "fine_res exceeds 21-bit grid coordinate capacity");
+    }
+    const std::uint32_t fine_res = static_cast<std::uint32_t>(fine_res_wide);
+
+    std::vector<char> needs_vertex(all_cells.size(), 0);
+    ProgressBar activation_bar(
+        "Activating incident cells", static_cast<std::size_t>(fine_res));
+
+#pragma omp parallel
+    {
+        std::vector<char> local_needs_vertex(all_cells.size(), 0);
+
+#pragma omp for schedule(dynamic)
+        for (std::uint32_t ix = 0; ix < fine_res; ++ix) {
+            for (std::uint32_t iy = 0; iy < fine_res; ++iy) {
+                for (std::uint32_t iz = 0; iz < fine_res; ++iz) {
+                    const std::size_t cell_a_idx =
+                        spatial_index.find_leaf_at(ix, iy, iz);
+                    if (cell_a_idx == SIZE_MAX) {
+                        continue;
+                    }
+                    const OctreeCell &cell_a = all_cells[cell_a_idx];
+                    const bool sign_a = sign_at_fine_vertex(
+                        cell_a, ix, iy, iz, spatial_index, max_depth,
+                        isovalue);
+
+                    if (ix + 1U < fine_res) {
+                        const std::size_t cell_b_idx =
+                            spatial_index.find_leaf_at(ix + 1U, iy, iz);
+                        if (cell_b_idx != SIZE_MAX) {
+                            const bool sign_b = sign_at_fine_vertex(
+                                all_cells[cell_b_idx], ix + 1U, iy, iz,
+                                spatial_index, max_depth, isovalue);
+                            if (sign_a != sign_b && iy > 0U && iz > 0U) {
+                                const std::size_t incident[4] = {
+                                    cell_a_idx,
+                                    spatial_index.find_leaf_at(ix, iy, iz - 1U),
+                                    spatial_index.find_leaf_at(
+                                        ix, iy - 1U, iz - 1U),
+                                    spatial_index.find_leaf_at(ix, iy - 1U, iz),
+                                };
+                                for (std::size_t ci : incident) {
+                                    if (ci != SIZE_MAX && all_cells[ci].is_leaf &&
+                                        all_cells[ci].representative_vertex_index < 0) {
+                                        local_needs_vertex[ci] = 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (iy + 1U < fine_res) {
+                        const std::size_t cell_c_idx =
+                            spatial_index.find_leaf_at(ix, iy + 1U, iz);
+                        if (cell_c_idx != SIZE_MAX) {
+                            const bool sign_c = sign_at_fine_vertex(
+                                all_cells[cell_c_idx], ix, iy + 1U, iz,
+                                spatial_index, max_depth, isovalue);
+                            if (sign_a != sign_c && ix > 0U && iz > 0U) {
+                                const std::size_t incident[4] = {
+                                    cell_a_idx,
+                                    spatial_index.find_leaf_at(ix - 1U, iy, iz),
+                                    spatial_index.find_leaf_at(
+                                        ix - 1U, iy, iz - 1U),
+                                    spatial_index.find_leaf_at(ix, iy, iz - 1U),
+                                };
+                                for (std::size_t ci : incident) {
+                                    if (ci != SIZE_MAX && all_cells[ci].is_leaf &&
+                                        all_cells[ci].representative_vertex_index < 0) {
+                                        local_needs_vertex[ci] = 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (iz + 1U < fine_res) {
+                        const std::size_t cell_d_idx =
+                            spatial_index.find_leaf_at(ix, iy, iz + 1U);
+                        if (cell_d_idx != SIZE_MAX) {
+                            const bool sign_d = sign_at_fine_vertex(
+                                all_cells[cell_d_idx], ix, iy, iz + 1U,
+                                spatial_index, max_depth, isovalue);
+                            if (sign_a != sign_d && ix > 0U && iy > 0U) {
+                                const std::size_t incident[4] = {
+                                    cell_a_idx,
+                                    spatial_index.find_leaf_at(ix, iy - 1U, iz),
+                                    spatial_index.find_leaf_at(
+                                        ix - 1U, iy - 1U, iz),
+                                    spatial_index.find_leaf_at(ix - 1U, iy, iz),
+                                };
+                                for (std::size_t ci : incident) {
+                                    if (ci != SIZE_MAX && all_cells[ci].is_leaf &&
+                                        all_cells[ci].representative_vertex_index < 0) {
+                                        local_needs_vertex[ci] = 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            activation_bar.tick();
+        }
+
+#pragma omp critical
+        {
+            for (std::size_t i = 0; i < all_cells.size(); ++i) {
+                if (local_needs_vertex[i]) {
+                    needs_vertex[i] = 1;
+                }
+            }
+        }
+    }
+
+    activation_bar.finish();
+
+    std::vector<std::size_t> missing_cells;
+    for (std::size_t i = 0; i < all_cells.size(); ++i) {
+        if (needs_vertex[i]) {
+            missing_cells.push_back(i);
+        }
+    }
+
+    // Expand over a bounded local 26-neighbourhood. A true fixed-point
+    // closure can percolate through huge connected regions of the octree and
+    // effectively never finish on large datasets, so keep the expansion local.
+    std::vector<char> expanded_needs_vertex = needs_vertex;
+    constexpr std::size_t MAX_CLOSURE_ITERATIONS = 2;
+    for (std::size_t closure_iteration = 1;
+         closure_iteration <= MAX_CLOSURE_ITERATIONS;
+         ++closure_iteration) {
+        std::vector<char> next_needs_vertex = expanded_needs_vertex;
+        ProgressCounter closure_counter(
+            "Closing incident neighbourhood", "cells",
+            100);
+        std::size_t newly_marked = 0;
+        for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            closure_counter.tick();
+            if (!expanded_needs_vertex[cell_idx]) {
+                continue;
+            }
+            const OctreeCell &cell = all_cells[cell_idx];
+            std::uint32_t ix = 0U, iy = 0U, iz = 0U;
+            spatial_index.quantize_min_corner(cell.bounds.min, ix, iy, iz);
+            const std::uint32_t span = 1U << (max_depth - cell.depth);
+
+            for (int dx = -1; dx <= 1; ++dx) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        if (dx == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+
+                        const std::int64_t px =
+                            dx < 0 ? static_cast<std::int64_t>(ix) - 1LL
+                                   : dx > 0 ? static_cast<std::int64_t>(ix + span)
+                                            : static_cast<std::int64_t>(ix);
+                        const std::int64_t py =
+                            dy < 0 ? static_cast<std::int64_t>(iy) - 1LL
+                                   : dy > 0 ? static_cast<std::int64_t>(iy + span)
+                                            : static_cast<std::int64_t>(iy);
+                        const std::int64_t pz =
+                            dz < 0 ? static_cast<std::int64_t>(iz) - 1LL
+                                   : dz > 0 ? static_cast<std::int64_t>(iz + span)
+                                            : static_cast<std::int64_t>(iz);
+                        if (px < 0 || py < 0 || pz < 0 ||
+                            px >= static_cast<std::int64_t>(fine_res) ||
+                            py >= static_cast<std::int64_t>(fine_res) ||
+                            pz >= static_cast<std::int64_t>(fine_res)) {
+                            continue;
+                        }
+
+                        const std::size_t neighbor_idx = spatial_index.find_leaf_at(
+                            static_cast<std::uint32_t>(px),
+                            static_cast<std::uint32_t>(py),
+                            static_cast<std::uint32_t>(pz));
+                        if (neighbor_idx != SIZE_MAX && all_cells[neighbor_idx].is_leaf &&
+                            all_cells[neighbor_idx].representative_vertex_index < 0 &&
+                            !next_needs_vertex[neighbor_idx]) {
+                            next_needs_vertex[neighbor_idx] = 1;
+                            ++newly_marked;
+                        }
+                    }
+                }
+            }
+        }
+        closure_counter.finish();
+        std::fprintf(stdout,
+                     "Incident closure iteration %zu complete (+%zu cells)\n",
+                     closure_iteration, newly_marked);
+        std::fflush(stdout);
+        expanded_needs_vertex.swap(next_needs_vertex);
+        if (newly_marked == 0) {
+            break;
+        }
+    }
+
+    std::vector<std::size_t> expanded_missing_cells;
+    for (std::size_t i = 0; i < all_cells.size(); ++i) {
+        if (expanded_needs_vertex[i]) {
+            expanded_missing_cells.push_back(i);
+        }
+    }
+    return expanded_missing_cells;
+}
+
+/**
+ * @brief Refine topology-required incident cells that still have no local
+ *        Hermite support.
+ *
+ * Returns true when at least one missing incident cell was split, so the
+ * caller can rebuild the spatial index and re-solve leaf vertices.
+ */
+inline bool refine_zero_sample_incident_cells(
+    std::vector<OctreeCell> &all_cells,
+    std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const LeafSpatialIndex &spatial_index,
+    std::uint32_t max_depth,
+    std::uint32_t base_resolution,
+    double isovalue,
+    const BoundingBox &domain) {
+    const std::vector<std::size_t> missing_cells =
+        collect_missing_incident_cells(
+            all_cells, spatial_index, max_depth, base_resolution, isovalue);
+
+    ProgressCounter refine_counter(
+        "Refining incident cells", "cells", 100);
+    std::size_t split_count = 0;
+    std::size_t zero_sample_count = 0;
+    for (std::size_t cell_idx : missing_cells) {
+        refine_counter.tick();
+        if (cell_idx >= all_cells.size()) {
+            continue;
+        }
+        OctreeCell &cell = all_cells[cell_idx];
+        if (!cell.is_leaf || cell.representative_vertex_index >= 0) {
+            continue;
+        }
+
+        const std::vector<std::size_t> contributors =
+            gather_face_cell_contributors(cell, all_contributors);
+        if (cell.corner_sign_mask == 0U && !contributors.empty()) {
+            cell.corner_values = sample_cell_corners(
+                cell, contributors, positions, smoothing_lengths);
+            cell.corner_sign_mask = compute_corner_sign_mask(
+                cell.corner_values, isovalue);
+        }
+        const std::vector<HermiteSample> samples =
+            compute_cell_hermite_samples(
+                cell.bounds, cell.corner_values, cell.corner_sign_mask,
+                contributors, positions, smoothing_lengths, isovalue);
+        if (!samples.empty()) {
+            continue;
+        }
+
+        ++zero_sample_count;
+        if (cell.depth < max_depth) {
+            split_octree_leaf(
+                cell_idx, all_cells, all_contributors,
+                positions, smoothing_lengths);
+            ++split_count;
+        }
+    }
+    refine_counter.finish();
+
+    std::fprintf(stdout,
+                 "Incident refinement: missing=%zu zero_sample=%zu split=%zu\n",
+                 missing_cells.size(), zero_sample_count, split_count);
+    std::fflush(stdout);
+
+    if (split_count == 0) {
+        return false;
+    }
+
+    balance_octree(
+        all_cells, all_contributors, positions, smoothing_lengths,
+        isovalue, domain, base_resolution, max_depth);
+    return true;
+}
+
+/**
+ * @brief Solve representative vertices for incident cells missed by the main
+ *        per-leaf activation pass.
+ */
+inline void activate_missing_incident_cells(
+    std::vector<OctreeCell> &all_cells,
+    std::vector<MeshVertex> &vertices,
+    const std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const LeafSpatialIndex &spatial_index,
+    std::uint32_t max_depth,
+    std::uint32_t base_resolution,
+    double isovalue) {
+    const std::vector<std::size_t> missing_cells =
+        collect_missing_incident_cells(
+            all_cells, spatial_index, max_depth, base_resolution, isovalue);
+
+    std::size_t already_present_count = 0;
+    std::size_t zero_sample_count = 0;
+    std::size_t activated_count = 0;
+    for (std::size_t cell_idx : missing_cells) {
+        OctreeCell &cell = all_cells[cell_idx];
+        if (!cell.is_leaf) {
+            continue;
+        }
+        if (cell.representative_vertex_index >= 0) {
+            ++already_present_count;
+            continue;
+        }
+
+        const std::vector<std::size_t> contributors =
+            gather_face_cell_contributors(cell, all_contributors);
+        if (cell.corner_sign_mask == 0U && !contributors.empty()) {
+            cell.corner_values = sample_cell_corners(
+                cell, contributors, positions, smoothing_lengths);
+            cell.corner_sign_mask = compute_corner_sign_mask(
+                cell.corner_values, isovalue);
+        }
+
+        const std::vector<HermiteSample> samples =
+            compute_cell_hermite_samples(
+                cell.bounds, cell.corner_values, cell.corner_sign_mask,
+                contributors, positions, smoothing_lengths, isovalue);
+        if (samples.empty()) {
+            ++zero_sample_count;
+            continue;
+        }
+
+        cell.representative_vertex_index =
+            static_cast<std::int64_t>(vertices.size());
+        cell.is_active = true;
+        vertices.push_back(solve_qef_for_leaf(samples, cell.bounds));
+        ++activated_count;
+    }
+
+    std::fprintf(stdout,
+                 "Retroactive QEF solve: missing=%zu already_present=%zu zero_sample=%zu added=%zu\n",
+                 missing_cells.size(), already_present_count,
+                 zero_sample_count, activated_count);
+    std::fflush(stdout);
 }
 
 /**

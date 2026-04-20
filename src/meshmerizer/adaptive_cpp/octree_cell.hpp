@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "bounding_box.hpp"
+#include "hermite.hpp"
 #include "kernel_wendland_c2.hpp"
 #include "morton.hpp"
 #include "particle_grid.hpp"
@@ -236,6 +237,60 @@ inline std::vector<std::vector<std::size_t>> filter_child_contributors(
 }
 
 /**
+ * @brief Split one leaf cell and append its children to the flat arrays.
+ */
+inline void split_octree_leaf(
+    std::size_t split_index,
+    std::vector<OctreeCell> &all_cells,
+    std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths) {
+    if (split_index >= all_cells.size() || !all_cells[split_index].is_leaf) {
+        return;
+    }
+
+    OctreeCell &parent = all_cells[split_index];
+    std::vector<std::size_t> contributors;
+    if (parent.contributor_begin >= 0 &&
+        parent.contributor_end > parent.contributor_begin) {
+        const auto begin_idx =
+            static_cast<std::size_t>(parent.contributor_begin);
+        const auto end_idx =
+            static_cast<std::size_t>(parent.contributor_end);
+        if (end_idx <= all_contributors.size()) {
+            contributors.assign(
+                all_contributors.begin() + static_cast<std::ptrdiff_t>(begin_idx),
+                all_contributors.begin() + static_cast<std::ptrdiff_t>(end_idx));
+        }
+    }
+
+    std::vector<OctreeCell> children = create_child_cells(parent);
+    std::vector<std::vector<std::size_t>> child_contributors =
+        filter_child_contributors(
+            contributors, positions, smoothing_lengths, children);
+
+    parent.is_leaf = false;
+    parent.is_active = false;
+    parent.has_surface = true;
+    parent.representative_vertex_index = -1;
+    parent.child_begin = static_cast<std::int64_t>(all_cells.size());
+
+    for (std::size_t i = 0; i < children.size(); ++i) {
+        const std::int64_t child_contrib_begin =
+            static_cast<std::int64_t>(all_contributors.size());
+        std::copy(child_contributors[i].begin(),
+                  child_contributors[i].end(),
+                  std::back_inserter(all_contributors));
+        const std::int64_t child_contrib_end =
+            static_cast<std::int64_t>(all_contributors.size());
+
+        children[i].contributor_begin = child_contrib_begin;
+        children[i].contributor_end = child_contrib_end;
+        all_cells.push_back(children[i]);
+    }
+}
+
+/**
  * @brief Evaluate the SPH field value at a given point.
  *
  * Sums the normalized Wendland C2 kernel contributions from all contributing
@@ -293,6 +348,45 @@ inline std::array<double, 8> sample_cell_corners(
             corner, contributor_indices, positions, smoothing_lengths);
     }
     return corner_values;
+}
+
+/**
+ * @brief Heuristic near-surface test using center value and gradient.
+ *
+ * If the field value at the cell center is close enough to the isovalue
+ * relative to the local gradient magnitude and cell radius, the isosurface can
+ * plausibly pass through the cell even when the corners are uniform.
+ */
+inline bool cell_near_isosurface_by_gradient(
+    const OctreeCell &cell,
+    const std::vector<std::size_t> &contributor_indices,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    double isovalue,
+    double safety_factor = 1.25) {
+    if (contributor_indices.empty()) {
+        return false;
+    }
+
+    const Vector3d center = cell.bounds.center();
+    const double center_value = evaluate_field_at_point(
+        center, contributor_indices, positions, smoothing_lengths);
+    const Vector3d gradient = evaluate_field_gradient_at_point(
+        center, contributor_indices, positions, smoothing_lengths);
+    const double gradient_magnitude = std::sqrt(
+        gradient.x * gradient.x +
+        gradient.y * gradient.y +
+        gradient.z * gradient.z);
+    if (gradient_magnitude < 1e-12) {
+        return false;
+    }
+
+    const double dx = cell.bounds.max.x - cell.bounds.min.x;
+    const double dy = cell.bounds.max.y - cell.bounds.min.y;
+    const double dz = cell.bounds.max.z - cell.bounds.min.z;
+    const double half_diagonal = 0.5 * std::sqrt(dx * dx + dy * dy + dz * dz);
+    const double estimated_variation = safety_factor * gradient_magnitude * half_diagonal;
+    return std::abs(center_value - isovalue) <= estimated_variation;
 }
 
 /**
@@ -924,8 +1018,13 @@ refine_octree(
         current_cell.corner_sign_mask =
             compute_corner_sign_mask(corner_values, isovalue);
 
-        if (!cell_may_contain_isosurface(
-                corner_values, isovalue)) {
+        const bool corner_surface =
+            cell_may_contain_isosurface(corner_values, isovalue);
+        const bool gradient_surface =
+            cell_near_isosurface_by_gradient(
+                current_cell, contributors, positions,
+                smoothing_lengths, isovalue);
+        if (!corner_surface && !gradient_surface) {
             current_cell.is_leaf = true;
             current_cell.is_active = false;
             current_cell.has_surface = false;
@@ -1065,7 +1164,13 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
         current_cell.corner_values = corner_values;
         current_cell.corner_sign_mask = compute_corner_sign_mask(corner_values, isovalue);
 
-        if (!cell_may_contain_isosurface(corner_values, isovalue)) {
+        const bool corner_surface =
+            cell_may_contain_isosurface(corner_values, isovalue);
+        const bool gradient_surface =
+            cell_near_isosurface_by_gradient(
+                current_cell, contributors, positions,
+                smoothing_lengths, isovalue);
+        if (!corner_surface && !gradient_surface) {
             current_cell.is_leaf = true;
             current_cell.is_active = false;
             current_cell.has_surface = false;

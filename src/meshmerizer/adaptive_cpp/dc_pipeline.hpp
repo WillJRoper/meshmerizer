@@ -215,7 +215,30 @@ inline DCPipelineResult run_dc_pipeline(
                         base_resolution);
 
     // ================================================================
-    // Step 4b: Optional Laplacian smoothing of QEF vertices.
+    // Step 4b: Retroactively activate incident cells missing QEF vertices.
+    // ================================================================
+    // A leaf can be incident to a sign-changing fine-grid edge even if its
+    // own corner sign mask is uniform. Those leaves still need representative
+    // vertices; otherwise face generation drops the corresponding quads and
+    // produces square holes.
+
+    while (refine_zero_sample_incident_cells(
+        all_cells, all_contributors, positions, smoothing_lengths,
+        spatial_index, max_depth, base_resolution, isovalue, domain)) {
+        spatial_index.build(all_cells, domain, max_depth, base_resolution);
+        qef_vertices = solve_all_leaf_vertices(
+            all_cells, all_contributors, positions,
+            smoothing_lengths, isovalue);
+    }
+    spatial_index.build(all_cells, domain, max_depth, base_resolution);
+
+    activate_missing_incident_cells(
+        all_cells, qef_vertices, all_contributors,
+        positions, smoothing_lengths, spatial_index,
+        max_depth, base_resolution, isovalue);
+
+    // ================================================================
+    // Step 4c: Optional Laplacian smoothing of QEF vertices.
     // ================================================================
     // If smoothing is enabled (iterations > 0), build a vertex
     // adjacency structure from the octree leaf connectivity and
