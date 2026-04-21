@@ -1,10 +1,13 @@
 """Tests for the adaptive C++ core scaffold and core utilities."""
 
+import numpy as np
+
 from meshmerizer.adaptive_core import (
     adaptive_status,
     bounding_box_contains,
     bounding_box_overlaps,
     cell_may_contain_isosurface,
+    classify_occupied_solid,
     compute_isovalue_from_percentile,
     corner_sign_mask,
     create_child_cells,
@@ -1136,3 +1139,175 @@ def test_fof_uses_tight_particle_bounds_for_linking_scale() -> None:
     assert len(set(labels_small_domain.tolist())) == 2
     assert len(set(labels_huge_domain.tolist())) == 2
     np.testing.assert_array_equal(labels_small_domain, labels_huge_domain)
+
+
+def _make_solid_sphere_particles(
+    n: int = 400,
+    radius: float = 0.9,
+    center=(2.0, 2.0, 2.0),
+    h: float = 0.2,
+    seed: int = 123,
+):
+    """Generate random particles inside a solid sphere."""
+    rng = np.random.default_rng(seed)
+    accepted = []
+    while len(accepted) < n:
+        points = rng.uniform(-radius, radius, size=(n, 3))
+        mask = np.sum(points**2, axis=1) <= radius**2
+        accepted.extend(points[mask].tolist())
+    positions = np.asarray(accepted[:n], dtype=np.float64)
+    positions += np.asarray(center, dtype=np.float64)
+    smoothing_lengths = np.full(n, h, dtype=np.float64)
+    return positions, smoothing_lengths
+
+
+def test_classify_occupied_solid_returns_boundary_summary() -> None:
+    """Occupied-solid scaffolding should identify inside/boundary leaves."""
+    positions, smoothing_lengths = _make_solid_sphere_particles()
+
+    result = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        3,
+    )
+
+    occupancy = result["occupancy"]
+    assert result["n_leaves"] == len(occupancy)
+    assert result["n_inside"] > 0
+    assert result["n_boundary_inside"] > 0
+    assert result["n_boundary_outside"] > 0
+    assert np.any(occupancy == 2)
+    assert np.any(occupancy == 3)
+
+
+def test_surface_band_refinement_scaffold_increases_leaf_count() -> None:
+    """Requested surface-band refinement should increase leaf resolution."""
+    positions, smoothing_lengths = _make_solid_sphere_particles()
+
+    coarse = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        2,
+        max_surface_leaf_size=0.0,
+    )
+    refined = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        2,
+        max_surface_leaf_size=0.3,
+    )
+
+    assert refined["n_leaves"] >= coarse["n_leaves"]
+    assert np.min(refined["cell_sizes"]) <= np.min(coarse["cell_sizes"])
+
+
+def test_erosion_wavefront_reduces_inside_leaf_count() -> None:
+    """Positive erosion radius should shrink the occupied solid."""
+    positions, smoothing_lengths = _make_solid_sphere_particles()
+
+    baseline = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        3,
+        erosion_radius=0.0,
+    )
+    eroded = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        3,
+        erosion_radius=0.25,
+    )
+
+    assert baseline["n_eroded_inside"] == baseline["n_inside"]
+    assert eroded["n_eroded_inside"] < eroded["n_inside"]
+    assert np.all(eroded["clearance"][eroded["eroded_inside"] > 0] >= 0.25)
+
+
+def test_opening_adds_back_leaves_after_erosion() -> None:
+    """Dilation stage should add back some leaves after erosion."""
+    positions, smoothing_lengths = _make_solid_sphere_particles()
+
+    opened = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        3,
+        erosion_radius=0.25,
+    )
+
+    assert opened["n_opened_inside"] >= opened["n_eroded_inside"]
+    assert opened["n_opened_inside"] <= opened["n_inside"]
+    assert np.any(opened["opened_inside"] > opened["eroded_inside"])
+
+
+def test_opened_solid_generates_boundary_samples() -> None:
+    """Opened solid scaffold should emit face-centered boundary samples."""
+    positions, smoothing_lengths = _make_solid_sphere_particles()
+
+    opened = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        3,
+        erosion_radius=0.25,
+    )
+
+    sample_positions = opened["opened_boundary_positions"]
+    sample_normals = opened["opened_boundary_normals"]
+    assert opened["n_opened_boundary_samples"] == len(sample_positions)
+    assert len(sample_positions) > 0
+    assert sample_positions.shape[1] == 3
+    assert sample_normals.shape[1] == 3
+    assert np.all(np.isin(np.abs(sample_normals), [0.0, 1.0]))
+    assert np.all(np.sum(np.abs(sample_normals), axis=1) == 1.0)
+
+
+def test_opened_solid_generates_surface_mesh() -> None:
+    """Opened solid scaffold should produce a non-empty surface mesh."""
+    positions, smoothing_lengths = _make_solid_sphere_particles()
+
+    opened = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        3,
+        erosion_radius=0.25,
+    )
+
+    vertices = opened["opened_surface_vertices"]
+    faces = opened["opened_surface_faces"]
+    assert opened["n_opened_surface_vertices"] == len(vertices)
+    assert opened["n_opened_surface_faces"] == len(faces)
+    assert len(vertices) > 0
+    assert len(faces) > 0
+    assert vertices.shape[1] == 3
+    assert faces.shape[1] == 3

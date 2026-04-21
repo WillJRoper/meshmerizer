@@ -29,6 +29,7 @@
  */
 
 #include "bounding_box.hpp"
+#include "adaptive_solid.hpp"
 #include "edge_subdiv.hpp"
 #include "faces.hpp"
 #include "mesh.hpp"
@@ -42,7 +43,12 @@
 #include "vertex_adjacency.hpp"
 #include "vertex_smooth.hpp"
 
+VertexAdjacency build_triangle_mesh_adjacency(
+    std::size_t n_vertices,
+    const std::vector<MeshTriangle> &triangles);
+
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -95,6 +101,8 @@ struct DCPipelineResult {
  *                          a fraction of the local cell radius.
  * @param min_normal_alignment_threshold Minimum allowed alignment between
  *                          usable Hermite normals and their mean direction.
+ * @param min_feature_thickness Minimum physical thickness to preserve via
+ *                          adaptive solid opening. 0 disables the regularizer.
  * @return DCPipelineResult containing the output mesh.
  */
 inline DCPipelineResult run_dc_pipeline(
@@ -109,7 +117,8 @@ inline DCPipelineResult run_dc_pipeline(
     double max_edge_ratio,
     std::uint32_t minimum_usable_hermite_samples = 3U,
     double max_qef_rms_residual_ratio = 0.1,
-    double min_normal_alignment_threshold = 0.97) {
+    double min_normal_alignment_threshold = 0.97,
+    double min_feature_thickness = 0.0) {
 
     DCPipelineResult result;
     result.isovalue = isovalue;
@@ -199,6 +208,185 @@ inline DCPipelineResult run_dc_pipeline(
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold);
 
+    if (min_feature_thickness > 0.0) {
+        const Vector3d domain_extent = domain.extent();
+        const double min_domain_extent = std::min(
+            domain_extent.x,
+            std::min(domain_extent.y, domain_extent.z));
+        const double finest_leaf_size =
+            min_domain_extent /
+            static_cast<double>(base_resolution * (1U << max_depth));
+        const double minimum_resolvable_thickness = 2.0 * finest_leaf_size;
+
+        double effective_min_feature_thickness = min_feature_thickness;
+        if (effective_min_feature_thickness < minimum_resolvable_thickness) {
+            std::fprintf(
+                stdout,
+                "Regularization warning: requested min_feature_thickness=%.6g "
+                "is below the resolvable minimum %.6g at base_resolution=%u "
+                "and max_depth=%u; clamping to %.6g\n",
+                min_feature_thickness,
+                minimum_resolvable_thickness,
+                base_resolution,
+                max_depth,
+                minimum_resolvable_thickness);
+            std::fflush(stdout);
+            effective_min_feature_thickness = minimum_resolvable_thickness;
+        }
+
+        const double opening_radius = 0.5 * effective_min_feature_thickness;
+        std::fprintf(stdout,
+                     "Regularization: min_feature_thickness=%.6g "
+                      "(opening radius=%.6g)\n",
+                     effective_min_feature_thickness, opening_radius);
+        std::fflush(stdout);
+
+        const double max_surface_leaf_size = opening_radius;
+        std::size_t regularization_refine_pass = 0U;
+        while (true) {
+            ++regularization_refine_pass;
+            std::fprintf(stdout,
+                         "Regularization pass %zu: target_leaf_size<=%.6g "
+                         "(total_cells=%zu)\n",
+                         regularization_refine_pass,
+                         max_surface_leaf_size,
+                         all_cells.size());
+            std::fflush(stdout);
+            if (!refine_surface_band_cells(
+                    all_cells, all_contributors, positions,
+                    smoothing_lengths, isovalue, max_depth,
+                    max_surface_leaf_size,
+                    minimum_usable_hermite_samples,
+                    max_qef_rms_residual_ratio,
+                    min_normal_alignment_threshold)) {
+                std::fprintf(stdout,
+                             "Regularization pass %zu: no further surface-band "
+                             "refinement required\n",
+                             regularization_refine_pass);
+                std::fflush(stdout);
+                break;
+            }
+        }
+
+        std::fprintf(stdout,
+                     "Regularization: targeted refinement complete; starting "
+                     "final balance (total_cells=%zu)\n",
+                     all_cells.size());
+        std::fflush(stdout);
+        balance_octree(
+            all_cells, all_contributors, positions, smoothing_lengths,
+            isovalue, domain, base_resolution, max_depth);
+
+        LeafSpatialIndex solid_spatial_index;
+        solid_spatial_index.build(all_cells, domain, max_depth, base_resolution);
+        const std::vector<OccupiedSolidLeaf> solid_leaves =
+            classify_occupied_solid_leaves(
+                all_cells, all_contributors, positions,
+                smoothing_lengths, solid_spatial_index,
+                isovalue, max_depth);
+        const std::vector<double> clearance =
+            compute_inside_clearance(solid_leaves);
+        const std::vector<std::uint8_t> eroded_inside =
+            erode_occupied_solid_leaves(
+                solid_leaves, clearance, opening_radius);
+        const std::vector<double> dilation_distance =
+            compute_distance_to_eroded_solid(solid_leaves, eroded_inside);
+        const std::vector<std::uint8_t> opened_inside =
+            dilate_eroded_solid_leaves(
+                eroded_inside, dilation_distance, opening_radius);
+
+        std::fprintf(stdout,
+                     "Regularization: extracting opened blocky surface "
+                     "(opened_inside=%zu)\n",
+                     static_cast<std::size_t>(std::count(
+                         opened_inside.begin(), opened_inside.end(),
+                         static_cast<std::uint8_t>(1U))));
+        std::fflush(stdout);
+
+        OpenedSurfaceMesh opened_surface = generate_opened_surface_mesh(
+            solid_leaves, opened_inside, all_cells, solid_spatial_index,
+            domain, base_resolution, max_depth);
+
+        std::fprintf(stdout,
+                     "Regularization: opened surface extraction done "
+                     "(%zu vertices, %zu triangles)\n",
+                     opened_surface.vertices.size(),
+                     opened_surface.triangles.size());
+        std::fflush(stdout);
+
+        if (smoothing_iterations > 0 && !opened_surface.vertices.empty()) {
+            std::fprintf(stdout,
+                "Smoothing     : %u iterations, lambda=%.2f (%zu vertices)\n",
+                smoothing_iterations, smoothing_strength,
+                opened_surface.vertices.size());
+            std::fflush(stdout);
+            VertexAdjacency adjacency = build_triangle_mesh_adjacency(
+                opened_surface.vertices.size(),
+                opened_surface.triangles);
+            laplacian_smooth_vertices(
+                opened_surface.vertices, adjacency,
+                smoothing_iterations, smoothing_strength);
+            std::fprintf(stdout, "Smoothing     : done\n");
+            std::fflush(stdout);
+        }
+
+        std::vector<MeshTriangle> &opened_triangles = opened_surface.triangles;
+        std::vector<MeshVertex> &opened_vertices = opened_surface.vertices;
+
+        if (max_edge_ratio > 0.0 && !opened_triangles.empty()) {
+            const std::size_t tris_before = opened_triangles.size();
+            const std::size_t verts_before = opened_vertices.size();
+            std::fprintf(stdout,
+                "Gap filling   : ratio=%.2f (%zu triangles, %zu vertices)\n",
+                max_edge_ratio, tris_before, verts_before);
+            std::fflush(stdout);
+            std::vector<double> cell_sizes(opened_vertices.size(), opening_radius);
+            subdivide_long_edges(
+                opened_vertices, opened_triangles,
+                cell_sizes, max_edge_ratio);
+            std::fprintf(stdout,
+                "Gap filling   : done (+%zu vertices, +%zu triangles)\n",
+                opened_vertices.size() - verts_before,
+                opened_triangles.size() - tris_before);
+            std::fflush(stdout);
+        }
+
+        std::size_t opened_inside_count = 0U;
+        for (std::uint8_t flag : opened_inside) {
+            opened_inside_count += flag != 0U ? 1U : 0U;
+        }
+        std::fprintf(stdout,
+                     "Regularization: leaves=%zu opened_inside=%zu "
+                     "surface_vertices=%zu surface_triangles=%zu "
+                     "qef_vertices=%zu\n",
+                     solid_leaves.size(), opened_inside_count,
+                     opened_vertices.size(),
+                     opened_triangles.size(),
+                     static_cast<std::size_t>(0));
+        std::fflush(stdout);
+
+        std::fprintf(stdout,
+                     "Regularization: using opened-solid blocky extraction "
+                     "with existing smoothing\n");
+        std::fflush(stdout);
+
+        print_octree_structure_summary(all_cells);
+
+        result.n_qef_vertices = 0U;
+        result.vertices.reserve(opened_vertices.size());
+        for (const auto &v : opened_vertices) {
+            result.vertices.push_back(v.position);
+        }
+        result.triangles.reserve(opened_triangles.size());
+        for (const auto &tri : opened_triangles) {
+            result.triangles.push_back(
+                {static_cast<std::uint32_t>(tri.vertex_indices[0]),
+                 static_cast<std::uint32_t>(tri.vertex_indices[1]),
+                 static_cast<std::uint32_t>(tri.vertex_indices[2])});
+        }
+        return result;
+    }
+
     // ================================================================
     // Step 3: Solve QEF vertices + normals on active leaves.
     // ================================================================
@@ -237,7 +425,8 @@ inline DCPipelineResult run_dc_pipeline(
 
     while (refine_zero_sample_incident_cells(
         all_cells, all_contributors, positions, smoothing_lengths,
-        spatial_index, max_depth, base_resolution, isovalue, domain)) {
+        spatial_index, max_depth, base_resolution, isovalue,
+        domain)) {
         spatial_index.build(all_cells, domain, max_depth, base_resolution);
         qef_vertices = solve_all_leaf_vertices(
             all_cells, all_contributors, positions,

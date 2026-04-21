@@ -125,9 +125,7 @@ def _run_pipeline(
     base_resolution=4,
     isovalue=0.01,
     max_depth=3,
-    screening_weight=4.0,
-    max_iters=1000,
-    tol=1e-5,
+    min_feature_thickness=0.0,
 ):
     """Run the full pipeline and return a trimesh + metadata."""
     result = run_full_pipeline(
@@ -138,9 +136,7 @@ def _run_pipeline(
         base_resolution=base_resolution,
         isovalue=isovalue,
         max_depth=max_depth,
-        screening_weight=screening_weight,
-        max_iters=max_iters,
-        tol=tol,
+        min_feature_thickness=min_feature_thickness,
     )
     verts = result["vertices"]
     faces = result["faces"].astype(np.int64)
@@ -225,9 +221,6 @@ class TestSolidSphereIntegration:
                 base_resolution=4,
                 isovalue=0.005,
                 max_depth=3,
-                screening_weight=4.0,
-                max_iters=1000,
-                tol=1e-5,
             )
             cls._result_cache = (mesh, meta)
         return cls._result_cache
@@ -319,7 +312,6 @@ class TestShellSphereIntegration:
                 base_resolution=4,
                 isovalue=0.01,
                 max_depth=3,
-                screening_weight=4.0,
             )
             cls._result_cache = (mesh, meta)
         return cls._result_cache
@@ -395,7 +387,6 @@ class TestTwoBlobsIntegration:
                 base_resolution=4,
                 isovalue=0.005,
                 max_depth=3,
-                screening_weight=4.0,
             )
             cls._result_cache = (mesh, meta)
         return cls._result_cache
@@ -450,7 +441,6 @@ class TestSmallFoFFluffFilteringIntegration:
                 base_resolution=4,
                 isovalue=0.005,
                 max_depth=3,
-                screening_weight=4.0,
             )
             cls._result_cache = (mesh, meta, filtered_positions)
         return cls._result_cache
@@ -484,6 +474,62 @@ class TestSmallFoFFluffFilteringIntegration:
         )
 
 
+class TestMinFeatureThicknessIntegration:
+    """min-feature-thickness should run the adaptive opening path."""
+
+    def test_regularization_runs_and_returns_mesh(self) -> None:
+        """The opened-solid path should produce a non-empty mesh."""
+        positions, sml = _make_solid_sphere_particles(
+            n=300,
+            radius=0.9,
+            center=(2.0, 2.0, 2.0),
+            h=0.20,
+            seed=303,
+        )
+
+        result = run_full_pipeline(
+            positions,
+            sml,
+            domain_min=(0.0, 0.0, 0.0),
+            domain_max=(4.0, 4.0, 4.0),
+            base_resolution=4,
+            isovalue=0.01,
+            max_depth=3,
+            min_feature_thickness=0.45,
+        )
+
+        assert result["vertices"].shape[0] > 0
+        assert result["faces"].shape[0] > 0
+
+    def test_regularized_sphere_remains_watertight(self) -> None:
+        """Sphere regularization path should keep a watertight surface."""
+        positions, sml = _make_solid_sphere_particles(
+            n=300,
+            radius=0.9,
+            center=(2.0, 2.0, 2.0),
+            h=0.20,
+            seed=404,
+        )
+
+        result = run_full_pipeline(
+            positions,
+            sml,
+            domain_min=(0.0, 0.0, 0.0),
+            domain_max=(4.0, 4.0, 4.0),
+            base_resolution=4,
+            isovalue=0.01,
+            max_depth=3,
+            min_feature_thickness=0.45,
+        )
+        mesh = trimesh.Trimesh(
+            vertices=result["vertices"],
+            faces=result["faces"],
+            process=False,
+        )
+
+        assert mesh.is_watertight
+
+
 # -------------------------------------------------------------------
 # Tests: Edge cases
 # -------------------------------------------------------------------
@@ -507,18 +553,14 @@ class TestEdgeCases:
             base_resolution=2,
             isovalue=0.001,
             max_depth=2,
-            screening_weight=4.0,
-            max_iters=100,
-            tol=1e-4,
         )
 
         # Should not crash; result may be empty.
         assert "vertices" in result
         assert "faces" in result
 
-    def test_high_screening_tighter_fit(self) -> None:
-        """Higher screening weight should not crash and should
-        still produce a valid mesh."""
+    def test_repeat_sphere_run_is_stable(self) -> None:
+        """A standard sphere reconstruction should remain stable."""
         positions, sml = _make_solid_sphere_particles(
             n=1000,
             radius=1.0,
@@ -529,14 +571,13 @@ class TestEdgeCases:
         mesh, meta = _run_pipeline(
             positions,
             sml,
-            screening_weight=20.0,
             max_depth=2,
         )
         # Should produce something, not crash.
         assert mesh is not None or meta["n_qef_vertices"] >= 0
 
-    def test_zero_screening_smoother(self) -> None:
-        """Zero screening weight (pure Poisson) should work."""
+    def test_second_sphere_run_is_stable(self) -> None:
+        """Another standard sphere reconstruction should remain stable."""
         positions, sml = _make_solid_sphere_particles(
             n=1000,
             radius=1.0,
@@ -547,7 +588,6 @@ class TestEdgeCases:
         mesh, meta = _run_pipeline(
             positions,
             sml,
-            screening_weight=0.0,
             max_depth=2,
         )
         assert mesh is not None or meta["n_qef_vertices"] >= 0

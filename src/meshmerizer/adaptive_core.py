@@ -468,10 +468,8 @@ def generate_mesh(
 ) -> tuple["numpy.ndarray", "numpy.ndarray", "numpy.ndarray"]:
     """Generate a dual-contour mesh from pre-built octree cells.
 
-    This is the legacy dual contouring path kept as a fallback
-    alternative to the Poisson reconstruction pipeline.  It
-    solves QEF vertices AND generates triangle faces entirely
-    in C++.
+    This is the direct dual contouring path. It solves QEF vertices and
+    generates triangle faces entirely in C++.
 
     Args:
         cells: Octree cell dictionaries (from ``refine_octree``).
@@ -568,8 +566,8 @@ def run_octree_pipeline(
 
     This combines top-level cell creation, contributor queries,
     octree refinement, and QEF vertex solving into a single C++
-    call.  Triangle face generation is NOT included — that is
-    handled in Python via FOF clustering + Poisson reconstruction.
+    call. Triangle face generation is NOT included — that is handled in
+    Python via FOF clustering plus the final reconstruction wrapper.
 
     Args:
         positions: Nx3 float64 array of particle positions.
@@ -606,6 +604,44 @@ def run_octree_pipeline(
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
+    )
+
+
+def classify_occupied_solid(
+    positions: "numpy.ndarray",
+    smoothing_lengths: "numpy.ndarray",
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    base_resolution: int,
+    isovalue: float,
+    max_depth: int,
+    minimum_usable_hermite_samples: int = 3,
+    max_qef_rms_residual_ratio: float = 0.1,
+    min_normal_alignment_threshold: float = 0.97,
+    max_surface_leaf_size: float = 0.0,
+    erosion_radius: float = 0.0,
+) -> dict:
+    """Classify the adaptive occupied solid on octree leaves.
+
+    This is scaffolding for the future minimum-thickness regularizer. It
+    returns a leaf-wise occupied-solid view of the current adaptive octree,
+    optionally after additional refinement of large surface leaves.
+    """
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
+    return _adaptive.classify_occupied_solid(
+        pos,
+        sml,
+        tuple(domain_minimum),
+        tuple(domain_maximum),
+        base_resolution,
+        isovalue,
+        max_depth,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+        max_surface_leaf_size,
+        erosion_radius,
     )
 
 
@@ -674,10 +710,10 @@ def fof_cluster(
     separation measured over the tight bounding box of the supplied
     points, then scaled by ``linking_factor``.
 
-    This is used before Poisson surface reconstruction to identify
-    distinct objects (e.g. separate galaxies or halos) so that each
-    object can be reconstructed independently, avoiding thin bridges
-    between unrelated structures.
+    This is used before mesh reconstruction to identify distinct
+    objects (e.g. separate galaxies or halos) so that each object can
+    be reconstructed independently, avoiding thin bridges between
+    unrelated structures.
 
     Args:
         positions: (N, 3) float64 array of point positions.
@@ -699,386 +735,6 @@ def fof_cluster(
     return labels
 
 
-# ---- Poisson basis functions (Phase 20a) --------------------------
-
-
-def bspline1d_evaluate(t: float) -> float:
-    """Evaluate the 1-D degree-1 (hat) B-spline at normalised t.
-
-    Args:
-        t: Normalised coordinate (distance from centre in units
-            of cell width).
-
-    Returns:
-        B-spline value in [0, 1].
-    """
-    return _adaptive.bspline1d_evaluate(t)
-
-
-def bspline1d_derivative(t: float) -> float:
-    """Evaluate the derivative of the 1-D degree-1 B-spline at t.
-
-    Args:
-        t: Normalised coordinate.
-
-    Returns:
-        Derivative value in {-1, 0, 1}.
-    """
-    return _adaptive.bspline1d_derivative(t)
-
-
-def bspline3d_evaluate(
-    point: tuple[float, float, float],
-    center: tuple[float, float, float],
-    width: float,
-) -> float:
-    """Evaluate the 3-D trilinear B-spline.
-
-    Args:
-        point: Evaluation point (x, y, z).
-        center: Cell centre (x, y, z).
-        width: Cell width.
-
-    Returns:
-        Basis function value in [0, 1].
-    """
-    return _adaptive.bspline3d_evaluate(point, center, width)
-
-
-def bspline3d_gradient(
-    point: tuple[float, float, float],
-    center: tuple[float, float, float],
-    width: float,
-) -> tuple[float, float, float]:
-    """Evaluate the gradient of the 3-D trilinear B-spline.
-
-    Args:
-        point: Evaluation point (x, y, z).
-        center: Cell centre (x, y, z).
-        width: Cell width.
-
-    Returns:
-        Gradient tuple (dB/dx, dB/dy, dB/dz).
-    """
-    return _adaptive.bspline3d_gradient(point, center, width)
-
-
-def assign_dof_indices(
-    cells: list[dict],
-) -> tuple[list[int], list[int]]:
-    """Assign contiguous DOF indices to leaf cells.
-
-    Args:
-        cells: List of cell dicts, each with an ``"is_leaf"`` key.
-
-    Returns:
-        Tuple of (cell_to_dof, dof_to_cell) lists.
-    """
-    return _adaptive.assign_dof_indices(cells)
-
-
-def assign_dof_indices_grouped(
-    cells: list[dict],
-    max_depth: int,
-) -> tuple[list[int], list[int], list[int]]:
-    """Depth-grouped DOF assignment for multi-depth Poisson.
-
-    DOFs at depth 0 are assigned first, then depth 1, etc.
-    This enables efficient depth-by-depth cascadic solving.
-
-    Args:
-        cells: List of cell dicts with ``is_leaf`` and ``depth``.
-        max_depth: Maximum octree depth.
-
-    Returns:
-        Tuple of (cell_to_dof, dof_to_cell, depth_dof_start).
-        depth_dof_start has (max_depth + 2) entries where entry d
-        is the first DOF index at depth d, and the last entry is
-        the total DOF count.
-    """
-    return _adaptive.assign_dof_indices_grouped(cells, max_depth)
-
-
-def enumerate_stencils(
-    cells: list[dict],
-    domain_min: tuple[float, float, float],
-    domain_max: tuple[float, float, float],
-    base_resolution: int,
-    max_depth: int,
-) -> tuple[list[int], list[int], list[int]]:
-    """Enumerate DOF stencils (neighbor DOFs) for each DOF.
-
-    Args:
-        cells: List of cell dicts with keys ``is_leaf``,
-            ``depth``, ``bounds_min``, ``bounds_max``,
-            ``morton_key``.
-        domain_min: Lower corner of the domain.
-        domain_max: Upper corner of the domain.
-        base_resolution: Top-level cells per axis.
-        max_depth: Maximum octree depth.
-
-    Returns:
-        Tuple of (stencil_offsets, stencil_neighbors,
-        stencil_depth_deltas).  depth_deltas[k] is 0 for
-        same-depth, -1 for coarser neighbor, +1 for finer.
-    """
-    return _adaptive.enumerate_stencils(
-        cells,
-        domain_min,
-        domain_max,
-        base_resolution,
-        max_depth,
-    )
-
-
-def splat_and_compute_rhs(
-    positions: "numpy.ndarray",
-    normals: "numpy.ndarray",
-    cells: list[dict],
-    domain_min: tuple[float, float, float],
-    domain_max: tuple[float, float, float],
-    base_resolution: int,
-    max_depth: int,
-) -> tuple[list[float], list[float], list[float], list[float]]:
-    """Splat oriented normals and compute the Poisson RHS.
-
-    Performs two steps of the screened Poisson pipeline:
-
-    1. **Normal splatting** (SGP06 Sec 3): distributes each
-       sample's unit normal into the overlapping B-spline DOFs,
-       weighted by the trilinear basis value and a uniform area
-       weight (1/N).
-    2. **RHS assembly** (SGP06 Sec 3): computes
-       ``b_i = sum_j V_j . G_ij`` where ``G_ij`` is the
-       precomputed gradient inner product between B-spline
-       basis functions.
-
-    Args:
-        positions: (N, 3) float64 array of sample positions.
-        normals: (N, 3) float64 array of sample unit normals.
-        cells: List of cell dicts with keys ``is_leaf``,
-            ``depth``, ``bounds_min``, ``bounds_max``,
-            ``morton_key``.
-        domain_min: Lower corner of the domain.
-        domain_max: Upper corner of the domain.
-        base_resolution: Top-level cells per axis.
-        max_depth: Maximum octree depth.
-
-    Returns:
-        Tuple of (v_field_x, v_field_y, v_field_z, rhs) where
-        each is a list of floats with one entry per DOF.
-    """
-    pos = np.ascontiguousarray(positions, dtype=np.float64)
-    nor = np.ascontiguousarray(normals, dtype=np.float64)
-    return _adaptive.splat_and_compute_rhs(
-        pos,
-        nor,
-        cells,
-        domain_min,
-        domain_max,
-        base_resolution,
-        max_depth,
-    )
-
-
-def laplacian_stencil_weight(
-    dx: int,
-    dy: int,
-    dz: int,
-    h: float,
-) -> float:
-    """Compute the 3-D Laplacian stencil weight for a given offset.
-
-    For degree-1 B-splines, the Laplacian stencil weight at
-    offset (dx, dy, dz) with cell width h is:
-
-        L = h * [K(dx)*M(dy)*M(dz) + M(dx)*K(dy)*M(dz)
-              + M(dx)*M(dy)*K(dz)]
-
-    where K is the 1-D stiffness integral and M is the 1-D mass
-    integral.
-
-    Args:
-        dx: Offset in x (-1, 0, +1).
-        dy: Offset in y (-1, 0, +1).
-        dz: Offset in z (-1, 0, +1).
-        h: Cell width.
-
-    Returns:
-        Stiffness integral value.
-    """
-    return _adaptive.laplacian_stencil_weight(dx, dy, dz, h)
-
-
-def pc_integrals_1d(j: int) -> tuple[float, float, float]:
-    """Return parent-child 1-D B-spline integrals for offset j.
-
-    Args:
-        j: Offset from parent centre to child centre in
-            child-width units (integer, -4..+4).
-
-    Returns:
-        Tuple of (mass, stiffness, gradient-value) raw integrals.
-    """
-    return _adaptive.pc_integrals_1d(j)
-
-
-def pc_laplacian_weight(
-    dx: int,
-    dy: int,
-    dz: int,
-) -> float:
-    """Return raw 3-D parent-child Laplacian stencil weight.
-
-    Args:
-        dx: Offset in x (child-width units, -4..+4).
-        dy: Offset in y.
-        dz: Offset in z.
-
-    Returns:
-        Raw stiffness weight (before 1/(2h) scaling).
-    """
-    return _adaptive.pc_laplacian_weight(dx, dy, dz)
-
-
-def apply_poisson_operator(
-    positions: "numpy.ndarray",
-    cells: list[dict],
-    domain_min: tuple[float, float, float],
-    domain_max: tuple[float, float, float],
-    base_resolution: int,
-    max_depth: int,
-    alpha: float,
-    x: list[float],
-) -> list[float]:
-    """Apply the screened Poisson operator A*x.
-
-    Builds the Laplacian stencil and screening term, then
-    computes A*x = (L + S)*x where L is the Laplacian and
-    S is the point-sampled screening matrix.
-
-    Args:
-        positions: (N, 3) float64 array of sample positions
-            (used for screening accumulation).
-        cells: List of cell dicts.
-        domain_min: Lower corner of the domain.
-        domain_max: Upper corner of the domain.
-        base_resolution: Top-level cells per axis.
-        max_depth: Maximum octree depth.
-        alpha: Screening weight (0.0 for pure Laplacian).
-        x: Input vector (length = n_dofs).
-
-    Returns:
-        List of floats: the result A*x.
-    """
-    pos = np.ascontiguousarray(positions, dtype=np.float64)
-    return _adaptive.apply_poisson_operator(
-        pos,
-        cells,
-        domain_min,
-        domain_max,
-        base_resolution,
-        max_depth,
-        alpha,
-        x,
-    )
-
-
-def solve_poisson(
-    positions: "numpy.ndarray",
-    cells: list[dict],
-    domain_min: tuple[float, float, float],
-    domain_max: tuple[float, float, float],
-    base_resolution: int,
-    max_depth: int,
-    alpha: float,
-    b: list[float],
-    max_iters: int = 1000,
-    tol: float = 1e-10,
-) -> tuple[list[float], int, float, bool]:
-    """Solve the screened Poisson system Ax = b with PCG.
-
-    Builds the operator (Laplacian + screening) and solves
-    using preconditioned Conjugate Gradients with Jacobi
-    preconditioning.
-
-    Args:
-        positions: (N, 3) float64 array of sample positions
-            (used for screening accumulation).
-        cells: List of cell dicts.
-        domain_min: Lower corner of the domain.
-        domain_max: Upper corner of the domain.
-        base_resolution: Top-level cells per axis.
-        max_depth: Maximum octree depth.
-        alpha: Screening weight (0.0 for pure Laplacian).
-        b: Right-hand side vector (length = n_dofs).
-        max_iters: Maximum CG iterations.
-        tol: Relative residual tolerance.
-
-    Returns:
-        Tuple of (solution, iterations, residual_norm,
-        converged) where solution is a list of floats.
-    """
-    pos = np.ascontiguousarray(positions, dtype=np.float64)
-    return _adaptive.solve_poisson(
-        pos,
-        cells,
-        domain_min,
-        domain_max,
-        base_resolution,
-        max_depth,
-        alpha,
-        b,
-        max_iters,
-        tol,
-    )
-
-
-def extract_poisson_mesh(
-    positions: np.ndarray,
-    cells,
-    domain_min,
-    domain_max,
-    base_resolution: int,
-    max_depth: int,
-    solution,
-):
-    """Extract an isosurface from a Poisson solution via Marching Cubes.
-
-    Evaluates the indicator function chi at leaf-cell corners, computes
-    the isovalue as the mean chi at sample positions, and runs classic
-    Marching Cubes (Lorensen & Cline 1987) to extract the isosurface.
-
-    Args:
-        positions: (N, 3) float64 array of sample positions (used to
-            compute the isovalue).
-        cells: List of cell dicts with keys ``is_leaf``, ``depth``,
-            ``bounds_min``, ``bounds_max``, ``morton_key``.
-        domain_min: (3,) lower corner of the domain bounding box.
-        domain_max: (3,) upper corner of the domain bounding box.
-        base_resolution: Number of top-level cells per axis.
-        max_depth: Maximum octree depth.
-        solution: Poisson solution vector (list or array of floats,
-            length = n_dofs).
-
-    Returns:
-        Tuple of (vertices, triangles, isovalue) where vertices is a
-        (V, 3) float64 ndarray, triangles is a (F, 3) uint32 ndarray,
-        and isovalue is a float.
-    """
-    pos = np.ascontiguousarray(positions, dtype=np.float64)
-    sol = list(solution)
-    return _adaptive.extract_poisson_mesh(
-        pos,
-        cells,
-        domain_min,
-        domain_max,
-        base_resolution,
-        max_depth,
-        sol,
-    )
-
-
 def run_full_pipeline(
     positions: np.ndarray,
     smoothing_lengths: np.ndarray,
@@ -1087,15 +743,13 @@ def run_full_pipeline(
     base_resolution: int,
     isovalue: float,
     max_depth: int,
-    screening_weight: float = 4.0,
-    max_iters: int = 1000,
-    tol: float = 1e-6,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
     max_edge_ratio: float = 1.5,
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
+    min_feature_thickness: float = 0.0,
 ) -> dict:
     """Run the full particles-to-mesh pipeline in C++.
 
@@ -1112,12 +766,6 @@ def run_full_pipeline(
         base_resolution: Number of top-level cells per axis.
         isovalue: Density isovalue for octree refinement.
         max_depth: Maximum octree refinement depth.
-        screening_weight: Poisson screening weight alpha
-            (legacy, unused by DC pipeline).
-        max_iters: Maximum PCG iterations
-            (legacy, unused by DC pipeline).
-        tol: PCG relative residual tolerance
-            (legacy, unused by DC pipeline).
         smoothing_iterations: Number of Laplacian smoothing
             iterations.  0 disables smoothing (default).
         smoothing_strength: Smoothing lambda in (0, 1].
@@ -1134,6 +782,10 @@ def run_full_pipeline(
         min_normal_alignment_threshold: Minimum alignment between
             usable Hermite normals and their mean direction before a
             split is required.
+        min_feature_thickness: Minimum physical feature thickness to
+            preserve via adaptive implicit opening. Features thinner
+            than this may be removed. ``0.0`` disables the
+            regularizer.
 
     Returns:
         Dict with keys ``vertices`` (V, 3) float64 ndarray,
@@ -1151,13 +803,11 @@ def run_full_pipeline(
         base_resolution,
         isovalue,
         max_depth,
-        screening_weight,
-        max_iters,
-        tol,
         smoothing_iterations,
         smoothing_strength,
         max_edge_ratio,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
+        min_feature_thickness,
     )

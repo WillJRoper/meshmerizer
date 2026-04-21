@@ -35,6 +35,7 @@ struct OctreeCell {
     bool is_leaf;
     bool is_active;
     bool has_surface;
+    bool is_topo_surface;
     std::int64_t child_begin;
     std::int64_t contributor_begin;
     std::int64_t contributor_end;
@@ -193,6 +194,7 @@ inline std::vector<OctreeCell> create_top_level_cells(
                     true,
                     false,
                     false,
+                    false,
                     -1,
                     -1,
                     -1,
@@ -264,6 +266,7 @@ inline std::vector<OctreeCell> create_child_cells(const OctreeCell &parent) {
             parent.depth + 1U,
             child_bounds_from_index(parent.bounds, child_index),
             true,
+            false,
             false,
             false,
             -1,
@@ -342,6 +345,7 @@ inline void split_octree_leaf(
     parent.is_leaf = false;
     parent.is_active = false;
     parent.has_surface = true;
+    parent.is_topo_surface = false;
     parent.representative_vertex_index = -1;
     parent.child_begin = static_cast<std::int64_t>(all_cells.size());
 
@@ -901,8 +905,17 @@ inline void balance_octree(
     hash.build(all_cells, domain, max_depth, base_resolution);
 
     bool any_split = true;
+    std::size_t balance_pass = 0;
     while (any_split) {
+        ++balance_pass;
         any_split = false;
+
+        const std::size_t cells_before_pass = all_cells.size();
+        std::fprintf(stdout,
+                     "Balance pass %zu: scanning %zu cells for 2:1 violations\n",
+                     balance_pass,
+                     cells_before_pass);
+        std::fflush(stdout);
 
         // Collect indices of leaf cells that violate the 2:1 rule.
         std::vector<std::size_t> to_split;
@@ -933,6 +946,16 @@ inline void balance_octree(
                 to_split.insert(
                     to_split.end(), thread_vec.begin(), thread_vec.end());
             }
+        }
+
+        std::fprintf(stdout,
+                     "Balance pass %zu: found %zu violating leaves\n",
+                     balance_pass,
+                     to_split.size());
+        std::fflush(stdout);
+
+        if (!any_split) {
+            break;
         }
 
         // Split each violating cell. The parent is copied before any
@@ -1003,6 +1026,7 @@ inline void balance_octree(
                 child.is_leaf = true;
                 child.is_active = false;
                 child.has_surface = false;
+                child.is_topo_surface = false;
 
                 // Sample corners so surface extraction can later determine
                 // whether this balance-forced leaf is active.
@@ -1028,8 +1052,19 @@ inline void balance_octree(
             }
             balance_counter.tick();
         }
+
+        std::fprintf(stdout,
+                     "Balance pass %zu: complete (total_cells_now=%zu)\n",
+                     balance_pass,
+                     all_cells.size());
+        std::fflush(stdout);
     }
 
+    std::fprintf(stdout,
+                 "Balance complete after %zu passes (total_cells=%zu)\n",
+                 balance_pass,
+                 all_cells.size());
+    std::fflush(stdout);
     balance_counter.finish();
 }
 
@@ -1236,6 +1271,7 @@ refine_octree(
                 current_cell.is_leaf = true;
                 current_cell.is_active = false;
                 current_cell.has_surface = false;
+                current_cell.is_topo_surface = false;
                 current_cell.child_begin = -1;
                 continue;
             }
@@ -1244,6 +1280,7 @@ refine_octree(
                 current_cell.is_leaf = true;
                 current_cell.is_active = true;
                 current_cell.has_surface = true;
+                current_cell.is_topo_surface = false;
                 current_cell.child_begin = -1;
                 continue;
             }
@@ -1251,6 +1288,7 @@ refine_octree(
             current_cell.is_leaf = false;
             current_cell.is_active = true;
             current_cell.has_surface = true;
+            current_cell.is_topo_surface = false;
 
             const std::int64_t child_begin_offset =
                 static_cast<std::int64_t>(all_cells.size());

@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_set>
 #include <vector>
 
 #include "faces.hpp"
@@ -278,6 +279,60 @@ inline VertexAdjacency build_vertex_adjacency(
     for (std::size_t vi = 0; vi < n_vertices; ++vi) {
         const std::size_t start = adj.offsets[vi];
         const auto &nbrs = per_vertex_neighbors[vi];
+        for (std::size_t k = 0; k < nbrs.size(); ++k) {
+            adj.neighbors[start + k] = nbrs[k];
+        }
+    }
+
+    return adj;
+}
+
+/**
+ * @brief Build vertex adjacency directly from triangle connectivity.
+ *
+ * This is useful for smoothing meshes that already have explicit triangle
+ * connectivity, such as the blocky opened-solid surface extractor.
+ *
+ * @param n_vertices Number of mesh vertices.
+ * @param triangles Triangle connectivity.
+ * @return VertexAdjacency in CSR format.
+ */
+inline VertexAdjacency build_triangle_mesh_adjacency(
+    std::size_t n_vertices,
+    const std::vector<MeshTriangle> &triangles) {
+    std::vector<std::unordered_set<std::size_t>> per_vertex_neighbors(
+        n_vertices);
+
+    for (const MeshTriangle &triangle : triangles) {
+        const std::size_t a = triangle.vertex_indices[0];
+        const std::size_t b = triangle.vertex_indices[1];
+        const std::size_t c = triangle.vertex_indices[2];
+        if (a >= n_vertices || b >= n_vertices || c >= n_vertices) {
+            continue;
+        }
+
+        per_vertex_neighbors[a].insert(b);
+        per_vertex_neighbors[a].insert(c);
+        per_vertex_neighbors[b].insert(a);
+        per_vertex_neighbors[b].insert(c);
+        per_vertex_neighbors[c].insert(a);
+        per_vertex_neighbors[c].insert(b);
+    }
+
+    VertexAdjacency adj;
+    adj.offsets.resize(n_vertices + 1U, 0U);
+    for (std::size_t vi = 0; vi < n_vertices; ++vi) {
+        adj.offsets[vi + 1U] =
+            adj.offsets[vi] + per_vertex_neighbors[vi].size();
+    }
+
+    adj.neighbors.resize(adj.offsets[n_vertices]);
+    for (std::size_t vi = 0; vi < n_vertices; ++vi) {
+        std::vector<std::size_t> nbrs(
+            per_vertex_neighbors[vi].begin(),
+            per_vertex_neighbors[vi].end());
+        std::sort(nbrs.begin(), nbrs.end());
+        const std::size_t start = adj.offsets[vi];
         for (std::size_t k = 0; k < nbrs.size(); ++k) {
             adj.neighbors[start + k] = nbrs[k];
         }

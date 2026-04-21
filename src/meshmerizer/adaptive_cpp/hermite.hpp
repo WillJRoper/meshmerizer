@@ -258,4 +258,17 @@ inline std::vector<HermiteSample> compute_cell_hermite_samples(
     return samples;
 }
 
+/**
+ * @brief Compute Hermite samples from a trilinear corner-value field.
+ *
+ * This variant does not query the SPH field. It treats the cell corner values
+ * as a local implicit field, interpolates edge crossings, and derives normals
+ * from the gradient of the trilinear interpolant.
+ *
+ * @param bounds Cell bounding box in world space.
+ * @param corner_values Scalar field samples at the eight cell corners.
+ * @param corner_sign_mask Precomputed sign mask relative to ``isovalue``.
+ * @param isovalue Target level-set value.
+ * @return Hermite samples, one per sign-changing edge.
+ */
 #endif  // MESHMERIZER_ADAPTIVE_CPP_HERMITE_HPP_

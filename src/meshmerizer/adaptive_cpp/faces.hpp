@@ -110,6 +110,9 @@ struct LeafSpatialIndex {
     /** @brief Maximum octree depth, cached for hierarchical probe. */
     std::uint32_t cached_max_depth;
 
+    /** @brief Finest-grid resolution per axis. */
+    std::uint32_t fine_resolution;
+
     /**
      * @brief Build the spatial index from a set of octree cells.
      *
@@ -144,6 +147,7 @@ struct LeafSpatialIndex {
         }
 
         cached_max_depth = max_depth;
+        fine_resolution = static_cast<std::uint32_t>(fine_res_wide);
 
         // The finest grid has base_resolution * 2^max_depth cells per axis.
         const double fine_cells_per_axis_x =

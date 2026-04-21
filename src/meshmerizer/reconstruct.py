@@ -1,15 +1,14 @@
-"""Poisson surface reconstruction via the C++ backend.
+"""Adaptive dual-contouring mesh reconstruction wrappers.
 
-This module provides a thin Python wrapper around the C++ full
-pipeline (``run_full_pipeline``) which performs screened Poisson
-surface reconstruction entirely in C++.  The previous Open3D-based
-implementation has been removed because Open3D crashes on large
-datasets (``Assertion failed: (idx < size())``).
+This module provides thin Python wrappers around the C++ adaptive meshing
+pipeline. Despite the legacy "Poisson" naming in some older code paths, the
+current backend performs adaptive octree refinement, QEF vertex solving, and
+dual contouring.
 
-The two entry points are:
+The two primary entry points are:
 
-- ``poisson_reconstruct_group``: reconstruct a single cluster.
-- ``poisson_reconstruct``: reconstruct all clusters and merge.
+- ``reconstruct_group``: reconstruct a mesh for one particle group.
+- ``reconstruct_mesh``: reconstruct one or more groups and merge them.
 """
 
 from __future__ import annotations
@@ -21,61 +20,48 @@ import numpy as np
 from meshmerizer.adaptive_core import run_full_pipeline
 
 
-def poisson_reconstruct_group(
+def reconstruct_group(
     positions: np.ndarray,
-    normals: np.ndarray,
     smoothing_lengths: np.ndarray,
     domain_min: tuple,
     domain_max: tuple,
     base_resolution: int,
     isovalue: float,
     max_depth: int,
-    screening_weight: float = 4.0,
-    max_iters: int = 1000,
-    tol: float = 1e-6,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
     max_edge_ratio: float = 1.5,
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
+    min_feature_thickness: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Reconstruct a mesh from particles via Poisson in C++.
-
-    Runs the full particles-to-mesh pipeline (octree + QEF +
-    Poisson + Marching Cubes) entirely in C++.
+    """Reconstruct a mesh for one particle group.
 
     Args:
         positions: (N, 3) float64 array of particle positions.
-        normals: Unused (kept for API compatibility).  Normals
-            are computed internally from the density field.
         smoothing_lengths: (N,) float64 array of smoothing lengths.
         domain_min: (x, y, z) lower corner of the domain.
         domain_max: (x, y, z) upper corner of the domain.
         base_resolution: Number of top-level cells per axis.
         isovalue: Density isovalue for octree refinement.
         max_depth: Maximum octree refinement depth.
-        screening_weight: Poisson screening weight alpha.
-        max_iters: Maximum PCG iterations.
-        tol: PCG relative residual tolerance.
-        smoothing_iterations: Number of Laplacian smoothing
-            iterations (0 = disabled).
+        smoothing_iterations: Number of Laplacian smoothing iterations.
         smoothing_strength: Smoothing lambda in (0, 1].
-        max_edge_ratio: Maximum edge length as a multiple of
-            local cell size for gap filling.  Default 1.5.
-        minimum_usable_hermite_samples: Minimum usable Hermite sample
-            count required before a corner-crossing cell may stop
-            refining.
-        max_qef_rms_residual_ratio: Maximum RMS QEF plane residual as
-            a fraction of the local cell radius before a split is
+        max_edge_ratio: Maximum edge length as a multiple of local cell size.
+        minimum_usable_hermite_samples: Minimum usable Hermite sample count
+            required before a corner-crossing cell may stop refining.
+        max_qef_rms_residual_ratio: Maximum RMS QEF plane residual as a
+            fraction of the local cell radius before a split is required.
+        min_normal_alignment_threshold: Minimum alignment between usable
+            Hermite normals and their mean direction before a split is
             required.
-        min_normal_alignment_threshold: Minimum alignment between
-            usable Hermite normals and their mean direction before a
-            split is required.
+        min_feature_thickness: Minimum physical feature thickness to preserve
+            via adaptive implicit opening.
+
     Returns:
-        Tuple of ``(vertices, faces)`` where ``vertices`` is an
-        (V, 3) float64 array and ``faces`` is an (F, 3) int64
-        array of triangle vertex indices.
+        Tuple of ``(vertices, faces)`` where ``vertices`` is a ``(V, 3)``
+        float64 array and ``faces`` is an ``(F, 3)`` int64 array.
 
     Raises:
         ValueError: If positions has fewer than 3 points.
@@ -97,26 +83,22 @@ def poisson_reconstruct_group(
         base_resolution,
         isovalue,
         max_depth,
-        screening_weight=screening_weight,
-        max_iters=max_iters,
-        tol=tol,
         smoothing_iterations=smoothing_iterations,
         smoothing_strength=smoothing_strength,
         max_edge_ratio=max_edge_ratio,
         minimum_usable_hermite_samples=minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
         min_normal_alignment_threshold=min_normal_alignment_threshold,
+        min_feature_thickness=min_feature_thickness,
     )
 
     verts = result["vertices"]
     faces = result["faces"].astype(np.int64)
-
     return verts, faces
 
 
-def poisson_reconstruct(
+def reconstruct_mesh(
     positions: np.ndarray,
-    normals: np.ndarray,
     smoothing_lengths: np.ndarray,
     domain_min: tuple,
     domain_max: tuple,
@@ -124,47 +106,38 @@ def poisson_reconstruct(
     isovalue: float,
     max_depth: int,
     group_labels: Optional[np.ndarray] = None,
-    screening_weight: float = 4.0,
-    max_iters: int = 1000,
-    tol: float = 1e-6,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
     max_edge_ratio: float = 1.5,
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
+    min_feature_thickness: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Reconstruct meshes for all FOF groups and merge them.
-
-    If ``group_labels`` is None, treats all particles as one group.
+    """Reconstruct meshes for one or more particle groups and merge them.
 
     Args:
         positions: (N, 3) float64 array of particle positions.
-        normals: Unused (kept for API compatibility).
         smoothing_lengths: (N,) float64 array of smoothing lengths.
         domain_min: (x, y, z) lower corner of the domain.
         domain_max: (x, y, z) upper corner of the domain.
         base_resolution: Number of top-level cells per axis.
         isovalue: Density isovalue for octree refinement.
         max_depth: Maximum octree refinement depth.
-        group_labels: (N,) int64 array of FOF group labels.
-        screening_weight: Poisson screening weight alpha.
-        max_iters: Maximum PCG iterations.
-        tol: PCG relative residual tolerance.
-        smoothing_iterations: Number of Laplacian smoothing
-            iterations (0 = disabled).
+        group_labels: Optional ``(N,)`` int64 array of group labels.
+        smoothing_iterations: Number of Laplacian smoothing iterations.
         smoothing_strength: Smoothing lambda in (0, 1].
-        max_edge_ratio: Maximum edge length as a multiple of
-            local cell size for gap filling.  Default 1.5.
-        minimum_usable_hermite_samples: Minimum usable Hermite sample
-            count required before a corner-crossing cell may stop
-            refining.
-        max_qef_rms_residual_ratio: Maximum RMS QEF plane residual as
-            a fraction of the local cell radius before a split is
+        max_edge_ratio: Maximum edge length as a multiple of local cell size.
+        minimum_usable_hermite_samples: Minimum usable Hermite sample count
+            required before a corner-crossing cell may stop refining.
+        max_qef_rms_residual_ratio: Maximum RMS QEF plane residual as a
+            fraction of the local cell radius before a split is required.
+        min_normal_alignment_threshold: Minimum alignment between usable
+            Hermite normals and their mean direction before a split is
             required.
-        min_normal_alignment_threshold: Minimum alignment between
-            usable Hermite normals and their mean direction before a
-            split is required.
+        min_feature_thickness: Minimum physical feature thickness to preserve
+            via adaptive implicit opening.
+
     Returns:
         Tuple of ``(vertices, faces)`` merged across all groups.
     """
@@ -187,24 +160,21 @@ def poisson_reconstruct(
         if group_pos.shape[0] < 3:
             continue
 
-        verts, faces = poisson_reconstruct_group(
+        verts, faces = reconstruct_group(
             group_pos,
-            None,
             group_sml,
             domain_min,
             domain_max,
             base_resolution,
             isovalue,
             max_depth,
-            screening_weight=screening_weight,
-            max_iters=max_iters,
-            tol=tol,
             smoothing_iterations=smoothing_iterations,
             smoothing_strength=smoothing_strength,
             max_edge_ratio=max_edge_ratio,
             minimum_usable_hermite_samples=minimum_usable_hermite_samples,
             max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
             min_normal_alignment_threshold=min_normal_alignment_threshold,
+            min_feature_thickness=min_feature_thickness,
         )
 
         if verts.shape[0] == 0:

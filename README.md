@@ -2,20 +2,19 @@
 
 Meshmerizer converts particle-based simulation outputs into watertight STL
 meshes for 3D printing or visualization. It uses an adaptive octree with
-a Wendland C2 SPH kernel and Poisson surface reconstruction (via Open3D)
-to produce smooth, resolution-adaptive surfaces directly from particle
-data — no intermediate voxel grids.
+a Wendland C2 SPH kernel and dual contouring to produce smooth,
+resolution-adaptive surfaces directly from particle data — no intermediate
+voxel grids.
 
 ## Features
 
 - **Adaptive octree refinement** — concentrates resolution near the
   isosurface, keeping memory proportional to the surface rather than the
   full volume.
-- **Poisson surface reconstruction** — produces smooth, watertight meshes
-  from oriented point clouds (QEF vertices + normals) via Open3D's
-  screened Poisson algorithm.
+- **Adaptive mesh reconstruction** — produces smooth, watertight meshes
+  from the adaptive implicit surface extracted from the SPH field.
 - **FOF clustering** — Friends-of-Friends clustering separates distinct
-  objects before Poisson reconstruction, preventing thin bridges between
+  objects before reconstruction, preventing thin bridges between
   unrelated structures.
 - **Wendland C2 kernel** — the same compact-support kernel used in modern
   SPH codes, with analytic gradients for accurate surface normals.
@@ -146,9 +145,8 @@ meshmerizer adaptive snapshot.hdf5 \
 | `--shift` | Coordinate shift `DX DY DZ` before cropping |
 | `--wrap-shift` / `--no-wrap-shift` | Wrap coordinates after shifting |
 | `--no-periodic` | Disable periodic wrapping for subregion selection |
-| `--poisson-depth` | Poisson reconstruction octree depth (default: max-depth) |
-| `--density-quantile` | Trim vertices below this density quantile (default: 0.1) |
-| `--linking-factor` | FOF linking length as fraction of mean separation (default: 1.5) |
+| `--linking-factor` | FOF linking length as fraction of mean separation (default: 0.2) |
+| `--min-feature-thickness` | Remove features thinner than this physical scale |
 | `--remove-islands-fraction` | Volume fraction threshold for island removal |
 | `--target-size` / `-s` | Scale longest mesh dimension to this size (cm) |
 | `--save-octree` | Save octree state to HDF5 after construction |
@@ -164,7 +162,7 @@ from meshmerizer.adaptive_core import (
     run_octree_pipeline,
     fof_cluster,
 )
-from meshmerizer.poisson import poisson_reconstruct
+from meshmerizer.reconstruct import reconstruct_mesh
 from meshmerizer.mesh.core import Mesh
 
 # Example: sphere of particles
@@ -198,10 +196,16 @@ group_labels = fof_cluster(
     vert_positions, domain_min, domain_max, linking_factor=1.5,
 )
 
-# Poisson surface reconstruction.
-mesh_verts, mesh_faces = poisson_reconstruct(
-    vert_positions, vert_normals, group_labels,
-    poisson_depth=max_depth, density_quantile=0.1,
+# Reconstruct the final mesh.
+mesh_verts, mesh_faces = reconstruct_mesh(
+    positions,
+    smoothing_lengths,
+    domain_min,
+    domain_max,
+    base_resolution,
+    isovalue,
+    max_depth,
+    group_labels=group_labels,
 )
 
 # Save as STL.
@@ -244,7 +248,7 @@ src/meshmerizer/
   __init__.py
   adaptive_core.py          # Stable Python API for the C++ core
   _adaptive.cpp             # Python/C++ extension bindings
-  poisson.py                # Poisson surface reconstruction (Open3D)
+  reconstruct.py            # Reconstruction wrappers over the C++ pipeline
   serialize.py              # HDF5 octree export/import
   logging.py                # Structured logging helpers
   logging_utils.py          # Logging utilities
@@ -277,7 +281,7 @@ src/meshmerizer/
 
 tests/
   test_adaptive_core.py     # Unit tests for the C++ core
-  test_poisson.py           # Poisson reconstruction tests
+  test_reconstruct.py       # Reconstruction wrapper tests
   test_serialize.py         # HDF5 round-trip tests
   test_logging.py           # Logging test
 ```

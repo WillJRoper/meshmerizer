@@ -233,6 +233,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     adaptive.add_argument(
+        "--min-feature-thickness",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum physical feature thickness to preserve via adaptive "
+            "solid opening. Features thinner than this may be removed. "
+            "When --target-size is provided, this value is interpreted in "
+            "print centimetres and converted back to native meshing units. "
+            "0 disables the regularizer. Default: 0.0"
+        ),
+    )
+    adaptive.add_argument(
         "--max-edge-ratio",
         type=float,
         default=1.5,
@@ -240,25 +252,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Maximum triangle edge length as a multiple of the "
             "local octree cell size. Edges longer than this are "
             "subdivided to fill gaps. Default: 1.5"
-        ),
-    )
-    adaptive.add_argument(
-        "--poisson-depth",
-        type=int,
-        default=None,
-        help=(
-            "Octree depth for the Poisson surface reconstruction. "
-            "Higher values produce finer detail. Defaults to 9."
-        ),
-    )
-    adaptive.add_argument(
-        "--density-quantile",
-        type=float,
-        default=0.0,
-        help=(
-            "Fraction of lowest-density vertices to trim after "
-            "Poisson reconstruction. Disabled by default (0.0). "
-            "Set to e.g. 0.02 to trim spurious membranes."
         ),
     )
     adaptive.add_argument(
@@ -291,16 +284,6 @@ def build_parser() -> argparse.ArgumentParser:
             "FOF linking factor: multiplier on mean inter-point "
             "separation for clustering particles into FOF groups. "
             "Used by --fof and --min-fof-cluster-size. Default: 0.2"
-        ),
-    )
-    adaptive.add_argument(
-        "--screening-weight",
-        type=float,
-        default=4.0,
-        help=(
-            "Poisson screening weight alpha. Higher values "
-            "produce tighter fit to data points, lower values "
-            "produce smoother surfaces. Default: 4.0"
         ),
     )
     adaptive.add_argument(

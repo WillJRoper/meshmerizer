@@ -32,13 +32,8 @@
 #include "adaptive_cpp/progress_bar.hpp"
 #include "adaptive_cpp/faces.hpp"
 #include "adaptive_cpp/fof.hpp"
-#include "adaptive_cpp/poisson_basis.hpp"
-#include "adaptive_cpp/poisson_rhs.hpp"
-#include "adaptive_cpp/poisson_stencil.hpp"
-#include "adaptive_cpp/poisson_solver.hpp"
-#include "adaptive_cpp/poisson_mc.hpp"
 #include "adaptive_cpp/dc_pipeline.hpp"
-#include "adaptive_cpp/poisson_pipeline.hpp"
+#include "adaptive_cpp/adaptive_solid.hpp"
 #include "adaptive_cpp/qef.hpp"
 
 /**
@@ -846,6 +841,7 @@ static PyObject *create_child_cells_py(PyObject *self, PyObject *args) {
         false,
         false,
         false,
+        false,
         -1,
         -1,
         -1,
@@ -924,6 +920,7 @@ static PyObject *filter_child_contributors_py(PyObject *self, PyObject *args) {
         false,
         false,
         false,
+        false,
         -1,
         -1,
         -1,
@@ -987,7 +984,7 @@ static PyObject *build_octree_cell_dict_with_contributors(
     }
 
     return Py_BuildValue(
-        "{sK,sI,s((ddd)(ddd)),sI,sI,sI,sL,sB,sN,sN}",
+        "{sK,sI,s((ddd)(ddd)),sI,sI,sI,sI,sL,sB,sN,sN}",
         "morton_key",
         static_cast<unsigned long long>(cell.morton_key),
         "depth",
@@ -1005,6 +1002,8 @@ static PyObject *build_octree_cell_dict_with_contributors(
         cell.is_active ? 1 : 0,
         "has_surface",
         cell.has_surface ? 1 : 0,
+        "is_topo_surface",
+        cell.is_topo_surface ? 1 : 0,
         "child_begin",
         static_cast<long long>(cell.child_begin),
         "corner_sign_mask",
@@ -2126,6 +2125,312 @@ static PyObject *run_octree_pipeline_py(
 }
 
 /**
+ * @brief Python binding for occupied-solid classification scaffolding.
+ *
+ * Returns a dictionary describing the leaf-wise occupied solid derived from
+ * the current adaptive octree. This is internal scaffolding for the upcoming
+ * minimum-thickness regularizer.
+ */
+static PyObject *classify_occupied_solid_py(
+        PyObject *self, PyObject *args) {
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    PyObject *domain_min_object = NULL;
+    PyObject *domain_max_object = NULL;
+    unsigned int base_resolution = 0U;
+    double isovalue = 0.0;
+    unsigned int max_depth = 0U;
+    unsigned int minimum_usable_hermite_samples = 3U;
+    double max_qef_rms_residual_ratio = 0.1;
+    double min_normal_alignment_threshold = 0.97;
+    double max_surface_leaf_size = 0.0;
+    double erosion_radius = 0.0;
+    (void)self;
+
+    if (!PyArg_ParseTuple(args, "OOOOIdI|Idddd",
+                          &positions_object,
+                          &smoothing_object,
+                          &domain_min_object,
+                          &domain_max_object,
+                          &base_resolution,
+                          &isovalue,
+                          &max_depth,
+                          &minimum_usable_hermite_samples,
+                          &max_qef_rms_residual_ratio,
+                          &min_normal_alignment_threshold,
+                          &max_surface_leaf_size,
+                          &erosion_radius)) {
+        return NULL;
+    }
+
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    BoundingBox domain{};
+
+    if (!parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths)) {
+        return NULL;
+    }
+    if (positions.size() != smoothing_lengths.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing lengths must match in size");
+        return NULL;
+    }
+    if (!parse_vector3d(domain_min_object, domain.min) ||
+        !parse_vector3d(domain_max_object, domain.max)) {
+        return NULL;
+    }
+
+    std::vector<OccupiedSolidLeaf> solid_leaves;
+    std::vector<double> clearance;
+    std::vector<std::uint8_t> eroded_inside;
+    std::vector<double> dilation_distance;
+    std::vector<std::uint8_t> opened_inside;
+    std::vector<OpenedBoundarySample> opened_boundary_samples;
+    OpenedSurfaceMesh opened_surface_mesh;
+    std::size_t inside_count = 0U;
+    std::size_t boundary_inside_count = 0U;
+    std::size_t boundary_outside_count = 0U;
+    std::size_t eroded_inside_count = 0U;
+    std::size_t opened_inside_count = 0U;
+
+    Py_BEGIN_ALLOW_THREADS
+
+    TopLevelParticleGrid grid(domain, base_resolution);
+    grid.insert_particles(positions);
+    grid.compute_bin_max_h(smoothing_lengths);
+
+    std::vector<OctreeCell> top_cells =
+        create_top_level_cells(domain, base_resolution);
+    std::vector<OctreeCell> initial_cells;
+    initial_cells.reserve(top_cells.size());
+    std::vector<std::size_t> initial_contributors;
+
+    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+        OctreeCell cell = top_cells[ci];
+        std::uint32_t sx = 0, sy = 0, sz = 0;
+        std::uint32_t ex = 0, ey = 0, ez = 0;
+        grid.contributor_bin_span(
+            cell.bounds, smoothing_lengths, sx, sy, sz, ex, ey, ez);
+
+        const std::int64_t begin =
+            static_cast<std::int64_t>(initial_contributors.size());
+        for (std::uint32_t ix = sx; ix <= ex; ++ix) {
+            for (std::uint32_t iy = sy; iy <= ey; ++iy) {
+                for (std::uint32_t iz = sz; iz <= ez; ++iz) {
+                    const TopLevelBin &bin =
+                        grid.bins[grid.flatten_index(ix, iy, iz)];
+                    for (std::size_t pi : bin.particle_indices) {
+                        if (particle_support_overlaps_box(
+                                positions[pi], smoothing_lengths[pi],
+                                cell.bounds)) {
+                            initial_contributors.push_back(pi);
+                        }
+                    }
+                }
+            }
+        }
+
+        const std::int64_t end =
+            static_cast<std::int64_t>(initial_contributors.size());
+        cell.contributor_begin = begin;
+        cell.contributor_end = end;
+        initial_cells.push_back(cell);
+    }
+
+    auto [all_cells, all_contributors] = refine_octree(
+        std::move(initial_cells), std::move(initial_contributors),
+        positions, smoothing_lengths, isovalue,
+        static_cast<std::uint32_t>(max_depth), domain,
+        static_cast<std::uint32_t>(base_resolution),
+        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+        max_qef_rms_residual_ratio, min_normal_alignment_threshold);
+
+    while (refine_surface_band_cells(
+        all_cells, all_contributors, positions, smoothing_lengths,
+        isovalue, static_cast<std::uint32_t>(max_depth),
+        max_surface_leaf_size,
+        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold)) {
+    }
+
+    balance_octree(
+        all_cells, all_contributors, positions, smoothing_lengths,
+        isovalue, domain, static_cast<std::uint32_t>(base_resolution),
+        static_cast<std::uint32_t>(max_depth));
+
+    LeafSpatialIndex spatial_index;
+    spatial_index.build(
+        all_cells, domain, static_cast<std::uint32_t>(max_depth),
+        static_cast<std::uint32_t>(base_resolution));
+    solid_leaves = classify_occupied_solid_leaves(
+        all_cells, all_contributors, positions, smoothing_lengths,
+        spatial_index, isovalue, static_cast<std::uint32_t>(max_depth));
+    clearance = compute_inside_clearance(solid_leaves);
+    eroded_inside = erode_occupied_solid_leaves(
+        solid_leaves, clearance, erosion_radius);
+    dilation_distance = compute_distance_to_eroded_solid(
+        solid_leaves, eroded_inside);
+    opened_inside = dilate_eroded_solid_leaves(
+        eroded_inside, dilation_distance, erosion_radius);
+    opened_boundary_samples = generate_opened_boundary_samples(
+        solid_leaves, opened_inside, all_cells);
+    opened_surface_mesh = generate_opened_surface_mesh(
+        solid_leaves, opened_inside, all_cells, spatial_index,
+        domain, static_cast<std::uint32_t>(base_resolution),
+        static_cast<std::uint32_t>(max_depth));
+
+    for (std::size_t i = 0; i < solid_leaves.size(); ++i) {
+        const OccupiedSolidLeaf &leaf = solid_leaves[i];
+        if (leaf.occupancy == OccupancyState::kInside ||
+            leaf.occupancy == OccupancyState::kBoundaryInside) {
+            ++inside_count;
+        }
+        if (leaf.occupancy == OccupancyState::kBoundaryInside) {
+            ++boundary_inside_count;
+        }
+        if (leaf.occupancy == OccupancyState::kBoundaryOutside) {
+            ++boundary_outside_count;
+        }
+        if (eroded_inside[i] != 0U) {
+            ++eroded_inside_count;
+        }
+        if (opened_inside[i] != 0U) {
+            ++opened_inside_count;
+        }
+    }
+
+    Py_END_ALLOW_THREADS
+
+    const npy_intp dims[1] = {static_cast<npy_intp>(solid_leaves.size())};
+    PyObject *occupancy_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
+    PyObject *depth_array = PyArray_SimpleNew(1, dims, NPY_UINT32);
+    PyObject *center_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *size_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *clearance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *eroded_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
+    PyObject *dilation_distance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *opened_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
+    const npy_intp sample_dims[2] = {
+        static_cast<npy_intp>(opened_boundary_samples.size()), 3};
+    PyObject *sample_positions_array =
+        PyArray_SimpleNew(2, sample_dims, NPY_DOUBLE);
+    PyObject *sample_normals_array =
+        PyArray_SimpleNew(2, sample_dims, NPY_DOUBLE);
+    const npy_intp mesh_vertex_dims[2] = {
+        static_cast<npy_intp>(opened_surface_mesh.vertices.size()), 3};
+    const npy_intp mesh_face_dims[2] = {
+        static_cast<npy_intp>(opened_surface_mesh.triangles.size()), 3};
+    PyObject *mesh_vertex_array =
+        PyArray_SimpleNew(2, mesh_vertex_dims, NPY_DOUBLE);
+    PyObject *mesh_face_array =
+        PyArray_SimpleNew(2, mesh_face_dims, NPY_UINT32);
+    if (!occupancy_array || !depth_array || !center_array || !size_array ||
+        !clearance_array || !eroded_inside_array ||
+        !dilation_distance_array || !opened_inside_array ||
+        !sample_positions_array || !sample_normals_array ||
+        !mesh_vertex_array || !mesh_face_array) {
+        Py_XDECREF(occupancy_array);
+        Py_XDECREF(depth_array);
+        Py_XDECREF(center_array);
+        Py_XDECREF(size_array);
+        Py_XDECREF(clearance_array);
+        Py_XDECREF(eroded_inside_array);
+        Py_XDECREF(dilation_distance_array);
+        Py_XDECREF(opened_inside_array);
+        Py_XDECREF(sample_positions_array);
+        Py_XDECREF(sample_normals_array);
+        Py_XDECREF(mesh_vertex_array);
+        Py_XDECREF(mesh_face_array);
+        return NULL;
+    }
+
+    auto *occupancy_data = static_cast<std::uint8_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(occupancy_array)));
+    auto *depth_data = static_cast<std::uint32_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(depth_array)));
+    auto *center_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(center_array)));
+    auto *size_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(size_array)));
+    auto *clearance_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(clearance_array)));
+    auto *eroded_inside_data = static_cast<std::uint8_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(eroded_inside_array)));
+    auto *dilation_distance_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(dilation_distance_array)));
+    auto *opened_inside_data = static_cast<std::uint8_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(opened_inside_array)));
+    auto *sample_positions_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(sample_positions_array)));
+    auto *sample_normals_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(sample_normals_array)));
+    auto *mesh_vertex_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(mesh_vertex_array)));
+    auto *mesh_face_data = static_cast<std::uint32_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(mesh_face_array)));
+
+    for (std::size_t i = 0; i < solid_leaves.size(); ++i) {
+        occupancy_data[i] = static_cast<std::uint8_t>(solid_leaves[i].occupancy);
+        depth_data[i] = solid_leaves[i].depth;
+        center_data[i] = solid_leaves[i].center_value;
+        size_data[i] = solid_leaves[i].cell_size;
+        clearance_data[i] = clearance[i];
+        eroded_inside_data[i] = eroded_inside[i];
+        dilation_distance_data[i] = dilation_distance[i];
+        opened_inside_data[i] = opened_inside[i];
+    }
+
+    for (std::size_t i = 0; i < opened_boundary_samples.size(); ++i) {
+        sample_positions_data[i * 3] = opened_boundary_samples[i].position.x;
+        sample_positions_data[i * 3 + 1] = opened_boundary_samples[i].position.y;
+        sample_positions_data[i * 3 + 2] = opened_boundary_samples[i].position.z;
+        sample_normals_data[i * 3] = opened_boundary_samples[i].outward_normal.x;
+        sample_normals_data[i * 3 + 1] = opened_boundary_samples[i].outward_normal.y;
+        sample_normals_data[i * 3 + 2] = opened_boundary_samples[i].outward_normal.z;
+    }
+
+    for (std::size_t i = 0; i < opened_surface_mesh.vertices.size(); ++i) {
+        mesh_vertex_data[i * 3] = opened_surface_mesh.vertices[i].position.x;
+        mesh_vertex_data[i * 3 + 1] = opened_surface_mesh.vertices[i].position.y;
+        mesh_vertex_data[i * 3 + 2] = opened_surface_mesh.vertices[i].position.z;
+    }
+    for (std::size_t i = 0; i < opened_surface_mesh.triangles.size(); ++i) {
+        mesh_face_data[i * 3] = opened_surface_mesh.triangles[i].vertex_indices[0];
+        mesh_face_data[i * 3 + 1] = opened_surface_mesh.triangles[i].vertex_indices[1];
+        mesh_face_data[i * 3 + 2] = opened_surface_mesh.triangles[i].vertex_indices[2];
+    }
+
+    return Py_BuildValue(
+        "{s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n}",
+        "occupancy", occupancy_array,
+        "depths", depth_array,
+        "center_values", center_array,
+        "cell_sizes", size_array,
+        "clearance", clearance_array,
+        "eroded_inside", eroded_inside_array,
+        "dilation_distance", dilation_distance_array,
+        "opened_inside", opened_inside_array,
+        "opened_boundary_positions", sample_positions_array,
+        "opened_boundary_normals", sample_normals_array,
+        "opened_surface_vertices", mesh_vertex_array,
+        "opened_surface_faces", mesh_face_array,
+        "n_leaves", static_cast<Py_ssize_t>(solid_leaves.size()),
+        "n_inside", static_cast<Py_ssize_t>(inside_count),
+        "n_boundary_inside", static_cast<Py_ssize_t>(boundary_inside_count),
+        "n_boundary_outside", static_cast<Py_ssize_t>(boundary_outside_count),
+        "n_eroded_inside", static_cast<Py_ssize_t>(eroded_inside_count),
+        "n_opened_inside", static_cast<Py_ssize_t>(opened_inside_count),
+        "n_opened_boundary_samples",
+        static_cast<Py_ssize_t>(opened_boundary_samples.size()),
+        "n_opened_surface_vertices",
+        static_cast<Py_ssize_t>(opened_surface_mesh.vertices.size()),
+        "n_opened_surface_faces",
+        static_cast<Py_ssize_t>(opened_surface_mesh.triangles.size()));
+}
+
+/**
  * @brief Python binding for friends-of-friends clustering.
  *
  * Args (positional):
@@ -2197,980 +2502,6 @@ static PyObject *fof_cluster_py(PyObject * /* self */,
     return result;
 }
 
-/* ===================================================================
- * Poisson basis bindings (Phase 20a)
- * =================================================================== */
-
-/**
- * @brief bspline1d_evaluate(t) -> float
- */
-static PyObject *bspline1d_evaluate_py(PyObject * /*self*/,
-                                       PyObject *args) {
-    double t;
-    if (!PyArg_ParseTuple(args, "d", &t)) {
-        return NULL;
-    }
-    return PyFloat_FromDouble(bspline1d_evaluate(t));
-}
-
-/**
- * @brief bspline1d_derivative(t) -> float
- */
-static PyObject *bspline1d_derivative_py(PyObject * /*self*/,
-                                         PyObject *args) {
-    double t;
-    if (!PyArg_ParseTuple(args, "d", &t)) {
-        return NULL;
-    }
-    return PyFloat_FromDouble(bspline1d_derivative(t));
-}
-
-/**
- * @brief bspline3d_evaluate(point, center, width) -> float
- *
- * point and center are (x, y, z) tuples.
- */
-static PyObject *bspline3d_evaluate_py(PyObject * /*self*/,
-                                       PyObject *args) {
-    PyObject *point_obj;
-    PyObject *center_obj;
-    double width;
-    if (!PyArg_ParseTuple(args, "OOd", &point_obj,
-                          &center_obj, &width)) {
-        return NULL;
-    }
-    Vector3d point{}, center{};
-    if (!parse_vector3d(point_obj, point)) return NULL;
-    if (!parse_vector3d(center_obj, center)) return NULL;
-    return PyFloat_FromDouble(
-        bspline3d_evaluate(point, center, width));
-}
-
-/**
- * @brief bspline3d_gradient(point, center, width) -> (dx, dy, dz)
- */
-static PyObject *bspline3d_gradient_py(PyObject * /*self*/,
-                                       PyObject *args) {
-    PyObject *point_obj;
-    PyObject *center_obj;
-    double width;
-    if (!PyArg_ParseTuple(args, "OOd", &point_obj,
-                          &center_obj, &width)) {
-        return NULL;
-    }
-    Vector3d point{}, center{};
-    if (!parse_vector3d(point_obj, point)) return NULL;
-    if (!parse_vector3d(center_obj, center)) return NULL;
-    Vector3d grad = bspline3d_gradient(point, center, width);
-    return Py_BuildValue("(ddd)", grad.x, grad.y, grad.z);
-}
-
-/**
- * @brief assign_dof_indices(cells_data) -> (cell_to_dof, dof_to_cell)
- *
- * cells_data is a list of dicts with keys:
- *   "is_leaf" (bool)
- * Returns two lists: cell_to_dof (int, -1 for non-leaves),
- *                    dof_to_cell (int).
- */
-static PyObject *assign_dof_indices_py(PyObject * /*self*/,
-                                       PyObject *args) {
-    PyObject *cells_obj;
-    if (!PyArg_ParseTuple(args, "O", &cells_obj)) {
-        return NULL;
-    }
-    PyObject *fast = PySequence_Fast(
-        cells_obj, "expected a sequence of cell dicts");
-    if (fast == NULL) return NULL;
-    const Py_ssize_t n = PySequence_Fast_GET_SIZE(fast);
-
-    /* Build a minimal vector of OctreeCells — we only need
-     * is_leaf for DOF assignment. */
-    std::vector<OctreeCell> cells(static_cast<std::size_t>(n));
-    for (Py_ssize_t i = 0; i < n; ++i) {
-        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
-        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
-        if (leaf == NULL) {
-            Py_DECREF(fast);
-            PyErr_SetString(
-                PyExc_KeyError, "cell dict missing 'is_leaf'");
-            return NULL;
-        }
-        cells[static_cast<std::size_t>(i)].is_leaf =
-            PyObject_IsTrue(leaf) != 0;
-    }
-    Py_DECREF(fast);
-
-    std::vector<std::int64_t> cell_to_dof;
-    std::vector<std::size_t> dof_to_cell;
-    assign_dof_indices(cells, cell_to_dof, dof_to_cell);
-
-    /* Build Python lists. */
-    PyObject *c2d = PyList_New(
-        static_cast<Py_ssize_t>(cell_to_dof.size()));
-    for (std::size_t i = 0; i < cell_to_dof.size(); ++i) {
-        PyList_SET_ITEM(
-            c2d, static_cast<Py_ssize_t>(i),
-            PyLong_FromLongLong(cell_to_dof[i]));
-    }
-    PyObject *d2c = PyList_New(
-        static_cast<Py_ssize_t>(dof_to_cell.size()));
-    for (std::size_t i = 0; i < dof_to_cell.size(); ++i) {
-        PyList_SET_ITEM(
-            d2c, static_cast<Py_ssize_t>(i),
-            PyLong_FromSize_t(dof_to_cell[i]));
-    }
-    return Py_BuildValue("(OO)", c2d, d2c);
-}
-
-/**
- * @brief assign_dof_indices_grouped(cells, max_depth)
- *        -> (cell_to_dof, dof_to_cell, depth_dof_start)
- *
- * Depth-grouped DOF assignment.  DOFs at depth 0 come first,
- * then depth 1, etc.  Returns depth_dof_start as a list of
- * (max_depth + 2) entries where entry d is the first DOF index
- * at depth d, and the last entry is the total DOF count.
- *
- * cells: list of dicts with keys 'is_leaf' and 'depth'.
- * max_depth: maximum depth in the octree (integer).
- */
-static PyObject *assign_dof_indices_grouped_py(
-    PyObject * /*self*/, PyObject *args) {
-    PyObject *cells_obj;
-    int max_depth_val;
-    if (!PyArg_ParseTuple(args, "Oi", &cells_obj,
-                          &max_depth_val)) {
-        return NULL;
-    }
-    PyObject *fast = PySequence_Fast(
-        cells_obj, "expected a sequence of cell dicts");
-    if (fast == NULL) return NULL;
-    const Py_ssize_t n = PySequence_Fast_GET_SIZE(fast);
-
-    std::vector<OctreeCell> cells(static_cast<std::size_t>(n));
-    for (Py_ssize_t i = 0; i < n; ++i) {
-        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
-        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
-        PyObject *depth = PyDict_GetItemString(d, "depth");
-        if (leaf == NULL || depth == NULL) {
-            Py_DECREF(fast);
-            PyErr_SetString(
-                PyExc_KeyError,
-                "cell dict missing 'is_leaf' or 'depth'");
-            return NULL;
-        }
-        cells[static_cast<std::size_t>(i)].is_leaf =
-            PyObject_IsTrue(leaf) != 0;
-        cells[static_cast<std::size_t>(i)].depth =
-            static_cast<std::uint32_t>(PyLong_AsLong(depth));
-    }
-    Py_DECREF(fast);
-
-    std::vector<std::int64_t> cell_to_dof;
-    std::vector<std::size_t> dof_to_cell;
-    std::vector<std::int64_t> depth_dof_start;
-    assign_dof_indices(cells, cell_to_dof, dof_to_cell,
-                       /*restrict_depth=*/-1,
-                       &depth_dof_start, max_depth_val);
-
-    PyObject *c2d = PyList_New(
-        static_cast<Py_ssize_t>(cell_to_dof.size()));
-    for (std::size_t i = 0; i < cell_to_dof.size(); ++i) {
-        PyList_SET_ITEM(
-            c2d, static_cast<Py_ssize_t>(i),
-            PyLong_FromLongLong(cell_to_dof[i]));
-    }
-    PyObject *d2c = PyList_New(
-        static_cast<Py_ssize_t>(dof_to_cell.size()));
-    for (std::size_t i = 0; i < dof_to_cell.size(); ++i) {
-        PyList_SET_ITEM(
-            d2c, static_cast<Py_ssize_t>(i),
-            PyLong_FromSize_t(dof_to_cell[i]));
-    }
-    PyObject *dds = PyList_New(
-        static_cast<Py_ssize_t>(depth_dof_start.size()));
-    for (std::size_t i = 0; i < depth_dof_start.size(); ++i) {
-        PyList_SET_ITEM(
-            dds, static_cast<Py_ssize_t>(i),
-            PyLong_FromLongLong(depth_dof_start[i]));
-    }
-    return Py_BuildValue("(OOO)", c2d, d2c, dds);
-}
-
-/**
- * @brief enumerate_stencils_py(octree_result, domain_min,
- *            domain_max, base_resolution, max_depth)
- *        -> (stencil_offsets, stencil_neighbors)
- *
- * octree_result is the tuple returned by run_octree_pipeline
- * (positions, normals) — but we need the raw cells. Instead,
- * we accept the cells as a list of dicts with keys:
- *   is_leaf, depth, bounds_min (tuple), bounds_max (tuple),
- *   morton_key
- *
- * Returns two lists:
- *   stencil_offsets  (list of int, length n_dofs + 1)
- *   stencil_neighbors (list of int)
- */
-static PyObject *enumerate_stencils_py(PyObject * /*self*/,
-                                       PyObject *args) {
-    PyObject *cells_obj;
-    PyObject *domain_min_obj;
-    PyObject *domain_max_obj;
-    unsigned int base_resolution;
-    unsigned int max_depth_val;
-    if (!PyArg_ParseTuple(args, "OOOII", &cells_obj,
-                          &domain_min_obj, &domain_max_obj,
-                          &base_resolution, &max_depth_val)) {
-        return NULL;
-    }
-    Vector3d dmin{}, dmax{};
-    if (!parse_vector3d(domain_min_obj, dmin)) return NULL;
-    if (!parse_vector3d(domain_max_obj, dmax)) return NULL;
-    BoundingBox domain = {dmin, dmax};
-
-    PyObject *fast = PySequence_Fast(
-        cells_obj, "expected a sequence of cell dicts");
-    if (fast == NULL) return NULL;
-    const Py_ssize_t n = PySequence_Fast_GET_SIZE(fast);
-
-    std::vector<OctreeCell> cells(static_cast<std::size_t>(n));
-    for (Py_ssize_t i = 0; i < n; ++i) {
-        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
-        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
-        PyObject *depth = PyDict_GetItemString(d, "depth");
-        PyObject *bmin = PyDict_GetItemString(d, "bounds_min");
-        PyObject *bmax = PyDict_GetItemString(d, "bounds_max");
-        PyObject *mkey = PyDict_GetItemString(d, "morton_key");
-        if (!leaf || !depth || !bmin || !bmax || !mkey) {
-            Py_DECREF(fast);
-            PyErr_SetString(PyExc_KeyError,
-                            "cell dict missing required key");
-            return NULL;
-        }
-        auto &c = cells[static_cast<std::size_t>(i)];
-        c.is_leaf = PyObject_IsTrue(leaf) != 0;
-        c.depth = static_cast<std::uint32_t>(
-            PyLong_AsUnsignedLong(depth));
-        if (!parse_vector3d(bmin, c.bounds.min)) {
-            Py_DECREF(fast);
-            return NULL;
-        }
-        if (!parse_vector3d(bmax, c.bounds.max)) {
-            Py_DECREF(fast);
-            return NULL;
-        }
-        c.morton_key = PyLong_AsUnsignedLongLong(mkey);
-    }
-    Py_DECREF(fast);
-
-    std::vector<std::int64_t> cell_to_dof;
-    std::vector<std::size_t> dof_to_cell;
-    assign_dof_indices(cells, cell_to_dof, dof_to_cell);
-
-    std::vector<std::size_t> offsets;
-    std::vector<std::int64_t> neighbors;
-    std::vector<int> depth_deltas;
-    enumerate_stencils(cells, cell_to_dof, dof_to_cell,
-                       domain, base_resolution, max_depth_val,
-                       offsets, neighbors, &depth_deltas);
-
-    PyObject *off_list = PyList_New(
-        static_cast<Py_ssize_t>(offsets.size()));
-    for (std::size_t i = 0; i < offsets.size(); ++i) {
-        PyList_SET_ITEM(off_list,
-                        static_cast<Py_ssize_t>(i),
-                        PyLong_FromSize_t(offsets[i]));
-    }
-    PyObject *nbr_list = PyList_New(
-        static_cast<Py_ssize_t>(neighbors.size()));
-    for (std::size_t i = 0; i < neighbors.size(); ++i) {
-        PyList_SET_ITEM(nbr_list,
-                        static_cast<Py_ssize_t>(i),
-                        PyLong_FromLongLong(neighbors[i]));
-    }
-    PyObject *dd_list = PyList_New(
-        static_cast<Py_ssize_t>(depth_deltas.size()));
-    for (std::size_t i = 0; i < depth_deltas.size(); ++i) {
-        PyList_SET_ITEM(dd_list,
-                        static_cast<Py_ssize_t>(i),
-                        PyLong_FromLong(depth_deltas[i]));
-    }
-    return Py_BuildValue("(OOO)", off_list, nbr_list, dd_list);
-}
-
-/**
- * @brief splat_and_compute_rhs(positions_arr, normals_arr, cells,
- *            domain_min, domain_max, base_resolution, max_depth)
- *        -> (v_field_x, v_field_y, v_field_z, rhs)
- *
- * Performs both normal splatting and RHS assembly in one call.
- * positions_arr and normals_arr are (N,3) float64 NumPy arrays.
- * cells is a list of dicts (same format as enumerate_stencils).
- *
- * Returns four lists:
- *   v_field_x, v_field_y, v_field_z (per-DOF vector field)
- *   rhs (per-DOF scalar RHS)
- */
-static PyObject *splat_and_compute_rhs_py(PyObject * /*self*/,
-                                          PyObject *args) {
-    PyObject *pos_obj;
-    PyObject *nor_obj;
-    PyObject *cells_obj;
-    PyObject *dmin_obj;
-    PyObject *dmax_obj;
-    unsigned int base_resolution;
-    unsigned int max_depth_val;
-    if (!PyArg_ParseTuple(args, "OOOOOII",
-                          &pos_obj, &nor_obj, &cells_obj,
-                          &dmin_obj, &dmax_obj,
-                          &base_resolution, &max_depth_val)) {
-        return NULL;
-    }
-
-    /* Parse domain. */
-    Vector3d dmin{}, dmax{};
-    if (!parse_vector3d(dmin_obj, dmin)) return NULL;
-    if (!parse_vector3d(dmax_obj, dmax)) return NULL;
-    BoundingBox domain = {dmin, dmax};
-
-    /* Parse positions and normals from NumPy arrays. */
-    PyArrayObject *pos_arr = reinterpret_cast<PyArrayObject *>(
-        PyArray_FROM_OTF(pos_obj, NPY_DOUBLE,
-                         NPY_ARRAY_IN_ARRAY));
-    if (pos_arr == NULL) return NULL;
-    PyArrayObject *nor_arr = reinterpret_cast<PyArrayObject *>(
-        PyArray_FROM_OTF(nor_obj, NPY_DOUBLE,
-                         NPY_ARRAY_IN_ARRAY));
-    if (nor_arr == NULL) {
-        Py_DECREF(pos_arr);
-        return NULL;
-    }
-
-    const npy_intp n_samples = PyArray_DIM(pos_arr, 0);
-    const double *pos_data =
-        static_cast<double *>(PyArray_DATA(pos_arr));
-    const double *nor_data =
-        static_cast<double *>(PyArray_DATA(nor_arr));
-
-    /* Convert to Vector3d arrays. */
-    std::vector<Vector3d> positions(
-        static_cast<std::size_t>(n_samples));
-    std::vector<Vector3d> normals_vec(
-        static_cast<std::size_t>(n_samples));
-    for (npy_intp i = 0; i < n_samples; ++i) {
-        positions[static_cast<std::size_t>(i)] = {
-            pos_data[i * 3], pos_data[i * 3 + 1],
-            pos_data[i * 3 + 2]};
-        normals_vec[static_cast<std::size_t>(i)] = {
-            nor_data[i * 3], nor_data[i * 3 + 1],
-            nor_data[i * 3 + 2]};
-    }
-    Py_DECREF(pos_arr);
-    Py_DECREF(nor_arr);
-
-    /* Parse cells. */
-    PyObject *fast = PySequence_Fast(
-        cells_obj, "expected a sequence of cell dicts");
-    if (fast == NULL) return NULL;
-    const Py_ssize_t nc = PySequence_Fast_GET_SIZE(fast);
-
-    std::vector<OctreeCell> cells(
-        static_cast<std::size_t>(nc));
-    for (Py_ssize_t i = 0; i < nc; ++i) {
-        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
-        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
-        PyObject *depth = PyDict_GetItemString(d, "depth");
-        PyObject *bmin = PyDict_GetItemString(d, "bounds_min");
-        PyObject *bmax = PyDict_GetItemString(d, "bounds_max");
-        PyObject *mkey = PyDict_GetItemString(d, "morton_key");
-        if (!leaf || !depth || !bmin || !bmax || !mkey) {
-            Py_DECREF(fast);
-            PyErr_SetString(PyExc_KeyError,
-                            "cell dict missing required key");
-            return NULL;
-        }
-        auto &c = cells[static_cast<std::size_t>(i)];
-        c.is_leaf = PyObject_IsTrue(leaf) != 0;
-        c.depth = static_cast<std::uint32_t>(
-            PyLong_AsUnsignedLong(depth));
-        if (!parse_vector3d(bmin, c.bounds.min)) {
-            Py_DECREF(fast);
-            return NULL;
-        }
-        if (!parse_vector3d(bmax, c.bounds.max)) {
-            Py_DECREF(fast);
-            return NULL;
-        }
-        c.morton_key = PyLong_AsUnsignedLongLong(mkey);
-    }
-    Py_DECREF(fast);
-
-    /* Build DOF indexing. */
-    std::vector<std::int64_t> cell_to_dof;
-    std::vector<std::size_t> dof_to_cell;
-    assign_dof_indices(cells, cell_to_dof, dof_to_cell);
-    const std::size_t n_dofs = dof_to_cell.size();
-
-    /* Build spatial hash. */
-    PoissonLeafHash hash;
-    hash.build(cells, domain, max_depth_val, base_resolution);
-
-    /* Build stencils. */
-    std::vector<std::size_t> stencil_offsets;
-    std::vector<std::int64_t> stencil_neighbors;
-    std::vector<int> stencil_depth_deltas;
-    enumerate_stencils(cells, cell_to_dof, dof_to_cell,
-                       domain, base_resolution, max_depth_val,
-                       stencil_offsets, stencil_neighbors,
-                       &stencil_depth_deltas);
-
-    /* Splat normals. */
-    std::vector<Vector3d> v_field;
-    splat_normals(positions.data(), normals_vec.data(),
-                  static_cast<std::size_t>(n_samples),
-                  hash, cells, cell_to_dof, dof_to_cell, n_dofs,
-                  base_resolution, v_field);
-
-    /* Compute RHS. */
-    std::vector<double> rhs;
-    compute_rhs(v_field, cells, cell_to_dof, dof_to_cell,
-                stencil_offsets, stencil_neighbors,
-                stencil_depth_deltas,
-                n_dofs, rhs);
-
-    /* Build result: 4 lists. */
-    PyObject *vx = PyList_New(static_cast<Py_ssize_t>(n_dofs));
-    PyObject *vy = PyList_New(static_cast<Py_ssize_t>(n_dofs));
-    PyObject *vz = PyList_New(static_cast<Py_ssize_t>(n_dofs));
-    PyObject *rhs_list = PyList_New(
-        static_cast<Py_ssize_t>(n_dofs));
-    for (std::size_t i = 0; i < n_dofs; ++i) {
-        const Py_ssize_t si = static_cast<Py_ssize_t>(i);
-        PyList_SET_ITEM(vx, si,
-                        PyFloat_FromDouble(v_field[i].x));
-        PyList_SET_ITEM(vy, si,
-                        PyFloat_FromDouble(v_field[i].y));
-        PyList_SET_ITEM(vz, si,
-                        PyFloat_FromDouble(v_field[i].z));
-        PyList_SET_ITEM(rhs_list, si,
-                        PyFloat_FromDouble(rhs[i]));
-    }
-    return Py_BuildValue("(OOOO)", vx, vy, vz, rhs_list);
-}
-
-/**
- * @brief laplacian_stencil_weight(dx, dy, dz, h) -> float
- *
- * Returns the 3-D Laplacian stencil weight for offset (dx,dy,dz)
- * at cell width h.
- */
-static PyObject *laplacian_stencil_weight_py(PyObject * /*self*/,
-                                             PyObject *args) {
-    int dx, dy, dz;
-    double h;
-    if (!PyArg_ParseTuple(args, "iiid", &dx, &dy, &dz, &h)) {
-        return NULL;
-    }
-    return PyFloat_FromDouble(
-        laplacian_stencil_weight(dx, dy, dz, h));
-}
-
-/**
- * @brief pc_integrals_1d(j) -> (mass, stiffness, grad_value)
- *
- * Return the 1-D parent-child cross-depth B-spline integrals
- * for offset j (integer, -4..+4).  Used for testing Phase 21a.
- */
-static PyObject *pc_integrals_1d_py(PyObject * /*self*/,
-                                     PyObject *args) {
-    int j;
-    if (!PyArg_ParseTuple(args, "i", &j)) {
-        return NULL;
-    }
-    return Py_BuildValue(
-        "(ddd)",
-        pc_mass_integral_1d(j),
-        pc_stiffness_integral_1d(j),
-        pc_grad_value_integral_1d(j));
-}
-
-/**
- * @brief pc_laplacian_weight(dx, dy, dz) -> float
- *
- * Return the raw 3-D parent-child Laplacian stencil weight.
- */
-static PyObject *pc_laplacian_weight_py(PyObject * /*self*/,
-                                         PyObject *args) {
-    int dx, dy, dz;
-    if (!PyArg_ParseTuple(args, "iii", &dx, &dy, &dz)) {
-        return NULL;
-    }
-    return PyFloat_FromDouble(
-        pc_laplacian_stencil_weight(dx, dy, dz));
-}
-
-/**
- * @brief apply_poisson_operator(positions_arr, cells, domain_min,
- *            domain_max, base_resolution, max_depth, alpha, x_vec)
- *        -> list[float]
- *
- * Builds the screened Poisson operator (Laplacian + screening)
- * and applies it to the input vector x.  Returns A * x as a list.
- *
- * positions_arr: (N, 3) float64 NumPy array of sample positions
- *   (used for screening accumulation only).
- * cells: list of cell dicts.
- * alpha: screening weight (0.0 for pure Laplacian).
- * x_vec: list of floats (length = n_dofs).
- */
-static PyObject *apply_poisson_operator_py(PyObject * /*self*/,
-                                           PyObject *args) {
-    PyObject *pos_obj;
-    PyObject *cells_obj;
-    PyObject *dmin_obj;
-    PyObject *dmax_obj;
-    unsigned int base_resolution;
-    unsigned int max_depth_val;
-    double alpha;
-    PyObject *x_obj;
-    if (!PyArg_ParseTuple(args, "OOOOIIdO",
-                          &pos_obj, &cells_obj,
-                          &dmin_obj, &dmax_obj,
-                          &base_resolution, &max_depth_val,
-                          &alpha, &x_obj)) {
-        return NULL;
-    }
-
-    /* Parse domain. */
-    Vector3d dmin{}, dmax{};
-    if (!parse_vector3d(dmin_obj, dmin)) return NULL;
-    if (!parse_vector3d(dmax_obj, dmax)) return NULL;
-    BoundingBox domain = {dmin, dmax};
-
-    /* Parse positions from NumPy array. */
-    PyArrayObject *pos_arr = reinterpret_cast<PyArrayObject *>(
-        PyArray_FROM_OTF(pos_obj, NPY_DOUBLE,
-                         NPY_ARRAY_IN_ARRAY));
-    if (pos_arr == NULL) return NULL;
-
-    const npy_intp n_samples = PyArray_DIM(pos_arr, 0);
-    const double *pos_data =
-        static_cast<double *>(PyArray_DATA(pos_arr));
-
-    std::vector<Vector3d> positions(
-        static_cast<std::size_t>(n_samples));
-    for (npy_intp i = 0; i < n_samples; ++i) {
-        positions[static_cast<std::size_t>(i)] = {
-            pos_data[i * 3], pos_data[i * 3 + 1],
-            pos_data[i * 3 + 2]};
-    }
-    Py_DECREF(pos_arr);
-
-    /* Parse cells. */
-    PyObject *fast = PySequence_Fast(
-        cells_obj, "expected a sequence of cell dicts");
-    if (fast == NULL) return NULL;
-    const Py_ssize_t nc = PySequence_Fast_GET_SIZE(fast);
-
-    std::vector<OctreeCell> cells(
-        static_cast<std::size_t>(nc));
-    for (Py_ssize_t i = 0; i < nc; ++i) {
-        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
-        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
-        PyObject *depth = PyDict_GetItemString(d, "depth");
-        PyObject *bmin = PyDict_GetItemString(d, "bounds_min");
-        PyObject *bmax = PyDict_GetItemString(d, "bounds_max");
-        PyObject *mkey = PyDict_GetItemString(d, "morton_key");
-        if (!leaf || !depth || !bmin || !bmax || !mkey) {
-            Py_DECREF(fast);
-            PyErr_SetString(PyExc_KeyError,
-                            "cell dict missing required key");
-            return NULL;
-        }
-        auto &c = cells[static_cast<std::size_t>(i)];
-        c.is_leaf = PyObject_IsTrue(leaf) != 0;
-        c.depth = static_cast<std::uint32_t>(
-            PyLong_AsUnsignedLong(depth));
-        if (!parse_vector3d(bmin, c.bounds.min)) {
-            Py_DECREF(fast);
-            return NULL;
-        }
-        if (!parse_vector3d(bmax, c.bounds.max)) {
-            Py_DECREF(fast);
-            return NULL;
-        }
-        c.morton_key = PyLong_AsUnsignedLongLong(mkey);
-    }
-    Py_DECREF(fast);
-
-    /* Build DOF indexing. */
-    std::vector<std::int64_t> cell_to_dof;
-    std::vector<std::size_t> dof_to_cell;
-    assign_dof_indices(cells, cell_to_dof, dof_to_cell);
-    const std::size_t n_dofs = dof_to_cell.size();
-
-    /* Build spatial hash. */
-    PoissonLeafHash hash;
-    hash.build(cells, domain, max_depth_val, base_resolution);
-
-    /* Build stencils. */
-    std::vector<std::size_t> stencil_offsets;
-    std::vector<std::int64_t> stencil_neighbors;
-    std::vector<int> stencil_depth_deltas;
-    enumerate_stencils(cells, cell_to_dof, dof_to_cell,
-                       domain, base_resolution, max_depth_val,
-                       stencil_offsets, stencil_neighbors,
-                       &stencil_depth_deltas);
-
-    /* Accumulate screening. */
-    ScreeningData screening;
-    accumulate_screening(positions.data(),
-                         static_cast<std::size_t>(n_samples),
-                         alpha, hash, cells, cell_to_dof,
-                         dof_to_cell, n_dofs,
-                         base_resolution, screening);
-
-    /* Parse input vector x. */
-    PyObject *x_fast = PySequence_Fast(
-        x_obj, "expected a sequence for x");
-    if (x_fast == NULL) return NULL;
-    const Py_ssize_t x_len = PySequence_Fast_GET_SIZE(x_fast);
-    if (static_cast<std::size_t>(x_len) != n_dofs) {
-        Py_DECREF(x_fast);
-        PyErr_SetString(PyExc_ValueError,
-                        "x length must equal n_dofs");
-        return NULL;
-    }
-    std::vector<double> x_vec(n_dofs);
-    for (Py_ssize_t i = 0; i < x_len; ++i) {
-        x_vec[static_cast<std::size_t>(i)] =
-            PyFloat_AsDouble(
-                PySequence_Fast_GET_ITEM(x_fast, i));
-    }
-    Py_DECREF(x_fast);
-
-    /* Apply operator. */
-    std::vector<double> result;
-    apply_operator(x_vec, cells, cell_to_dof, dof_to_cell,
-                    stencil_offsets, stencil_neighbors,
-                    stencil_depth_deltas,
-                    screening, n_dofs, result);
-
-    /* Build result list. */
-    PyObject *out = PyList_New(static_cast<Py_ssize_t>(n_dofs));
-    for (std::size_t i = 0; i < n_dofs; ++i) {
-        PyList_SET_ITEM(out, static_cast<Py_ssize_t>(i),
-                        PyFloat_FromDouble(result[i]));
-    }
-    return out;
-}
-
-/**
- * @brief solve_poisson(positions_arr, cells, domain_min,
- *            domain_max, base_resolution, max_depth, alpha,
- *            b_vec, max_iters, tol)
- *        -> (solution_list, iterations, residual, converged)
- *
- * Solves the screened Poisson system A x = b using PCG.
- */
-static PyObject *solve_poisson_py(PyObject * /*self*/,
-                                  PyObject *args) {
-    PyObject *pos_obj;
-    PyObject *cells_obj;
-    PyObject *dmin_obj;
-    PyObject *dmax_obj;
-    unsigned int base_resolution;
-    unsigned int max_depth_val;
-    double alpha;
-    PyObject *b_obj;
-    unsigned int max_iters;
-    double tol;
-    if (!PyArg_ParseTuple(args, "OOOOIIdOId",
-                          &pos_obj, &cells_obj,
-                          &dmin_obj, &dmax_obj,
-                          &base_resolution, &max_depth_val,
-                          &alpha, &b_obj,
-                          &max_iters, &tol)) {
-        return NULL;
-    }
-
-    /* Parse domain. */
-    Vector3d dmin{}, dmax{};
-    if (!parse_vector3d(dmin_obj, dmin)) return NULL;
-    if (!parse_vector3d(dmax_obj, dmax)) return NULL;
-    BoundingBox domain = {dmin, dmax};
-
-    /* Parse positions. */
-    PyArrayObject *pos_arr = reinterpret_cast<PyArrayObject *>(
-        PyArray_FROM_OTF(pos_obj, NPY_DOUBLE,
-                         NPY_ARRAY_IN_ARRAY));
-    if (pos_arr == NULL) return NULL;
-    const npy_intp n_samples = PyArray_DIM(pos_arr, 0);
-    const double *pos_data =
-        static_cast<double *>(PyArray_DATA(pos_arr));
-    std::vector<Vector3d> positions(
-        static_cast<std::size_t>(n_samples));
-    for (npy_intp i = 0; i < n_samples; ++i) {
-        positions[static_cast<std::size_t>(i)] = {
-            pos_data[i * 3], pos_data[i * 3 + 1],
-            pos_data[i * 3 + 2]};
-    }
-    Py_DECREF(pos_arr);
-
-    /* Parse cells. */
-    PyObject *fast = PySequence_Fast(
-        cells_obj, "expected a sequence of cell dicts");
-    if (fast == NULL) return NULL;
-    const Py_ssize_t nc = PySequence_Fast_GET_SIZE(fast);
-    std::vector<OctreeCell> cells(
-        static_cast<std::size_t>(nc));
-    for (Py_ssize_t i = 0; i < nc; ++i) {
-        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
-        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
-        PyObject *depth = PyDict_GetItemString(d, "depth");
-        PyObject *bmin_d = PyDict_GetItemString(d, "bounds_min");
-        PyObject *bmax_d = PyDict_GetItemString(d, "bounds_max");
-        PyObject *mkey = PyDict_GetItemString(d, "morton_key");
-        if (!leaf || !depth || !bmin_d || !bmax_d || !mkey) {
-            Py_DECREF(fast);
-            PyErr_SetString(PyExc_KeyError,
-                            "cell dict missing required key");
-            return NULL;
-        }
-        auto &c = cells[static_cast<std::size_t>(i)];
-        c.is_leaf = PyObject_IsTrue(leaf) != 0;
-        c.depth = static_cast<std::uint32_t>(
-            PyLong_AsUnsignedLong(depth));
-        if (!parse_vector3d(bmin_d, c.bounds.min)) {
-            Py_DECREF(fast);
-            return NULL;
-        }
-        if (!parse_vector3d(bmax_d, c.bounds.max)) {
-            Py_DECREF(fast);
-            return NULL;
-        }
-        c.morton_key = PyLong_AsUnsignedLongLong(mkey);
-    }
-    Py_DECREF(fast);
-
-    /* Parse b vector. */
-    PyObject *b_fast = PySequence_Fast(
-        b_obj, "expected a sequence for b");
-    if (b_fast == NULL) return NULL;
-    const Py_ssize_t b_len = PySequence_Fast_GET_SIZE(b_fast);
-    std::vector<double> b_vec(
-        static_cast<std::size_t>(b_len));
-    for (Py_ssize_t i = 0; i < b_len; ++i) {
-        b_vec[static_cast<std::size_t>(i)] =
-            PyFloat_AsDouble(
-                PySequence_Fast_GET_ITEM(b_fast, i));
-    }
-    Py_DECREF(b_fast);
-
-    /* Solve. */
-    std::vector<double> x;
-    SolverResult sr = solve_poisson(
-        positions.data(),
-        static_cast<std::size_t>(n_samples),
-        cells, domain, base_resolution, max_depth_val,
-        alpha, b_vec,
-        static_cast<std::size_t>(max_iters), tol, x);
-
-    /* Build result. */
-    const std::size_t n_dofs = x.size();
-    PyObject *x_list = PyList_New(
-        static_cast<Py_ssize_t>(n_dofs));
-    for (std::size_t i = 0; i < n_dofs; ++i) {
-        PyList_SET_ITEM(x_list, static_cast<Py_ssize_t>(i),
-                        PyFloat_FromDouble(x[i]));
-    }
-    return Py_BuildValue("(OIdO)", x_list,
-                         static_cast<int>(sr.iterations),
-                         sr.residual_norm,
-                         sr.converged ? Py_True : Py_False);
-}
-
-/**
- * @brief Extract an isosurface from the Poisson solution using Marching
- *        Cubes (Phase 20e).
- *
- * Arguments:
- *   positions  -- (N, 3) float64 array of sample positions (for isovalue).
- *   cells      -- list of cell dicts (is_leaf, depth, bounds_min, bounds_max,
- *                 morton_key).
- *   domain_min -- (3,) lower corner of domain.
- *   domain_max -- (3,) upper corner of domain.
- *   base_resolution -- uint, top-level cells per axis.
- *   max_depth  -- uint, maximum octree depth.
- *   solution   -- list of floats, Poisson solution vector.
- *
- * Returns:
- *   (vertices, triangles) where vertices is (V, 3) float64 ndarray and
- *   triangles is (F, 3) uint32 ndarray.
- *
- * @par References
- * - Lorensen & Cline, SIGGRAPH 1987.
- * - Kazhdan, Bolitho & Hoppe, SGP 2006.
- * - Kazhdan & Hoppe, ToG 2013.
- */
-static PyObject *extract_poisson_mesh_py(PyObject * /*self*/,
-                                         PyObject *args) {
-    PyObject *pos_obj;
-    PyObject *cells_obj;
-    PyObject *dmin_obj;
-    PyObject *dmax_obj;
-    unsigned int base_resolution;
-    unsigned int max_depth_val;
-    PyObject *sol_obj;
-    if (!PyArg_ParseTuple(args, "OOOOIIO",
-                          &pos_obj, &cells_obj,
-                          &dmin_obj, &dmax_obj,
-                          &base_resolution, &max_depth_val,
-                          &sol_obj)) {
-        return NULL;
-    }
-
-    /* Parse domain. */
-    Vector3d dmin{}, dmax{};
-    if (!parse_vector3d(dmin_obj, dmin)) return NULL;
-    if (!parse_vector3d(dmax_obj, dmax)) return NULL;
-    BoundingBox domain = {dmin, dmax};
-
-    /* Parse positions. */
-    PyArrayObject *pos_arr = reinterpret_cast<PyArrayObject *>(
-        PyArray_FROM_OTF(pos_obj, NPY_DOUBLE,
-                         NPY_ARRAY_IN_ARRAY));
-    if (pos_arr == NULL) return NULL;
-    const npy_intp n_samples = PyArray_DIM(pos_arr, 0);
-    const double *pos_data =
-        static_cast<double *>(PyArray_DATA(pos_arr));
-    std::vector<Vector3d> positions(
-        static_cast<std::size_t>(n_samples));
-    for (npy_intp i = 0; i < n_samples; ++i) {
-        positions[static_cast<std::size_t>(i)] = {
-            pos_data[i * 3], pos_data[i * 3 + 1],
-            pos_data[i * 3 + 2]};
-    }
-    Py_DECREF(pos_arr);
-
-    /* Parse cells. */
-    PyObject *fast = PySequence_Fast(
-        cells_obj, "expected a sequence of cell dicts");
-    if (fast == NULL) return NULL;
-    const Py_ssize_t nc = PySequence_Fast_GET_SIZE(fast);
-    std::vector<OctreeCell> cells(
-        static_cast<std::size_t>(nc));
-    for (Py_ssize_t i = 0; i < nc; ++i) {
-        PyObject *d = PySequence_Fast_GET_ITEM(fast, i);
-        PyObject *leaf = PyDict_GetItemString(d, "is_leaf");
-        PyObject *depth = PyDict_GetItemString(d, "depth");
-        PyObject *bmin_d = PyDict_GetItemString(d, "bounds_min");
-        PyObject *bmax_d = PyDict_GetItemString(d, "bounds_max");
-        PyObject *mkey = PyDict_GetItemString(d, "morton_key");
-        if (!leaf || !depth || !bmin_d || !bmax_d || !mkey) {
-            Py_DECREF(fast);
-            PyErr_SetString(PyExc_KeyError,
-                            "cell dict missing required key");
-            return NULL;
-        }
-        auto &c = cells[static_cast<std::size_t>(i)];
-        c.is_leaf = PyObject_IsTrue(leaf) != 0;
-        c.depth = static_cast<std::uint32_t>(
-            PyLong_AsUnsignedLong(depth));
-        if (!parse_vector3d(bmin_d, c.bounds.min)) {
-            Py_DECREF(fast);
-            return NULL;
-        }
-        if (!parse_vector3d(bmax_d, c.bounds.max)) {
-            Py_DECREF(fast);
-            return NULL;
-        }
-        c.morton_key = PyLong_AsUnsignedLongLong(mkey);
-    }
-    Py_DECREF(fast);
-
-    /* Parse solution vector. */
-    PyObject *sol_fast = PySequence_Fast(
-        sol_obj, "expected a sequence for solution");
-    if (sol_fast == NULL) return NULL;
-    const Py_ssize_t sol_len =
-        PySequence_Fast_GET_SIZE(sol_fast);
-    std::vector<double> solution(
-        static_cast<std::size_t>(sol_len));
-    for (Py_ssize_t i = 0; i < sol_len; ++i) {
-        solution[static_cast<std::size_t>(i)] =
-            PyFloat_AsDouble(
-                PySequence_Fast_GET_ITEM(sol_fast, i));
-    }
-    Py_DECREF(sol_fast);
-
-    /* Build DOF indexing and spatial hash. */
-    std::vector<std::int64_t> cell_to_dof;
-    std::vector<std::size_t> dof_to_cell;
-    assign_dof_indices(cells, cell_to_dof, dof_to_cell);
-
-    PoissonLeafHash hash;
-    hash.build(cells, domain, max_depth_val, base_resolution);
-
-    /* Step 1: Evaluate chi at corners. */
-    std::size_t n_leaves = 0;
-    for (const auto &c : cells) {
-        if (c.is_leaf) ++n_leaves;
-    }
-    std::vector<std::array<double, 8>> corner_values;
-    std::vector<VirtualCell> virtual_cells;
-    evaluate_chi_at_corners(solution, cells, cell_to_dof, hash,
-                            base_resolution, max_depth_val, n_leaves,
-                            domain, corner_values, virtual_cells);
-
-    /* Step 2: Compute isovalue from sample positions. */
-    double isovalue = compute_isovalue(
-        positions.data(),
-        static_cast<std::size_t>(n_samples),
-        solution, cells, cell_to_dof, hash,
-        base_resolution);
-
-    /* Step 3: Extract isosurface. */
-    std::vector<Vector3d> vertices;
-    std::vector<std::array<std::uint32_t, 3>> triangles;
-    extract_isosurface(cells, corner_values, virtual_cells,
-                       isovalue, domain, base_resolution,
-                       max_depth_val, vertices, triangles);
-
-    /* Build output arrays. */
-    const std::size_t nv = vertices.size();
-    const std::size_t nf = triangles.size();
-
-    npy_intp vdims[2] = {static_cast<npy_intp>(nv), 3};
-    PyObject *v_arr = PyArray_SimpleNew(2, vdims, NPY_DOUBLE);
-    if (v_arr == NULL) return NULL;
-    double *v_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(v_arr)));
-    for (std::size_t i = 0; i < nv; ++i) {
-        v_data[i * 3] = vertices[i].x;
-        v_data[i * 3 + 1] = vertices[i].y;
-        v_data[i * 3 + 2] = vertices[i].z;
-    }
-
-    npy_intp fdims[2] = {static_cast<npy_intp>(nf), 3};
-    PyObject *f_arr = PyArray_SimpleNew(2, fdims, NPY_UINT32);
-    if (f_arr == NULL) {
-        Py_DECREF(v_arr);
-        return NULL;
-    }
-    std::uint32_t *f_data = static_cast<std::uint32_t *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(f_arr)));
-    for (std::size_t i = 0; i < nf; ++i) {
-        f_data[i * 3] = triangles[i][0];
-        f_data[i * 3 + 1] = triangles[i][1];
-        f_data[i * 3 + 2] = triangles[i][2];
-    }
-
-    return Py_BuildValue("(OOd)", v_arr, f_arr, isovalue);
-}
-
 /**
  * @brief Python binding for the full particles-to-mesh pipeline.
  *
@@ -3182,9 +2513,6 @@ static PyObject *extract_poisson_mesh_py(PyObject * /*self*/,
  *   base_resolution   – unsigned int
  *   isovalue          – double
  *   max_depth         – unsigned int
- *   screening_weight  – double
- *   max_iters         – unsigned int
- *   tol               – double
  *   smoothing_iterations – unsigned int (default 0)
  *   smoothing_strength   – double (default 0.5)
  *   max_edge_ratio       – double (default 1.5)
@@ -3207,17 +2535,15 @@ static PyObject *run_full_pipeline_py(
     unsigned int base_resolution = 0U;
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
-    double screening_weight = 4.0;
-    unsigned int max_iters = 1000U;
-    double tol = 1e-6;
     unsigned int smoothing_iterations = 0U;
     double smoothing_strength = 0.5;
     double max_edge_ratio = 1.5;
     unsigned int minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
+    double min_feature_thickness = 0.0;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdIdId|IddIdd",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|IddIddd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -3225,15 +2551,13 @@ static PyObject *run_full_pipeline_py(
                           &base_resolution,
                           &isovalue,
                           &max_depth,
-                          &screening_weight,
-                          &max_iters,
-                          &tol,
                           &smoothing_iterations,
                           &smoothing_strength,
                           &max_edge_ratio,
                           &minimum_usable_hermite_samples,
                           &max_qef_rms_residual_ratio,
-                          &min_normal_alignment_threshold)) {
+                          &min_normal_alignment_threshold,
+                          &min_feature_thickness)) {
         return NULL;
     }
 
@@ -3277,7 +2601,8 @@ static PyObject *run_full_pipeline_py(
         max_edge_ratio,
         static_cast<std::uint32_t>(minimum_usable_hermite_samples),
         max_qef_rms_residual_ratio,
-        min_normal_alignment_threshold);
+        min_normal_alignment_threshold,
+        min_feature_thickness);
 
     Py_END_ALLOW_THREADS
 
@@ -3353,90 +2678,6 @@ static PyMethodDef adaptive_methods[] = {
         METH_VARARGS,
         PyDoc_STR(
             "Run FOF clustering on vertex positions."),
-    },
-    {
-        "bspline1d_evaluate",
-        bspline1d_evaluate_py,
-        METH_VARARGS,
-        PyDoc_STR("Evaluate 1-D degree-1 B-spline at t."),
-    },
-    {
-        "bspline1d_derivative",
-        bspline1d_derivative_py,
-        METH_VARARGS,
-        PyDoc_STR("Evaluate derivative of 1-D degree-1 B-spline at t."),
-    },
-    {
-        "bspline3d_evaluate",
-        bspline3d_evaluate_py,
-        METH_VARARGS,
-        PyDoc_STR("Evaluate 3-D trilinear B-spline at point."),
-    },
-    {
-        "bspline3d_gradient",
-        bspline3d_gradient_py,
-        METH_VARARGS,
-        PyDoc_STR("Evaluate gradient of 3-D trilinear B-spline."),
-    },
-    {
-        "assign_dof_indices",
-        assign_dof_indices_py,
-        METH_VARARGS,
-        PyDoc_STR("Assign contiguous DOF indices to leaf cells."),
-    },
-    {
-        "assign_dof_indices_grouped",
-        assign_dof_indices_grouped_py,
-        METH_VARARGS,
-        PyDoc_STR("Depth-grouped DOF assignment."),
-    },
-    {
-        "enumerate_stencils",
-        enumerate_stencils_py,
-        METH_VARARGS,
-        PyDoc_STR("Enumerate DOF stencils (neighbor DOFs)."),
-    },
-    {
-        "splat_and_compute_rhs",
-        splat_and_compute_rhs_py,
-        METH_VARARGS,
-        PyDoc_STR("Splat normals and compute Poisson RHS."),
-    },
-    {
-        "laplacian_stencil_weight",
-        laplacian_stencil_weight_py,
-        METH_VARARGS,
-        PyDoc_STR("Laplacian stencil weight for offset (dx,dy,dz)."),
-    },
-    {
-        "pc_integrals_1d",
-        pc_integrals_1d_py,
-        METH_VARARGS,
-        PyDoc_STR("Parent-child 1D integrals: (mass, stiff, gv)."),
-    },
-    {
-        "pc_laplacian_weight",
-        pc_laplacian_weight_py,
-        METH_VARARGS,
-        PyDoc_STR("Parent-child 3D Laplacian stencil weight."),
-    },
-    {
-        "apply_poisson_operator",
-        apply_poisson_operator_py,
-        METH_VARARGS,
-        PyDoc_STR("Apply screened Poisson operator A*x."),
-    },
-    {
-        "solve_poisson",
-        solve_poisson_py,
-        METH_VARARGS,
-        PyDoc_STR("Solve screened Poisson system with PCG."),
-    },
-    {
-        "extract_poisson_mesh",
-        extract_poisson_mesh_py,
-        METH_VARARGS,
-        PyDoc_STR("Extract isosurface from Poisson solution via MC."),
     },
     {
         "adaptive_status",
@@ -3590,6 +2831,13 @@ static PyMethodDef adaptive_methods[] = {
             "Run the octree pipeline in C++ "
             "(build + refine + solve vertices) "
             "and return (positions, normals)."),
+    },
+    {
+        "classify_occupied_solid",
+        classify_occupied_solid_py,
+        METH_VARARGS,
+        PyDoc_STR(
+            "Classify the adaptive occupied solid for morphology scaffolding."),
     },
     {
         "run_full_pipeline",

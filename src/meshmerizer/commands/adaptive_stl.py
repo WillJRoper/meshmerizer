@@ -25,9 +25,55 @@ from meshmerizer.adaptive_core import (
 )
 from meshmerizer.logging import log_status, record_elapsed
 from meshmerizer.mesh.core import Mesh
-from meshmerizer.poisson import poisson_reconstruct
 from meshmerizer.printing import scale_mesh_to_print
+from meshmerizer.reconstruct import reconstruct_mesh
 from meshmerizer.serialize import export_octree, import_octree
+
+
+def _compute_print_scale_factor_cm(
+    domain_min: tuple[float, float, float],
+    domain_max: tuple[float, float, float],
+    target_size_cm: float,
+) -> float:
+    """Return scale factor from native units to print millimetres.
+
+    The adaptive pipeline runs in native snapshot units. When a target print
+    size is requested, we convert user-facing print-length controls back into
+    native units using the same longest-dimension scale factor that will later
+    be applied to the final mesh.
+
+    Args:
+        domain_min: Lower corner of the working domain.
+        domain_max: Upper corner of the working domain.
+        target_size_cm: Requested longest print dimension in centimetres.
+
+    Returns:
+        Uniform scale factor mapping native units to output millimetres.
+
+    Raises:
+        ValueError: If the working domain has zero extent.
+    """
+    extents = np.asarray(domain_max, dtype=np.float64) - np.asarray(
+        domain_min, dtype=np.float64
+    )
+    max_dimension = float(np.max(extents))
+    if max_dimension <= 0.0:
+        raise ValueError("working domain has zero extent")
+    target_size_mm = float(target_size_cm) * 10.0
+    return target_size_mm / max_dimension
+
+
+def _convert_print_length_to_native_units(
+    length_cm: float,
+    domain_min: tuple[float, float, float],
+    domain_max: tuple[float, float, float],
+    target_size_cm: float,
+) -> float:
+    """Convert a print-space centimetre length to native meshing units."""
+    scale_factor = _compute_print_scale_factor_cm(
+        domain_min, domain_max, target_size_cm
+    )
+    return (float(length_cm) * 10.0) / scale_factor
 
 
 def _remove_islands(
@@ -38,10 +84,10 @@ def _remove_islands(
 
     Args:
         mesh: Input mesh.
-        remove_islands_fraction: Fraction of the total volume below
-            which a connected component is discarded.  ``0.0`` keeps
-            only the largest component.  ``None`` disables island
-            removal entirely.
+        remove_islands_fraction: Fraction of the largest component
+            volume below which a connected component is discarded.
+            ``0.0`` keeps only the largest component. ``None``
+            disables island removal entirely.
 
     Returns:
         A new ``Mesh`` with small islands removed, or the original
@@ -49,6 +95,25 @@ def _remove_islands(
     """
     if remove_islands_fraction is None:
         return mesh
+
+    def _component_reference_volume(component) -> float:
+        """Return a robust size estimate for island filtering.
+
+        Prefer the true enclosed volume for watertight meshes. When a
+        component is not watertight, fall back to its convex-hull volume so
+        that a large but imperfect main body is not incorrectly treated as
+        having zero size.
+        """
+        if component.is_watertight:
+            volume = abs(float(component.volume))
+            if np.isfinite(volume):
+                return volume
+
+        try:
+            hull_volume = abs(float(component.convex_hull.volume))
+        except Exception:
+            hull_volume = 0.0
+        return hull_volume if np.isfinite(hull_volume) else 0.0
 
     # Split into connected components via trimesh.
     tm = mesh.mesh
@@ -60,7 +125,7 @@ def _remove_islands(
         # Keep only the single largest component by volume.
         largest = max(
             components,
-            key=lambda c: abs(c.volume) if c.is_watertight else 0.0,
+            key=_component_reference_volume,
         )
         log_status(
             "Cleaning",
@@ -68,32 +133,30 @@ def _remove_islands(
         )
         return Mesh(mesh=largest)
 
-    # Keep components whose volume fraction exceeds the threshold.
-    volumes = []
-    for comp in components:
-        vol = abs(comp.volume) if comp.is_watertight else 0.0
-        volumes.append(vol)
-    total_volume = sum(volumes)
-    if total_volume == 0.0:
+    # Keep components whose volume fraction exceeds the threshold relative to
+    # the largest resolved object, not the sum of all objects.
+    volumes = [_component_reference_volume(comp) for comp in components]
+    largest_volume = max(volumes, default=0.0)
+    if largest_volume == 0.0:
         return mesh
 
     kept = [
         c
         for c, v in zip(components, volumes)
-        if v / total_volume >= remove_islands_fraction
+        if v / largest_volume >= remove_islands_fraction
     ]
     if not kept:
         # Keep at least the largest if nothing passes the threshold.
         kept = [
             max(
                 components,
-                key=lambda c: abs(c.volume) if c.is_watertight else 0.0,
+                key=_component_reference_volume,
             )
         ]
     log_status(
         "Cleaning",
         f"Kept {len(kept)} of {len(components)} components "
-        f"(fraction >= {remove_islands_fraction}).",
+        f"(fraction >= {remove_islands_fraction} of largest volume).",
     )
     import trimesh
 
@@ -383,6 +446,10 @@ def run_adaptive(args) -> None:
     """
     total_start = time.perf_counter()
 
+    effective_min_feature_thickness = getattr(
+        args, "min_feature_thickness", 0.0
+    )
+
     # Set OpenMP thread count if requested.
     if args.nthreads is not None:
         from meshmerizer._adaptive import set_num_threads
@@ -456,6 +523,25 @@ def run_adaptive(args) -> None:
                 )
                 sys.exit(1)
 
+        if (
+            args.target_size is not None
+            and effective_min_feature_thickness > 0.0
+        ):
+            effective_min_feature_thickness = (
+                _convert_print_length_to_native_units(
+                    effective_min_feature_thickness,
+                    domain_min,
+                    domain_max,
+                    args.target_size,
+                )
+            )
+            log_status(
+                "Config",
+                "Interpreting --min-feature-thickness in print units: "
+                f"{args.min_feature_thickness} cm -> "
+                f"{effective_min_feature_thickness:.6g} native units",
+            )
+
         max_depth = args.max_depth
         base_resolution = args.base_resolution
 
@@ -517,6 +603,7 @@ def run_adaptive(args) -> None:
                 min_normal_alignment_threshold=getattr(
                     args, "min_normal_alignment_threshold", 0.97
                 ),
+                min_feature_thickness=effective_min_feature_thickness,
             )
             record_elapsed(
                 "Octree construction",
@@ -557,7 +644,7 @@ def run_adaptive(args) -> None:
                 "Solving QEF vertices...",
             )
             mesh_start = time.perf_counter()
-            vert_positions, vert_normals = solve_vertices(
+            vert_positions, _ = solve_vertices(
                 cells,
                 contributors,
                 positions,
@@ -575,11 +662,9 @@ def run_adaptive(args) -> None:
             )
         else:
             # Fast path: run the full particles-to-mesh pipeline
-            # in C++ (octree + QEF + Poisson + Marching Cubes).
+            # in C++ (octree refinement + QEF + dual contouring).
             # If FOF is enabled, cluster particles first and
             # reconstruct each group independently.
-            screening_weight = getattr(args, "screening_weight", 4.0)
-
             if getattr(args, "fof", False):
                 log_status(
                     "Clustering",
@@ -612,13 +697,11 @@ def run_adaptive(args) -> None:
                 f"Running C++ full pipeline: "
                 f"base_resolution={base_resolution}, "
                 f"max_depth={max_depth}, "
-                f"isovalue={isovalue}, "
-                f"screening={screening_weight}",
+                f"isovalue={isovalue}",
             )
             pipeline_start = time.perf_counter()
-            mesh_verts, mesh_faces = poisson_reconstruct(
+            mesh_verts, mesh_faces = reconstruct_mesh(
                 positions,
-                None,
                 smoothing_lengths,
                 domain_min,
                 domain_max,
@@ -626,7 +709,6 @@ def run_adaptive(args) -> None:
                 isovalue,
                 max_depth,
                 group_labels=group_labels,
-                screening_weight=screening_weight,
                 smoothing_iterations=getattr(args, "smoothing_iterations", 0),
                 smoothing_strength=getattr(args, "smoothing_strength", 0.5),
                 max_edge_ratio=getattr(args, "max_edge_ratio", 1.5),
@@ -639,6 +721,7 @@ def run_adaptive(args) -> None:
                 min_normal_alignment_threshold=getattr(
                     args, "min_normal_alignment_threshold", 0.97
                 ),
+                min_feature_thickness=effective_min_feature_thickness,
             )
             record_elapsed(
                 "Full pipeline",
@@ -735,14 +818,14 @@ def run_adaptive(args) -> None:
                 "Using QEF vertices from loaded octree.",
             )
             vert_positions = state["vertices"]
-            vert_normals = state["normals"]
+            _ = state["normals"]
         else:
             log_status(
                 "Meshing",
                 "Solving QEF vertices from loaded octree...",
             )
             mesh_start = time.perf_counter()
-            vert_positions, vert_normals = solve_vertices(
+            vert_positions, _ = solve_vertices(
                 cells,
                 contributors,
                 positions,
@@ -774,10 +857,8 @@ def run_adaptive(args) -> None:
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # Step 5: Optional FOF clustering + Poisson surface reconstruction.
+    # Step 5: Optional FOF clustering + mesh reconstruction.
     # ------------------------------------------------------------------
-    poisson_depth = args.poisson_depth if args.poisson_depth is not None else 9
-
     if getattr(args, "fof", False):
         # Cluster QEF vertices into distinct objects.
         log_status(
@@ -802,27 +883,23 @@ def run_adaptive(args) -> None:
         # Single group — treat all vertices as one object.
         group_labels = np.zeros(len(vert_positions), dtype=np.int64)
 
-    # Run Poisson reconstruction per group and merge.
-    screening_weight = getattr(args, "screening_weight", 4.0)
-    poisson_depth = args.poisson_depth if args.poisson_depth is not None else 9
+    # Reconstruct each requested group and merge the meshes.
+    reconstruction_depth = max_depth
     log_status(
         "Meshing",
-        f"Running Poisson reconstruction "
-        f"(depth={poisson_depth}, "
-        f"screening={screening_weight})...",
+        f"Running adaptive mesh reconstruction "
+        f"(depth={reconstruction_depth})...",
     )
-    poisson_start = time.perf_counter()
-    mesh_verts, mesh_faces = poisson_reconstruct(
+    reconstruction_start = time.perf_counter()
+    mesh_verts, mesh_faces = reconstruct_mesh(
         positions,
-        vert_normals,
         smoothing_lengths,
         domain_min,
         domain_max,
         base_resolution,
         isovalue,
-        poisson_depth,
+        reconstruction_depth,
         group_labels=group_labels,
-        screening_weight=screening_weight,
         smoothing_iterations=getattr(args, "smoothing_iterations", 0),
         smoothing_strength=getattr(args, "smoothing_strength", 0.5),
         max_edge_ratio=getattr(args, "max_edge_ratio", 1.5),
@@ -835,10 +912,11 @@ def run_adaptive(args) -> None:
         min_normal_alignment_threshold=getattr(
             args, "min_normal_alignment_threshold", 0.97
         ),
+        min_feature_thickness=effective_min_feature_thickness,
     )
     record_elapsed(
-        "Poisson reconstruction",
-        poisson_start,
+        "Mesh reconstruction",
+        reconstruction_start,
         operation="Meshing",
     )
 
@@ -846,12 +924,12 @@ def run_adaptive(args) -> None:
     n_tris = len(mesh_faces)
     log_status(
         "Meshing",
-        f"Poisson mesh: {n_mesh_verts} vertices, {n_tris} triangles.",
+        f"Reconstructed mesh: {n_mesh_verts} vertices, {n_tris} triangles.",
     )
 
     if n_tris == 0:
         print(
-            "Warning: Poisson reconstruction produced no "
+            "Warning: Reconstruction produced no "
             "triangles. Check isovalue and domain selection.",
             file=sys.stderr,
         )
