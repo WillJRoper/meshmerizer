@@ -291,21 +291,41 @@ inline DCPipelineResult run_dc_pipeline(
                 solid_leaves, clearance, opening_radius);
         const std::vector<double> dilation_distance =
             compute_distance_to_eroded_solid(solid_leaves, eroded_inside);
-        const std::vector<std::uint8_t> opened_inside =
+        std::vector<std::uint8_t> opened_inside =
             dilate_eroded_solid_leaves(
                 eroded_inside, dilation_distance, opening_radius);
+        fill_small_opened_cavities(solid_leaves, opened_inside);
+        prune_small_opened_components(solid_leaves, opened_inside);
+        suppress_opened_edge_contacts(
+            solid_leaves, all_cells, solid_spatial_index, opened_inside);
+
+        auto log_opened_count = [&]() {
+            return static_cast<std::size_t>(std::count(
+                opened_inside.begin(), opened_inside.end(),
+                static_cast<std::uint8_t>(1U)));
+        };
 
         std::fprintf(stdout,
                      "Regularization: extracting opened blocky surface "
                      "(opened_inside=%zu)\n",
-                     static_cast<std::size_t>(std::count(
-                         opened_inside.begin(), opened_inside.end(),
-                         static_cast<std::uint8_t>(1U))));
+                     log_opened_count());
         std::fflush(stdout);
 
         OpenedSurfaceMesh opened_surface = generate_opened_surface_mesh(
             solid_leaves, opened_inside, all_cells, solid_spatial_index,
             domain, base_resolution, max_depth);
+        if (resolve_opened_edge_ambiguities(
+                solid_leaves, all_cells, solid_spatial_index,
+                opened_inside, opened_surface)) {
+            std::fprintf(stdout,
+                         "Regularization: re-extracting opened blocky surface "
+                         "after ambiguity cleanup (opened_inside=%zu)\n",
+                         log_opened_count());
+            std::fflush(stdout);
+            opened_surface = generate_opened_surface_mesh(
+                solid_leaves, opened_inside, all_cells, solid_spatial_index,
+                domain, base_resolution, max_depth);
+        }
 
         std::fprintf(stdout,
                      "Regularization: opened surface extraction done "

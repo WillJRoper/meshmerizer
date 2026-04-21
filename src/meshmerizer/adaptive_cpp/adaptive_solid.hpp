@@ -36,6 +36,17 @@ struct OpenedBoundarySample {
     std::size_t leaf_index;
 };
 
+inline std::vector<std::int64_t> build_opened_cell_to_leaf_index(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<OccupiedSolidLeaf> &solid_leaves) {
+    std::vector<std::int64_t> cell_to_leaf_index(all_cells.size(), -1);
+    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        cell_to_leaf_index[solid_leaves[leaf_index].cell_index] =
+            static_cast<std::int64_t>(leaf_index);
+    }
+    return cell_to_leaf_index;
+}
+
 inline std::vector<std::size_t> gather_cell_contributors(
     const OctreeCell &cell,
     const std::vector<std::size_t> &all_contributors) {
@@ -548,6 +559,339 @@ inline std::vector<std::uint8_t> dilate_eroded_solid_leaves(
     return opened_inside;
 }
 
+inline void prune_small_opened_components(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    std::vector<std::uint8_t> &opened_inside,
+    double min_component_volume_ratio = 0.05) {
+    if (opened_inside.empty() || min_component_volume_ratio <= 0.0) {
+        return;
+    }
+
+    std::vector<std::uint8_t> visited(opened_inside.size(), 0U);
+    std::vector<std::vector<std::size_t>> components;
+    std::vector<double> component_volumes;
+
+    ProgressCounter component_counter(
+        "Opened component analysis", "leaves", 1000);
+    for (std::size_t leaf_index = 0; leaf_index < opened_inside.size(); ++leaf_index) {
+        component_counter.tick();
+        if (opened_inside[leaf_index] == 0U || visited[leaf_index] != 0U) {
+            continue;
+        }
+
+        std::vector<std::size_t> component;
+        std::queue<std::size_t> queue;
+        queue.push(leaf_index);
+        visited[leaf_index] = 1U;
+        double component_volume = 0.0;
+
+        while (!queue.empty()) {
+            const std::size_t current = queue.front();
+            queue.pop();
+            component.push_back(current);
+            const double cell_size = solid_leaves[current].cell_size;
+            component_volume += cell_size * cell_size * cell_size;
+
+            for (std::int64_t neighbor_leaf :
+                 solid_leaves[current].face_neighbor_leaf_indices) {
+                if (neighbor_leaf < 0) {
+                    continue;
+                }
+                const std::size_t neighbor =
+                    static_cast<std::size_t>(neighbor_leaf);
+                if (neighbor >= opened_inside.size() ||
+                    opened_inside[neighbor] == 0U || visited[neighbor] != 0U) {
+                    continue;
+                }
+                visited[neighbor] = 1U;
+                queue.push(neighbor);
+            }
+        }
+
+        components.push_back(std::move(component));
+        component_volumes.push_back(component_volume);
+    }
+    component_counter.finish();
+
+    if (components.size() <= 1U) {
+        return;
+    }
+
+    const double largest_volume = *std::max_element(
+        component_volumes.begin(), component_volumes.end());
+    if (largest_volume <= 0.0) {
+        return;
+    }
+
+    const double volume_threshold = min_component_volume_ratio * largest_volume;
+    std::size_t removed_components = 0U;
+    std::size_t removed_leaves = 0U;
+    for (std::size_t component_index = 0; component_index < components.size();
+         ++component_index) {
+        if (component_volumes[component_index] >= volume_threshold) {
+            continue;
+        }
+        ++removed_components;
+        removed_leaves += components[component_index].size();
+        for (std::size_t leaf_index : components[component_index]) {
+            opened_inside[leaf_index] = 0U;
+        }
+    }
+
+    if (removed_components > 0U) {
+        std::fprintf(stdout,
+                     "Opened component pruning: removed %zu small components "
+                     "(%zu leaves, threshold=%.6g of largest volume)\n",
+                     removed_components,
+                     removed_leaves,
+                     min_component_volume_ratio);
+        std::fflush(stdout);
+    }
+}
+
+inline void fill_small_opened_cavities(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    std::vector<std::uint8_t> &opened_inside,
+    double max_cavity_volume_ratio = 0.05) {
+    if (opened_inside.empty() || max_cavity_volume_ratio <= 0.0) {
+        return;
+    }
+
+    double opened_volume = 0.0;
+    for (std::size_t leaf_index = 0; leaf_index < opened_inside.size(); ++leaf_index) {
+        if (opened_inside[leaf_index] == 0U) {
+            continue;
+        }
+        const double cell_size = solid_leaves[leaf_index].cell_size;
+        opened_volume += cell_size * cell_size * cell_size;
+    }
+    if (opened_volume <= 0.0) {
+        return;
+    }
+
+    struct OutsideComponent {
+        std::vector<std::size_t> leaves;
+        double volume = 0.0;
+        bool touches_domain_boundary = false;
+    };
+
+    std::vector<std::uint8_t> visited(opened_inside.size(), 0U);
+    std::vector<OutsideComponent> outside_components;
+    ProgressCounter cavity_counter(
+        "Opened cavity analysis", "leaves", 1000);
+
+    for (std::size_t leaf_index = 0; leaf_index < opened_inside.size(); ++leaf_index) {
+        cavity_counter.tick();
+        if (opened_inside[leaf_index] != 0U || visited[leaf_index] != 0U) {
+            continue;
+        }
+
+        OutsideComponent component;
+        std::queue<std::size_t> queue;
+        queue.push(leaf_index);
+        visited[leaf_index] = 1U;
+
+        while (!queue.empty()) {
+            const std::size_t current = queue.front();
+            queue.pop();
+            component.leaves.push_back(current);
+            const double cell_size = solid_leaves[current].cell_size;
+            component.volume += cell_size * cell_size * cell_size;
+
+            for (std::int64_t neighbor_leaf :
+                 solid_leaves[current].face_neighbor_leaf_indices) {
+                if (neighbor_leaf < 0) {
+                    component.touches_domain_boundary = true;
+                    continue;
+                }
+
+                const std::size_t neighbor =
+                    static_cast<std::size_t>(neighbor_leaf);
+                if (neighbor >= opened_inside.size() ||
+                    opened_inside[neighbor] != 0U || visited[neighbor] != 0U) {
+                    continue;
+                }
+                visited[neighbor] = 1U;
+                queue.push(neighbor);
+            }
+        }
+
+        outside_components.push_back(std::move(component));
+    }
+    cavity_counter.finish();
+
+    const double max_cavity_volume = max_cavity_volume_ratio * opened_volume;
+    std::size_t filled_components = 0U;
+    std::size_t filled_leaves = 0U;
+    for (const OutsideComponent &component : outside_components) {
+        if (component.touches_domain_boundary ||
+            component.volume > max_cavity_volume) {
+            continue;
+        }
+        ++filled_components;
+        filled_leaves += component.leaves.size();
+        for (std::size_t leaf_index : component.leaves) {
+            opened_inside[leaf_index] = 1U;
+        }
+    }
+
+    if (filled_components > 0U) {
+        std::fprintf(stdout,
+                     "Opened cavity fill: filled %zu enclosed cavities "
+                     "(%zu leaves, threshold=%.6g of opened volume)\n",
+                     filled_components,
+                     filled_leaves,
+                     max_cavity_volume_ratio);
+        std::fflush(stdout);
+    }
+}
+
+inline std::uint32_t leaf_min_fine_x(
+    const OctreeCell &cell,
+    const LeafSpatialIndex &spatial_index) {
+    return static_cast<std::uint32_t>(std::llround(
+        (cell.bounds.min.x - spatial_index.domain_min.x) *
+        spatial_index.inv_cell_size_x));
+}
+
+inline std::uint32_t leaf_min_fine_y(
+    const OctreeCell &cell,
+    const LeafSpatialIndex &spatial_index) {
+    return static_cast<std::uint32_t>(std::llround(
+        (cell.bounds.min.y - spatial_index.domain_min.y) *
+        spatial_index.inv_cell_size_y));
+}
+
+inline std::uint32_t leaf_min_fine_z(
+    const OctreeCell &cell,
+    const LeafSpatialIndex &spatial_index) {
+    return static_cast<std::uint32_t>(std::llround(
+        (cell.bounds.min.z - spatial_index.domain_min.z) *
+        spatial_index.inv_cell_size_z));
+}
+
+inline std::uint32_t leaf_span_fine(
+    const OctreeCell &cell,
+    const LeafSpatialIndex &spatial_index) {
+    return static_cast<std::uint32_t>(std::llround(
+        (cell.bounds.max.x - cell.bounds.min.x) *
+        spatial_index.inv_cell_size_x));
+}
+
+inline void suppress_opened_edge_contacts(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<OctreeCell> &all_cells,
+    const LeafSpatialIndex &spatial_index,
+    std::vector<std::uint8_t> &opened_inside) {
+    if (opened_inside.empty()) {
+        return;
+    }
+
+    struct RemovalCandidate {
+        std::size_t leaf_index;
+        std::uint32_t exposed_faces;
+        std::uint32_t cell_volume_units;
+    };
+
+    std::vector<RemovalCandidate> candidates;
+    candidates.reserve(opened_inside.size() / 16U + 1U);
+    const std::vector<std::int64_t> cell_to_leaf_index =
+        build_opened_cell_to_leaf_index(all_cells, solid_leaves);
+    ProgressCounter contact_counter(
+        "Opened contact cleanup", "leaves", 1000);
+
+    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        contact_counter.tick();
+        if (opened_inside[leaf_index] == 0U) {
+            continue;
+        }
+
+        const OctreeCell &cell = all_cells[solid_leaves[leaf_index].cell_index];
+        const std::uint32_t ix0 = leaf_min_fine_x(cell, spatial_index);
+        const std::uint32_t iy0 = leaf_min_fine_y(cell, spatial_index);
+        const std::uint32_t iz0 = leaf_min_fine_z(cell, spatial_index);
+        const std::uint32_t span = leaf_span_fine(cell, spatial_index);
+        if (span == 0U) {
+            continue;
+        }
+
+        std::uint32_t exposed_faces = 0U;
+        auto face_open = [&](std::int32_t dx, std::int32_t dy, std::int32_t dz) {
+            const std::int64_t qx = static_cast<std::int64_t>(ix0) + dx;
+            const std::int64_t qy = static_cast<std::int64_t>(iy0) + dy;
+            const std::int64_t qz = static_cast<std::int64_t>(iz0) + dz;
+            if (qx < 0 || qy < 0 || qz < 0 ||
+                qx >= static_cast<std::int64_t>(spatial_index.fine_resolution) ||
+                qy >= static_cast<std::int64_t>(spatial_index.fine_resolution) ||
+                qz >= static_cast<std::int64_t>(spatial_index.fine_resolution)) {
+                return true;
+            }
+            const std::size_t neighbor_cell = spatial_index.find_leaf_at(
+                static_cast<std::uint32_t>(qx),
+                static_cast<std::uint32_t>(qy),
+                static_cast<std::uint32_t>(qz));
+            if (neighbor_cell == SIZE_MAX ||
+                neighbor_cell >= cell_to_leaf_index.size()) {
+                return true;
+            }
+            const std::int64_t neighbor_leaf = cell_to_leaf_index[neighbor_cell];
+            if (neighbor_leaf < 0) {
+                return true;
+            }
+            return opened_inside[static_cast<std::size_t>(neighbor_leaf)] == 0U;
+        };
+
+        if (face_open(-1, 0, 0)) {
+            ++exposed_faces;
+        }
+        if (face_open(static_cast<std::int32_t>(span), 0, 0)) {
+            ++exposed_faces;
+        }
+        if (face_open(0, -1, 0)) {
+            ++exposed_faces;
+        }
+        if (face_open(0, static_cast<std::int32_t>(span), 0)) {
+            ++exposed_faces;
+        }
+        if (face_open(0, 0, -1)) {
+            ++exposed_faces;
+        }
+        if (face_open(0, 0, static_cast<std::int32_t>(span))) {
+            ++exposed_faces;
+        }
+
+        if (exposed_faces >= 5U) {
+            candidates.push_back({leaf_index, exposed_faces, span * span * span});
+        }
+    }
+    contact_counter.finish();
+
+    if (candidates.empty()) {
+        return;
+    }
+
+    std::sort(
+        candidates.begin(),
+        candidates.end(),
+        [](const RemovalCandidate &a, const RemovalCandidate &b) {
+            if (a.exposed_faces != b.exposed_faces) {
+                return a.exposed_faces > b.exposed_faces;
+            }
+            return a.cell_volume_units < b.cell_volume_units;
+        });
+
+    std::size_t removed = 0U;
+    for (const RemovalCandidate &candidate : candidates) {
+        opened_inside[candidate.leaf_index] = 0U;
+        ++removed;
+    }
+
+    std::fprintf(stdout,
+                 "Opened contact cleanup: removed %zu highly exposed leaves\n",
+                 removed);
+    std::fflush(stdout);
+}
+
 inline std::vector<OpenedBoundarySample> generate_opened_boundary_samples(
     const std::vector<OccupiedSolidLeaf> &solid_leaves,
     const std::vector<std::uint8_t> &opened_inside,
@@ -638,11 +982,229 @@ struct CornerVote {
     std::uint32_t outside = 0U;
 };
 
+inline void unpack_surface_corner_coords(
+    std::uint64_t key,
+    std::uint32_t &ix,
+    std::uint32_t &iy,
+    std::uint32_t &iz) {
+    ix = static_cast<std::uint32_t>((key >> 42U) & 0x1fffffU);
+    iy = static_cast<std::uint32_t>((key >> 21U) & 0x1fffffU);
+    iz = static_cast<std::uint32_t>(key & 0x1fffffU);
+}
+
 inline std::uint64_t pack_surface_corner_coords(
     std::uint32_t ix, std::uint32_t iy, std::uint32_t iz) {
     return (static_cast<std::uint64_t>(ix) << 42U) |
            (static_cast<std::uint64_t>(iy) << 21U) |
            static_cast<std::uint64_t>(iz);
+}
+
+inline bool resolve_opened_edge_ambiguities(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<OctreeCell> &all_cells,
+    const LeafSpatialIndex &spatial_index,
+    std::vector<std::uint8_t> &opened_inside,
+    const OpenedSurfaceMesh &mesh) {
+    struct EdgeKey {
+        std::size_t a;
+        std::size_t b;
+
+        bool operator==(const EdgeKey &other) const {
+            return a == other.a && b == other.b;
+        }
+    };
+    struct EdgeKeyHash {
+        std::size_t operator()(const EdgeKey &key) const {
+            std::size_t h = key.a;
+            h ^= key.b + 0x9e3779b9ULL + (h << 6U) + (h >> 2U);
+            return h;
+        }
+    };
+
+    if (mesh.triangles.empty() || mesh.vertex_keys.size() != mesh.vertices.size()) {
+        return false;
+    }
+
+    const std::vector<std::int64_t> cell_to_leaf_index =
+        build_opened_cell_to_leaf_index(all_cells, solid_leaves);
+
+    auto lookup_leaf = [&](std::int64_t qx,
+                           std::int64_t qy,
+                           std::int64_t qz) -> std::int64_t {
+        if (qx < 0 || qy < 0 || qz < 0 ||
+            qx >= static_cast<std::int64_t>(spatial_index.fine_resolution) ||
+            qy >= static_cast<std::int64_t>(spatial_index.fine_resolution) ||
+            qz >= static_cast<std::int64_t>(spatial_index.fine_resolution)) {
+            return -1;
+        }
+        const std::size_t cell_index = spatial_index.find_leaf_at(
+            static_cast<std::uint32_t>(qx),
+            static_cast<std::uint32_t>(qy),
+            static_cast<std::uint32_t>(qz));
+        if (cell_index == SIZE_MAX || cell_index >= cell_to_leaf_index.size()) {
+            return -1;
+        }
+        return cell_to_leaf_index[cell_index];
+    };
+
+    auto opened_at_voxel = [&](std::int64_t qx,
+                               std::int64_t qy,
+                               std::int64_t qz) -> bool {
+        const std::int64_t leaf_index = lookup_leaf(qx, qy, qz);
+        return leaf_index >= 0 &&
+               opened_inside[static_cast<std::size_t>(leaf_index)] != 0U;
+    };
+
+    std::unordered_map<EdgeKey, std::uint32_t, EdgeKeyHash> edge_counts;
+    edge_counts.reserve(mesh.triangles.size() * 2U);
+    ProgressCounter edge_counter(
+        "Opened edge ambiguity scan", "triangles", 1000);
+    for (const MeshTriangle &triangle : mesh.triangles) {
+        edge_counter.tick();
+        for (std::size_t i = 0; i < 3U; ++i) {
+            const std::size_t v0 = triangle.vertex_indices[i];
+            const std::size_t v1 = triangle.vertex_indices[(i + 1U) % 3U];
+            EdgeKey key{std::min(v0, v1), std::max(v0, v1)};
+            ++edge_counts[key];
+        }
+    }
+    edge_counter.finish();
+
+    struct CandidateFill {
+        std::size_t leaf_index;
+        std::uint32_t score;
+        double cell_size;
+    };
+
+    std::vector<CandidateFill> fills;
+    fills.reserve(16U);
+    ProgressCounter resolve_counter(
+        "Opened edge ambiguity resolve", "edges", 100);
+
+    for (const auto &entry : edge_counts) {
+        if (entry.second <= 2U) {
+            continue;
+        }
+        resolve_counter.tick();
+
+        std::uint32_t ax, ay, az, bx, by, bz;
+        unpack_surface_corner_coords(mesh.vertex_keys[entry.first.a], ax, ay, az);
+        unpack_surface_corner_coords(mesh.vertex_keys[entry.first.b], bx, by, bz);
+
+        int axis = -1;
+        std::uint32_t gx = std::min(ax, bx);
+        std::uint32_t gy = std::min(ay, by);
+        std::uint32_t gz = std::min(az, bz);
+        if (ax != bx && ay == by && az == bz) {
+            axis = 0;
+        } else if (ax == bx && ay != by && az == bz) {
+            axis = 1;
+        } else if (ax == bx && ay == by && az != bz) {
+            axis = 2;
+        } else {
+            continue;
+        }
+
+        std::array<std::array<std::int64_t, 3>, 4> voxels;
+        if (axis == 0) {
+            voxels = {{{static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy) - 1, static_cast<std::int64_t>(gz) - 1},
+                       {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz) - 1},
+                       {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy) - 1, static_cast<std::int64_t>(gz)},
+                       {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz)}}};
+        } else if (axis == 1) {
+            voxels = {{{static_cast<std::int64_t>(gx) - 1, static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz) - 1},
+                       {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz) - 1},
+                       {static_cast<std::int64_t>(gx) - 1, static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz)},
+                       {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz)}}};
+        } else {
+            voxels = {{{static_cast<std::int64_t>(gx) - 1, static_cast<std::int64_t>(gy) - 1, static_cast<std::int64_t>(gz)},
+                       {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy) - 1, static_cast<std::int64_t>(gz)},
+                       {static_cast<std::int64_t>(gx) - 1, static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz)},
+                       {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz)}}};
+        }
+
+        std::array<bool, 4> inside = {false, false, false, false};
+        std::array<std::int64_t, 4> leaf_indices = {-1, -1, -1, -1};
+        std::uint32_t inside_count = 0U;
+        for (std::size_t i = 0; i < 4U; ++i) {
+            leaf_indices[i] = lookup_leaf(voxels[i][0], voxels[i][1], voxels[i][2]);
+            inside[i] = leaf_indices[i] >= 0 &&
+                        opened_inside[static_cast<std::size_t>(leaf_indices[i])] != 0U;
+            inside_count += inside[i] ? 1U : 0U;
+        }
+
+        const bool diagonal_pattern =
+            (inside[0] && inside[3] && !inside[1] && !inside[2]) ||
+            (!inside[0] && !inside[3] && inside[1] && inside[2]);
+        if (inside_count != 2U || !diagonal_pattern) {
+            continue;
+        }
+
+        CandidateFill best{SIZE_MAX, 0U, std::numeric_limits<double>::infinity()};
+        for (std::size_t i = 0; i < 4U; ++i) {
+            if (inside[i] || leaf_indices[i] < 0) {
+                continue;
+            }
+
+            std::uint32_t score = 0U;
+            static const std::int32_t neighbor_offsets[6][3] = {
+                {-1, 0, 0}, {1, 0, 0},
+                {0, -1, 0}, {0, 1, 0},
+                {0, 0, -1}, {0, 0, 1},
+            };
+            for (const auto &offset : neighbor_offsets) {
+                if (opened_at_voxel(
+                        voxels[i][0] + offset[0],
+                        voxels[i][1] + offset[1],
+                        voxels[i][2] + offset[2])) {
+                    ++score;
+                }
+            }
+
+            const std::size_t leaf_index = static_cast<std::size_t>(leaf_indices[i]);
+            const double cell_size = solid_leaves[leaf_index].cell_size;
+            if (score > best.score ||
+                (score == best.score && cell_size < best.cell_size)) {
+                best = {leaf_index, score, cell_size};
+            }
+        }
+
+        if (best.leaf_index != SIZE_MAX) {
+            fills.push_back(best);
+        }
+    }
+    resolve_counter.finish();
+
+    if (fills.empty()) {
+        return false;
+    }
+
+    std::sort(
+        fills.begin(),
+        fills.end(),
+        [](const CandidateFill &a, const CandidateFill &b) {
+            if (a.score != b.score) {
+                return a.score > b.score;
+            }
+            return a.cell_size < b.cell_size;
+        });
+
+    std::size_t applied = 0U;
+    for (const CandidateFill &fill : fills) {
+        if (opened_inside[fill.leaf_index] != 0U) {
+            continue;
+        }
+        opened_inside[fill.leaf_index] = 1U;
+        ++applied;
+    }
+
+    if (applied > 0U) {
+        std::fprintf(stdout,
+                     "Opened edge ambiguity resolve: filled %zu leaves\n",
+                     applied);
+        std::fflush(stdout);
+    }
+    return applied > 0U;
 }
 
 inline OpenedSurfaceMesh generate_opened_surface_mesh(
@@ -1023,17 +1585,6 @@ inline void apply_opened_corner_field(
         cell.is_active = false;
         cell.representative_vertex_index = -1;
     }
-}
-
-inline std::vector<std::int64_t> build_opened_cell_to_leaf_index(
-    const std::vector<OctreeCell> &all_cells,
-    const std::vector<OccupiedSolidLeaf> &solid_leaves) {
-    std::vector<std::int64_t> cell_to_leaf_index(all_cells.size(), -1);
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        cell_to_leaf_index[solid_leaves[leaf_index].cell_index] =
-            static_cast<std::int64_t>(leaf_index);
-    }
-    return cell_to_leaf_index;
 }
 
 inline bool opened_sign_at_fine_vertex(
