@@ -1,12 +1,31 @@
-"""Meshmerizer package.
+"""Meshmerizer public package API."""
 
-Meshmerizer converts particle-based simulation outputs into 3D-printable
-STL meshes using an adaptive octree and dual contouring.
+from meshmerizer.api import (
+    MeshResult,
+    TopologyState,
+    TreeState,
+    build_and_refine_tree,
+    compute_isovalue_from_percentile,
+    erode_and_dilate,
+    fof_cluster,
+    get_mesh,
+    get_mesh_from_tree,
+    remove_islands,
+    smooth_mesh,
+    subdivide_long_edges,
+)
 
-The package is organized into focused subpackages:
-
-- ``meshmerizer.adaptive_core``: Python wrapper for the adaptive C++ core.
-- ``meshmerizer.serialize``: HDF5 octree serialization.
-- ``meshmerizer.commands``: CLI parsing, loading, and command execution.
-- ``meshmerizer.mesh``: lightweight trimesh wrapper for STL export.
-"""
+__all__ = [
+    "MeshResult",
+    "TopologyState",
+    "TreeState",
+    "build_and_refine_tree",
+    "compute_isovalue_from_percentile",
+    "erode_and_dilate",
+    "fof_cluster",
+    "get_mesh",
+    "get_mesh_from_tree",
+    "remove_islands",
+    "smooth_mesh",
+    "subdivide_long_edges",
+]
