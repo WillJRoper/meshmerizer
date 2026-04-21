@@ -1276,6 +1276,151 @@ static PyObject *hermite_samples_for_cell_py(PyObject *self, PyObject *args) {
 }
 
 /**
+ * @brief Build top-level cells and refine them in one resumable call.
+ *
+ * This binding mirrors the first half of ``run_octree_pipeline`` but returns
+ * the refined cell dictionaries and flat contributor array so Python callers
+ * can continue the pipeline from an explicit tree state.
+ */
+static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    PyObject *domain_min_object = NULL;
+    PyObject *domain_max_object = NULL;
+    unsigned int base_resolution = 0U;
+    double isovalue = 0.0;
+    unsigned int max_depth = 0U;
+    unsigned int minimum_usable_hermite_samples = 3U;
+    double max_qef_rms_residual_ratio = 0.1;
+    double min_normal_alignment_threshold = 0.97;
+
+    if (!PyArg_ParseTuple(args, "OOOOIdI|Idd",
+                          &positions_object,
+                          &smoothing_object,
+                          &domain_min_object,
+                          &domain_max_object,
+                          &base_resolution,
+                          &isovalue,
+                          &max_depth,
+                          &minimum_usable_hermite_samples,
+                          &max_qef_rms_residual_ratio,
+                          &min_normal_alignment_threshold)) {
+        return NULL;
+    }
+
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    if (!parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths)) {
+        return NULL;
+    }
+    if (positions.size() != smoothing_lengths.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing lengths must match in size");
+        return NULL;
+    }
+
+    BoundingBox domain{};
+    if (!parse_vector3d(domain_min_object, domain.min) ||
+        !parse_vector3d(domain_max_object, domain.max)) {
+        return NULL;
+    }
+
+    TopLevelParticleGrid grid(domain, base_resolution);
+    grid.insert_particles(positions);
+    grid.compute_bin_max_h(smoothing_lengths);
+
+    std::vector<OctreeCell> top_cells =
+        create_top_level_cells(domain, base_resolution);
+    std::vector<OctreeCell> initial_cells;
+    initial_cells.reserve(top_cells.size());
+    std::vector<std::size_t> initial_contributors;
+
+    ProgressBar pipeline_contrib_bar(
+        "Contributor query", top_cells.size());
+    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+        OctreeCell cell = top_cells[ci];
+
+        std::uint32_t sx = 0, sy = 0, sz = 0;
+        std::uint32_t ex = 0, ey = 0, ez = 0;
+        grid.contributor_bin_span(
+            cell.bounds, smoothing_lengths,
+            sx, sy, sz, ex, ey, ez);
+
+        const std::int64_t begin = static_cast<std::int64_t>(
+            initial_contributors.size());
+
+        for (std::uint32_t ix = sx; ix <= ex; ++ix) {
+            for (std::uint32_t iy = sy; iy <= ey; ++iy) {
+                for (std::uint32_t iz = sz; iz <= ez; ++iz) {
+                    const TopLevelBin &bin =
+                        grid.bins[grid.flatten_index(ix, iy, iz)];
+                    for (std::size_t pi : bin.particle_indices) {
+                        if (particle_support_overlaps_box(
+                                positions[pi],
+                                smoothing_lengths[pi],
+                                cell.bounds)) {
+                            initial_contributors.push_back(pi);
+                        }
+                    }
+                }
+            }
+        }
+
+        const std::int64_t end = static_cast<std::int64_t>(
+            initial_contributors.size());
+        cell.contributor_begin = begin;
+        cell.contributor_end = end;
+        initial_cells.push_back(cell);
+        pipeline_contrib_bar.tick();
+    }
+    pipeline_contrib_bar.finish();
+
+    auto [all_cells, all_contributors] = refine_octree(
+        std::move(initial_cells),
+        std::move(initial_contributors),
+        positions,
+        smoothing_lengths,
+        isovalue,
+        max_depth,
+        domain,
+        static_cast<std::uint32_t>(base_resolution),
+        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold);
+
+    PyObject *cells_list = PyList_New(static_cast<Py_ssize_t>(all_cells.size()));
+    if (cells_list == NULL) {
+        return NULL;
+    }
+    for (std::size_t i = 0; i < all_cells.size(); ++i) {
+        PyObject *cell_dict = build_octree_cell_dict_with_contributors(
+            all_cells[i], all_contributors);
+        if (cell_dict == NULL) {
+            Py_DECREF(cells_list);
+            return NULL;
+        }
+        PyList_SET_ITEM(cells_list, static_cast<Py_ssize_t>(i), cell_dict);
+    }
+
+    npy_intp contrib_dims[1] = {
+        static_cast<npy_intp>(all_contributors.size())};
+    PyObject *contributors_array =
+        PyArray_SimpleNew(1, contrib_dims, NPY_INT64);
+    if (contributors_array == NULL) {
+        Py_DECREF(cells_list);
+        return NULL;
+    }
+    auto *contrib_data = static_cast<std::int64_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(contributors_array)));
+    for (std::size_t i = 0; i < all_contributors.size(); ++i) {
+        contrib_data[i] = static_cast<std::int64_t>(all_contributors[i]);
+    }
+
+    return Py_BuildValue("(NN)", cells_list, contributors_array);
+}
+
+/**
  * @brief Solve the QEF for one leaf cell and return its representative vertex.
  *
  * @param self Unused.
@@ -2743,6 +2888,14 @@ static PyMethodDef adaptive_methods[] = {
         corner_sign_mask_py,
         METH_VARARGS,
         PyDoc_STR("Return the sign mask of eight corner samples."),
+    },
+    {
+        "build_refined_tree",
+        build_refined_tree_py,
+        METH_VARARGS,
+        PyDoc_STR(
+            "Build and refine the adaptive octree in C++ and return "
+            "(cells, contributors) for resumable Python workflows."),
     },
     {
         "create_top_level_cells",

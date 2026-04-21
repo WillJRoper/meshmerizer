@@ -608,6 +608,36 @@ def run_octree_pipeline(
     )
 
 
+def build_refined_tree(
+    positions: "numpy.ndarray",
+    smoothing_lengths: "numpy.ndarray",
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    base_resolution: int,
+    isovalue: float,
+    max_depth: int,
+    minimum_usable_hermite_samples: int = 3,
+    max_qef_rms_residual_ratio: float = 0.1,
+    min_normal_alignment_threshold: float = 0.97,
+) -> tuple[tuple[dict[str, object], ...], "numpy.ndarray"]:
+    """Build and refine the adaptive tree in C++ and return resumable state."""
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
+    cells, contributors = _adaptive.build_refined_tree(
+        pos,
+        sml,
+        domain_minimum,
+        domain_maximum,
+        base_resolution,
+        isovalue,
+        max_depth,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+    )
+    return cells, np.asarray(contributors, dtype=np.int64)
+
+
 def classify_occupied_solid(
     positions: "numpy.ndarray",
     smoothing_lengths: "numpy.ndarray",

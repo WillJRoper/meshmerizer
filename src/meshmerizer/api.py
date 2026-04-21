@@ -14,6 +14,7 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 
 from meshmerizer.adaptive_core import (
+    build_refined_tree,
     classify_occupied_solid,
     compute_isovalue_from_percentile,
     fof_cluster,
@@ -123,7 +124,7 @@ def build_and_refine_tree(
 ) -> TreeState:
     """Build and refine the adaptive tree without extracting a final mesh."""
     pos, sml = _validate_particle_arrays(positions, smoothing_lengths)
-    classify_occupied_solid(
+    cells, contributors = build_refined_tree(
         pos,
         sml,
         tuple(domain_min),
@@ -134,16 +135,10 @@ def build_and_refine_tree(
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
-        max_surface_leaf_size=0.0,
-        erosion_radius=0.0,
     )
-    # The current binding surface does not yet expose a dedicated serialized
-    # refined tree builder that can be resumed without re-running C++. For
-    # now, the public TreeState stores the validated particle/domain metadata
-    # that is sufficient to reconstruct the tree and mesh deterministically.
     return TreeState(
-        cells=(),
-        contributors=(),
+        cells=cells,
+        contributors=tuple(int(v) for v in contributors.tolist()),
         positions=pos,
         smoothing_lengths=sml,
         domain_min=tuple(domain_min),
