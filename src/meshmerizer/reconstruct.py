@@ -1,9 +1,8 @@
-"""Adaptive dual-contouring mesh reconstruction wrappers.
+"""Adaptive mesh reconstruction wrappers.
 
 This module provides thin Python wrappers around the C++ adaptive meshing
-pipeline. Despite the legacy "Poisson" naming in some older code paths, the
-current backend performs adaptive octree refinement, QEF vertex solving, and
-dual contouring.
+pipeline. The current backend performs adaptive octree refinement, optional
+minimum-thickness regularization, mesh extraction, smoothing, and gap filling.
 
 The two primary entry points are:
 

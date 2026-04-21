@@ -24,7 +24,7 @@ def test_remove_islands_fraction_uses_largest_component_reference() -> None:
 
 
 def test_remove_islands_keeps_large_nonwatertight_main_component() -> None:
-    """A large imperfect main body should not lose out to tiny watertight fluff."""
+    """A large imperfect main body should not lose out to tiny fluff."""
     main = trimesh.creation.box(extents=(10.0, 10.0, 10.0))
     main_faces = np.delete(main.faces.copy(), 0, axis=0)
     nonwatertight_main = trimesh.Trimesh(

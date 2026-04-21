@@ -111,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     adaptive.set_defaults(periodic=True)
 
-    # Particle / field selection.
+    # Particle selection.
     adaptive.add_argument(
         "--particle-type",
         "-p",
@@ -119,13 +119,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="gas",
         choices=["gas", "dark_matter", "stars", "black_holes"],
         help="Particle type to extract. Default: 'gas'",
-    )
-    adaptive.add_argument(
-        "--field",
-        "-f",
-        type=str,
-        default="masses",
-        help="Particle field to project. Default: 'masses'",
     )
     adaptive.add_argument(
         "--box-size",
@@ -217,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Number of Laplacian smoothing iterations applied "
-            "to QEF vertices before face generation. 0 disables "
+            "to the extracted mesh vertices. 0 disables "
             "smoothing. Default: 0"
         ),
     )
@@ -291,9 +284,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "Remove connected components whose volume fraction is "
-            "below this threshold. Use 0.0 to keep only the "
-            "largest component."
+            "Remove connected components whose volume is below this "
+            "fraction of the largest component volume. Use 0.0 to keep "
+            "only the largest component."
         ),
     )
     adaptive.add_argument(
@@ -314,7 +307,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Save the octree state to an HDF5 file after "
-            "construction. Allows resuming meshing later."
+            "construction so later runs can reuse the adaptive tree and "
+            "particle data."
         ),
     )
     adaptive.add_argument(
@@ -323,8 +317,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Load a previously saved octree from HDF5 instead of "
-            "building from a snapshot. The positional filename is "
-            "still required for the output path default."
+            "building from a snapshot. The saved file's isovalue, domain, "
+            "base resolution, max depth, particles, cells, and contributors "
+            "are reused. Snapshot-loading flags are ignored in this mode. "
+            "The positional filename is still required for the output path "
+            "default."
         ),
     )
     adaptive.add_argument(
@@ -335,8 +332,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help=(
             "Save a 6-panel figure of QEF vertex projections "
-            "(one per face of the bounding box). Optionally "
-            "provide an output path; defaults to "
+            "(one per face of the bounding box). When used with "
+            "--load-octree, QEF vertices are solved only for this diagnostic "
+            "visualization. Optionally provide an output path; defaults to "
             "'qef_vertices.png'."
         ),
     )

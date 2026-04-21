@@ -1,8 +1,9 @@
-"""Python wrapper for the adaptive meshing C++ core.
+"""Python wrappers for the adaptive C++ meshing core.
 
-This module is the stable Python entry point for the new adaptive rewrite. The
-initial implementation only exposes scaffold-level functionality while the C++
-core types and algorithms are introduced in later phases.
+This module exposes the compiled octree, QEF, reconstruction, and regularized
+opened-solid helpers used by both the CLI and the tests. Lower-level helpers
+remain available for diagnostics and unit testing, while ``run_full_pipeline``
+provides the main particles-to-mesh entry point.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ _adaptive = import_module("meshmerizer._adaptive")
 
 
 def adaptive_status() -> str:
-    """Return the current adaptive core scaffold status string.
+    """Return a short status string from the compiled adaptive extension.
 
     Returns:
         Short human-readable status from the C++ adaptive extension.
@@ -623,9 +624,10 @@ def classify_occupied_solid(
 ) -> dict:
     """Classify the adaptive occupied solid on octree leaves.
 
-    This is scaffolding for the future minimum-thickness regularizer. It
-    returns a leaf-wise occupied-solid view of the current adaptive octree,
-    optionally after additional refinement of large surface leaves.
+    This diagnostic helper exposes the opened-solid scaffolding used by the
+    minimum-thickness regularizer. It returns a leaf-wise occupied-solid
+    view of the adaptive octree, optionally after additional refinement of
+    large surface leaves.
     """
     pos = np.ascontiguousarray(positions, dtype=np.float64)
     sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
@@ -790,8 +792,7 @@ def run_full_pipeline(
     Returns:
         Dict with keys ``vertices`` (V, 3) float64 ndarray,
         ``faces`` (F, 3) uint32 ndarray, ``isovalue`` float,
-        ``n_qef_vertices`` int, ``solver_converged`` bool,
-        ``solver_iterations`` int, ``solver_residual`` float.
+        and ``n_qef_vertices`` int.
     """
     pos = np.ascontiguousarray(positions, dtype=np.float64)
     sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)

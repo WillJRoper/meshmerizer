@@ -89,7 +89,6 @@ def apply_coordinate_shift(
 
 def crop_particles_to_region(
     coords: np.ndarray,
-    values: np.ndarray,
     smoothing_lengths: Optional[np.ndarray],
     *,
     center: np.ndarray,
@@ -101,7 +100,6 @@ def crop_particles_to_region(
 
     Args:
         coords: Particle coordinates with shape ``(N, 3)``.
-        values: Scalar values associated with each particle.
         smoothing_lengths: Optional per-particle smoothing lengths.
         center: Region centre in world coordinates.
         extent: Cubic region side length.
@@ -109,8 +107,8 @@ def crop_particles_to_region(
         periodic: Whether to use periodic selection around the region centre.
 
     Returns:
-        Tuple containing cropped local coordinates, cropped values, cropped
-        smoothing lengths, and the world-space origin of the selected region.
+        Tuple containing cropped local coordinates, cropped smoothing lengths,
+        and the world-space origin of the selected region.
 
     Raises:
         ValueError: If the region specification or array shapes are invalid.
@@ -127,11 +125,8 @@ def crop_particles_to_region(
         raise ValueError("center must have shape (3,)")
 
     coords_arr = np.asarray(coords, dtype=np.float64)
-    values_arr = np.asarray(values)
     if coords_arr.ndim != 2 or coords_arr.shape[1] != 3:
         raise ValueError("coords must have shape (N, 3)")
-    if values_arr.shape[0] != coords_arr.shape[0]:
-        raise ValueError("values must have shape (N,)")
 
     half = 0.5 * float(extent)
     mins = c - half
@@ -158,23 +153,22 @@ def crop_particles_to_region(
     # Apply the particle mask to every array together so the caller receives a
     # consistent cropped particle set.
     cropped_coords = local[mask]
-    cropped_values = values_arr[mask]
     if smoothing_lengths is None:
         cropped_h = None
     else:
         h_arr = np.asarray(smoothing_lengths)
         cropped_h = h_arr[mask]
 
-    return cropped_coords, cropped_values, cropped_h, origin
+    return cropped_coords, cropped_h, origin
 
 
-def tighten_voxelization_bounds(
+def tighten_working_bounds(
     coords: np.ndarray,
     smoothing_lengths: Optional[np.ndarray],
     *,
     box_size: float,
 ) -> tuple[np.ndarray, Optional[np.ndarray], np.ndarray, float]:
-    """Shrink the voxelization cube to the occupied particle bounds.
+    """Shrink the working cube to the occupied particle bounds.
 
     Args:
         coords: Particle coordinates with shape ``(N, 3)``.
@@ -183,7 +177,7 @@ def tighten_voxelization_bounds(
 
     Returns:
         Tuple containing shifted coordinates, shifted smoothing lengths, the
-        origin offset, and the tightened cubic box size.
+        origin offset, and the tightened cubic working-domain size.
 
     Raises:
         ValueError: If the inputs are empty or malformed.
@@ -228,7 +222,6 @@ def raise_if_empty_subregion_selection(
     n_selected: int,
     *,
     particle_type: str,
-    field: str,
     center: np.ndarray,
     extent: float,
     periodic: bool,
@@ -238,7 +231,6 @@ def raise_if_empty_subregion_selection(
     Args:
         n_selected: Number of particles selected by the crop.
         particle_type: Selected particle family.
-        field: Requested particle field.
         center: Crop centre.
         extent: Crop extent.
         periodic: Whether the selection used periodic wrapping.
@@ -254,7 +246,7 @@ def raise_if_empty_subregion_selection(
     c = np.asarray(center, dtype=np.float64)
     msg = (
         "Subregion selection contains no particles: "
-        f"particle_type={particle_type} field={field} "
+        f"particle_type={particle_type} "
         f"center=({c[0]:.6g},{c[1]:.6g},{c[2]:.6g}) "
         f"extent={float(extent):.6g} periodic={periodic} "
         f"selected_particles={n_selected}. "
@@ -268,7 +260,6 @@ def raise_if_empty_subregion_selection(
 def load_swift_particles(
     filename: Path,
     particle_type: str,
-    field: str,
     smoothing_factor: float,
     box_size: Optional[float],
     shift: list[float],
@@ -289,7 +280,6 @@ def load_swift_particles(
     Args:
         filename: Snapshot filename.
         particle_type: Particle family to extract.
-        field: Field to project into the voxel grid.
         smoothing_factor: Multiplier applied to smoothing lengths.
         box_size: Optional box size override.
         shift: Coordinate shift applied before cropping.
@@ -297,11 +287,11 @@ def load_swift_particles(
         center: Optional crop centre.
         extent: Optional crop extent.
         periodic: Whether crop selection is periodic.
-        tight_bounds: Whether to tighten the voxelization cube to occupancy.
+        tight_bounds: Whether to tighten the working cube to occupancy.
 
     Returns:
-        Tuple containing field values, prepared coordinates, smoothing lengths,
-        effective box size, and the world-space origin.
+        Tuple containing prepared coordinates, smoothing lengths, effective box
+        size, and the world-space origin.
 
     Raises:
         RuntimeError: If the snapshot cannot be loaded or has no usable box.
@@ -359,25 +349,13 @@ def load_swift_particles(
     else:
         raise ValueError(f"Unknown particle type '{particle_type}'")
 
-    # Extract coordinates and the requested scalar field together so any field
-    # validation error is raised before later preprocessing begins.
+    # Extract coordinates for the selected particle family.
     log_status("Loading", f"Extracting {particle_type} particles...")
     extract_start = time.perf_counter()
     coords_cosmo = part_data.coordinates
     coords = coords_cosmo.value
-
-    if not hasattr(part_data, field):
-        available_fields = [
-            key for key in part_data.__dict__.keys() if not key.startswith("_")
-        ]
-        raise ValueError(
-            f"Field '{field}' not found in {particle_type} particles. "
-            f"Available fields: {available_fields}"
-        )
-
-    field_data = getattr(part_data, field).value
     record_elapsed(
-        "Particle field extraction",
+        "Particle extraction",
         extract_start,
         operation="Loading",
     )
@@ -451,15 +429,14 @@ def load_swift_particles(
     effective_box_size = full_box_size
 
     # When the user requests a subregion, remap the selected particles into the
-    # local cube coordinates expected by voxelization.
+    # local cube coordinates expected by the adaptive reconstruction code.
     if center is not None:
         crop_start = time.perf_counter()
         assert extent is not None
         center_arr = np.asarray(center, dtype=np.float64)
         extent_f = float(extent)
-        coords, field_data, h, origin = crop_particles_to_region(
+        coords, h, origin = crop_particles_to_region(
             coords,
-            field_data,
             h,
             center=center_arr,
             extent=extent_f,
@@ -483,39 +460,35 @@ def load_swift_particles(
         raise_if_empty_subregion_selection(
             n_selected,
             particle_type=particle_type,
-            field=field,
             center=center_arr,
             extent=extent_f,
             periodic=periodic,
         )
         log_debug_status(
             "Cleaning",
-            f"Selected {n_selected} {particle_type} particles "
-            f"for field '{field}'.",
+            f"Selected {n_selected} {particle_type} particles.",
         )
         record_elapsed("Subregion crop", crop_start, operation="Cleaning")
 
     # Tight bounds are applied after any explicit crop so the optimization acts
-    # on the actual region that will be voxelized.
+    # on the actual region that will be reconstructed.
     if tight_bounds:
         tighten_start = time.perf_counter()
-        coords, h, origin_offset, effective_box_size = (
-            tighten_voxelization_bounds(
-                coords,
-                h,
-                box_size=effective_box_size,
-            )
+        coords, h, origin_offset, effective_box_size = tighten_working_bounds(
+            coords,
+            h,
+            box_size=effective_box_size,
         )
         origin = origin + origin_offset
         if center is not None and periodic:
             origin = np.mod(origin, full_box_size)
         log_debug_status(
             "Cleaning",
-            "Tightened voxelization bounds: "
+            "Tightened working bounds: "
             f"origin=({origin[0]:.6g},{origin[1]:.6g},{origin[2]:.6g}) "
             f"box_size={effective_box_size:.6g}",
         )
         record_elapsed("Tight bounds", tighten_start, operation="Cleaning")
 
     record_elapsed("Particle preparation", total_start, operation="Loading")
-    return field_data, coords, h, effective_box_size, origin
+    return coords, h, effective_box_size, origin

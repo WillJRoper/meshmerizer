@@ -1670,10 +1670,10 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
  * @brief Solve QEF vertices for all active leaf cells (vertex-only,
  *        no face generation).
  *
- * This is the Poisson-pipeline counterpart to ``generate_mesh_py``.
  * It accepts the same arguments but returns only ``(positions, normals)``
- * without triangle faces — those are generated later via FOF + Poisson
- * in Python.
+ * without triangle faces. This is mainly used for diagnostics,
+ * visualization, and tests that inspect the vertex solve separately from the
+ * final mesh extraction path.
  *
  * @param args  Python tuple:
  *   (cells, contributors, positions, smoothing_lengths, isovalue,
@@ -1898,7 +1898,7 @@ static PyObject *solve_vertices_py(PyObject *self, PyObject *args) {
  *
  * This is the vertex-only counterpart to ``build_mesh_numpy_result``,
  * used by the octree pipeline which returns QEF vertices without
- * triangle faces (Poisson reconstruction happens in Python).
+ * triangle faces.
  */
 static PyObject *build_vertices_numpy_result(
     const std::vector<MeshVertex> &vertices) {
@@ -1959,8 +1959,7 @@ static PyObject *build_vertices_numpy_result(
  *
  * This builds the adaptive octree and solves QEF vertices for every
  * active leaf cell, but does NOT generate triangle faces.  Face
- * generation is handled in Python via FOF clustering + Poisson
- * surface reconstruction.
+ * generation is handled later by the reconstruction pipeline.
  *
  * Accepts:
  *   positions         – Nx3 float64 array (or list of 3-tuples)
@@ -2518,13 +2517,10 @@ static PyObject *fof_cluster_py(PyObject * /* self */,
  *   max_edge_ratio       – double (default 1.5)
  *
  * Returns a dict with keys:
- *   vertices       – (V, 3) float64 ndarray
- *   faces          – (F, 3) uint32 ndarray
- *   isovalue       – float
- *   n_qef_vertices – int
- *   solver_converged  – bool
- *   solver_iterations – int
- *   solver_residual   – float
+ *   vertices            – (V, 3) float64 ndarray
+ *   faces               – (F, 3) uint32 ndarray
+ *   isovalue            – float
+ *   n_qef_vertices      – int
  */
 static PyObject *run_full_pipeline_py(
         PyObject * /*self*/, PyObject *args) {
@@ -2656,15 +2652,6 @@ static PyObject *run_full_pipeline_py(
         PyFloat_FromDouble(result.isovalue));
     PyDict_SetItemString(dict, "n_qef_vertices",
         PyLong_FromSize_t(result.n_qef_vertices));
-    // DC pipeline has no solver — report as converged with 0
-    // iterations for backward compatibility with existing tests.
-    PyDict_SetItemString(dict, "solver_converged",
-        PyBool_FromLong(1));
-    PyDict_SetItemString(dict, "solver_iterations",
-        PyLong_FromSize_t(0));
-    PyDict_SetItemString(dict, "solver_residual",
-        PyFloat_FromDouble(0.0));
-
     return dict;
 }
 
@@ -2845,9 +2832,9 @@ static PyMethodDef adaptive_methods[] = {
         METH_VARARGS,
         PyDoc_STR(
             "Run the full particles-to-mesh pipeline "
-            "(octree + Poisson + Marching Cubes) in C++ "
+            "(adaptive octree + reconstruction) in C++ "
             "and return a dict with vertices, faces, and "
-            "solver metadata."),
+            "basic pipeline metadata."),
     },
     {NULL, NULL, 0, NULL},
 };

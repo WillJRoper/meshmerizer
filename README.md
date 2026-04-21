@@ -1,18 +1,17 @@
 # Meshmerizer
 
-Meshmerizer converts particle-based simulation outputs into watertight STL
-meshes for 3D printing or visualization. It uses an adaptive octree with
-a Wendland C2 SPH kernel and dual contouring to produce smooth,
-resolution-adaptive surfaces directly from particle data — no intermediate
-voxel grids.
+Meshmerizer converts particle-based simulation outputs into STL meshes for 3D
+printing or visualization. It uses an adaptive octree with a Wendland C2 SPH
+kernel and adaptive reconstruction to produce smooth, resolution-adaptive
+surfaces directly from particle data.
 
 ## Features
 
 - **Adaptive octree refinement** — concentrates resolution near the
   isosurface, keeping memory proportional to the surface rather than the
   full volume.
-- **Adaptive mesh reconstruction** — produces smooth, watertight meshes
-  from the adaptive implicit surface extracted from the SPH field.
+- **Adaptive mesh reconstruction** — extracts a mesh directly from the adaptive
+  implicit surface without building a dense uniform voxel grid.
 - **FOF clustering** — Friends-of-Friends clustering separates distinct
   objects before reconstruction, preventing thin bridges between
   unrelated structures.
@@ -20,9 +19,8 @@ voxel grids.
   SPH codes, with analytic gradients for accurate surface normals.
 - **C++ core with optional OpenMP** — the heavy computation (refinement,
   QEF solve) runs in compiled C++ with optional multi-threaded parallelism.
-- **HDF5 serialization** — save and reload the full octree state (including
-  QEF vertices and FOF labels) so meshing can be resumed without
-  reprocessing particles.
+- **HDF5 serialization** — save and reload the octree, contributors, and
+  particle data so meshing can be resumed without rebuilding the tree.
 - **SWIFT snapshot support** — load particles directly from SWIFT HDF5
   snapshots via swiftsimio.
 - **Print scaling** — scale the output mesh to a target physical size for
@@ -34,7 +32,7 @@ voxel grids.
 
 ## Installation
 
-Requires Python 3.8+ and Open3D (installed automatically):
+Requires Python 3.8+:
 
 ```bash
 pip install -e .
@@ -77,7 +75,6 @@ Basic adaptive STL generation:
 ```bash
 meshmerizer adaptive snapshot.hdf5 \
   --particle-type gas \
-  --field masses \
   --base-resolution 4 \
   --max-depth 4 \
   --isovalue 0.5 \
@@ -117,8 +114,7 @@ meshmerizer adaptive snapshot.hdf5 \
   --output first_try.stl
 ```
 
-Reload the octree later to re-mesh with a different isovalue or
-post-processing without rebuilding:
+Reload the octree later to re-mesh without rebuilding the tree:
 
 ```bash
 meshmerizer adaptive snapshot.hdf5 \
@@ -136,7 +132,6 @@ meshmerizer adaptive snapshot.hdf5 \
 | `--isovalue` / `-t` | Isosurface threshold (overrides `--surface-percentile`) |
 | `--surface-percentile` | Density percentile for auto isovalue (default: 5) |
 | `--particle-type` / `-p` | Particle type: `gas`, `dark_matter`, `stars`, `black_holes` |
-| `--field` / `-f` | Particle field to project (default: `masses`) |
 | `--smoothing-factor` | Multiplier for particle smoothing lengths (default: 1.0) |
 | `--box-size` / `-b` | Physical box size override |
 | `--center` | Subregion center `X Y Z` in simulation units |
@@ -147,7 +142,7 @@ meshmerizer adaptive snapshot.hdf5 \
 | `--no-periodic` | Disable periodic wrapping for subregion selection |
 | `--linking-factor` | FOF linking length as fraction of mean separation (default: 0.2) |
 | `--min-feature-thickness` | Remove features thinner than this physical scale |
-| `--remove-islands-fraction` | Volume fraction threshold for island removal |
+| `--remove-islands-fraction` | Minimum fraction of the largest component volume to keep |
 | `--target-size` / `-s` | Scale longest mesh dimension to this size (cm) |
 | `--save-octree` | Save octree state to HDF5 after construction |
 | `--load-octree` | Load a previously saved octree from HDF5 |
@@ -159,10 +154,9 @@ meshmerizer adaptive snapshot.hdf5 \
 import numpy as np
 
 from meshmerizer.adaptive_core import (
-    run_octree_pipeline,
+    run_full_pipeline,
     fof_cluster,
 )
-from meshmerizer.reconstruct import reconstruct_mesh
 from meshmerizer.mesh.core import Mesh
 
 # Example: sphere of particles
@@ -184,20 +178,15 @@ base_resolution = 4
 max_depth = 4
 isovalue = 0.5
 
-# Run the C++ octree pipeline (returns QEF vertex positions + normals).
-vert_positions, vert_normals = run_octree_pipeline(
+# Optional particle-level FOF labels.
+group_labels = fof_cluster(
     positions, smoothing_lengths,
     domain_min, domain_max,
-    base_resolution, isovalue, max_depth,
+    linking_factor=1.5,
 )
 
-# Cluster vertices into distinct objects.
-group_labels = fof_cluster(
-    vert_positions, domain_min, domain_max, linking_factor=1.5,
-)
-
-# Reconstruct the final mesh.
-mesh_verts, mesh_faces = reconstruct_mesh(
+# Run the full C++ reconstruction pipeline.
+result = run_full_pipeline(
     positions,
     smoothing_lengths,
     domain_min,
@@ -205,11 +194,10 @@ mesh_verts, mesh_faces = reconstruct_mesh(
     base_resolution,
     isovalue,
     max_depth,
-    group_labels=group_labels,
 )
 
 # Save as STL.
-mesh = Mesh(vertices=mesh_verts, faces=mesh_faces)
+mesh = Mesh(vertices=result["vertices"], faces=result["faces"])
 mesh.save("output.stl")
 ```
 
@@ -248,7 +236,7 @@ src/meshmerizer/
   __init__.py
   adaptive_core.py          # Stable Python API for the C++ core
   _adaptive.cpp             # Python/C++ extension bindings
-  reconstruct.py            # Reconstruction wrappers over the C++ pipeline
+  reconstruct.py            # Grouped reconstruction wrappers over the C++ pipeline
   serialize.py              # HDF5 octree export/import
   logging.py                # Structured logging helpers
   logging_utils.py          # Logging utilities
@@ -267,7 +255,8 @@ src/meshmerizer/
     hermite.hpp             # HermiteSample, edge crossings
     qef.hpp                 # QEF accumulator, 3x3 solver
     mesh.hpp                # MeshVertex, MeshTriangle structs
-    faces.hpp               # QEF vertex solving for active leaves
+    faces.hpp               # QEF vertex solving and face extraction helpers
+    adaptive_solid.hpp      # Opened-solid regularization helpers
     fof.hpp                 # Friends-of-Friends clustering
 
   commands/                 # CLI modules

@@ -15,8 +15,8 @@
  *   4. Build spatial index for leaf cell neighbor lookups.
  *   5. Generate dual contour faces from sign-changing edges.
  *
- * Unlike the Poisson pipeline, this approach directly connects the
- * QEF vertices (one per active leaf) using the primal edge topology
+ * This approach directly connects the QEF vertices (one per active leaf)
+ * using the primal edge topology
  * of the octree.  For each primal edge where the indicator function
  * changes sign, the four leaf cells sharing that edge contribute a
  * quad (split into two triangles).

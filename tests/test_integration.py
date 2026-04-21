@@ -1,8 +1,8 @@
 """Integration tests for the full particles-to-mesh pipeline.
 
 These tests use synthetic particle distributions with known geometry
-to validate the end-to-end pipeline (octree + QEF + Poisson +
-Marching Cubes).  Each test generates particles, runs the pipeline,
+to validate the end-to-end adaptive reconstruction pipeline. Each test
+generates particles, runs the pipeline,
 and checks geometric properties of the output mesh against the
 known input.
 
@@ -258,20 +258,17 @@ class TestSolidSphereIntegration:
         radii = np.linalg.norm(mesh.vertices - center, axis=1)
         median_r = np.median(radii)
         # Median radius should be within 50% of the true radius.
-        # This is a generous tolerance because the Poisson surface
-        # at low resolution won't be a perfect sphere.
+        # This is a generous tolerance because the adaptive mesh at low
+        # resolution won't be a perfect sphere.
         assert 0.5 < median_r < 1.5, (
             f"Median vertex radius {median_r:.3f}; expected near 1.0"
         )
 
-    def test_solver_converged(self) -> None:
-        """PCG solver should converge."""
+    def test_pipeline_metadata_present(self) -> None:
+        """Basic pipeline metadata should be present."""
         _, meta = self._get_result()
-        assert meta["solver_converged"], (
-            f"Solver did not converge after "
-            f"{meta['solver_iterations']} iterations "
-            f"(residual={meta['solver_residual']:.2e})"
-        )
+        assert "isovalue" in meta
+        assert "n_qef_vertices" in meta
 
     def test_qef_vertices_produced(self) -> None:
         """Pipeline should produce QEF vertices internally."""

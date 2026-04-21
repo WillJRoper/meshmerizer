@@ -73,7 +73,7 @@ def test_run_full_pipeline_sphere() -> None:
 
 
 def test_run_full_pipeline_metadata() -> None:
-    """Pipeline result should contain solver metadata."""
+    """Pipeline result should contain mesh and basic pipeline metadata."""
     positions, sml = _make_sphere_particles(n=500)
 
     result = run_full_pipeline(
@@ -88,12 +88,6 @@ def test_run_full_pipeline_metadata() -> None:
 
     assert "isovalue" in result
     assert "n_qef_vertices" in result
-    assert "solver_converged" in result
-    assert "solver_iterations" in result
-    assert "solver_residual" in result
-    assert isinstance(result["solver_converged"], bool)
-    assert result["solver_iterations"] >= 0
-    assert result["solver_residual"] >= 0.0
 
 
 def test_reconstruct_group_sphere() -> None:

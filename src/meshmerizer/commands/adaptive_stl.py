@@ -182,10 +182,9 @@ def _load_particles_for_adaptive(args):
     """
     from meshmerizer.commands.loading import load_swift_particles
 
-    field_data, coords, h, effective_box_size, origin = load_swift_particles(
+    coords, h, effective_box_size, origin = load_swift_particles(
         filename=args.filename,
         particle_type=args.particle_type,
-        field=args.field,
         smoothing_factor=args.smoothing_factor,
         box_size=args.box_size,
         shift=list(args.shift),
@@ -545,8 +544,8 @@ def run_adaptive(args) -> None:
         max_depth = args.max_depth
         base_resolution = args.base_resolution
 
-        # Determine isovalue: explicit --isovalue takes priority,
-        # otherwise compute from the density percentile.
+        # Determine isovalue: explicit --isovalue takes priority. Otherwise we
+        # use a fast self-density proxy derived from the smoothing lengths.
         if args.isovalue is not None:
             isovalue = args.isovalue
         else:
@@ -560,8 +559,8 @@ def run_adaptive(args) -> None:
             )
 
         if args.save_octree is not None:
-            # We need intermediate cells/contributors for saving,
-            # so use the step-by-step path through Python.
+            # We need intermediate cells/contributors for serialization, so use
+            # the explicit octree-build path through Python.
             log_status(
                 "Building",
                 f"Building octree: base_resolution="
@@ -638,31 +637,9 @@ def run_adaptive(args) -> None:
             )
             record_elapsed("Octree save", save_start, operation="Saving")
 
-            # Generate QEF vertices from the saved octree data.
-            log_status(
-                "Meshing",
-                "Solving QEF vertices...",
-            )
-            mesh_start = time.perf_counter()
-            vert_positions, _ = solve_vertices(
-                cells,
-                contributors,
-                positions,
-                smoothing_lengths,
-                isovalue,
-                domain_min,
-                domain_max,
-                max_depth,
-                base_resolution,
-            )
-            record_elapsed(
-                "Vertex solve",
-                mesh_start,
-                operation="Meshing",
-            )
         else:
             # Fast path: run the full particles-to-mesh pipeline
-            # in C++ (octree refinement + QEF + dual contouring).
+            # in C++.
             # If FOF is enabled, cluster particles first and
             # reconstruct each group independently.
             if getattr(args, "fof", False):
@@ -807,22 +784,13 @@ def run_adaptive(args) -> None:
         record_elapsed("Octree save", save_start, operation="Saving")
 
     # ------------------------------------------------------------------
-    # Step 4: Generate mesh for load-octree path.
+    # Step 4: Optional diagnostic QEF-vertex solve for octree-backed runs.
     # ------------------------------------------------------------------
-    if args.load_octree is not None:
-        # If the loaded HDF5 already contains QEF vertices, reuse them
-        # instead of re-solving (saves significant compute time).
-        if state.get("vertices") is not None:
+    if args.load_octree is not None or args.save_octree is not None:
+        if getattr(args, "visualise_verts", None):
             log_status(
                 "Meshing",
-                "Using QEF vertices from loaded octree.",
-            )
-            vert_positions = state["vertices"]
-            _ = state["normals"]
-        else:
-            log_status(
-                "Meshing",
-                "Solving QEF vertices from loaded octree...",
+                "Solving QEF vertices for visualization...",
             )
             mesh_start = time.perf_counter()
             vert_positions, _ = solve_vertices(
@@ -837,30 +805,23 @@ def run_adaptive(args) -> None:
                 base_resolution,
             )
             record_elapsed("Vertex solve", mesh_start, operation="Meshing")
-
-    n_verts = len(vert_positions)
-    log_status(
-        "Meshing",
-        f"Solved {n_verts} QEF vertices.",
-    )
-
-    # Optionally save a 6-panel vertex visualisation figure.
-    if getattr(args, "visualise_verts", None):
-        _visualize_vertices(vert_positions, args.visualise_verts)
-
-    if n_verts == 0:
-        print(
-            "Warning: No QEF vertices produced. "
-            "Check isovalue and domain selection.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            log_status(
+                "Meshing",
+                f"Solved {len(vert_positions)} QEF vertices.",
+            )
+            if len(vert_positions) == 0:
+                print(
+                    "Warning: No QEF vertices produced for visualization. "
+                    "Check isovalue and domain selection.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            _visualize_vertices(vert_positions, args.visualise_verts)
 
     # ------------------------------------------------------------------
-    # Step 5: Optional FOF clustering + mesh reconstruction.
+    # Step 5: Optional particle FOF clustering + mesh reconstruction.
     # ------------------------------------------------------------------
     if getattr(args, "fof", False):
-        # Cluster QEF vertices into distinct objects.
         log_status(
             "Clustering",
             f"Running FOF clustering "
@@ -868,7 +829,7 @@ def run_adaptive(args) -> None:
         )
         cluster_start = time.perf_counter()
         group_labels = fof_cluster(
-            vert_positions,
+            positions,
             domain_min,
             domain_max,
             args.linking_factor,
@@ -880,8 +841,7 @@ def run_adaptive(args) -> None:
             f"Found {n_groups} group(s).",
         )
     else:
-        # Single group — treat all vertices as one object.
-        group_labels = np.zeros(len(vert_positions), dtype=np.int64)
+        group_labels = np.zeros(len(positions), dtype=np.int64)
 
     # Reconstruct each requested group and merge the meshes.
     reconstruction_depth = max_depth

@@ -1,4 +1,4 @@
-"""Tests for the adaptive C++ core scaffold and core utilities."""
+"""Tests for the adaptive C++ core utilities and diagnostics."""
 
 import numpy as np
 
