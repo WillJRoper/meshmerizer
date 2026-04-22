@@ -303,6 +303,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     adaptive.add_argument(
+        "--simplify-factor",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of faces to keep during final mesh simplification. "
+            "Use values in (0, 1]; smaller values simplify more aggressively. "
+            "1.0 disables simplification. Default: 1.0"
+        ),
+    )
+    adaptive.add_argument(
         "--target-size",
         "-s",
         type=float,

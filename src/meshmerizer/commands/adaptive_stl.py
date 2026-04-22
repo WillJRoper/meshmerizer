@@ -168,6 +168,25 @@ def _remove_islands(
     return Mesh(mesh=combined)
 
 
+def _simplify_mesh(mesh: Mesh, simplify_factor: float) -> Mesh:
+    """Optionally simplify the mesh after extraction and cleanup."""
+    if simplify_factor == 1.0:
+        return mesh
+
+    log_status(
+        "Cleaning",
+        f"Simplifying mesh to retain factor {simplify_factor:.6g}...",
+    )
+    before_faces = len(mesh.faces)
+    mesh.simplify(factor=simplify_factor)
+    after_faces = len(mesh.faces)
+    log_status(
+        "Cleaning",
+        f"Simplified mesh faces: {before_faces} -> {after_faces}",
+    )
+    return mesh
+
+
 def _load_particles_for_adaptive(args):
     """Load and prepare particles for the adaptive pipeline.
 
@@ -756,6 +775,9 @@ def run_adaptive(args) -> None:
             # Remove small disconnected islands if requested.
             mesh = _remove_islands(mesh, args.remove_islands_fraction)
 
+            # Simplify the final mesh if requested.
+            mesh = _simplify_mesh(mesh, args.simplify_factor)
+
             # Scale the mesh to physical print size.
             if args.target_size is not None:
                 log_status(
@@ -931,6 +953,9 @@ def run_adaptive(args) -> None:
 
     # Remove small disconnected islands if requested.
     mesh = _remove_islands(mesh, args.remove_islands_fraction)
+
+    # Simplify the final mesh if requested.
+    mesh = _simplify_mesh(mesh, args.simplify_factor)
 
     # Scale the mesh to a physical print size if requested.
     if args.target_size is not None:
