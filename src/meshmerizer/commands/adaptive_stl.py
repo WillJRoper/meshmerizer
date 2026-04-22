@@ -9,7 +9,6 @@ clusters before meshing.
 
 from __future__ import annotations
 
-import sys
 import time
 from collections import Counter
 from typing import Optional
@@ -23,7 +22,7 @@ from meshmerizer.adaptive_core import (
     refine_octree,
     solve_vertices,
 )
-from meshmerizer.logging import log_status, record_elapsed
+from meshmerizer.logging import abort_with_error, log_status, record_elapsed
 from meshmerizer.mesh.core import Mesh
 from meshmerizer.printing import scale_mesh_to_print
 from meshmerizer.reconstruct import reconstruct_mesh
@@ -196,20 +195,18 @@ def _load_particles_for_adaptive(args):
     )
 
     if h is None:
-        print(
-            "Error: Smoothing lengths are required for the "
-            "adaptive pipeline but could not be determined.",
-            file=sys.stderr,
+        abort_with_error(
+            "Loading",
+            "Smoothing lengths are required for the adaptive pipeline but "
+            "could not be determined.",
         )
-        sys.exit(1)
 
     n_particles = coords.shape[0]
     if n_particles == 0:
-        print(
-            "Error: No particles selected. Check domain selection flags.",
-            file=sys.stderr,
+        abort_with_error(
+            "Loading",
+            "No particles selected. Check domain selection flags.",
         )
-        sys.exit(1)
 
     log_status(
         "Loading",
@@ -315,12 +312,11 @@ def _visualize_vertices(vert_positions, output_path: str) -> None:
     try:
         import matplotlib.pyplot as plt
     except ImportError:
-        print(
-            "Error: matplotlib is required for --visualise-verts. "
-            "Install it with: pip install matplotlib",
-            file=sys.stderr,
+        abort_with_error(
+            "Meshing",
+            "matplotlib is required for --visualise-verts. Install it with: "
+            "pip install matplotlib",
         )
-        return
 
     # Define the six face views.  Each entry is:
     #   (title, horizontal_axis_index, vertical_axis_index,
@@ -361,7 +357,7 @@ def _visualize_vertices(vert_positions, output_path: str) -> None:
     plt.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved vertex visualisation to {output_path}")
+    log_status("Saving", f"Saved vertex visualisation to {output_path}")
 
 
 def _emit_tree_structure_summary(cells) -> None:
@@ -517,13 +513,11 @@ def run_adaptive(args) -> None:
                 operation="Clustering",
             )
             if len(positions) == 0:
-                print(
-                    "Error: Particle FOF filtering removed all particles. "
-                    "Lower --min-fof-cluster-size or adjust "
-                    "--linking-factor.",
-                    file=sys.stderr,
+                abort_with_error(
+                    "Clustering",
+                    "Particle FOF filtering removed all particles. Lower "
+                    "--min-fof-cluster-size or adjust --linking-factor.",
                 )
-                sys.exit(1)
 
         if (
             args.target_size is not None
@@ -738,13 +732,11 @@ def run_adaptive(args) -> None:
             )
 
             if n_tris == 0:
-                print(
-                    "Warning: Pipeline produced no "
-                    "triangles. Check isovalue and "
+                abort_with_error(
+                    "Meshing",
+                    "Pipeline produced no triangles. Check isovalue and "
                     "domain selection.",
-                    file=sys.stderr,
                 )
-                sys.exit(1)
 
             # Translate back to world-space and build Mesh.
             mesh_verts += origin
@@ -834,12 +826,11 @@ def run_adaptive(args) -> None:
                 f"Solved {len(vert_positions)} QEF vertices.",
             )
             if len(vert_positions) == 0:
-                print(
-                    "Warning: No QEF vertices produced for visualization. "
-                    "Check isovalue and domain selection.",
-                    file=sys.stderr,
+                abort_with_error(
+                    "Meshing",
+                    "No QEF vertices produced for visualization. Check "
+                    "isovalue and domain selection.",
                 )
-                sys.exit(1)
             _visualize_vertices(vert_positions, args.visualise_verts)
 
     # ------------------------------------------------------------------
@@ -913,12 +904,11 @@ def run_adaptive(args) -> None:
     )
 
     if n_tris == 0:
-        print(
-            "Warning: Reconstruction produced no "
-            "triangles. Check isovalue and domain selection.",
-            file=sys.stderr,
+        abort_with_error(
+            "Meshing",
+            "Reconstruction produced no triangles. Check isovalue and domain "
+            "selection.",
         )
-        sys.exit(1)
 
     # ------------------------------------------------------------------
     # Step 6: Convert to a Mesh object and apply post-processing.

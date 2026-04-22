@@ -16,7 +16,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, NoReturn, Optional
 
 from tqdm.auto import tqdm
 
@@ -130,9 +130,24 @@ def _caller_function_name(stack_offset: int = 2) -> str:
     return "<unknown>"
 
 
+def current_thread_label() -> str:
+    """Return a stable thread label for the standardized prefix.
+
+    Returns:
+        ``"main"`` for the main thread, a 1-based pool worker index when the
+        thread name ends in ``_<n>``, or the raw thread name otherwise.
+    """
+    thread = threading.current_thread()
+    if thread.name == "MainThread":
+        return "main"
+    if current_thread_number() is not None:
+        return "worker"
+    return thread.name
+
+
 def format_status_prefix(
     operation: str,
-    thread: int | None = None,
+    thread: str | int | None = None,
     func: str | None = None,
 ) -> str:
     """Return a standardized terminal status prefix.
@@ -144,15 +159,12 @@ def format_status_prefix(
         func: Optional function name to include in the prefix.
 
     Returns:
-        Formatted prefix like ``"[Loading][my_func]"`` or
+        Formatted prefix like ``"[Loading][my_func][main]"`` or
         ``"[Meshing][my_func][2]"``.
     """
-    parts = [f"[{operation}]"]
-    if func is not None:
-        parts.append(f"[{func}]")
-    if thread is not None:
-        parts.append(f"[{thread}]")
-    return "".join(parts)
+    resolved_func = func if func is not None else "<unknown>"
+    resolved_thread = current_thread_label() if thread is None else str(thread)
+    return f"[{operation}][{resolved_func}][{resolved_thread}]"
 
 
 def current_thread_number() -> int | None:
@@ -169,6 +181,55 @@ def current_thread_number() -> int | None:
     if not suffix.isdigit():
         return None
     return int(suffix) + 1
+
+
+def log_warning_status(
+    operation: str,
+    message: str,
+    *,
+    thread: str | int | None = None,
+) -> None:
+    """Log a warning status line with the standardized prefix."""
+    log_status(
+        operation,
+        message,
+        thread=thread,
+        level=std_logging.WARNING,
+        _stack_offset=3,
+    )
+
+
+def log_error_status(
+    operation: str,
+    message: str,
+    *,
+    thread: str | int | None = None,
+) -> None:
+    """Log an error status line with the standardized prefix."""
+    log_status(
+        operation,
+        message,
+        thread=thread,
+        level=std_logging.ERROR,
+        _stack_offset=3,
+    )
+
+
+def abort_with_error(
+    operation: str,
+    message: str,
+    *,
+    exit_code: int = 1,
+) -> "NoReturn":
+    """Log an error line and terminate the process.
+
+    Args:
+        operation: Short operation label.
+        message: Human-readable error message.
+        exit_code: Process exit code.
+    """
+    log_error_status(operation, message)
+    raise SystemExit(exit_code)
 
 
 def get_logger(name: str | None = None) -> std_logging.Logger:

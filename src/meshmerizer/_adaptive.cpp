@@ -747,7 +747,8 @@ static PyObject *create_top_level_cells_with_contributors_py(
         return NULL;
     }
 
-    ProgressBar contrib_bar("Contributor query", cells.size());
+    ProgressBar contrib_bar(
+        "Building", "build_refined_tree_py", cells.size());
     for (std::size_t ci = 0; ci < cells.size(); ++ci) {
         /* Query contributors for this cell using the shared grid. */
         std::uint32_t sx = 0, sy = 0, sz = 0;
@@ -1337,7 +1338,7 @@ static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
     std::vector<std::size_t> initial_contributors;
 
     ProgressBar pipeline_contrib_bar(
-        "Contributor query", top_cells.size());
+        "Building", "generate_mesh_py", top_cells.size());
     for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
         OctreeCell cell = top_cells[ci];
 
@@ -1493,7 +1494,7 @@ static PyObject *extract_opened_surface_mesh_py(
     std::vector<std::size_t> initial_contributors;
 
     ProgressBar pipeline_contrib_bar(
-        "Contributor query", top_cells.size());
+        "Building", "classify_occupied_solid_py", top_cells.size());
     for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
         OctreeCell cell = top_cells[ci];
 
@@ -2367,7 +2368,7 @@ static PyObject *run_octree_pipeline_py(
     std::vector<std::size_t> initial_contributors;
 
     ProgressBar pipeline_contrib_bar(
-        "Contributor query", top_cells.size());
+        "Building", "extract_opened_surface_mesh_py", top_cells.size());
     for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
         OctreeCell cell = top_cells[ci];
 

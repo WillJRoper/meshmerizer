@@ -63,9 +63,9 @@ inline void print_octree_structure_summary(
     };
 
     if (all_cells.empty()) {
-        std::fprintf(stdout,
-                     "Tree summary : total=0 leaf=0 internal=0 active=0 inactive=0 surface=0\n");
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Tree", "print_octree_structure_summary",
+            "total=0 leaf=0 internal=0 active=0 inactive=0 surface=0\n");
         return;
     }
 
@@ -96,19 +96,30 @@ inline void print_octree_structure_summary(
         }
     }
 
-    std::fprintf(stdout,
-                 "Tree summary : total=%zu leaf=%zu internal=%zu active=%zu inactive=%zu surface=%zu\n",
-                 all_cells.size(), total_leaf, all_cells.size() - total_leaf,
-                 total_active, all_cells.size() - total_active, total_surface);
+    meshmerizer_log_detail::print_status(
+        "Tree",
+        "print_octree_structure_summary",
+        "total=%zu leaf=%zu internal=%zu active=%zu inactive=%zu surface=%zu\n",
+        all_cells.size(),
+        total_leaf,
+        all_cells.size() - total_leaf,
+        total_active,
+        all_cells.size() - total_active,
+        total_surface);
     for (std::uint32_t depth = 0; depth < per_depth.size(); ++depth) {
         const DepthSummary &summary = per_depth[depth];
-        std::fprintf(stdout,
-                     "  depth %u   : total=%zu leaf=%zu internal=%zu active=%zu inactive=%zu surface=%zu\n",
-                     depth, summary.total, summary.leaf,
-                     summary.total - summary.leaf, summary.active,
-                     summary.total - summary.active, summary.has_surface);
+        meshmerizer_log_detail::print_status(
+            "Tree",
+            "print_octree_structure_summary",
+            "depth %u: total=%zu leaf=%zu internal=%zu active=%zu inactive=%zu surface=%zu\n",
+            depth,
+            summary.total,
+            summary.leaf,
+            summary.total - summary.leaf,
+            summary.active,
+            summary.total - summary.active,
+            summary.has_surface);
     }
-    std::fflush(stdout);
 }
 
 /**
@@ -896,7 +907,8 @@ inline void balance_octree(
     const BoundingBox &domain,
     std::uint32_t base_resolution,
     std::uint32_t max_depth) {
-    ProgressCounter balance_counter("Balancing", "cells split", 10);
+    ProgressCounter balance_counter(
+        "Building", "balance_octree", "cells split", 10);
 
     // Build the spatial hash once; we will update it incrementally
     // as cells are split rather than rebuilding from scratch each
@@ -911,11 +923,12 @@ inline void balance_octree(
         any_split = false;
 
         const std::size_t cells_before_pass = all_cells.size();
-        std::fprintf(stdout,
-                     "Balance pass %zu: scanning %zu cells for 2:1 violations\n",
-                     balance_pass,
-                     cells_before_pass);
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Building",
+            "balance_octree",
+            "pass %zu: scanning %zu cells for 2:1 violations\n",
+            balance_pass,
+            cells_before_pass);
 
         // Collect indices of leaf cells that violate the 2:1 rule.
         std::vector<std::size_t> to_split;
@@ -948,11 +961,12 @@ inline void balance_octree(
             }
         }
 
-        std::fprintf(stdout,
-                     "Balance pass %zu: found %zu violating leaves\n",
-                     balance_pass,
-                     to_split.size());
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Building",
+            "balance_octree",
+            "pass %zu: found %zu violating leaves\n",
+            balance_pass,
+            to_split.size());
 
         if (!any_split) {
             break;
@@ -1053,18 +1067,20 @@ inline void balance_octree(
             balance_counter.tick();
         }
 
-        std::fprintf(stdout,
-                     "Balance pass %zu: complete (total_cells_now=%zu)\n",
-                     balance_pass,
-                     all_cells.size());
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Building",
+            "balance_octree",
+            "pass %zu: complete (total_cells_now=%zu)\n",
+            balance_pass,
+            all_cells.size());
     }
 
-    std::fprintf(stdout,
-                 "Balance complete after %zu passes (total_cells=%zu)\n",
-                 balance_pass,
-                 all_cells.size());
-    std::fflush(stdout);
+    meshmerizer_log_detail::print_status(
+        "Building",
+        "balance_octree",
+        "complete after %zu passes (total_cells=%zu)\n",
+        balance_pass,
+        all_cells.size());
     balance_counter.finish();
 }
 
@@ -1146,7 +1162,8 @@ refine_octree(
         leaf_queue.push(all_cells.size() - 1);
     }
 
-    ProgressCounter refine_counter("Refining", "cells", 100);
+    ProgressCounter refine_counter(
+        "Building", "refine_octree", "cells", 100);
 
     struct RefinementResult {
         bool has_surface = false;

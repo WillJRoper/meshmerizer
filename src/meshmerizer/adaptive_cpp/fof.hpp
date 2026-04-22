@@ -261,7 +261,7 @@ inline std::vector<std::int64_t> fof_cluster(
     DisjointSet dset;
     dset.init(n);
 
-    ProgressBar fof_bar("FOF clustering", n);
+    ProgressBar fof_bar("Clustering", "fof_cluster", n);
 
     // For each point, check the 27 neighboring bins and union with
     // any point within the linking length.

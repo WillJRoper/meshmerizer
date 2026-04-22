@@ -147,8 +147,8 @@ struct TopLevelParticleGrid {
      * @param positions Particle positions in world space.
      */
     void insert_particles(const std::vector<Vector3d> &positions) {
-        ProgressBar grid_bar("Binning particles",
-                             positions.size());
+        ProgressBar grid_bar(
+            "Building", "insert_particles", positions.size());
 #ifdef WITH_OPENMP
         const std::size_t n_particles = positions.size();
         const std::size_t n_bins = bins.size();

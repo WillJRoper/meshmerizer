@@ -96,25 +96,25 @@ inline bool refine_surface_band_cells(
     }
 
     if (cells_to_visit.empty()) {
-        std::fprintf(stdout,
-                     "Regularization targeted refine: no surface-band splits needed "
-                     "(leaf_size_target=%.6g, total_cells=%zu)\n",
-                     max_surface_leaf_size,
-                     all_cells.size());
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "refine_surface_band_cells",
+            "no surface-band splits needed (leaf_size_target=%.6g, total_cells=%zu)\n",
+            max_surface_leaf_size,
+            all_cells.size());
         return false;
     }
 
-    std::fprintf(stdout,
-                 "Regularization targeted refine: starting from %zu surface-band "
-                 "cells to reach leaf_size<=%.6g (total_cells_before=%zu)\n",
-                 cells_to_visit.size(),
-                 max_surface_leaf_size,
-                 all_cells.size());
-    std::fflush(stdout);
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "refine_surface_band_cells",
+        "starting from %zu surface-band cells to reach leaf_size<=%.6g (total_cells_before=%zu)\n",
+        cells_to_visit.size(),
+        max_surface_leaf_size,
+        all_cells.size());
 
     ProgressCounter refine_counter(
-        "Regularization targeted refine", "cells", 100);
+        "Regularization", "refine_surface_band_cells", "cells", 100);
     std::size_t split_count = 0U;
     std::size_t processed_count = 0U;
 
@@ -220,13 +220,13 @@ inline bool refine_surface_band_cells(
 
     refine_counter.finish();
 
-    std::fprintf(stdout,
-                 "Regularization targeted refine: processed=%zu split=%zu "
-                 "(total_cells_after_refine=%zu)\n",
-                 processed_count,
-                 split_count,
-                 all_cells.size());
-    std::fflush(stdout);
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "refine_surface_band_cells",
+        "processed=%zu split=%zu (total_cells_after_refine=%zu)\n",
+        processed_count,
+        split_count,
+        all_cells.size());
     return split_count > 0U;
 }
 
@@ -289,7 +289,7 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
     std::vector<std::int64_t> cell_to_leaf_index(all_cells.size(), -1);
 
     ProgressCounter classify_counter(
-        "Classifying solid leaves", "cells", 1000);
+        "Regularization", "classify_occupied_solid_leaves", "cells", 1000);
 
 #pragma omp parallel for schedule(dynamic)
     for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
@@ -320,7 +320,7 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
     classify_counter.finish();
 
     ProgressCounter occupancy_counter(
-        "Building occupancy", "cells", 1000);
+        "Regularization", "classify_occupied_solid_leaves", "cells", 1000);
     for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
         occupancy_counter.tick();
         const OctreeCell &cell = all_cells[cell_idx];
@@ -362,7 +362,7 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
     occupancy_counter.finish();
 
     ProgressCounter neighbor_counter(
-        "Linking solid neighbors", "leaves", 1000);
+        "Regularization", "classify_occupied_solid_leaves", "leaves", 1000);
     for (OccupiedSolidLeaf &leaf : solid_leaves) {
         neighbor_counter.tick();
         const auto neighbors = face_neighbor_cells(
@@ -385,7 +385,8 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
 inline std::vector<std::uint8_t> build_inside_mask(
     const std::vector<OccupiedSolidLeaf> &solid_leaves) {
     std::vector<std::uint8_t> inside_mask(solid_leaves.size(), 0U);
-    ProgressCounter mask_counter("Building inside mask", "leaves", 1000);
+    ProgressCounter mask_counter(
+        "Regularization", "build_inside_mask", "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
         mask_counter.tick();
         inside_mask[leaf_index] =
@@ -410,7 +411,8 @@ inline std::vector<double> compute_outside_distance_from_inside_mask(
         std::greater<QueueEntry>> queue;
 
     ProgressCounter seed_counter(
-        "Thickening distance seeds", "leaves", 1000);
+        "Regularization", "compute_outside_distance_from_inside_mask",
+        "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
         seed_counter.tick();
         if (inside_mask[leaf_index] == 0U) {
@@ -441,7 +443,8 @@ inline std::vector<double> compute_outside_distance_from_inside_mask(
     seed_counter.finish();
 
     ProgressCounter wavefront_counter(
-        "Thickening distance wavefront", "queue pops", 10000);
+        "Regularization", "compute_outside_distance_from_inside_mask",
+        "queue pops", 10000);
     while (!queue.empty()) {
         wavefront_counter.tick();
         const auto [distance, leaf_index] = queue.top();
@@ -483,7 +486,8 @@ inline std::vector<std::uint8_t> dilate_inside_mask(
     double dilation_radius) {
     std::vector<std::uint8_t> dilated_inside(inside_mask.size(), 0U);
 
-    ProgressCounter dilate_counter("Pre-thickening solid", "leaves", 1000);
+    ProgressCounter dilate_counter(
+        "Regularization", "dilate_inside_mask", "leaves", 1000);
 #pragma omp parallel for schedule(static)
     for (std::size_t leaf_index = 0; leaf_index < inside_mask.size(); ++leaf_index) {
         dilate_counter.tick();
@@ -533,26 +537,27 @@ inline bool refine_thickening_band_cells(
     }
 
     if (cells_to_visit.empty()) {
-        std::fprintf(stdout,
-                     "Pre-thickening refine: no growth-band splits needed "
-                     "(leaf_size_target=%.6g, radius=%.6g, total_cells=%zu)\n",
-                     target_leaf_size,
-                     thickening_radius,
-                     all_cells.size());
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "refine_thickening_band_cells",
+            "no growth-band splits needed (leaf_size_target=%.6g, radius=%.6g, total_cells=%zu)\n",
+            target_leaf_size,
+            thickening_radius,
+            all_cells.size());
         return false;
     }
 
-    std::fprintf(stdout,
-                 "Pre-thickening refine: starting from %zu growth-band cells "
-                 "to reach leaf_size<=%.6g (radius=%.6g, total_cells_before=%zu)\n",
-                 cells_to_visit.size(),
-                 target_leaf_size,
-                 thickening_radius,
-                 all_cells.size());
-    std::fflush(stdout);
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "refine_thickening_band_cells",
+        "starting from %zu growth-band cells to reach leaf_size<=%.6g (radius=%.6g, total_cells_before=%zu)\n",
+        cells_to_visit.size(),
+        target_leaf_size,
+        thickening_radius,
+        all_cells.size());
 
-    ProgressCounter refine_counter("Pre-thickening refine", "cells", 100);
+    ProgressCounter refine_counter(
+        "Regularization", "refine_thickening_band_cells", "cells", 100);
     std::size_t split_count = 0U;
     std::size_t processed_count = 0U;
 
@@ -653,13 +658,13 @@ inline bool refine_thickening_band_cells(
 
     refine_counter.finish();
 
-    std::fprintf(stdout,
-                 "Pre-thickening refine: processed=%zu split=%zu "
-                 "(total_cells_after_refine=%zu)\n",
-                 processed_count,
-                 split_count,
-                 all_cells.size());
-    std::fflush(stdout);
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "refine_thickening_band_cells",
+        "processed=%zu split=%zu (total_cells_after_refine=%zu)\n",
+        processed_count,
+        split_count,
+        all_cells.size());
     return split_count > 0U;
 }
 
@@ -675,7 +680,7 @@ inline std::vector<double> compute_inside_clearance(
         std::greater<QueueEntry>> queue;
 
     ProgressCounter seed_counter(
-        "Inside clearance seeds", "leaves", 1000);
+        "Regularization", "compute_inside_clearance", "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
         seed_counter.tick();
         if (inside_mask[leaf_index] == 0U) {
@@ -706,7 +711,7 @@ inline std::vector<double> compute_inside_clearance(
     seed_counter.finish();
 
     ProgressCounter wavefront_counter(
-        "Inside clearance wavefront", "queue pops", 10000);
+        "Regularization", "compute_inside_clearance", "queue pops", 10000);
 
     while (!queue.empty()) {
         wavefront_counter.tick();
@@ -749,7 +754,8 @@ inline std::vector<std::uint8_t> erode_occupied_solid_leaves(
     double erosion_radius) {
     std::vector<std::uint8_t> kept_inside(inside_mask.size(), 0U);
 
-    ProgressCounter erode_counter("Eroding solid", "leaves", 1000);
+    ProgressCounter erode_counter(
+        "Regularization", "erode_occupied_solid_leaves", "leaves", 1000);
 #pragma omp parallel for schedule(static)
     for (std::size_t leaf_index = 0; leaf_index < inside_mask.size(); ++leaf_index) {
         erode_counter.tick();
@@ -774,7 +780,7 @@ inline std::vector<double> compute_distance_to_eroded_solid(
         std::greater<QueueEntry>> queue;
 
     ProgressCounter seed_counter(
-        "Dilation distance seeds", "leaves", 1000);
+        "Regularization", "compute_distance_to_eroded_solid", "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
         seed_counter.tick();
         if (eroded_inside[leaf_index] == 0U) {
@@ -802,7 +808,7 @@ inline std::vector<double> compute_distance_to_eroded_solid(
     seed_counter.finish();
 
     ProgressCounter wavefront_counter(
-        "Dilation distance wavefront", "queue pops", 10000);
+        "Regularization", "compute_distance_to_eroded_solid", "queue pops", 10000);
 
     while (!queue.empty()) {
         wavefront_counter.tick();
@@ -845,7 +851,8 @@ inline std::vector<std::uint8_t> dilate_eroded_solid_leaves(
     double dilation_radius) {
     std::vector<std::uint8_t> opened_inside(eroded_inside.size(), 0U);
 
-    ProgressCounter dilate_counter("Dilating solid", "leaves", 1000);
+    ProgressCounter dilate_counter(
+        "Regularization", "dilate_eroded_solid_leaves", "leaves", 1000);
 #pragma omp parallel for schedule(static)
     for (std::size_t leaf_index = 0; leaf_index < eroded_inside.size(); ++leaf_index) {
         dilate_counter.tick();
@@ -872,7 +879,7 @@ inline void prune_small_opened_components(
     std::vector<double> component_volumes;
 
     ProgressCounter component_counter(
-        "Opened component analysis", "leaves", 1000);
+        "Regularization", "prune_small_opened_components", "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < opened_inside.size(); ++leaf_index) {
         component_counter.tick();
         if (opened_inside[leaf_index] == 0U || visited[leaf_index] != 0U) {
@@ -939,13 +946,13 @@ inline void prune_small_opened_components(
     }
 
     if (removed_components > 0U) {
-        std::fprintf(stdout,
-                     "Opened component pruning: removed %zu small components "
-                     "(%zu leaves, threshold=%.6g of largest volume)\n",
-                     removed_components,
-                     removed_leaves,
-                     min_component_volume_ratio);
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "prune_small_opened_components",
+            "removed %zu small components (%zu leaves, threshold=%.6g of largest volume)\n",
+            removed_components,
+            removed_leaves,
+            min_component_volume_ratio);
     }
 }
 
@@ -978,7 +985,7 @@ inline void fill_small_opened_cavities(
     std::vector<std::uint8_t> visited(opened_inside.size(), 0U);
     std::vector<OutsideComponent> outside_components;
     ProgressCounter cavity_counter(
-        "Opened cavity analysis", "leaves", 1000);
+        "Regularization", "fill_small_opened_cavities", "leaves", 1000);
 
     for (std::size_t leaf_index = 0; leaf_index < opened_inside.size(); ++leaf_index) {
         cavity_counter.tick();
@@ -1036,13 +1043,13 @@ inline void fill_small_opened_cavities(
     }
 
     if (filled_components > 0U) {
-        std::fprintf(stdout,
-                     "Opened cavity fill: filled %zu enclosed cavities "
-                     "(%zu leaves, threshold=%.6g of opened volume)\n",
-                     filled_components,
-                     filled_leaves,
-                     max_cavity_volume_ratio);
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "fill_small_opened_cavities",
+            "filled %zu enclosed cavities (%zu leaves, threshold=%.6g of opened volume)\n",
+            filled_components,
+            filled_leaves,
+            max_cavity_volume_ratio);
     }
 }
 
@@ -1098,7 +1105,7 @@ inline void suppress_opened_edge_contacts(
     const std::vector<std::int64_t> cell_to_leaf_index =
         build_opened_cell_to_leaf_index(all_cells, solid_leaves);
     ProgressCounter contact_counter(
-        "Opened contact cleanup", "leaves", 1000);
+        "Regularization", "suppress_opened_edge_contacts", "leaves", 1000);
 
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
         contact_counter.tick();
@@ -1186,10 +1193,11 @@ inline void suppress_opened_edge_contacts(
         ++removed;
     }
 
-    std::fprintf(stdout,
-                 "Opened contact cleanup: removed %zu highly exposed leaves\n",
-                 removed);
-    std::fflush(stdout);
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "suppress_opened_edge_contacts",
+        "removed %zu highly exposed leaves\n",
+        removed);
 }
 
 inline std::vector<OpenedBoundarySample> generate_opened_boundary_samples(
@@ -1203,7 +1211,7 @@ inline std::vector<OpenedBoundarySample> generate_opened_boundary_samples(
     std::vector<std::vector<OpenedBoundarySample>> thread_samples(
         static_cast<std::size_t>(n_threads));
     ProgressCounter sample_counter(
-        "Opened boundary samples", "leaves", 1000);
+        "Meshing", "generate_opened_boundary_samples", "leaves", 1000);
 
 #pragma omp parallel for schedule(dynamic)
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
@@ -1358,7 +1366,7 @@ inline bool resolve_opened_edge_ambiguities(
     std::unordered_map<EdgeKey, std::uint32_t, EdgeKeyHash> edge_counts;
     edge_counts.reserve(mesh.triangles.size() * 2U);
     ProgressCounter edge_counter(
-        "Opened edge ambiguity scan", "triangles", 1000);
+        "Regularization", "resolve_opened_edge_ambiguities", "triangles", 1000);
     for (const MeshTriangle &triangle : mesh.triangles) {
         edge_counter.tick();
         for (std::size_t i = 0; i < 3U; ++i) {
@@ -1379,7 +1387,7 @@ inline bool resolve_opened_edge_ambiguities(
     std::vector<CandidateFill> fills;
     fills.reserve(16U);
     ProgressCounter resolve_counter(
-        "Opened edge ambiguity resolve", "edges", 100);
+        "Regularization", "resolve_opened_edge_ambiguities", "edges", 100);
 
     for (const auto &entry : edge_counts) {
         if (entry.second <= 2U) {
@@ -1499,10 +1507,11 @@ inline bool resolve_opened_edge_ambiguities(
     }
 
     if (applied > 0U) {
-        std::fprintf(stdout,
-                     "Opened edge ambiguity resolve: filled %zu leaves\n",
-                     applied);
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "resolve_opened_edge_ambiguities",
+            "filled %zu leaves\n",
+            applied);
     }
     return applied > 0U;
 }
@@ -1520,7 +1529,7 @@ inline OpenedSurfaceMesh generate_opened_surface_mesh(
     std::vector<Vector3d> normal_accum;
     vertex_lookup.reserve(solid_leaves.size() * 8U);
     ProgressCounter surface_counter(
-        "Opened surface extraction", "leaves", 1000);
+        "Meshing", "generate_opened_surface_mesh", "leaves", 1000);
 
     const std::uint32_t fine_resolution =
         base_resolution * (1U << max_depth);
@@ -1742,7 +1751,7 @@ inline OpenedSurfaceMesh generate_opened_surface_mesh(
     surface_counter.finish();
 
     ProgressCounter normal_counter(
-        "Opened surface normals", "vertices", 1000);
+        "Meshing", "generate_opened_surface_mesh", "vertices", 1000);
     for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
         normal_counter.tick();
         const double mag = std::sqrt(
@@ -2110,8 +2119,8 @@ inline std::vector<MeshTriangle> generate_opened_dual_contour_faces(
     std::vector<std::vector<MeshTriangle>> thread_triangles(
         static_cast<std::size_t>(n_threads));
 
-    ProgressBar face_bar("Generating faces",
-                         static_cast<std::size_t>(fine_res));
+    ProgressBar face_bar(
+        "Meshing", "extract_opened_surface_mesh", static_cast<std::size_t>(fine_res));
 
 #pragma omp parallel for schedule(dynamic)
     for (std::uint32_t ix = 0; ix < fine_res; ++ix) {

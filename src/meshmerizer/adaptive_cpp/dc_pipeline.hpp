@@ -145,7 +145,7 @@ inline DCPipelineResult run_dc_pipeline(
     std::vector<std::size_t> initial_contributors;
 
     ProgressBar contrib_bar(
-        "Contributor query", top_cells.size());
+        "Building", "run_dc_pipeline", top_cells.size());
 
     for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
         OctreeCell cell = top_cells[ci];
@@ -223,38 +223,39 @@ inline DCPipelineResult run_dc_pipeline(
 
         double effective_min_feature_thickness = min_feature_thickness;
         if (effective_min_feature_thickness < minimum_resolvable_thickness) {
-            std::fprintf(
-                stdout,
-                "Regularization warning: requested min_feature_thickness=%.6g "
-                "is below the resolvable minimum %.6g at base_resolution=%u "
-                "and max_depth=%u; clamping to %.6g\n",
+            meshmerizer_log_detail::print_status(
+                "Regularization",
+                "run_dc_pipeline",
+                "requested min_feature_thickness=%.6g is below the resolvable "
+                "minimum %.6g at base_resolution=%u and max_depth=%u; "
+                "clamping to %.6g\n",
                 min_feature_thickness,
                 minimum_resolvable_thickness,
                 base_resolution,
                 max_depth,
                 minimum_resolvable_thickness);
-            std::fflush(stdout);
             effective_min_feature_thickness = minimum_resolvable_thickness;
         }
 
         const double opening_radius = 0.5 * effective_min_feature_thickness;
-        std::fprintf(stdout,
-                     "Regularization: min_feature_thickness=%.6g "
-                      "(opening radius=%.6g)\n",
-                     effective_min_feature_thickness, opening_radius);
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "run_dc_pipeline",
+            "min_feature_thickness=%.6g (opening radius=%.6g)\n",
+            effective_min_feature_thickness,
+            opening_radius);
 
         const double max_surface_leaf_size = opening_radius;
         std::size_t regularization_refine_pass = 0U;
         while (true) {
             ++regularization_refine_pass;
-            std::fprintf(stdout,
-                         "Regularization pass %zu: target_leaf_size<=%.6g "
-                         "(total_cells=%zu)\n",
-                         regularization_refine_pass,
-                         max_surface_leaf_size,
-                         all_cells.size());
-            std::fflush(stdout);
+            meshmerizer_log_detail::print_status(
+                "Regularization",
+                "run_dc_pipeline",
+                "pass %zu: target_leaf_size<=%.6g (total_cells=%zu)\n",
+                regularization_refine_pass,
+                max_surface_leaf_size,
+                all_cells.size());
             if (!refine_surface_band_cells(
                     all_cells, all_contributors, positions,
                     smoothing_lengths, isovalue, max_depth,
@@ -262,20 +263,21 @@ inline DCPipelineResult run_dc_pipeline(
                     minimum_usable_hermite_samples,
                     max_qef_rms_residual_ratio,
                     min_normal_alignment_threshold)) {
-                std::fprintf(stdout,
-                             "Regularization pass %zu: no further surface-band "
-                             "refinement required\n",
-                             regularization_refine_pass);
-                std::fflush(stdout);
+                meshmerizer_log_detail::print_status(
+                    "Regularization",
+                    "run_dc_pipeline",
+                    "pass %zu: no further surface-band refinement required\n",
+                    regularization_refine_pass);
                 break;
             }
         }
 
-        std::fprintf(stdout,
-                     "Regularization: targeted refinement complete; starting "
-                     "final balance (total_cells=%zu)\n",
-                     all_cells.size());
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "run_dc_pipeline",
+            "targeted refinement complete; starting final balance "
+            "(total_cells=%zu)\n",
+            all_cells.size());
         balance_octree(
             all_cells, all_contributors, positions, smoothing_lengths,
             isovalue, domain, base_resolution, max_depth);
@@ -299,14 +301,15 @@ inline DCPipelineResult run_dc_pipeline(
                     compute_outside_distance_from_inside_mask(
                         solid_leaves, inside_mask);
                 ++thickening_refine_pass;
-                std::fprintf(stdout,
-                             "Pre-thickening pass %zu: target_leaf_size<=%.6g "
-                             "(radius=%.6g, total_cells=%zu)\n",
-                             thickening_refine_pass,
-                             thickening_leaf_size_target,
-                             pre_thickening_radius,
-                             all_cells.size());
-                std::fflush(stdout);
+                meshmerizer_log_detail::print_status(
+                    "Regularization",
+                    "run_dc_pipeline",
+                    "pre-thickening pass %zu: target_leaf_size<=%.6g "
+                    "(radius=%.6g, total_cells=%zu)\n",
+                    thickening_refine_pass,
+                    thickening_leaf_size_target,
+                    pre_thickening_radius,
+                    all_cells.size());
                 if (!refine_thickening_band_cells(
                         all_cells, all_contributors, positions,
                         smoothing_lengths, isovalue, max_depth,
@@ -316,19 +319,21 @@ inline DCPipelineResult run_dc_pipeline(
                         minimum_usable_hermite_samples,
                         max_qef_rms_residual_ratio,
                         min_normal_alignment_threshold)) {
-                    std::fprintf(stdout,
-                                 "Pre-thickening pass %zu: no further growth-band "
-                                 "refinement required\n",
-                                 thickening_refine_pass);
-                    std::fflush(stdout);
+                    meshmerizer_log_detail::print_status(
+                        "Regularization",
+                        "run_dc_pipeline",
+                        "pre-thickening pass %zu: no further growth-band "
+                        "refinement required\n",
+                        thickening_refine_pass);
                     break;
                 }
 
-                std::fprintf(stdout,
-                             "Pre-thickening: balancing octree after growth-band "
-                             "refinement (total_cells=%zu)\n",
-                             all_cells.size());
-                std::fflush(stdout);
+                meshmerizer_log_detail::print_status(
+                    "Regularization",
+                    "run_dc_pipeline",
+                    "pre-thickening: balancing octree after growth-band "
+                    "refinement (total_cells=%zu)\n",
+                    all_cells.size());
                 balance_octree(
                     all_cells, all_contributors, positions, smoothing_lengths,
                     isovalue, domain, base_resolution, max_depth);
@@ -346,10 +351,11 @@ inline DCPipelineResult run_dc_pipeline(
                     solid_leaves, inside_mask);
             inside_mask = dilate_inside_mask(
                 inside_mask, thickening_distance, pre_thickening_radius);
-            std::fprintf(stdout,
-                         "Pre-thickening: applied outward radius %.6g\n",
-                         pre_thickening_radius);
-            std::fflush(stdout);
+            meshmerizer_log_detail::print_status(
+                "Regularization",
+                "run_dc_pipeline",
+                "pre-thickening: applied outward radius %.6g\n",
+                pre_thickening_radius);
         }
 
         const std::vector<double> clearance =
@@ -373,11 +379,11 @@ inline DCPipelineResult run_dc_pipeline(
                 static_cast<std::uint8_t>(1U)));
         };
 
-        std::fprintf(stdout,
-                     "Regularization: extracting opened blocky surface "
-                     "(opened_inside=%zu)\n",
-                     log_opened_count());
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "run_dc_pipeline",
+            "extracting opened blocky surface (opened_inside=%zu)\n",
+            log_opened_count());
 
         OpenedSurfaceMesh opened_surface = generate_opened_surface_mesh(
             solid_leaves, opened_inside, all_cells, solid_spatial_index,
@@ -385,37 +391,39 @@ inline DCPipelineResult run_dc_pipeline(
         if (resolve_opened_edge_ambiguities(
                 solid_leaves, all_cells, solid_spatial_index,
                 opened_inside, opened_surface)) {
-            std::fprintf(stdout,
-                         "Regularization: re-extracting opened blocky surface "
-                         "after ambiguity cleanup (opened_inside=%zu)\n",
-                         log_opened_count());
-            std::fflush(stdout);
+            meshmerizer_log_detail::print_status(
+                "Regularization",
+                "run_dc_pipeline",
+                "re-extracting opened blocky surface after ambiguity cleanup "
+                "(opened_inside=%zu)\n",
+                log_opened_count());
             opened_surface = generate_opened_surface_mesh(
                 solid_leaves, opened_inside, all_cells, solid_spatial_index,
                 domain, base_resolution, max_depth);
         }
 
-        std::fprintf(stdout,
-                     "Regularization: opened surface extraction done "
-                     "(%zu vertices, %zu triangles)\n",
-                     opened_surface.vertices.size(),
-                     opened_surface.triangles.size());
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "run_dc_pipeline",
+            "opened surface extraction done (%zu vertices, %zu triangles)\n",
+            opened_surface.vertices.size(),
+            opened_surface.triangles.size());
 
         if (smoothing_iterations > 0 && !opened_surface.vertices.empty()) {
-            std::fprintf(stdout,
-                "Smoothing     : %u iterations, lambda=%.2f (%zu vertices)\n",
+            meshmerizer_log_detail::print_status(
+                "Cleaning",
+                "run_dc_pipeline",
+                "%u smoothing iterations, lambda=%.2f (%zu vertices)\n",
                 smoothing_iterations, smoothing_strength,
                 opened_surface.vertices.size());
-            std::fflush(stdout);
             VertexAdjacency adjacency = build_triangle_mesh_adjacency(
                 opened_surface.vertices.size(),
                 opened_surface.triangles);
             laplacian_smooth_vertices(
                 opened_surface.vertices, adjacency,
                 smoothing_iterations, smoothing_strength);
-            std::fprintf(stdout, "Smoothing     : done\n");
-            std::fflush(stdout);
+            meshmerizer_log_detail::print_status(
+                "Cleaning", "run_dc_pipeline", "smoothing done\n");
         }
 
         std::vector<MeshTriangle> &opened_triangles = opened_surface.triangles;
@@ -424,39 +432,42 @@ inline DCPipelineResult run_dc_pipeline(
         if (max_edge_ratio > 0.0 && !opened_triangles.empty()) {
             const std::size_t tris_before = opened_triangles.size();
             const std::size_t verts_before = opened_vertices.size();
-            std::fprintf(stdout,
-                "Gap filling   : ratio=%.2f (%zu triangles, %zu vertices)\n",
+            meshmerizer_log_detail::print_status(
+                "Meshing",
+                "run_dc_pipeline",
+                "gap filling ratio=%.2f (%zu triangles, %zu vertices)\n",
                 max_edge_ratio, tris_before, verts_before);
-            std::fflush(stdout);
             std::vector<double> cell_sizes(opened_vertices.size(), opening_radius);
             subdivide_long_edges(
                 opened_vertices, opened_triangles,
                 cell_sizes, max_edge_ratio);
-            std::fprintf(stdout,
-                "Gap filling   : done (+%zu vertices, +%zu triangles)\n",
+            meshmerizer_log_detail::print_status(
+                "Meshing",
+                "run_dc_pipeline",
+                "gap filling done (+%zu vertices, +%zu triangles)\n",
                 opened_vertices.size() - verts_before,
                 opened_triangles.size() - tris_before);
-            std::fflush(stdout);
         }
 
         std::size_t opened_inside_count = 0U;
         for (std::uint8_t flag : opened_inside) {
             opened_inside_count += flag != 0U ? 1U : 0U;
         }
-        std::fprintf(stdout,
-                     "Regularization: leaves=%zu opened_inside=%zu "
-                     "surface_vertices=%zu surface_triangles=%zu "
-                     "qef_vertices=%zu\n",
-                     solid_leaves.size(), opened_inside_count,
-                     opened_vertices.size(),
-                     opened_triangles.size(),
-                     static_cast<std::size_t>(0));
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "run_dc_pipeline",
+            "leaves=%zu opened_inside=%zu surface_vertices=%zu "
+            "surface_triangles=%zu qef_vertices=%zu\n",
+            solid_leaves.size(),
+            opened_inside_count,
+            opened_vertices.size(),
+            opened_triangles.size(),
+            static_cast<std::size_t>(0));
 
-        std::fprintf(stdout,
-                     "Regularization: using opened-solid blocky extraction "
-                     "with existing smoothing\n");
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "run_dc_pipeline",
+            "using opened-solid blocky extraction with existing smoothing\n");
 
         print_octree_structure_summary(all_cells);
 
@@ -539,20 +550,20 @@ inline DCPipelineResult run_dc_pipeline(
     // connect the smoothed positions.
 
     if (smoothing_iterations > 0) {
-        std::fprintf(stdout,
-            "Smoothing     : %u iterations, lambda=%.2f "
-            "(%zu vertices)\n",
+        meshmerizer_log_detail::print_status(
+            "Cleaning",
+            "run_dc_pipeline",
+            "%u smoothing iterations, lambda=%.2f (%zu vertices)\n",
             smoothing_iterations, smoothing_strength,
             qef_vertices.size());
-        std::fflush(stdout);
         VertexAdjacency adjacency = build_vertex_adjacency(
             all_cells, spatial_index, max_depth,
             qef_vertices.size());
         laplacian_smooth_vertices(
             qef_vertices, adjacency,
             smoothing_iterations, smoothing_strength);
-        std::fprintf(stdout, "Smoothing     : done\n");
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Cleaning", "run_dc_pipeline", "smoothing done\n");
     }
 
     // ================================================================
@@ -582,11 +593,11 @@ inline DCPipelineResult run_dc_pipeline(
     if (max_edge_ratio > 0.0 && !dc_triangles.empty()) {
         const std::size_t tris_before = dc_triangles.size();
         const std::size_t verts_before = qef_vertices.size();
-        std::fprintf(stdout,
-            "Gap filling   : ratio=%.2f (%zu triangles, "
-            "%zu vertices)\n",
+        meshmerizer_log_detail::print_status(
+            "Meshing",
+            "run_dc_pipeline",
+            "gap filling ratio=%.2f (%zu triangles, %zu vertices)\n",
             max_edge_ratio, tris_before, verts_before);
-        std::fflush(stdout);
         std::vector<double> cell_sizes =
             compute_vertex_cell_sizes(
                 all_cells, qef_vertices.size());
@@ -597,11 +608,11 @@ inline DCPipelineResult run_dc_pipeline(
             qef_vertices.size() - verts_before;
         const std::size_t new_tris =
             dc_triangles.size() - tris_before;
-        std::fprintf(stdout,
-            "Gap filling   : done (+%zu vertices, "
-            "+%zu triangles)\n",
+        meshmerizer_log_detail::print_status(
+            "Meshing",
+            "run_dc_pipeline",
+            "gap filling done (+%zu vertices, +%zu triangles)\n",
             new_verts, new_tris);
-        std::fflush(stdout);
     }
 
     print_octree_structure_summary(all_cells);

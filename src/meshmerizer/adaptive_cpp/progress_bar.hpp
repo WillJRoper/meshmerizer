@@ -23,9 +23,13 @@
 #define MESHMERIZER_PROGRESS_BAR_HPP
 
 #include <atomic>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdio>
+#include <sstream>
 #include <string>
+
+#include "omp_config.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -34,7 +38,44 @@
 #include <unistd.h>
 #endif
 
-namespace detail {
+namespace meshmerizer_log_detail {
+
+inline std::string current_thread_label() {
+    return omp_get_thread_num() == 0 ? "main" : "worker";
+}
+
+inline std::string format_status_prefix(
+    const std::string& operation,
+    const std::string& function_name,
+    const std::string& thread_label = current_thread_label()) {
+    std::ostringstream stream;
+    stream << "[" << operation << "]"
+           << "[" << function_name << "]"
+           << "[" << thread_label << "]";
+    return stream.str();
+}
+
+inline void vprint_status(
+    const std::string& operation,
+    const std::string& function_name,
+    const char* format,
+    std::va_list args) {
+    const std::string prefix = format_status_prefix(operation, function_name);
+    std::fprintf(stdout, "%s ", prefix.c_str());
+    std::vfprintf(stdout, format, args);
+    std::fflush(stdout);
+}
+
+inline void print_status(
+    const std::string& operation,
+    const std::string& function_name,
+    const char* format,
+    ...) {
+    std::va_list args;
+    va_start(args, format);
+    vprint_status(operation, function_name, format, args);
+    va_end(args);
+}
 
 /**
  * @brief Query the terminal width in columns.
@@ -61,7 +102,7 @@ inline int terminal_width() {
 #endif
 }
 
-}  // namespace detail
+}  // namespace meshmerizer_log_detail
 
 /**
  * @class ProgressBar
@@ -86,8 +127,10 @@ public:
      *               "Meshing", "Solving vertices").
      * @param total  Total number of work items.
      */
-    ProgressBar(const std::string& label, std::size_t total)
-        : label_(label),
+    ProgressBar(const std::string& operation,
+                const std::string& function_name,
+                std::size_t total)
+        : prefix_(meshmerizer_log_detail::format_status_prefix(operation, function_name)),
           total_(total),
           current_(0),
           last_rendered_percent_(-1),
@@ -138,7 +181,7 @@ public:
 
 private:
     /** Short label shown before the bar. */
-    std::string label_;
+    std::string prefix_;
 
     /** Total number of work items. */
     std::size_t total_;
@@ -172,15 +215,15 @@ private:
     void render(int pct) {
         if (pct > 100) pct = 100;
 
-        int width = detail::terminal_width();
+        int width = meshmerizer_log_detail::terminal_width();
 
         /* Fixed-width parts:
-         *   "[" + label + "] " = label.size() + 3
+         *   prefix + " "        = prefix.size() + 1
          *   "[" + "] "         = 3
          *   "100%"             = 4  (always reserve for 3 digits + %)
-         *   Total overhead     = label.size() + 10
+         *   Total overhead     = prefix.size() + 8
          */
-        int overhead = static_cast<int>(label_.size()) + 10;
+        int overhead = static_cast<int>(prefix_.size()) + 8;
         int bar_width = width - overhead;
         if (bar_width < 4) bar_width = 4;
 
@@ -205,8 +248,8 @@ private:
         /* Print with carriage return to overwrite the current line. */
         std::fprintf(
             stdout,
-            "\r[%s] [%s] %3d%%",
-            label_.c_str(),
+            "\r%s [%s] %3d%%",
+            prefix_.c_str(),
             bar_str.c_str(),
             pct
         );
@@ -238,10 +281,11 @@ public:
      * @param unit   Noun describing counted items (e.g. "cells").
      * @param update_interval  Minimum count change between redraws.
      */
-    ProgressCounter(const std::string& label,
+    ProgressCounter(const std::string& operation,
+                    const std::string& function_name,
                     const std::string& unit = "items",
                     std::size_t update_interval = 1)
-        : label_(label),
+        : prefix_(meshmerizer_log_detail::format_status_prefix(operation, function_name)),
           unit_(unit),
           current_(0),
           last_rendered_(0),
@@ -277,7 +321,7 @@ public:
     }
 
 private:
-    std::string label_;
+    std::string prefix_;
     std::string unit_;
     std::atomic<std::size_t> current_;
     std::atomic<std::size_t> last_rendered_;
@@ -293,13 +337,13 @@ private:
      * @param count  Current item count.
      */
     void render(std::size_t count) {
-        int width = detail::terminal_width();
+        int width = meshmerizer_log_detail::terminal_width();
 
         /* Build the content string. */
         char buf[256];
         int len = std::snprintf(
-            buf, sizeof(buf), "\r[%s] %zu %s processed",
-            label_.c_str(), count, unit_.c_str());
+            buf, sizeof(buf), "\r%s %zu %s processed",
+            prefix_.c_str(), count, unit_.c_str());
 
         /* Pad with spaces to the terminal width to clear old text. */
         int pad = width - len;

@@ -329,7 +329,7 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
     // written by different threads (they share the same byte).
     std::vector<char> is_active_leaf(n_cells, 0);
 
-    ProgressBar vertex_bar("Solving vertices", n_cells);
+    ProgressBar vertex_bar("Meshing", "solve_vertices", n_cells);
 
     // Pass 1 (parallel): For each leaf cell, lazily sample corners if
     // needed, compute Hermite samples, and solve the QEF.  Each
@@ -681,7 +681,7 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
 
     std::vector<char> needs_vertex(all_cells.size(), 0);
     ProgressBar activation_bar(
-        "Activating incident cells", static_cast<std::size_t>(fine_res));
+        "Meshing", "activate_incident_cells", static_cast<std::size_t>(fine_res));
 
 #pragma omp parallel
     {
@@ -809,8 +809,7 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
          ++closure_iteration) {
         std::vector<char> next_needs_vertex = expanded_needs_vertex;
         ProgressCounter closure_counter(
-            "Closing incident neighbourhood", "cells",
-            100);
+            "Meshing", "close_incident_neighbourhood", "cells", 100);
         std::size_t newly_marked = 0;
         for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
             closure_counter.tick();
@@ -863,10 +862,12 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
             }
         }
         closure_counter.finish();
-        std::fprintf(stdout,
-                     "Incident closure iteration %zu complete (+%zu cells)\n",
-                     closure_iteration, newly_marked);
-        std::fflush(stdout);
+        meshmerizer_log_detail::print_status(
+            "Meshing",
+            "close_incident_neighbourhood",
+            "iteration %zu complete (+%zu cells)\n",
+            closure_iteration,
+            newly_marked);
         expanded_needs_vertex.swap(next_needs_vertex);
         if (newly_marked == 0) {
             break;
@@ -904,7 +905,7 @@ inline bool refine_zero_sample_incident_cells(
             all_cells, spatial_index, max_depth, base_resolution, isovalue);
 
     ProgressCounter refine_counter(
-        "Refining incident cells", "cells", 100);
+        "Meshing", "refine_incident_cells", "cells", 100);
     std::size_t split_count = 0;
     std::size_t zero_sample_count = 0;
     for (std::size_t cell_idx : missing_cells) {
@@ -943,10 +944,13 @@ inline bool refine_zero_sample_incident_cells(
     }
     refine_counter.finish();
 
-    std::fprintf(stdout,
-                 "Incident refinement: missing=%zu zero_sample=%zu split=%zu\n",
-                 missing_cells.size(), zero_sample_count, split_count);
-    std::fflush(stdout);
+    meshmerizer_log_detail::print_status(
+        "Meshing",
+        "refine_zero_sample_incident_cells",
+        "missing=%zu zero_sample=%zu split=%zu\n",
+        missing_cells.size(),
+        zero_sample_count,
+        split_count);
 
     if (split_count == 0) {
         return false;
@@ -1014,11 +1018,14 @@ inline void activate_missing_incident_cells(
         ++activated_count;
     }
 
-    std::fprintf(stdout,
-                 "Retroactive QEF solve: missing=%zu already_present=%zu zero_sample=%zu added=%zu\n",
-                 missing_cells.size(), already_present_count,
-                 zero_sample_count, activated_count);
-    std::fflush(stdout);
+    meshmerizer_log_detail::print_status(
+        "Meshing",
+        "activate_missing_incident_cells",
+        "missing=%zu already_present=%zu zero_sample=%zu added=%zu\n",
+        missing_cells.size(),
+        already_present_count,
+        zero_sample_count,
+        activated_count);
 }
 
 /**
@@ -1099,8 +1106,8 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
     std::vector<std::vector<MeshTriangle>> thread_triangles(
         static_cast<std::size_t>(n_threads));
 
-    ProgressBar face_bar("Generating faces",
-                         static_cast<std::size_t>(fine_res));
+    ProgressBar face_bar(
+        "Meshing", "generate_faces", static_cast<std::size_t>(fine_res));
 
     // Iterate over all fine-grid vertex positions.  Each vertex
     // position (ix, iy, iz) is the min corner of a fine-grid cell.

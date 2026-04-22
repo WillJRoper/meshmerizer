@@ -8,7 +8,12 @@ from typing import Optional
 
 import numpy as np
 
-from meshmerizer.logging import log_debug_status, log_status, record_elapsed
+from meshmerizer.logging import (
+    log_debug_status,
+    log_status,
+    log_warning_status,
+    record_elapsed,
+)
 
 
 def boxsize_to_float(boxsize: object) -> float:
@@ -408,8 +413,14 @@ def load_swift_particles(
                 operation="Loading",
             )
         except Exception as exc:
-            log_status("Loading", f"Error generating smoothing lengths: {exc}")
-            log_status("Loading", "Falling back to point deposition.")
+            log_warning_status(
+                "Loading",
+                f"Error generating smoothing lengths: {exc}",
+            )
+            log_warning_status(
+                "Loading",
+                "Falling back to point deposition.",
+            )
             h = None
             record_elapsed(
                 "Smoothing-length generation",

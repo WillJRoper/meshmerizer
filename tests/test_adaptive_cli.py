@@ -11,6 +11,7 @@ from meshmerizer.commands.adaptive_stl import (
     _remove_islands,
     run_adaptive,
 )
+from meshmerizer.logging import format_status_prefix
 from meshmerizer.mesh.core import Mesh
 
 
@@ -200,3 +201,9 @@ def test_run_adaptive_converts_pre_thickening_in_print_units(
         10.0,
     )
     assert np.isclose(captured["pre_thickening_radius"], expected)
+
+
+def test_format_status_prefix_includes_operation_function_and_thread() -> None:
+    prefix = format_status_prefix("Loading", func="run_adaptive")
+
+    assert prefix == "[Loading][run_adaptive][main]"
