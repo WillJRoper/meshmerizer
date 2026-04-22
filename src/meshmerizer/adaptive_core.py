@@ -638,6 +638,41 @@ def build_refined_tree(
     return cells, np.asarray(contributors, dtype=np.int64)
 
 
+def extract_opened_surface_mesh(
+    positions: "numpy.ndarray",
+    smoothing_lengths: "numpy.ndarray",
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    base_resolution: int,
+    isovalue: float,
+    max_depth: int,
+    opened_inside: "numpy.ndarray",
+    minimum_usable_hermite_samples: int = 3,
+    max_qef_rms_residual_ratio: float = 0.1,
+    min_normal_alignment_threshold: float = 0.97,
+) -> tuple["numpy.ndarray", "numpy.ndarray"]:
+    """Extract a blocky opened-surface mesh from an editable opened mask."""
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
+    opened = np.ascontiguousarray(opened_inside, dtype=np.uint8)
+    vertices, faces = _adaptive.extract_opened_surface_mesh(
+        pos,
+        sml,
+        domain_minimum,
+        domain_maximum,
+        base_resolution,
+        isovalue,
+        max_depth,
+        opened,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+    )
+    return np.asarray(vertices, dtype=np.float64), np.asarray(
+        faces, dtype=np.uint32
+    )
+
+
 def classify_occupied_solid(
     positions: "numpy.ndarray",
     smoothing_lengths: "numpy.ndarray",

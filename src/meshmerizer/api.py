@@ -17,6 +17,7 @@ from meshmerizer.adaptive_core import (
     build_refined_tree,
     classify_occupied_solid,
     compute_isovalue_from_percentile,
+    extract_opened_surface_mesh,
     fof_cluster,
     generate_mesh,
     run_full_pipeline,
@@ -244,6 +245,38 @@ def get_mesh_from_tree(
     return mesh_result
 
 
+def get_mesh_from_topology(
+    topology: TopologyState,
+    *,
+    remove_islands_fraction: Optional[float] = None,
+) -> MeshResult:
+    """Extract a mesh from a Python-editable topology state."""
+    vertices, faces = extract_opened_surface_mesh(
+        topology.tree.positions,
+        topology.tree.smoothing_lengths,
+        topology.tree.domain_min,
+        topology.tree.domain_max,
+        topology.tree.base_resolution,
+        topology.tree.isovalue,
+        topology.tree.max_depth,
+        topology.opened_inside,
+        topology.tree.minimum_usable_hermite_samples,
+        topology.tree.max_qef_rms_residual_ratio,
+        topology.tree.min_normal_alignment_threshold,
+    )
+    mesh_result = MeshResult(
+        mesh=Mesh(vertices=vertices, faces=faces),
+        isovalue=topology.tree.isovalue,
+        n_qef_vertices=0,
+    )
+    if remove_islands_fraction is not None:
+        mesh_result.mesh = remove_islands(
+            mesh_result.mesh,
+            remove_islands_fraction=remove_islands_fraction,
+        )
+    return mesh_result
+
+
 def get_mesh(
     positions: Sequence[Sequence[float]],
     smoothing_lengths: Sequence[float],
@@ -325,6 +358,7 @@ __all__ = [
     "fof_cluster",
     "get_mesh",
     "get_mesh_from_tree",
+    "get_mesh_from_topology",
     "remove_islands",
     "smooth_mesh",
     "subdivide_long_edges",

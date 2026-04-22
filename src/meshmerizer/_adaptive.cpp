@@ -1421,6 +1421,176 @@ static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
 }
 
 /**
+ * @brief Extract a blocky opened-surface mesh from an editable opened mask.
+ *
+ * This lets Python callers modify the opened-solid topology and then hand the
+ * mask back to C++ for consistent mesh extraction and ambiguity cleanup.
+ */
+static PyObject *extract_opened_surface_mesh_py(
+    PyObject * /* self */, PyObject *args) {
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    PyObject *domain_min_object = NULL;
+    PyObject *domain_max_object = NULL;
+    PyObject *opened_inside_object = NULL;
+    unsigned int base_resolution = 0U;
+    double isovalue = 0.0;
+    unsigned int max_depth = 0U;
+    unsigned int minimum_usable_hermite_samples = 3U;
+    double max_qef_rms_residual_ratio = 0.1;
+    double min_normal_alignment_threshold = 0.97;
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    BoundingBox domain{};
+    std::vector<std::uint8_t> opened_inside;
+
+    if (!PyArg_ParseTuple(args, "OOOOIdIO|Idd",
+                          &positions_object,
+                          &smoothing_object,
+                          &domain_min_object,
+                          &domain_max_object,
+                          &base_resolution,
+                          &isovalue,
+                          &max_depth,
+                          &opened_inside_object,
+                          &minimum_usable_hermite_samples,
+                          &max_qef_rms_residual_ratio,
+                          &min_normal_alignment_threshold)) {
+        return NULL;
+    }
+
+    if (!parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths)) {
+        return NULL;
+    }
+    if (positions.size() != smoothing_lengths.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing lengths must match in size");
+        return NULL;
+    }
+    if (!parse_vector3d(domain_min_object, domain.min) ||
+        !parse_vector3d(domain_max_object, domain.max)) {
+        return NULL;
+    }
+
+    std::vector<double> opened_inside_double;
+    if (!parse_double_sequence(opened_inside_object, opened_inside_double)) {
+        return NULL;
+    }
+    opened_inside.reserve(opened_inside_double.size());
+    for (double value : opened_inside_double) {
+        opened_inside.push_back(value != 0.0 ? 1U : 0U);
+    }
+
+    TopLevelParticleGrid grid(domain, base_resolution);
+    grid.insert_particles(positions);
+    grid.compute_bin_max_h(smoothing_lengths);
+
+    std::vector<OctreeCell> top_cells =
+        create_top_level_cells(domain, base_resolution);
+    std::vector<OctreeCell> initial_cells;
+    initial_cells.reserve(top_cells.size());
+    std::vector<std::size_t> initial_contributors;
+
+    ProgressBar pipeline_contrib_bar(
+        "Contributor query", top_cells.size());
+    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+        OctreeCell cell = top_cells[ci];
+
+        std::uint32_t sx = 0, sy = 0, sz = 0;
+        std::uint32_t ex = 0, ey = 0, ez = 0;
+        grid.contributor_bin_span(
+            cell.bounds, smoothing_lengths,
+            sx, sy, sz, ex, ey, ez);
+
+        const std::int64_t begin = static_cast<std::int64_t>(
+            initial_contributors.size());
+        for (std::uint32_t ix = sx; ix <= ex; ++ix) {
+            for (std::uint32_t iy = sy; iy <= ey; ++iy) {
+                for (std::uint32_t iz = sz; iz <= ez; ++iz) {
+                    const TopLevelBin &bin =
+                        grid.bins[grid.flatten_index(ix, iy, iz)];
+                    for (std::size_t pi : bin.particle_indices) {
+                        if (particle_support_overlaps_box(
+                                positions[pi], smoothing_lengths[pi],
+                                cell.bounds)) {
+                            initial_contributors.push_back(pi);
+                        }
+                    }
+                }
+            }
+        }
+        const std::int64_t end = static_cast<std::int64_t>(
+            initial_contributors.size());
+        cell.contributor_begin = begin;
+        cell.contributor_end = end;
+        initial_cells.push_back(cell);
+        pipeline_contrib_bar.tick();
+    }
+    pipeline_contrib_bar.finish();
+
+    auto [all_cells, all_contributors] = refine_octree(
+        std::move(initial_cells), std::move(initial_contributors),
+        positions, smoothing_lengths, isovalue, max_depth, domain,
+        static_cast<std::uint32_t>(base_resolution),
+        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+        max_qef_rms_residual_ratio, min_normal_alignment_threshold);
+
+    LeafSpatialIndex spatial_index;
+    spatial_index.build(all_cells, domain, max_depth,
+                        static_cast<std::uint32_t>(base_resolution));
+    const std::vector<OccupiedSolidLeaf> solid_leaves =
+        classify_occupied_solid_leaves(
+            all_cells, all_contributors, positions, smoothing_lengths,
+            spatial_index, isovalue, max_depth);
+    if (opened_inside.size() != solid_leaves.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "opened_inside length must match the number of solid leaves");
+        return NULL;
+    }
+
+    OpenedSurfaceMesh opened_surface_mesh = generate_opened_surface_mesh(
+        solid_leaves, opened_inside, all_cells, spatial_index,
+        domain, static_cast<std::uint32_t>(base_resolution), max_depth);
+    if (resolve_opened_edge_ambiguities(
+            solid_leaves, all_cells, spatial_index,
+            opened_inside, opened_surface_mesh)) {
+        opened_surface_mesh = generate_opened_surface_mesh(
+            solid_leaves, opened_inside, all_cells, spatial_index,
+            domain, static_cast<std::uint32_t>(base_resolution), max_depth);
+    }
+
+    npy_intp vertex_dims[2] = {
+        static_cast<npy_intp>(opened_surface_mesh.vertices.size()), 3};
+    npy_intp face_dims[2] = {
+        static_cast<npy_intp>(opened_surface_mesh.triangles.size()), 3};
+    PyObject *vertex_array = PyArray_SimpleNew(2, vertex_dims, NPY_DOUBLE);
+    PyObject *face_array = PyArray_SimpleNew(2, face_dims, NPY_UINT32);
+    if (vertex_array == NULL || face_array == NULL) {
+        Py_XDECREF(vertex_array);
+        Py_XDECREF(face_array);
+        return NULL;
+    }
+
+    auto *vertex_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(vertex_array)));
+    auto *face_data = static_cast<std::uint32_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(face_array)));
+    for (std::size_t i = 0; i < opened_surface_mesh.vertices.size(); ++i) {
+        vertex_data[i * 3] = opened_surface_mesh.vertices[i].position.x;
+        vertex_data[i * 3 + 1] = opened_surface_mesh.vertices[i].position.y;
+        vertex_data[i * 3 + 2] = opened_surface_mesh.vertices[i].position.z;
+    }
+    for (std::size_t i = 0; i < opened_surface_mesh.triangles.size(); ++i) {
+        face_data[i * 3] = opened_surface_mesh.triangles[i].vertex_indices[0];
+        face_data[i * 3 + 1] = opened_surface_mesh.triangles[i].vertex_indices[1];
+        face_data[i * 3 + 2] = opened_surface_mesh.triangles[i].vertex_indices[2];
+    }
+
+    return Py_BuildValue("(NN)", vertex_array, face_array);
+}
+
+/**
  * @brief Solve the QEF for one leaf cell and return its representative vertex.
  *
  * @param self Unused.
@@ -2896,6 +3066,14 @@ static PyMethodDef adaptive_methods[] = {
         PyDoc_STR(
             "Build and refine the adaptive octree in C++ and return "
             "(cells, contributors) for resumable Python workflows."),
+    },
+    {
+        "extract_opened_surface_mesh",
+        extract_opened_surface_mesh_py,
+        METH_VARARGS,
+        PyDoc_STR(
+            "Extract a blocky opened-surface mesh from a Python-editable "
+            "opened_inside mask."),
     },
     {
         "create_top_level_cells",

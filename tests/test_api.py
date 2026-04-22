@@ -9,6 +9,7 @@ from meshmerizer import (
     build_and_refine_tree,
     erode_and_dilate,
     get_mesh,
+    get_mesh_from_topology,
     get_mesh_from_tree,
     remove_islands,
     smooth_mesh,
@@ -95,6 +96,23 @@ def test_get_mesh_from_tree_returns_mesh_result() -> None:
         max_depth=2,
     )
     result = get_mesh_from_tree(tree)
+    assert isinstance(result, MeshResult)
+    assert result.mesh.faces.shape[1] == 3
+
+
+def test_get_mesh_from_topology_returns_mesh_result() -> None:
+    positions, smoothing_lengths = _simple_particles()
+    tree = build_and_refine_tree(
+        positions,
+        smoothing_lengths,
+        domain_min=(0.0, 0.0, 0.0),
+        domain_max=(2.0, 2.0, 2.0),
+        base_resolution=2,
+        isovalue=0.01,
+        max_depth=2,
+    )
+    topology = erode_and_dilate(tree, min_feature_thickness=0.2)
+    result = get_mesh_from_topology(topology)
     assert isinstance(result, MeshResult)
     assert result.mesh.faces.shape[1] == 3
 
