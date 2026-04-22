@@ -686,6 +686,7 @@ def classify_occupied_solid(
     min_normal_alignment_threshold: float = 0.97,
     max_surface_leaf_size: float = 0.0,
     erosion_radius: float = 0.0,
+    pre_thickening_radius: float = 0.0,
 ) -> dict:
     """Classify the adaptive occupied solid on octree leaves.
 
@@ -709,6 +710,7 @@ def classify_occupied_solid(
         min_normal_alignment_threshold,
         max_surface_leaf_size,
         erosion_radius,
+        pre_thickening_radius,
     )
 
 
@@ -817,6 +819,7 @@ def run_full_pipeline(
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
     min_feature_thickness: float = 0.0,
+    pre_thickening_radius: float = 0.0,
 ) -> dict:
     """Run the full particles-to-mesh pipeline in C++.
 
@@ -853,6 +856,8 @@ def run_full_pipeline(
             preserve via adaptive implicit opening. Features thinner
             than this may be removed. ``0.0`` disables the
             regularizer.
+        pre_thickening_radius: Optional outward thickening radius applied
+            to the leaf-wise occupied solid before the opening stage.
 
     Returns:
         Dict with keys ``vertices`` (V, 3) float64 ndarray,
@@ -876,4 +881,5 @@ def run_full_pipeline(
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
         min_feature_thickness,
+        pre_thickening_radius,
     )

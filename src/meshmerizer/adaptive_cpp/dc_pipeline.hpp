@@ -103,6 +103,8 @@ struct DCPipelineResult {
  *                          usable Hermite normals and their mean direction.
  * @param min_feature_thickness Minimum physical thickness to preserve via
  *                          adaptive solid opening. 0 disables the regularizer.
+ * @param pre_thickening_radius Optional outward leaf-space thickening radius
+ *                          applied before the opening stage.
  * @return DCPipelineResult containing the output mesh.
  */
 inline DCPipelineResult run_dc_pipeline(
@@ -118,7 +120,8 @@ inline DCPipelineResult run_dc_pipeline(
     std::uint32_t minimum_usable_hermite_samples = 3U,
     double max_qef_rms_residual_ratio = 0.1,
     double min_normal_alignment_threshold = 0.97,
-    double min_feature_thickness = 0.0) {
+    double min_feature_thickness = 0.0,
+    double pre_thickening_radius = 0.0) {
 
     DCPipelineResult result;
     result.isovalue = isovalue;
@@ -279,16 +282,81 @@ inline DCPipelineResult run_dc_pipeline(
 
         LeafSpatialIndex solid_spatial_index;
         solid_spatial_index.build(all_cells, domain, max_depth, base_resolution);
-        const std::vector<OccupiedSolidLeaf> solid_leaves =
+        std::vector<OccupiedSolidLeaf> solid_leaves =
             classify_occupied_solid_leaves(
                 all_cells, all_contributors, positions,
                 smoothing_lengths, solid_spatial_index,
                 isovalue, max_depth);
+        std::vector<std::uint8_t> inside_mask = build_inside_mask(solid_leaves);
+
+        if (pre_thickening_radius > 0.0) {
+            const double thickening_leaf_size_target =
+                std::max(pre_thickening_radius * 0.5, finest_leaf_size);
+            std::size_t thickening_refine_pass = 0U;
+
+            while (true) {
+                const std::vector<double> thickening_distance =
+                    compute_outside_distance_from_inside_mask(
+                        solid_leaves, inside_mask);
+                ++thickening_refine_pass;
+                std::fprintf(stdout,
+                             "Pre-thickening pass %zu: target_leaf_size<=%.6g "
+                             "(radius=%.6g, total_cells=%zu)\n",
+                             thickening_refine_pass,
+                             thickening_leaf_size_target,
+                             pre_thickening_radius,
+                             all_cells.size());
+                std::fflush(stdout);
+                if (!refine_thickening_band_cells(
+                        all_cells, all_contributors, positions,
+                        smoothing_lengths, isovalue, max_depth,
+                        thickening_leaf_size_target, solid_leaves,
+                        inside_mask, thickening_distance,
+                        pre_thickening_radius,
+                        minimum_usable_hermite_samples,
+                        max_qef_rms_residual_ratio,
+                        min_normal_alignment_threshold)) {
+                    std::fprintf(stdout,
+                                 "Pre-thickening pass %zu: no further growth-band "
+                                 "refinement required\n",
+                                 thickening_refine_pass);
+                    std::fflush(stdout);
+                    break;
+                }
+
+                std::fprintf(stdout,
+                             "Pre-thickening: balancing octree after growth-band "
+                             "refinement (total_cells=%zu)\n",
+                             all_cells.size());
+                std::fflush(stdout);
+                balance_octree(
+                    all_cells, all_contributors, positions, smoothing_lengths,
+                    isovalue, domain, base_resolution, max_depth);
+                solid_spatial_index.build(
+                    all_cells, domain, max_depth, base_resolution);
+                solid_leaves = classify_occupied_solid_leaves(
+                    all_cells, all_contributors, positions,
+                    smoothing_lengths, solid_spatial_index,
+                    isovalue, max_depth);
+                inside_mask = build_inside_mask(solid_leaves);
+            }
+
+            const std::vector<double> thickening_distance =
+                compute_outside_distance_from_inside_mask(
+                    solid_leaves, inside_mask);
+            inside_mask = dilate_inside_mask(
+                inside_mask, thickening_distance, pre_thickening_radius);
+            std::fprintf(stdout,
+                         "Pre-thickening: applied outward radius %.6g\n",
+                         pre_thickening_radius);
+            std::fflush(stdout);
+        }
+
         const std::vector<double> clearance =
-            compute_inside_clearance(solid_leaves);
+            compute_inside_clearance(solid_leaves, inside_mask);
         const std::vector<std::uint8_t> eroded_inside =
             erode_occupied_solid_leaves(
-                solid_leaves, clearance, opening_radius);
+                inside_mask, clearance, opening_radius);
         const std::vector<double> dilation_distance =
             compute_distance_to_eroded_solid(solid_leaves, eroded_inside);
         std::vector<std::uint8_t> opened_inside =

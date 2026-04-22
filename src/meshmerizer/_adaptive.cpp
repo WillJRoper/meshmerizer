@@ -2459,9 +2459,10 @@ static PyObject *classify_occupied_solid_py(
     double min_normal_alignment_threshold = 0.97;
     double max_surface_leaf_size = 0.0;
     double erosion_radius = 0.0;
+    double pre_thickening_radius = 0.0;
     (void)self;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdI|Idddd",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|Iddddd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -2473,7 +2474,8 @@ static PyObject *classify_occupied_solid_py(
                           &max_qef_rms_residual_ratio,
                           &min_normal_alignment_threshold,
                           &max_surface_leaf_size,
-                          &erosion_radius)) {
+                          &erosion_radius,
+                          &pre_thickening_radius)) {
         return NULL;
     }
 
@@ -2497,6 +2499,8 @@ static PyObject *classify_occupied_solid_py(
 
     std::vector<OccupiedSolidLeaf> solid_leaves;
     std::vector<double> clearance;
+    std::vector<double> thickening_distance;
+    std::vector<std::uint8_t> thickened_inside;
     std::vector<std::uint8_t> eroded_inside;
     std::vector<double> dilation_distance;
     std::vector<std::uint8_t> opened_inside;
@@ -2506,6 +2510,7 @@ static PyObject *classify_occupied_solid_py(
     std::size_t boundary_inside_count = 0U;
     std::size_t boundary_outside_count = 0U;
     std::size_t eroded_inside_count = 0U;
+    std::size_t thickened_inside_count = 0U;
     std::size_t opened_inside_count = 0U;
 
     Py_BEGIN_ALLOW_THREADS
@@ -2581,9 +2586,23 @@ static PyObject *classify_occupied_solid_py(
     solid_leaves = classify_occupied_solid_leaves(
         all_cells, all_contributors, positions, smoothing_lengths,
         spatial_index, isovalue, static_cast<std::uint32_t>(max_depth));
-    clearance = compute_inside_clearance(solid_leaves);
+    std::vector<std::uint8_t> inside_mask = build_inside_mask(solid_leaves);
+    thickening_distance.assign(
+        solid_leaves.size(), std::numeric_limits<double>::infinity());
+    thickened_inside = inside_mask;
+    if (pre_thickening_radius > 0.0) {
+        thickening_distance = compute_outside_distance_from_inside_mask(
+            solid_leaves, inside_mask);
+        thickened_inside = dilate_inside_mask(
+            inside_mask, thickening_distance, pre_thickening_radius);
+        inside_mask = thickened_inside;
+    } else {
+        thickening_distance = compute_outside_distance_from_inside_mask(
+            solid_leaves, inside_mask);
+    }
+    clearance = compute_inside_clearance(solid_leaves, inside_mask);
     eroded_inside = erode_occupied_solid_leaves(
-        solid_leaves, clearance, erosion_radius);
+        inside_mask, clearance, erosion_radius);
     dilation_distance = compute_distance_to_eroded_solid(
         solid_leaves, eroded_inside);
     opened_inside = dilate_eroded_solid_leaves(
@@ -2610,6 +2629,9 @@ static PyObject *classify_occupied_solid_py(
         if (eroded_inside[i] != 0U) {
             ++eroded_inside_count;
         }
+        if (thickened_inside[i] != 0U) {
+            ++thickened_inside_count;
+        }
         if (opened_inside[i] != 0U) {
             ++opened_inside_count;
         }
@@ -2623,6 +2645,8 @@ static PyObject *classify_occupied_solid_py(
     PyObject *center_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
     PyObject *size_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
     PyObject *clearance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *thickening_distance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *thickened_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
     PyObject *eroded_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
     PyObject *dilation_distance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
     PyObject *opened_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
@@ -2642,6 +2666,7 @@ static PyObject *classify_occupied_solid_py(
         PyArray_SimpleNew(2, mesh_face_dims, NPY_UINT32);
     if (!occupancy_array || !depth_array || !center_array || !size_array ||
         !clearance_array || !eroded_inside_array ||
+        !thickening_distance_array || !thickened_inside_array ||
         !dilation_distance_array || !opened_inside_array ||
         !sample_positions_array || !sample_normals_array ||
         !mesh_vertex_array || !mesh_face_array) {
@@ -2650,6 +2675,8 @@ static PyObject *classify_occupied_solid_py(
         Py_XDECREF(center_array);
         Py_XDECREF(size_array);
         Py_XDECREF(clearance_array);
+        Py_XDECREF(thickening_distance_array);
+        Py_XDECREF(thickened_inside_array);
         Py_XDECREF(eroded_inside_array);
         Py_XDECREF(dilation_distance_array);
         Py_XDECREF(opened_inside_array);
@@ -2670,6 +2697,10 @@ static PyObject *classify_occupied_solid_py(
         PyArray_DATA(reinterpret_cast<PyArrayObject *>(size_array)));
     auto *clearance_data = static_cast<double *>(
         PyArray_DATA(reinterpret_cast<PyArrayObject *>(clearance_array)));
+    auto *thickening_distance_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(thickening_distance_array)));
+    auto *thickened_inside_data = static_cast<std::uint8_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(thickened_inside_array)));
     auto *eroded_inside_data = static_cast<std::uint8_t *>(
         PyArray_DATA(reinterpret_cast<PyArrayObject *>(eroded_inside_array)));
     auto *dilation_distance_data = static_cast<double *>(
@@ -2691,6 +2722,8 @@ static PyObject *classify_occupied_solid_py(
         center_data[i] = solid_leaves[i].center_value;
         size_data[i] = solid_leaves[i].cell_size;
         clearance_data[i] = clearance[i];
+        thickening_distance_data[i] = thickening_distance[i];
+        thickened_inside_data[i] = thickened_inside[i];
         eroded_inside_data[i] = eroded_inside[i];
         dilation_distance_data[i] = dilation_distance[i];
         opened_inside_data[i] = opened_inside[i];
@@ -2717,12 +2750,14 @@ static PyObject *classify_occupied_solid_py(
     }
 
     return Py_BuildValue(
-        "{s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n}",
+        "{s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n}",
         "occupancy", occupancy_array,
         "depths", depth_array,
         "center_values", center_array,
         "cell_sizes", size_array,
         "clearance", clearance_array,
+        "thickening_distance", thickening_distance_array,
+        "thickened_inside", thickened_inside_array,
         "eroded_inside", eroded_inside_array,
         "dilation_distance", dilation_distance_array,
         "opened_inside", opened_inside_array,
@@ -2734,6 +2769,7 @@ static PyObject *classify_occupied_solid_py(
         "n_inside", static_cast<Py_ssize_t>(inside_count),
         "n_boundary_inside", static_cast<Py_ssize_t>(boundary_inside_count),
         "n_boundary_outside", static_cast<Py_ssize_t>(boundary_outside_count),
+        "n_thickened_inside", static_cast<Py_ssize_t>(thickened_inside_count),
         "n_eroded_inside", static_cast<Py_ssize_t>(eroded_inside_count),
         "n_opened_inside", static_cast<Py_ssize_t>(opened_inside_count),
         "n_opened_boundary_samples",
@@ -2853,8 +2889,9 @@ static PyObject *run_full_pipeline_py(
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
     double min_feature_thickness = 0.0;
+    double pre_thickening_radius = 0.0;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdI|IddIddd",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|IddIdddd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -2868,7 +2905,8 @@ static PyObject *run_full_pipeline_py(
                           &minimum_usable_hermite_samples,
                           &max_qef_rms_residual_ratio,
                           &min_normal_alignment_threshold,
-                          &min_feature_thickness)) {
+                          &min_feature_thickness,
+                          &pre_thickening_radius)) {
         return NULL;
     }
 
@@ -2913,7 +2951,8 @@ static PyObject *run_full_pipeline_py(
         static_cast<std::uint32_t>(minimum_usable_hermite_samples),
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
-        min_feature_thickness);
+        min_feature_thickness,
+        pre_thickening_radius);
 
     Py_END_ALLOW_THREADS
 

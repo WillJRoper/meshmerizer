@@ -448,6 +448,9 @@ def run_adaptive(args) -> None:
     effective_min_feature_thickness = getattr(
         args, "min_feature_thickness", 0.0
     )
+    effective_pre_thickening_radius = getattr(
+        args, "pre_thickening_radius", 0.0
+    )
 
     # Set OpenMP thread count if requested.
     if args.nthreads is not None:
@@ -541,6 +544,25 @@ def run_adaptive(args) -> None:
                 f"{effective_min_feature_thickness:.6g} native units",
             )
 
+        if (
+            args.target_size is not None
+            and effective_pre_thickening_radius > 0.0
+        ):
+            effective_pre_thickening_radius = (
+                _convert_print_length_to_native_units(
+                    effective_pre_thickening_radius,
+                    domain_min,
+                    domain_max,
+                    args.target_size,
+                )
+            )
+            log_status(
+                "Config",
+                "Interpreting --pre-thickening-radius in print units: "
+                f"{args.pre_thickening_radius} cm -> "
+                f"{effective_pre_thickening_radius:.6g} native units",
+            )
+
         max_depth = args.max_depth
         base_resolution = args.base_resolution
 
@@ -603,6 +625,7 @@ def run_adaptive(args) -> None:
                     args, "min_normal_alignment_threshold", 0.97
                 ),
                 min_feature_thickness=effective_min_feature_thickness,
+                pre_thickening_radius=effective_pre_thickening_radius,
             )
             record_elapsed(
                 "Octree construction",
@@ -699,6 +722,7 @@ def run_adaptive(args) -> None:
                     args, "min_normal_alignment_threshold", 0.97
                 ),
                 min_feature_thickness=effective_min_feature_thickness,
+                pre_thickening_radius=effective_pre_thickening_radius,
             )
             record_elapsed(
                 "Full pipeline",
@@ -873,6 +897,7 @@ def run_adaptive(args) -> None:
             args, "min_normal_alignment_threshold", 0.97
         ),
         min_feature_thickness=effective_min_feature_thickness,
+        pre_thickening_radius=effective_pre_thickening_radius,
     )
     record_elapsed(
         "Mesh reconstruction",

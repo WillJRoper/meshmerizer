@@ -238,6 +238,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     adaptive.add_argument(
+        "--pre-thickening-radius",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional outward pre-thickening radius applied to the leaf-wise "
+            "occupied solid before the minimum-thickness opening stage. This "
+            "can puff up fragile features so they survive regularization. "
+            "When --target-size is provided, this value is interpreted in "
+            "print centimetres and converted back to native meshing units. "
+            "0 disables pre-thickening. Default: 0.0"
+        ),
+    )
+    adaptive.add_argument(
         "--max-edge-ratio",
         type=float,
         default=1.5,

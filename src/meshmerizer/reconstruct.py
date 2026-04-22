@@ -34,6 +34,7 @@ def reconstruct_group(
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
     min_feature_thickness: float = 0.0,
+    pre_thickening_radius: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct a mesh for one particle group.
 
@@ -57,6 +58,8 @@ def reconstruct_group(
             required.
         min_feature_thickness: Minimum physical feature thickness to preserve
             via adaptive implicit opening.
+        pre_thickening_radius: Optional outward thickening radius applied
+            before the opening stage.
 
     Returns:
         Tuple of ``(vertices, faces)`` where ``vertices`` is a ``(V, 3)``
@@ -89,6 +92,7 @@ def reconstruct_group(
         max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
         min_normal_alignment_threshold=min_normal_alignment_threshold,
         min_feature_thickness=min_feature_thickness,
+        pre_thickening_radius=pre_thickening_radius,
     )
 
     verts = result["vertices"]
@@ -112,6 +116,7 @@ def reconstruct_mesh(
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
     min_feature_thickness: float = 0.0,
+    pre_thickening_radius: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct meshes for one or more particle groups and merge them.
 
@@ -136,6 +141,8 @@ def reconstruct_mesh(
             required.
         min_feature_thickness: Minimum physical feature thickness to preserve
             via adaptive implicit opening.
+        pre_thickening_radius: Optional outward thickening radius applied
+            before the opening stage.
 
     Returns:
         Tuple of ``(vertices, faces)`` merged across all groups.
@@ -174,6 +181,7 @@ def reconstruct_mesh(
             max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
             min_normal_alignment_threshold=min_normal_alignment_threshold,
             min_feature_thickness=min_feature_thickness,
+            pre_thickening_radius=pre_thickening_radius,
         )
 
         if verts.shape[0] == 0:

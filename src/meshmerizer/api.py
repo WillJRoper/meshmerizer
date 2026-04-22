@@ -56,6 +56,8 @@ class TopologyState:
     centers: np.ndarray
     sizes: np.ndarray
     clearance: np.ndarray
+    thickening_distance: np.ndarray
+    thickened_inside: np.ndarray
     eroded_inside: np.ndarray
     dilation_distance: np.ndarray
     opened_inside: np.ndarray
@@ -156,6 +158,8 @@ def build_and_refine_tree(
 def erode_and_dilate(
     tree: TreeState,
     min_feature_thickness: float,
+    *,
+    pre_thickening_radius: float = 0.0,
 ) -> TopologyState:
     """Build the opened-solid topology used by the regularized pipeline."""
     erosion_radius = 0.5 * float(min_feature_thickness)
@@ -172,6 +176,7 @@ def erode_and_dilate(
         tree.min_normal_alignment_threshold,
         max_surface_leaf_size=erosion_radius,
         erosion_radius=erosion_radius,
+        pre_thickening_radius=pre_thickening_radius,
     )
     return TopologyState(
         tree=tree,
@@ -180,6 +185,8 @@ def erode_and_dilate(
         centers=result["center_values"],
         sizes=result["cell_sizes"],
         clearance=result["clearance"],
+        thickening_distance=result["thickening_distance"],
+        thickened_inside=result["thickened_inside"],
         eroded_inside=result["eroded_inside"],
         dilation_distance=result["dilation_distance"],
         opened_inside=result["opened_inside"],
@@ -198,10 +205,16 @@ def get_mesh_from_tree(
     smoothing_strength: float = 0.5,
     max_edge_ratio: float = 1.5,
     min_feature_thickness: float = 0.0,
+    pre_thickening_radius: float = 0.0,
     remove_islands_fraction: Optional[float] = None,
 ) -> MeshResult:
     """Extract a mesh from an already-built tree state."""
-    if tree.cells and tree.contributors and min_feature_thickness <= 0.0:
+    if (
+        tree.cells
+        and tree.contributors
+        and min_feature_thickness <= 0.0
+        and pre_thickening_radius <= 0.0
+    ):
         vertices, _, faces = generate_mesh(
             tree.cells,
             tree.contributors,
@@ -234,6 +247,7 @@ def get_mesh_from_tree(
             max_qef_rms_residual_ratio=tree.max_qef_rms_residual_ratio,
             min_normal_alignment_threshold=tree.min_normal_alignment_threshold,
             min_feature_thickness=min_feature_thickness,
+            pre_thickening_radius=pre_thickening_radius,
         )
         mesh_result = _mesh_result_from_pipeline_dict(result)
 
@@ -292,6 +306,7 @@ def get_mesh(
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
     min_feature_thickness: float = 0.0,
+    pre_thickening_radius: float = 0.0,
     remove_islands_fraction: Optional[float] = None,
 ) -> MeshResult:
     """Run the full public particles-to-mesh workflow."""
@@ -311,6 +326,7 @@ def get_mesh(
         max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
         min_normal_alignment_threshold=min_normal_alignment_threshold,
         min_feature_thickness=min_feature_thickness,
+        pre_thickening_radius=pre_thickening_radius,
     )
     mesh_result = _mesh_result_from_pipeline_dict(result)
     if remove_islands_fraction is not None:
