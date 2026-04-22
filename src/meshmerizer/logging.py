@@ -68,6 +68,7 @@ class LoggingState:
         logger: Root logger used by the package.
         console_handler: Active console handler, if configured.
         file_handler: Active file handler, if configured.
+        warnings: Deferred warning messages collected during the run.
         lock: Re-entrant lock protecting shared logging state.
     """
 
@@ -82,6 +83,7 @@ class LoggingState:
     )
     console_handler: Optional[std_logging.Handler] = None
     file_handler: Optional[std_logging.Handler] = None
+    warnings: list[str] = field(default_factory=list)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -107,11 +109,11 @@ class TqdmConsoleHandler(std_logging.Handler):
 
 
 class ConsoleVisibilityFilter(std_logging.Filter):
-    """Only show warnings/errors or explicitly surfaced summaries."""
+    """Only show errors or explicitly surfaced summaries."""
 
     def filter(self, record: std_logging.LogRecord) -> bool:
         """Return whether a record should be shown on stdout."""
-        return record.levelno >= std_logging.WARNING or bool(
+        return record.levelno >= std_logging.ERROR or bool(
             getattr(record, "console_visible", False)
         )
 
@@ -201,6 +203,14 @@ def log_warning_status(
     thread: str | int | None = None,
 ) -> None:
     """Log a warning status line with the standardized prefix."""
+    func = _caller_function_name(stack_offset=3)
+    formatted = (
+        f"{format_status_prefix(operation, thread=thread, func=func)} "
+        f"{message}"
+    )
+    with _STATE.lock:
+        if _STATE.active:
+            _STATE.warnings.append(formatted)
     log_status(
         operation,
         message,
@@ -409,6 +419,18 @@ def emit_timing_summary() -> None:
     log_summary_status("Timing", "Summary:\n" + "\n".join(lines))
 
 
+def emit_warning_summary() -> None:
+    """Print a concise end-of-run summary of deferred warnings."""
+    with _STATE.lock:
+        if not _STATE.warnings:
+            return
+        warnings = list(_STATE.warnings)
+
+    lines = [f"{len(warnings)} warning(s) recorded:"]
+    lines.extend(f"  - {warning}" for warning in warnings)
+    log_summary_status("Warning", "Summary:\n" + "\n".join(lines))
+
+
 def _remove_handler(handler: Optional[std_logging.Handler]) -> None:
     """Detach and close one logger handler if present.
 
@@ -470,6 +492,7 @@ def _configure_cli_logging() -> None:
     _STATE.file_handler = file_handler
     _STATE.log_path = log_path
     _STATE.timings.clear()
+    _STATE.warnings.clear()
     _set_cpp_status_log_path(log_path)
 
     log_debug_status("Logging", f"Detailed log: {log_path}")
@@ -482,6 +505,7 @@ def _teardown_cli_logging() -> None:
         ``None``. Logging handlers are removed and shared state is reset.
     """
     try:
+        emit_warning_summary()
         emit_timing_summary()
         if _STATE.log_path is not None:
             log_summary_status(
@@ -495,6 +519,7 @@ def _teardown_cli_logging() -> None:
         _STATE.file_handler = None
         _STATE.log_path = None
         _STATE.timings.clear()
+        _STATE.warnings.clear()
 
 
 @contextmanager

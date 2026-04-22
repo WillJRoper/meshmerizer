@@ -11,7 +11,12 @@ from meshmerizer.commands.adaptive_stl import (
     _remove_islands,
     run_adaptive,
 )
-from meshmerizer.logging import format_status_prefix
+from meshmerizer.logging import (
+    cli_logging_context,
+    emit_warning_summary,
+    format_status_prefix,
+    log_warning_status,
+)
 from meshmerizer.mesh.core import Mesh
 
 
@@ -207,3 +212,20 @@ def test_format_status_prefix_includes_operation_function_and_thread() -> None:
     prefix = format_status_prefix("Loading", func="run_adaptive")
 
     assert prefix == "[Loading][run_adaptive][main]"
+
+
+def test_warning_summary_is_deferred_until_end(monkeypatch) -> None:
+    records = []
+
+    def capture_summary(operation, message, *, thread=None):
+        records.append(message)
+
+    with cli_logging_context():
+        monkeypatch.setattr(
+            "meshmerizer.logging.log_summary_status", capture_summary
+        )
+        log_warning_status("Cleaning", "deferred warning")
+        assert not any("deferred warning" in message for message in records)
+        emit_warning_summary()
+
+    assert any("deferred warning" in message for message in records)
