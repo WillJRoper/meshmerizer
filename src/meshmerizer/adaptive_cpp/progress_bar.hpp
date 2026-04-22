@@ -26,6 +26,7 @@
 #include <cstdarg>
 #include <cstddef>
 #include <cstdio>
+#include <mutex>
 #include <sstream>
 #include <string>
 
@@ -42,6 +43,21 @@ namespace meshmerizer_log_detail {
 
 inline std::string current_thread_label() {
     return omp_get_thread_num() == 0 ? "main" : "worker";
+}
+
+inline std::mutex& status_log_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline std::string& status_log_path() {
+    static std::string path;
+    return path;
+}
+
+inline void set_status_log_path(const char* path) {
+    std::lock_guard<std::mutex> lock(status_log_mutex());
+    status_log_path() = path == nullptr ? "" : std::string(path);
 }
 
 inline std::string format_status_prefix(
@@ -61,9 +77,24 @@ inline void vprint_status(
     const char* format,
     std::va_list args) {
     const std::string prefix = format_status_prefix(operation, function_name);
-    std::fprintf(stdout, "%s ", prefix.c_str());
-    std::vfprintf(stdout, format, args);
-    std::fflush(stdout);
+    std::lock_guard<std::mutex> lock(status_log_mutex());
+    const std::string path = status_log_path();
+
+    FILE* stream = stdout;
+    if (!path.empty()) {
+        stream = std::fopen(path.c_str(), "a");
+        if (stream == nullptr) {
+            stream = stdout;
+        }
+    }
+
+    std::fprintf(stream, "%s ", prefix.c_str());
+    std::vfprintf(stream, format, args);
+    std::fflush(stream);
+
+    if (stream != stdout) {
+        std::fclose(stream);
+    }
 }
 
 inline void print_status(

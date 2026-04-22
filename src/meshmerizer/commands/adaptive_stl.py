@@ -22,7 +22,12 @@ from meshmerizer.adaptive_core import (
     refine_octree,
     solve_vertices,
 )
-from meshmerizer.logging import abort_with_error, log_status, record_elapsed
+from meshmerizer.logging import (
+    abort_with_error,
+    log_status,
+    log_summary_status,
+    record_elapsed,
+)
 from meshmerizer.mesh.core import Mesh
 from meshmerizer.printing import scale_mesh_to_print
 from meshmerizer.reconstruct import reconstruct_mesh
@@ -357,7 +362,9 @@ def _visualize_vertices(vert_positions, output_path: str) -> None:
     plt.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    log_status("Saving", f"Saved vertex visualisation to {output_path}")
+    log_summary_status(
+        "Saving", f"Saved vertex visualisation to {output_path}"
+    )
 
 
 def _emit_tree_structure_summary(cells) -> None:
@@ -427,7 +434,7 @@ def _emit_tree_structure_summary(cells) -> None:
             )
         )
 
-    log_status("Tree", "\n".join(lines))
+    log_summary_status("Tree", "\n".join(lines))
 
 
 def run_adaptive(args) -> None:
@@ -773,7 +780,7 @@ def run_adaptive(args) -> None:
                 total_start,
                 operation="Done",
             )
-            log_status(
+            log_summary_status(
                 "Done",
                 f"Adaptive mesh saved to {output_path}",
             )
@@ -940,11 +947,11 @@ def run_adaptive(args) -> None:
     if output_path is None:
         output_path = args.filename.with_suffix(".stl")
 
-    log_status("Saving", f"Writing STL to {output_path}...")
+    log_summary_status("Saving", f"Writing STL to {output_path}...")
     mesh.save(str(output_path))
 
     if args.load_octree is not None or args.save_octree is not None:
         _emit_tree_structure_summary(cells)
 
     record_elapsed("Total pipeline", total_start, operation="Done")
-    log_status("Done", f"Adaptive mesh saved to {output_path}")
+    log_summary_status("Done", f"Adaptive mesh saved to {output_path}")

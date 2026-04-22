@@ -13,6 +13,7 @@ from meshmerizer.logging import (
     log_debug_status,
     log_error_status,
     log_status,
+    log_summary_status,
     log_warning_status,
 )
 
@@ -23,6 +24,7 @@ __all__ = [
     "format_status_prefix",
     "log_debug_status",
     "log_error_status",
+    "log_summary_status",
     "log_status",
     "log_warning_status",
 ]

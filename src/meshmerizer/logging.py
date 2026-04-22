@@ -15,6 +15,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from importlib import import_module
 from pathlib import Path
 from typing import Iterator, NoReturn, Optional
 
@@ -105,6 +106,16 @@ class TqdmConsoleHandler(std_logging.Handler):
             self.handleError(record)
 
 
+class ConsoleVisibilityFilter(std_logging.Filter):
+    """Only show warnings/errors or explicitly surfaced summaries."""
+
+    def filter(self, record: std_logging.LogRecord) -> bool:
+        """Return whether a record should be shown on stdout."""
+        return record.levelno >= std_logging.WARNING or bool(
+            getattr(record, "console_visible", False)
+        )
+
+
 def _caller_function_name(stack_offset: int = 2) -> str:
     """Return the name of the calling function.
 
@@ -160,7 +171,7 @@ def format_status_prefix(
 
     Returns:
         Formatted prefix like ``"[Loading][my_func][main]"`` or
-        ``"[Meshing][my_func][2]"``.
+        ``"[Meshing][my_func][worker]"``.
     """
     resolved_func = func if func is not None else "<unknown>"
     resolved_thread = current_thread_label() if thread is None else str(thread)
@@ -278,6 +289,7 @@ def log_status(
     *,
     thread: int | None = None,
     level: int = std_logging.INFO,
+    console: bool = False,
     _stack_offset: int = 2,
 ) -> None:
     """Log a terminal status line with a standardized prefix.
@@ -287,6 +299,7 @@ def log_status(
         message: Human-readable status message.
         thread: Optional 1-based worker identifier.
         level: Standard-library logging level.
+        console: Whether to also surface the message on stdout.
         _stack_offset: Internal parameter controlling how many stack
             frames to skip when resolving the caller function name.
     """
@@ -295,6 +308,23 @@ def log_status(
         level,
         f"{format_status_prefix(operation, thread=thread, func=func)}"
         f" {message}",
+        extra={"console_visible": console},
+    )
+
+
+def log_summary_status(
+    operation: str,
+    message: str,
+    *,
+    thread: int | None = None,
+) -> None:
+    """Log a final or summary message to both stdout and the file log."""
+    log_status(
+        operation,
+        message,
+        thread=thread,
+        console=True,
+        _stack_offset=3,
     )
 
 
@@ -376,7 +406,7 @@ def emit_timing_summary() -> None:
         if stat.count > 1:
             count_suffix = f" ({stat.count}x)"
         lines.append(f"  {label}: {stat.total:.3f} s{count_suffix}")
-    log_status("Timing", "Summary:\n" + "\n".join(lines))
+    log_summary_status("Timing", "Summary:\n" + "\n".join(lines))
 
 
 def _remove_handler(handler: Optional[std_logging.Handler]) -> None:
@@ -394,6 +424,20 @@ def _remove_handler(handler: Optional[std_logging.Handler]) -> None:
     handler.close()
 
 
+def _set_cpp_status_log_path(path: Optional[Path]) -> None:
+    """Tell the adaptive C++ extension where to write status lines."""
+    try:
+        adaptive = import_module("meshmerizer._adaptive")
+    except Exception:
+        return
+
+    setter = getattr(adaptive, "set_status_log_path", None)
+    if setter is None:
+        return
+
+    setter(None if path is None else str(path))
+
+
 def _configure_cli_logging() -> None:
     """Attach tqdm-safe console and file logging handlers.
 
@@ -407,6 +451,7 @@ def _configure_cli_logging() -> None:
     console_handler = TqdmConsoleHandler()
     console_handler.setLevel(std_logging.INFO)
     console_handler.setFormatter(std_logging.Formatter("%(message)s"))
+    console_handler.addFilter(ConsoleVisibilityFilter())
 
     log_path = Path.cwd() / "meshmerizer.log"
     file_handler = std_logging.FileHandler(
@@ -425,6 +470,7 @@ def _configure_cli_logging() -> None:
     _STATE.file_handler = file_handler
     _STATE.log_path = log_path
     _STATE.timings.clear()
+    _set_cpp_status_log_path(log_path)
 
     log_debug_status("Logging", f"Detailed log: {log_path}")
 
@@ -438,8 +484,11 @@ def _teardown_cli_logging() -> None:
     try:
         emit_timing_summary()
         if _STATE.log_path is not None:
-            log_status("Logging", f"Detailed log saved to {_STATE.log_path}")
+            log_summary_status(
+                "Logging", f"Detailed log saved to {_STATE.log_path}"
+            )
     finally:
+        _set_cpp_status_log_path(None)
         _remove_handler(_STATE.console_handler)
         _remove_handler(_STATE.file_handler)
         _STATE.console_handler = None

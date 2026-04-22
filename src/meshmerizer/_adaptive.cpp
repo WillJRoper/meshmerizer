@@ -3182,6 +3182,19 @@ static PyMethodDef adaptive_methods[] = {
         PyDoc_STR("Set the number of OpenMP threads."),
     },
     {
+        "set_status_log_path",
+        [](PyObject *, PyObject *args) -> PyObject * {
+            const char *path = nullptr;
+            if (!PyArg_ParseTuple(args, "z", &path)) {
+                return NULL;
+            }
+            meshmerizer_log_detail::set_status_log_path(path);
+            Py_RETURN_NONE;
+        },
+        METH_VARARGS,
+        PyDoc_STR("Set the destination file for C++ status logging."),
+    },
+    {
         "run_octree_pipeline",
         run_octree_pipeline_py,
         METH_VARARGS,
