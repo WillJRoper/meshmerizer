@@ -92,6 +92,9 @@ class LoggingState:
 _STATE = LoggingState()
 
 
+CPP_STATUS_LOG_NAME = "meshmerizer_cpp.log"
+
+
 class TqdmConsoleHandler(std_logging.Handler):
     """Console logging handler that plays nicely with tqdm progress bars."""
 
@@ -493,6 +496,7 @@ def _configure_cli_logging() -> None:
     console_handler.addFilter(ConsoleVisibilityFilter())
 
     log_path = Path.cwd() / "meshmerizer.log"
+    cpp_log_path = Path.cwd() / CPP_STATUS_LOG_NAME
     file_handler = std_logging.FileHandler(
         log_path, mode="w", encoding="utf-8"
     )
@@ -510,7 +514,7 @@ def _configure_cli_logging() -> None:
     _STATE.log_path = log_path
     _STATE.timings.clear()
     _STATE.warnings.clear()
-    _set_cpp_status_log_path(log_path)
+    _set_cpp_status_log_path(cpp_log_path)
     _set_cpp_silent_mode(_STATE.silent)
 
     log_debug_status("Logging", f"Detailed log: {log_path}")

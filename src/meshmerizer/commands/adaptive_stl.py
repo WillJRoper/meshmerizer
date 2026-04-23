@@ -10,7 +10,6 @@ clusters before meshing.
 from __future__ import annotations
 
 import time
-from collections import Counter
 from typing import Optional
 
 import numpy as np
@@ -290,15 +289,13 @@ def _filter_small_particle_fof_clusters(
         return positions, smoothing_lengths
 
     labels = fof_cluster(positions, domain_min, domain_max, linking_factor)
-    counts = Counter(labels.tolist())
-    kept_labels = sorted(
-        label for label, count in counts.items() if count >= min_cluster_size
-    )
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    kept_labels = unique_labels[counts >= min_cluster_size]
 
-    n_groups = len(counts)
-    n_kept_groups = len(kept_labels)
+    n_groups = int(unique_labels.size)
+    n_kept_groups = int(kept_labels.size)
     n_removed_groups = n_groups - n_kept_groups
-    kept_mask = np.isin(labels, np.asarray(kept_labels, dtype=np.int64))
+    kept_mask = np.isin(labels, kept_labels)
     n_kept_particles = int(np.count_nonzero(kept_mask))
     n_removed_particles = int(len(positions) - n_kept_particles)
 
@@ -474,6 +471,14 @@ def run_adaptive(args) -> None:
         args, "pre_thickening_radius", 0.0
     )
 
+    center = getattr(args, "center", None)
+    extent = getattr(args, "extent", None)
+
+    if center is not None and extent is None:
+        abort_with_error("Config", "--center requires --extent.")
+    if extent is not None and center is None:
+        abort_with_error("Config", "--extent requires --center.")
+
     # Set OpenMP thread count if requested.
     if args.nthreads is not None:
         from meshmerizer._adaptive import set_num_threads
@@ -508,6 +513,44 @@ def run_adaptive(args) -> None:
             f"Loaded {len(cells)} cells, "
             f"{len(positions)} particles from HDF5.",
         )
+
+        if (
+            args.target_size is not None
+            and effective_min_feature_thickness > 0.0
+        ):
+            effective_min_feature_thickness = (
+                _convert_print_length_to_native_units(
+                    effective_min_feature_thickness,
+                    domain_min,
+                    domain_max,
+                    args.target_size,
+                )
+            )
+            log_status(
+                "Config",
+                "Interpreting --min-feature-thickness in print units: "
+                f"{args.min_feature_thickness} cm -> "
+                f"{effective_min_feature_thickness:.6g} native units",
+            )
+
+        if (
+            args.target_size is not None
+            and effective_pre_thickening_radius > 0.0
+        ):
+            effective_pre_thickening_radius = (
+                _convert_print_length_to_native_units(
+                    effective_pre_thickening_radius,
+                    domain_min,
+                    domain_max,
+                    args.target_size,
+                )
+            )
+            log_status(
+                "Config",
+                "Interpreting --pre-thickening-radius in print units: "
+                f"{args.pre_thickening_radius} cm -> "
+                f"{effective_pre_thickening_radius:.6g} native units",
+            )
     else:
         # Load particles from the SWIFT snapshot.
         positions, smoothing_lengths, domain_min, domain_max, origin = (
@@ -699,7 +742,7 @@ def run_adaptive(args) -> None:
                     domain_max,
                     args.linking_factor,
                 )
-                n_groups = len(set(group_labels.tolist()))
+                n_groups = int(np.unique(group_labels).size)
                 record_elapsed(
                     "FOF clustering",
                     cluster_start,
@@ -878,7 +921,7 @@ def run_adaptive(args) -> None:
             domain_max,
             args.linking_factor,
         )
-        n_groups = len(set(group_labels.tolist()))
+        n_groups = int(np.unique(group_labels).size)
         record_elapsed("FOF clustering", cluster_start, operation="Clustering")
         log_status(
             "Clustering",

@@ -4,6 +4,7 @@ from argparse import Namespace
 from pathlib import Path
 
 import numpy as np
+import pytest
 import trimesh
 
 from meshmerizer.commands.adaptive_stl import (
@@ -12,6 +13,8 @@ from meshmerizer.commands.adaptive_stl import (
     _simplify_mesh,
     run_adaptive,
 )
+from meshmerizer.commands.args import build_parser
+from meshmerizer.commands.main import main
 from meshmerizer.logging import (
     _STATE,
     cli_logging_context,
@@ -210,6 +213,120 @@ def test_run_adaptive_converts_pre_thickening_in_print_units(
         10.0,
     )
     assert np.isclose(captured["pre_thickening_radius"], expected)
+
+
+def test_run_adaptive_converts_regularization_lengths_for_loaded_octree(
+    monkeypatch, tmp_path
+) -> None:
+    captured = {}
+
+    monkeypatch.setattr(
+        "meshmerizer.commands.adaptive_stl.import_octree",
+        lambda path: {
+            "positions": np.array(
+                [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]],
+                dtype=np.float64,
+            ),
+            "smoothing_lengths": np.full(3, 0.1, dtype=np.float64),
+            "domain_minimum": (0.0, 0.0, 0.0),
+            "domain_maximum": (2.0, 1.0, 1.0),
+            "cells": [],
+            "contributors": [],
+            "isovalue": 0.01,
+            "max_depth": 2,
+            "base_resolution": 2,
+        },
+    )
+    monkeypatch.setattr(
+        "meshmerizer.commands.adaptive_stl.reconstruct_mesh",
+        lambda *args, **kwargs: (
+            captured.update(kwargs),
+            np.array(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=np.float64,
+            ),
+            np.array([[0, 1, 2]], dtype=np.uint32),
+        )[1:],
+    )
+    monkeypatch.setattr(
+        "meshmerizer.mesh.core.trimesh.Trimesh.export",
+        lambda self, *args, **kwargs: None,
+    )
+
+    args = Namespace(
+        nthreads=None,
+        load_octree=tmp_path / "tree.hdf5",
+        save_octree=None,
+        filename=Path("snapshot.hdf5"),
+        output=tmp_path / "out.stl",
+        min_feature_thickness=0.2,
+        pre_thickening_radius=0.4,
+        simplify_factor=1.0,
+        target_size=10.0,
+        max_depth=2,
+        base_resolution=2,
+        isovalue=None,
+        surface_percentile=5.0,
+        fof=False,
+        linking_factor=0.2,
+        smoothing_iterations=0,
+        smoothing_strength=0.5,
+        max_edge_ratio=1.5,
+        min_usable_hermite_samples=3,
+        max_qef_rms_residual_ratio=0.1,
+        min_normal_alignment_threshold=0.97,
+        remove_islands_fraction=None,
+        visualise_verts=None,
+        min_fof_cluster_size=None,
+        center=None,
+        extent=None,
+        silent=False,
+    )
+
+    run_adaptive(args)
+
+    expected_thickening = _convert_print_length_to_native_units(
+        0.4,
+        (0.0, 0.0, 0.0),
+        (2.0, 1.0, 1.0),
+        10.0,
+    )
+    expected_thickness = _convert_print_length_to_native_units(
+        0.2,
+        (0.0, 0.0, 0.0),
+        (2.0, 1.0, 1.0),
+        10.0,
+    )
+    assert np.isclose(captured["pre_thickening_radius"], expected_thickening)
+    assert np.isclose(captured["min_feature_thickness"], expected_thickness)
+
+
+def test_build_parser_supports_top_level_help() -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["--help"])
+    assert excinfo.value.code == 0
+
+
+def test_main_without_arguments_prints_usage(capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main([])
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert "usage:" in captured.err
+
+
+def test_main_accepts_snapshot_without_subcommand(monkeypatch) -> None:
+    called = {}
+
+    monkeypatch.setattr(
+        "meshmerizer.commands.args.run_adaptive",
+        lambda args: called.setdefault("filename", args.filename),
+    )
+
+    main(["snapshot.hdf5", "--silent"])
+
+    assert str(called["filename"]) == "snapshot.hdf5"
 
 
 def test_format_status_prefix_includes_operation_function_and_thread() -> None:

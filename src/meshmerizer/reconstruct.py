@@ -69,6 +69,9 @@ def reconstruct_group(
         ValueError: If positions has fewer than 3 points.
     """
     positions = np.ascontiguousarray(positions, dtype=np.float64)
+    smoothing_lengths = np.ascontiguousarray(
+        smoothing_lengths, dtype=np.float64
+    )
     if positions.ndim != 2 or positions.shape[1] != 3:
         raise ValueError(f"positions must be (N, 3), got {positions.shape}")
     if positions.shape[0] < 3:
@@ -76,6 +79,20 @@ def reconstruct_group(
             "Need at least 3 points for reconstruction, "
             f"got {positions.shape[0]}"
         )
+    if smoothing_lengths.ndim != 1:
+        raise ValueError(
+            "smoothing_lengths must be a 1-D array, "
+            f"got {smoothing_lengths.shape}"
+        )
+    if smoothing_lengths.shape[0] != positions.shape[0]:
+        raise ValueError(
+            "smoothing_lengths must have the same length as positions, "
+            f"got {smoothing_lengths.shape[0]} and {positions.shape[0]}"
+        )
+    if not np.all(np.isfinite(smoothing_lengths)):
+        raise ValueError("smoothing_lengths must be finite")
+    if np.any(smoothing_lengths < 0.0):
+        raise ValueError("smoothing_lengths must be non-negative")
 
     result = run_full_pipeline(
         positions,
@@ -147,10 +164,31 @@ def reconstruct_mesh(
     Returns:
         Tuple of ``(vertices, faces)`` merged across all groups.
     """
+    positions = np.ascontiguousarray(positions, dtype=np.float64)
+    smoothing_lengths = np.ascontiguousarray(
+        smoothing_lengths, dtype=np.float64
+    )
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError(f"positions must be (N, 3), got {positions.shape}")
+    if smoothing_lengths.ndim != 1:
+        raise ValueError(
+            "smoothing_lengths must be a 1-D array, "
+            f"got {smoothing_lengths.shape}"
+        )
+    if smoothing_lengths.shape[0] != positions.shape[0]:
+        raise ValueError(
+            "smoothing_lengths must have the same length as positions, "
+            f"got {smoothing_lengths.shape[0]} and {positions.shape[0]}"
+        )
+
     if group_labels is None:
         group_labels = np.zeros(len(positions), dtype=np.int64)
     else:
         group_labels = np.asarray(group_labels, dtype=np.int64)
+        if group_labels.shape != (positions.shape[0],):
+            raise ValueError(
+                f"group_labels must have shape (N,), got {group_labels.shape}"
+            )
 
     unique_groups = np.unique(group_labels)
 
