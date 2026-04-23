@@ -36,6 +36,10 @@ backward compatibility, or transitional warnings**.
   adding Doxygen coverage to key native regularization and cancellation headers.
 - Updated stale native binding terminology so `_adaptive.cpp` now describes the
   current binding layer instead of historical scaffold/rewrite language.
+- Continued Commit 3 and Commit 5 work by moving adaptive CLI orchestration out
+  of `meshmerizer.commands.adaptive_stl` into `meshmerizer.cli.adaptive` and
+  splitting the control flow into focused helpers for configuration, input
+  loading, octree construction, direct pipeline execution, and mesh output.
 
 ### Commit 1: Reorganize package layout around clear layers
 
