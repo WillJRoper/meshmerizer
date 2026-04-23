@@ -204,6 +204,9 @@ public:
      * the percentage check avoids lock contention on stdout.
      */
     void tick() {
+        if (!enabled_) {
+            return;
+        }
         if (total_ == 0) {
             return;
         }
@@ -221,9 +224,7 @@ public:
              * gets printed twice at the same value.  We avoid a
              * mutex here to keep the hot path lock-free. */
             last_rendered_percent_ = pct;
-            if (enabled_) {
-                render(pct);
-            }
+            render(pct);
         }
     }
 
@@ -369,14 +370,15 @@ public:
      * Thread-safe for concurrent OpenMP calls.
      */
     void tick() {
+        if (!enabled_) {
+            return;
+        }
         std::size_t now =
             current_.fetch_add(1, std::memory_order_relaxed) + 1;
         if (now - last_rendered_.load(std::memory_order_relaxed)
             >= update_interval_) {
             last_rendered_.store(now, std::memory_order_relaxed);
-            if (enabled_) {
-                render(now);
-            }
+            render(now);
         }
     }
 
