@@ -148,3 +148,27 @@ def test_reconstruct_mesh_empty_returns_empty() -> None:
 
     assert verts.shape == (0, 3)
     assert faces.shape == (0, 3)
+
+
+def test_reconstruct_group_propagates_keyboard_interrupt(monkeypatch) -> None:
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float64,
+    )
+    sml = np.ones(3, dtype=np.float64)
+
+    monkeypatch.setattr(
+        "meshmerizer.reconstruct.run_full_pipeline",
+        lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        reconstruct_group(
+            positions,
+            sml,
+            domain_min=(0.0, 0.0, 0.0),
+            domain_max=(4.0, 4.0, 4.0),
+            base_resolution=4,
+            isovalue=0.01,
+            max_depth=2,
+        )

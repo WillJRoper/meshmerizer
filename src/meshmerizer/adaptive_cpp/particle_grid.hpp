@@ -15,6 +15,7 @@
 
 #include "progress_bar.hpp"
 #include "bounding_box.hpp"
+#include "cancellation.hpp"
 #include "omp_config.hpp"
 
 /**
@@ -162,6 +163,9 @@ struct TopLevelParticleGrid {
         // Pass 1: compute bin index per particle and count per bin.
 #pragma omp parallel for schedule(static)
         for (std::size_t i = 0; i < n_particles; ++i) {
+            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(i)) {
+                continue;
+            }
             const Vector3d coords = bin_coordinates(positions[i]);
             const std::size_t bin_idx = flatten_index(
                 static_cast<std::uint32_t>(coords.x),
@@ -186,6 +190,9 @@ struct TopLevelParticleGrid {
         // data buffer.
 #pragma omp parallel for schedule(static)
         for (std::size_t i = 0; i < n_particles; ++i) {
+            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(i)) {
+                continue;
+            }
             const std::size_t bin_idx = particle_bin[i];
             int pos;
 #pragma omp atomic capture
@@ -199,6 +206,8 @@ struct TopLevelParticleGrid {
         for (std::size_t particle_index = 0;
              particle_index < positions.size();
              ++particle_index) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(
+                particle_index);
             const Vector3d coords =
                 bin_coordinates(positions[particle_index]);
             bins[flatten_index(

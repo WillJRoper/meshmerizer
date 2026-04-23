@@ -432,6 +432,99 @@ def test_main_accepts_snapshot_without_subcommand(monkeypatch) -> None:
     assert str(called["filename"]) == "snapshot.hdf5"
 
 
+def test_main_exits_cleanly_on_keyboard_interrupt(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "meshmerizer.commands.args.run_adaptive",
+        lambda args: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["snapshot.hdf5"])
+
+    assert excinfo.value.code == 130
+    captured = capsys.readouterr()
+    assert (
+        "Interrupted by user; cancelled without writing output."
+        in captured.out
+    )
+
+
+def test_run_adaptive_removes_temporary_output_on_interrupt(
+    monkeypatch, tmp_path
+) -> None:
+    positions = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]])
+    smoothing_lengths = np.full(3, 0.1)
+    output_path = tmp_path / "out.stl"
+    temp_path = tmp_path / "out.stl.tmp"
+
+    monkeypatch.setattr(
+        "meshmerizer.commands.adaptive_stl._load_particles_for_adaptive",
+        lambda args: (
+            positions.copy(),
+            smoothing_lengths.copy(),
+            (0.0, 0.0, 0.0),
+            (1.0, 1.0, 1.0),
+            np.zeros(3),
+        ),
+    )
+    monkeypatch.setattr(
+        "meshmerizer.commands.adaptive_stl.compute_isovalue_from_percentile",
+        lambda smoothing_lengths, percentile: 0.01,
+    )
+    monkeypatch.setattr(
+        "meshmerizer.commands.adaptive_stl.reconstruct_mesh",
+        lambda *args, **kwargs: (
+            np.array(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=np.float64,
+            ),
+            np.array([[0, 1, 2]], dtype=np.uint32),
+        ),
+    )
+
+    def interrupting_export(self, filename, *args, **kwargs):
+        Path(filename).write_text("partial")
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(
+        "meshmerizer.mesh.core.trimesh.Trimesh.export",
+        interrupting_export,
+    )
+
+    args = Namespace(
+        nthreads=None,
+        load_octree=None,
+        save_octree=None,
+        filename=Path("snapshot.hdf5"),
+        output=output_path,
+        min_feature_thickness=0.0,
+        pre_thickening_radius=0.0,
+        simplify_factor=1.0,
+        target_size=None,
+        max_depth=2,
+        base_resolution=2,
+        isovalue=None,
+        surface_percentile=5.0,
+        fof=False,
+        linking_factor=0.2,
+        smoothing_iterations=0,
+        smoothing_strength=0.5,
+        max_edge_ratio=1.5,
+        min_usable_hermite_samples=3,
+        max_qef_rms_residual_ratio=0.1,
+        min_normal_alignment_threshold=0.97,
+        remove_islands_fraction=None,
+        visualise_verts=None,
+        min_fof_cluster_size=None,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        run_adaptive(args)
+
+    assert not output_path.exists()
+    assert not temp_path.exists()
+
+
 def test_format_status_prefix_includes_operation_function_and_thread() -> None:
     prefix = format_status_prefix("Loading", func="run_adaptive")
 

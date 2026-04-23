@@ -30,6 +30,7 @@
 
 #include "bounding_box.hpp"
 #include "adaptive_solid.hpp"
+#include "cancellation.hpp"
 #include "edge_subdiv.hpp"
 #include "faces.hpp"
 #include "mesh.hpp"
@@ -158,6 +159,7 @@ inline DCPipelineResult run_dc_pipeline(
         "Building", "run_dc_pipeline", top_cells.size());
 
     for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(ci);
         OctreeCell cell = top_cells[ci];
 
         std::uint32_t sx = 0, sy = 0, sz = 0;
@@ -269,6 +271,8 @@ inline DCPipelineResult run_dc_pipeline(
         const double max_surface_leaf_size = opening_radius;
         std::size_t regularization_refine_pass = 0U;
         while (true) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(
+                regularization_refine_pass + 1U);
             ++regularization_refine_pass;
             const auto surface_refine_pass_start =
                 std::chrono::steady_clock::now();
@@ -329,6 +333,8 @@ inline DCPipelineResult run_dc_pipeline(
             std::size_t thickening_refine_pass = 0U;
 
             while (true) {
+                meshmerizer_cancel_detail::poll_for_cancellation_serial(
+                    thickening_refine_pass + 1U);
                 const auto thickening_distance_start =
                     std::chrono::steady_clock::now();
                 const std::vector<double> thickening_distance =
@@ -665,6 +671,8 @@ inline DCPipelineResult run_dc_pipeline(
         all_cells, all_contributors, positions, smoothing_lengths,
         spatial_index, max_depth, base_resolution, isovalue,
         domain)) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(
+            qef_vertices.size() + all_cells.size());
         spatial_index.build(all_cells, domain, max_depth, base_resolution);
         qef_vertices = solve_all_leaf_vertices(
             all_cells, all_contributors, positions,

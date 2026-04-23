@@ -30,6 +30,7 @@
 #include <sstream>
 #include <string>
 
+#include "cancellation.hpp"
 #include "omp_config.hpp"
 
 #ifdef _WIN32
@@ -205,14 +206,22 @@ public:
      */
     void tick() {
         if (!enabled_) {
+            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                    current_.load(std::memory_order_relaxed) + 1U)) {
+                return;
+            }
             return;
         }
         if (total_ == 0) {
+            meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(1U);
             return;
         }
         /* Atomic increment; returns the value *before* increment. */
         std::size_t prev = current_.fetch_add(1, std::memory_order_relaxed);
         std::size_t now = prev + 1;
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(now)) {
+            return;
+        }
 
         /* Only redraw when the integer percentage changes. */
         int pct = static_cast<int>(
@@ -371,10 +380,17 @@ public:
      */
     void tick() {
         if (!enabled_) {
+            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                    current_.load(std::memory_order_relaxed) + 1U)) {
+                return;
+            }
             return;
         }
         std::size_t now =
             current_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(now)) {
+            return;
+        }
         if (now - last_rendered_.load(std::memory_order_relaxed)
             >= update_interval_) {
             last_rendered_.store(now, std::memory_order_relaxed);

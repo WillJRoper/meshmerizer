@@ -47,6 +47,7 @@
 #include "hermite.hpp"
 #include "mesh.hpp"
 #include "octree_cell.hpp"
+#include "cancellation.hpp"
 #include "omp_config.hpp"
 #include "progress_bar.hpp"
 #include "qef.hpp"
@@ -339,6 +340,11 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
     // are no data races.
 #pragma omp parallel for schedule(dynamic)
     for (std::size_t cell_idx = 0; cell_idx < n_cells; ++cell_idx) {
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                cell_idx)) {
+            vertex_bar.tick();
+            continue;
+        }
         OctreeCell &cell = all_cells[cell_idx];
         if (!cell.is_leaf) {
             vertex_bar.tick();
@@ -416,6 +422,7 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
     // vertex indices must be dense and deterministic.
     std::vector<MeshVertex> vertices;
     for (std::size_t cell_idx = 0; cell_idx < n_cells; ++cell_idx) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
         OctreeCell &cell = all_cells[cell_idx];
         if (is_active_leaf[cell_idx]) {
             cell.representative_vertex_index =
@@ -682,6 +689,10 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
 
 #pragma omp for schedule(dynamic)
         for (std::uint32_t ix = 0; ix < fine_res; ++ix) {
+            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(ix)) {
+                activation_bar.tick();
+                continue;
+            }
             for (std::uint32_t iy = 0; iy < fine_res; ++iy) {
                 for (std::uint32_t iz = 0; iz < fine_res; ++iz) {
                     const std::size_t cell_a_idx =
@@ -787,6 +798,7 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
 
     std::vector<std::size_t> missing_cells;
     for (std::size_t i = 0; i < all_cells.size(); ++i) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(i);
         if (needs_vertex[i]) {
             missing_cells.push_back(i);
         }
@@ -805,6 +817,7 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
             "Meshing", "close_incident_neighbourhood", "cells", 100);
         std::size_t newly_marked = 0;
         for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
             closure_counter.tick();
             if (!expanded_needs_vertex[cell_idx]) {
                 continue;
@@ -869,6 +882,7 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
 
     std::vector<std::size_t> expanded_missing_cells;
     for (std::size_t i = 0; i < all_cells.size(); ++i) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(i);
         if (expanded_needs_vertex[i]) {
             expanded_missing_cells.push_back(i);
         }
@@ -902,6 +916,7 @@ inline bool refine_zero_sample_incident_cells(
     std::size_t split_count = 0;
     std::size_t zero_sample_count = 0;
     for (std::size_t cell_idx : missing_cells) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
         refine_counter.tick();
         if (cell_idx >= all_cells.size()) {
             continue;
@@ -977,6 +992,7 @@ inline void activate_missing_incident_cells(
     std::size_t zero_sample_count = 0;
     std::size_t activated_count = 0;
     for (std::size_t cell_idx : missing_cells) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
         OctreeCell &cell = all_cells[cell_idx];
         if (!cell.is_leaf) {
             continue;
@@ -1091,6 +1107,8 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
     std::vector<std::uint64_t> candidate_origins;
     candidate_origins.reserve(vertices.size() * 8U);
     for (const OctreeCell &cell : all_cells) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(
+            candidate_origins.size() + 1U);
         if (!cell.is_leaf || cell.representative_vertex_index < 0) {
             continue;
         }
@@ -1154,6 +1172,11 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
     for (std::int64_t candidate_index = 0;
          candidate_index < static_cast<std::int64_t>(candidate_origins.size());
          ++candidate_index) {
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                static_cast<std::size_t>(candidate_index))) {
+            face_bar.tick();
+            continue;
+        }
         // Select this thread's triangle buffer.
         std::vector<MeshTriangle> &local_triangles =
             thread_triangles[

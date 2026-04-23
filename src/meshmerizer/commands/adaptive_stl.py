@@ -454,6 +454,20 @@ def _emit_tree_structure_summary(cells) -> None:
     log_summary_status("Tree", "\n".join(lines))
 
 
+def _save_mesh_output(mesh: Mesh, output_path: Path) -> None:
+    """Write mesh output atomically to avoid partial files on cancel."""
+    temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        mesh.save(str(temp_path))
+        temp_path.replace(output_path)
+    except BaseException:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def run_adaptive(args) -> None:
     """Run the adaptive meshing pipeline from CLI arguments.
 
@@ -881,7 +895,7 @@ def run_adaptive(args) -> None:
                 f"Writing STL to {output_path}...",
             )
             save_start = time.perf_counter()
-            mesh.save(str(output_path))
+            _save_mesh_output(mesh, Path(output_path))
             record_elapsed("STL export", save_start, operation="Saving")
 
             record_elapsed(
@@ -1087,7 +1101,7 @@ def run_adaptive(args) -> None:
 
     log_summary_status("Saving", f"Writing STL to {output_path}...")
     save_start = time.perf_counter()
-    mesh.save(str(output_path))
+    _save_mesh_output(mesh, Path(output_path))
     record_elapsed("STL export", save_start, operation="Saving")
 
     if args.load_octree is not None or args.save_octree is not None:

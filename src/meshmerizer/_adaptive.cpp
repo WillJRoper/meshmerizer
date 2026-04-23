@@ -34,7 +34,26 @@
 #include "adaptive_cpp/fof.hpp"
 #include "adaptive_cpp/dc_pipeline.hpp"
 #include "adaptive_cpp/adaptive_solid.hpp"
+#include "adaptive_cpp/cancellation.hpp"
 #include "adaptive_cpp/qef.hpp"
+
+static PyObject *raise_cancelled_exception() {
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyErr_SetNone(PyExc_KeyboardInterrupt);
+    return NULL;
+}
+
+static PyObject *raise_cpp_exception(const std::exception &exc) {
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyErr_SetString(PyExc_RuntimeError, exc.what());
+    return NULL;
+}
+
+static PyObject *raise_unknown_cpp_exception() {
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyErr_SetString(PyExc_RuntimeError, "unhandled C++ exception");
+    return NULL;
+}
 
 /**
  * @brief Parse a Python `(x, y, z)` tuple into a `Vector3d`.
@@ -2351,89 +2370,100 @@ static PyObject *run_octree_pipeline_py(
     // longer need any Python objects after parsing.
     std::vector<MeshVertex> vertices;
 
-    Py_BEGIN_ALLOW_THREADS
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyThreadState *_save = PyEval_SaveThread();
+    try {
+        // -- Step 1: Create top-level cells + query contributors --
+        TopLevelParticleGrid grid(domain, base_resolution);
+        grid.insert_particles(positions);
+        grid.compute_bin_max_h(smoothing_lengths);
 
-    // -- Step 1: Create top-level cells + query contributors --
-    TopLevelParticleGrid grid(domain, base_resolution);
-    grid.insert_particles(positions);
-    grid.compute_bin_max_h(smoothing_lengths);
+        std::vector<OctreeCell> top_cells =
+            create_top_level_cells(domain, base_resolution);
 
-    std::vector<OctreeCell> top_cells =
-        create_top_level_cells(domain, base_resolution);
+        // Build initial cells with contributor ranges stored in a
+        // flat vector that refine_octree can consume directly.
+        std::vector<OctreeCell> initial_cells;
+        initial_cells.reserve(top_cells.size());
+        std::vector<std::size_t> initial_contributors;
 
-    // Build initial cells with contributor ranges stored in a
-    // flat vector that refine_octree can consume directly.
-    std::vector<OctreeCell> initial_cells;
-    initial_cells.reserve(top_cells.size());
-    std::vector<std::size_t> initial_contributors;
+        ProgressBar pipeline_contrib_bar(
+            "Building", "extract_opened_surface_mesh_py", top_cells.size());
+        for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+            OctreeCell cell = top_cells[ci];
 
-    ProgressBar pipeline_contrib_bar(
-        "Building", "extract_opened_surface_mesh_py", top_cells.size());
-    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
-        OctreeCell cell = top_cells[ci];
+            std::uint32_t sx = 0, sy = 0, sz = 0;
+            std::uint32_t ex = 0, ey = 0, ez = 0;
+            grid.contributor_bin_span(
+                cell.bounds, smoothing_lengths,
+                sx, sy, sz, ex, ey, ez);
 
-        std::uint32_t sx = 0, sy = 0, sz = 0;
-        std::uint32_t ex = 0, ey = 0, ez = 0;
-        grid.contributor_bin_span(
-            cell.bounds, smoothing_lengths,
-            sx, sy, sz, ex, ey, ez);
+            const std::int64_t begin =
+                static_cast<std::int64_t>(
+                    initial_contributors.size());
 
-        const std::int64_t begin =
-            static_cast<std::int64_t>(
-                initial_contributors.size());
-
-        for (std::uint32_t ix = sx; ix <= ex; ++ix) {
-            for (std::uint32_t iy = sy; iy <= ey; ++iy) {
-                for (std::uint32_t iz = sz;
-                     iz <= ez; ++iz) {
-                    const TopLevelBin &bin =
-                        grid.bins[grid.flatten_index(
-                            ix, iy, iz)];
-                    for (std::size_t pi :
-                         bin.particle_indices) {
-                        if (particle_support_overlaps_box(
-                                positions[pi],
-                                smoothing_lengths[pi],
-                                cell.bounds)) {
-                            initial_contributors.push_back(
-                                pi);
+            for (std::uint32_t ix = sx; ix <= ex; ++ix) {
+                for (std::uint32_t iy = sy; iy <= ey; ++iy) {
+                    for (std::uint32_t iz = sz;
+                         iz <= ez; ++iz) {
+                        const TopLevelBin &bin =
+                            grid.bins[grid.flatten_index(
+                                ix, iy, iz)];
+                        for (std::size_t pi :
+                             bin.particle_indices) {
+                            if (particle_support_overlaps_box(
+                                    positions[pi],
+                                    smoothing_lengths[pi],
+                                    cell.bounds)) {
+                                initial_contributors.push_back(
+                                    pi);
+                            }
                         }
                     }
                 }
             }
+
+            const std::int64_t end =
+                static_cast<std::int64_t>(
+                    initial_contributors.size());
+            cell.contributor_begin = begin;
+            cell.contributor_end = end;
+            initial_cells.push_back(cell);
+            pipeline_contrib_bar.tick();
         }
+        pipeline_contrib_bar.finish();
 
-        const std::int64_t end =
-            static_cast<std::int64_t>(
-                initial_contributors.size());
-        cell.contributor_begin = begin;
-        cell.contributor_end = end;
-        initial_cells.push_back(cell);
-        pipeline_contrib_bar.tick();
+        // -- Step 2: Refine octree (uses the overload that accepts
+        //    pre-built initial contributors) --
+        auto [all_cells, all_contributors] = refine_octree(
+            std::move(initial_cells),
+            std::move(initial_contributors),
+            positions,
+            smoothing_lengths,
+            isovalue,
+            static_cast<std::uint32_t>(max_depth),
+            domain,
+            static_cast<std::uint32_t>(base_resolution),
+            static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+            max_qef_rms_residual_ratio,
+            min_normal_alignment_threshold);
+
+        // -- Step 3: Solve QEF vertices for active leaf cells --
+        vertices = solve_all_leaf_vertices(
+            all_cells, all_contributors, positions,
+            smoothing_lengths, isovalue);
+    } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
+        PyEval_RestoreThread(_save);
+        return raise_cancelled_exception();
+    } catch (const std::exception &exc) {
+        PyEval_RestoreThread(_save);
+        return raise_cpp_exception(exc);
+    } catch (...) {
+        PyEval_RestoreThread(_save);
+        return raise_unknown_cpp_exception();
     }
-    pipeline_contrib_bar.finish();
-
-    // -- Step 2: Refine octree (uses the overload that accepts
-    //    pre-built initial contributors) --
-    auto [all_cells, all_contributors] = refine_octree(
-        std::move(initial_cells),
-        std::move(initial_contributors),
-        positions,
-        smoothing_lengths,
-        isovalue,
-        static_cast<std::uint32_t>(max_depth),
-        domain,
-        static_cast<std::uint32_t>(base_resolution),
-        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
-        max_qef_rms_residual_ratio,
-        min_normal_alignment_threshold);
-
-    // -- Step 3: Solve QEF vertices for active leaf cells --
-    vertices = solve_all_leaf_vertices(
-        all_cells, all_contributors, positions,
-        smoothing_lengths, isovalue);
-
-    Py_END_ALLOW_THREADS
+    PyEval_RestoreThread(_save);
+    meshmerizer_cancel_detail::reset_cancel_state();
 
     // Return (positions_Nx3, normals_Nx3) as NumPy arrays.
     return build_vertices_numpy_result(vertices);
@@ -2514,131 +2544,142 @@ static PyObject *classify_occupied_solid_py(
     std::size_t thickened_inside_count = 0U;
     std::size_t opened_inside_count = 0U;
 
-    Py_BEGIN_ALLOW_THREADS
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyThreadState *_save = PyEval_SaveThread();
+    try {
+        TopLevelParticleGrid grid(domain, base_resolution);
+        grid.insert_particles(positions);
+        grid.compute_bin_max_h(smoothing_lengths);
 
-    TopLevelParticleGrid grid(domain, base_resolution);
-    grid.insert_particles(positions);
-    grid.compute_bin_max_h(smoothing_lengths);
+        std::vector<OctreeCell> top_cells =
+            create_top_level_cells(domain, base_resolution);
+        std::vector<OctreeCell> initial_cells;
+        initial_cells.reserve(top_cells.size());
+        std::vector<std::size_t> initial_contributors;
 
-    std::vector<OctreeCell> top_cells =
-        create_top_level_cells(domain, base_resolution);
-    std::vector<OctreeCell> initial_cells;
-    initial_cells.reserve(top_cells.size());
-    std::vector<std::size_t> initial_contributors;
+        for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+            OctreeCell cell = top_cells[ci];
+            std::uint32_t sx = 0, sy = 0, sz = 0;
+            std::uint32_t ex = 0, ey = 0, ez = 0;
+            grid.contributor_bin_span(
+                cell.bounds, smoothing_lengths, sx, sy, sz, ex, ey, ez);
 
-    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
-        OctreeCell cell = top_cells[ci];
-        std::uint32_t sx = 0, sy = 0, sz = 0;
-        std::uint32_t ex = 0, ey = 0, ez = 0;
-        grid.contributor_bin_span(
-            cell.bounds, smoothing_lengths, sx, sy, sz, ex, ey, ez);
-
-        const std::int64_t begin =
-            static_cast<std::int64_t>(initial_contributors.size());
-        for (std::uint32_t ix = sx; ix <= ex; ++ix) {
-            for (std::uint32_t iy = sy; iy <= ey; ++iy) {
-                for (std::uint32_t iz = sz; iz <= ez; ++iz) {
-                    const TopLevelBin &bin =
-                        grid.bins[grid.flatten_index(ix, iy, iz)];
-                    for (std::size_t pi : bin.particle_indices) {
-                        if (particle_support_overlaps_box(
-                                positions[pi], smoothing_lengths[pi],
-                                cell.bounds)) {
-                            initial_contributors.push_back(pi);
+            const std::int64_t begin =
+                static_cast<std::int64_t>(initial_contributors.size());
+            for (std::uint32_t ix = sx; ix <= ex; ++ix) {
+                for (std::uint32_t iy = sy; iy <= ey; ++iy) {
+                    for (std::uint32_t iz = sz; iz <= ez; ++iz) {
+                        const TopLevelBin &bin =
+                            grid.bins[grid.flatten_index(ix, iy, iz)];
+                        for (std::size_t pi : bin.particle_indices) {
+                            if (particle_support_overlaps_box(
+                                    positions[pi], smoothing_lengths[pi],
+                                    cell.bounds)) {
+                                initial_contributors.push_back(pi);
+                            }
                         }
                     }
                 }
             }
+
+            const std::int64_t end =
+                static_cast<std::int64_t>(initial_contributors.size());
+            cell.contributor_begin = begin;
+            cell.contributor_end = end;
+            initial_cells.push_back(cell);
         }
 
-        const std::int64_t end =
-            static_cast<std::int64_t>(initial_contributors.size());
-        cell.contributor_begin = begin;
-        cell.contributor_end = end;
-        initial_cells.push_back(cell);
+        auto [all_cells, all_contributors] = refine_octree(
+            std::move(initial_cells), std::move(initial_contributors),
+            positions, smoothing_lengths, isovalue,
+            static_cast<std::uint32_t>(max_depth), domain,
+            static_cast<std::uint32_t>(base_resolution),
+            static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+            max_qef_rms_residual_ratio, min_normal_alignment_threshold);
+
+        while (refine_surface_band_cells(
+            all_cells, all_contributors, positions, smoothing_lengths,
+            isovalue, static_cast<std::uint32_t>(max_depth),
+            max_surface_leaf_size,
+            static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+            max_qef_rms_residual_ratio,
+            min_normal_alignment_threshold)) {
+        }
+
+        balance_octree(
+            all_cells, all_contributors, positions, smoothing_lengths,
+            isovalue, domain, static_cast<std::uint32_t>(base_resolution),
+            static_cast<std::uint32_t>(max_depth));
+
+        LeafSpatialIndex spatial_index;
+        spatial_index.build(
+            all_cells, domain, static_cast<std::uint32_t>(max_depth),
+            static_cast<std::uint32_t>(base_resolution));
+        solid_leaves = classify_occupied_solid_leaves(
+            all_cells, all_contributors, positions, smoothing_lengths,
+            spatial_index, isovalue, static_cast<std::uint32_t>(max_depth));
+        std::vector<std::uint8_t> inside_mask = build_inside_mask(solid_leaves);
+        thickening_distance.assign(
+            solid_leaves.size(), std::numeric_limits<double>::infinity());
+        thickened_inside = inside_mask;
+        if (pre_thickening_radius > 0.0) {
+            thickening_distance = compute_outside_distance_from_inside_mask(
+                solid_leaves, inside_mask);
+            thickened_inside = dilate_inside_mask(
+                inside_mask, thickening_distance, pre_thickening_radius);
+            inside_mask = thickened_inside;
+        } else {
+            thickening_distance = compute_outside_distance_from_inside_mask(
+                solid_leaves, inside_mask);
+        }
+        clearance = compute_inside_clearance(solid_leaves, inside_mask);
+        eroded_inside = erode_occupied_solid_leaves(
+            inside_mask, clearance, erosion_radius);
+        dilation_distance = compute_distance_to_eroded_solid(
+            solid_leaves, eroded_inside);
+        opened_inside = dilate_eroded_solid_leaves(
+            eroded_inside, dilation_distance, erosion_radius);
+        opened_boundary_samples = generate_opened_boundary_samples(
+            solid_leaves, opened_inside, all_cells);
+        opened_surface_mesh = generate_opened_surface_mesh(
+            solid_leaves, opened_inside, all_cells, spatial_index,
+            domain, static_cast<std::uint32_t>(base_resolution),
+            static_cast<std::uint32_t>(max_depth));
+
+        for (std::size_t i = 0; i < solid_leaves.size(); ++i) {
+            const OccupiedSolidLeaf &leaf = solid_leaves[i];
+            if (leaf.occupancy == OccupancyState::kInside ||
+                leaf.occupancy == OccupancyState::kBoundaryInside) {
+                ++inside_count;
+            }
+            if (leaf.occupancy == OccupancyState::kBoundaryInside) {
+                ++boundary_inside_count;
+            }
+            if (leaf.occupancy == OccupancyState::kBoundaryOutside) {
+                ++boundary_outside_count;
+            }
+            if (eroded_inside[i] != 0U) {
+                ++eroded_inside_count;
+            }
+            if (thickened_inside[i] != 0U) {
+                ++thickened_inside_count;
+            }
+            if (opened_inside[i] != 0U) {
+                ++opened_inside_count;
+            }
+        }
+    } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
+        PyEval_RestoreThread(_save);
+        return raise_cancelled_exception();
+    } catch (const std::exception &exc) {
+        PyEval_RestoreThread(_save);
+        return raise_cpp_exception(exc);
+    } catch (...) {
+        PyEval_RestoreThread(_save);
+        return raise_unknown_cpp_exception();
     }
-
-    auto [all_cells, all_contributors] = refine_octree(
-        std::move(initial_cells), std::move(initial_contributors),
-        positions, smoothing_lengths, isovalue,
-        static_cast<std::uint32_t>(max_depth), domain,
-        static_cast<std::uint32_t>(base_resolution),
-        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
-        max_qef_rms_residual_ratio, min_normal_alignment_threshold);
-
-    while (refine_surface_band_cells(
-        all_cells, all_contributors, positions, smoothing_lengths,
-        isovalue, static_cast<std::uint32_t>(max_depth),
-        max_surface_leaf_size,
-        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
-        max_qef_rms_residual_ratio,
-        min_normal_alignment_threshold)) {
-    }
-
-    balance_octree(
-        all_cells, all_contributors, positions, smoothing_lengths,
-        isovalue, domain, static_cast<std::uint32_t>(base_resolution),
-        static_cast<std::uint32_t>(max_depth));
-
-    LeafSpatialIndex spatial_index;
-    spatial_index.build(
-        all_cells, domain, static_cast<std::uint32_t>(max_depth),
-        static_cast<std::uint32_t>(base_resolution));
-    solid_leaves = classify_occupied_solid_leaves(
-        all_cells, all_contributors, positions, smoothing_lengths,
-        spatial_index, isovalue, static_cast<std::uint32_t>(max_depth));
-    std::vector<std::uint8_t> inside_mask = build_inside_mask(solid_leaves);
-    thickening_distance.assign(
-        solid_leaves.size(), std::numeric_limits<double>::infinity());
-    thickened_inside = inside_mask;
-    if (pre_thickening_radius > 0.0) {
-        thickening_distance = compute_outside_distance_from_inside_mask(
-            solid_leaves, inside_mask);
-        thickened_inside = dilate_inside_mask(
-            inside_mask, thickening_distance, pre_thickening_radius);
-        inside_mask = thickened_inside;
-    } else {
-        thickening_distance = compute_outside_distance_from_inside_mask(
-            solid_leaves, inside_mask);
-    }
-    clearance = compute_inside_clearance(solid_leaves, inside_mask);
-    eroded_inside = erode_occupied_solid_leaves(
-        inside_mask, clearance, erosion_radius);
-    dilation_distance = compute_distance_to_eroded_solid(
-        solid_leaves, eroded_inside);
-    opened_inside = dilate_eroded_solid_leaves(
-        eroded_inside, dilation_distance, erosion_radius);
-    opened_boundary_samples = generate_opened_boundary_samples(
-        solid_leaves, opened_inside, all_cells);
-    opened_surface_mesh = generate_opened_surface_mesh(
-        solid_leaves, opened_inside, all_cells, spatial_index,
-        domain, static_cast<std::uint32_t>(base_resolution),
-        static_cast<std::uint32_t>(max_depth));
-
-    for (std::size_t i = 0; i < solid_leaves.size(); ++i) {
-        const OccupiedSolidLeaf &leaf = solid_leaves[i];
-        if (leaf.occupancy == OccupancyState::kInside ||
-            leaf.occupancy == OccupancyState::kBoundaryInside) {
-            ++inside_count;
-        }
-        if (leaf.occupancy == OccupancyState::kBoundaryInside) {
-            ++boundary_inside_count;
-        }
-        if (leaf.occupancy == OccupancyState::kBoundaryOutside) {
-            ++boundary_outside_count;
-        }
-        if (eroded_inside[i] != 0U) {
-            ++eroded_inside_count;
-        }
-        if (thickened_inside[i] != 0U) {
-            ++thickened_inside_count;
-        }
-        if (opened_inside[i] != 0U) {
-            ++opened_inside_count;
-        }
-    }
-
-    Py_END_ALLOW_THREADS
+    PyEval_RestoreThread(_save);
+    meshmerizer_cancel_detail::reset_cancel_state();
 
     const npy_intp dims[1] = {static_cast<npy_intp>(solid_leaves.size())};
     PyObject *occupancy_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
@@ -2831,10 +2872,23 @@ static PyObject *fof_cluster_py(PyObject * /* self */,
     // Run FOF clustering with the GIL released.
     std::vector<std::int64_t> labels;
 
-    Py_BEGIN_ALLOW_THREADS
-    labels = fof_cluster(positions, domain_min, domain_max,
-                         linking_factor);
-    Py_END_ALLOW_THREADS
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyThreadState *_save = PyEval_SaveThread();
+    try {
+        labels = fof_cluster(positions, domain_min, domain_max,
+                             linking_factor);
+    } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
+        PyEval_RestoreThread(_save);
+        return raise_cancelled_exception();
+    } catch (const std::exception &exc) {
+        PyEval_RestoreThread(_save);
+        return raise_cpp_exception(exc);
+    } catch (...) {
+        PyEval_RestoreThread(_save);
+        return raise_unknown_cpp_exception();
+    }
+    PyEval_RestoreThread(_save);
+    meshmerizer_cancel_detail::reset_cancel_state();
 
     // Build a 1-D int64 NumPy array from the labels.
     const npy_intp dims[1] = {
@@ -2939,23 +2993,34 @@ static PyObject *run_full_pipeline_py(
     // Release GIL and run the entire pipeline in C++.
     DCPipelineResult result;
 
-    Py_BEGIN_ALLOW_THREADS
-
-    result = run_dc_pipeline(
-        positions, smoothing_lengths, domain,
-        static_cast<std::uint32_t>(base_resolution),
-        isovalue,
-        static_cast<std::uint32_t>(max_depth),
-        static_cast<std::uint32_t>(smoothing_iterations),
-        smoothing_strength,
-        max_edge_ratio,
-        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
-        max_qef_rms_residual_ratio,
-        min_normal_alignment_threshold,
-        min_feature_thickness,
-        pre_thickening_radius);
-
-    Py_END_ALLOW_THREADS
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyThreadState *_save = PyEval_SaveThread();
+    try {
+        result = run_dc_pipeline(
+            positions, smoothing_lengths, domain,
+            static_cast<std::uint32_t>(base_resolution),
+            isovalue,
+            static_cast<std::uint32_t>(max_depth),
+            static_cast<std::uint32_t>(smoothing_iterations),
+            smoothing_strength,
+            max_edge_ratio,
+            static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+            max_qef_rms_residual_ratio,
+            min_normal_alignment_threshold,
+            min_feature_thickness,
+            pre_thickening_radius);
+    } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
+        PyEval_RestoreThread(_save);
+        return raise_cancelled_exception();
+    } catch (const std::exception &exc) {
+        PyEval_RestoreThread(_save);
+        return raise_cpp_exception(exc);
+    } catch (...) {
+        PyEval_RestoreThread(_save);
+        return raise_unknown_cpp_exception();
+    }
+    PyEval_RestoreThread(_save);
+    meshmerizer_cancel_detail::reset_cancel_state();
 
     // Build output NumPy arrays.
     const std::size_t nv = result.vertices.size();

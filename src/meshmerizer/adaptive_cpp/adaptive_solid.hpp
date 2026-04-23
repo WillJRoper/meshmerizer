@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "cancellation.hpp"
 #include "faces.hpp"
 #include "octree_cell.hpp"
 
@@ -101,6 +102,7 @@ inline bool refine_surface_band_cells(
 
     std::queue<std::size_t> cells_to_visit;
     for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
         const OctreeCell &cell = all_cells[cell_idx];
         if (!cell.is_leaf || !cell.has_surface || cell.depth >= max_depth) {
             continue;
@@ -134,6 +136,8 @@ inline bool refine_surface_band_cells(
     std::size_t processed_count = 0U;
 
     while (!cells_to_visit.empty()) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(
+            processed_count + split_count + 1U);
         const std::size_t cell_idx = cells_to_visit.front();
         cells_to_visit.pop();
         refine_counter.tick();
@@ -343,6 +347,7 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
             occupancy_dirty.resize(all_cells.size(), 0U);
         }
         for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
             if (cell_idx >= occupancy_dirty.size() || occupancy_dirty[cell_idx] == 0U) {
                 continue;
             }
@@ -367,6 +372,11 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
 
 #pragma omp parallel for schedule(dynamic)
     for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                cell_idx)) {
+            classify_counter.tick();
+            continue;
+        }
         classify_counter.tick();
         const OctreeCell &cell = all_cells[cell_idx];
         if (!cell.is_leaf) {
@@ -405,6 +415,11 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
 
 #pragma omp parallel for schedule(dynamic)
     for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                cell_idx)) {
+            occupancy_counter.tick();
+            continue;
+        }
         occupancy_counter.tick();
         const OctreeCell &cell = all_cells[cell_idx];
         if (!cell.is_leaf) {
@@ -454,6 +469,7 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
     occupancy_counter.finish();
 
     for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
         if (leaf_is_included[cell_idx] == 0U) {
             continue;
         }
@@ -472,6 +488,11 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
     for (std::int64_t leaf_index = 0;
          leaf_index < static_cast<std::int64_t>(solid_leaves.size());
          ++leaf_index) {
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                static_cast<std::size_t>(leaf_index))) {
+            neighbor_counter.tick();
+            continue;
+        }
         OccupiedSolidLeaf &leaf =
             solid_leaves[static_cast<std::size_t>(leaf_index)];
         neighbor_counter.tick();
@@ -497,6 +518,7 @@ inline std::vector<std::uint8_t> build_inside_mask(
     ProgressCounter mask_counter(
         "Regularization", "build_inside_mask", "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
         mask_counter.tick();
         inside_mask[leaf_index] =
             (solid_leaves[leaf_index].occupancy == OccupancyState::kInside ||
@@ -524,6 +546,7 @@ inline std::vector<double> compute_outside_distance_from_inside_mask(
         "Regularization", "compute_outside_distance_from_inside_mask",
         "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
         seed_counter.tick();
         if (inside_mask[leaf_index] == 0U) {
             continue;
@@ -556,6 +579,7 @@ inline std::vector<double> compute_outside_distance_from_inside_mask(
         "Regularization", "compute_outside_distance_from_inside_mask",
         "queue pops", 10000);
     while (!queue.empty()) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
         wavefront_counter.tick();
         const auto [distance, leaf_index] = queue.top();
         queue.pop();
@@ -611,6 +635,11 @@ inline std::vector<std::uint8_t> dilate_inside_mask(
         "Regularization", "dilate_inside_mask", "leaves", 1000);
 #pragma omp parallel for schedule(static)
     for (std::size_t leaf_index = 0; leaf_index < inside_mask.size(); ++leaf_index) {
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                leaf_index)) {
+            dilate_counter.tick();
+            continue;
+        }
         dilate_counter.tick();
         dilated_inside[leaf_index] =
             (inside_mask[leaf_index] != 0U ||
@@ -683,6 +712,7 @@ inline bool refine_thickening_band_cells(
     };
 
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
         if (inside_mask[leaf_index] != 0U) {
             continue;
         }
@@ -700,6 +730,7 @@ inline bool refine_thickening_band_cells(
     }
 
     for (std::size_t leaf_index : band_seed_leaf_indices) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
         for (std::int64_t neighbor_leaf_index :
              solid_leaves[leaf_index].face_neighbor_leaf_indices) {
             if (neighbor_leaf_index < 0) {
@@ -758,6 +789,8 @@ inline bool refine_thickening_band_cells(
     };
 
     while (!cells_to_visit.empty()) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(
+            processed_count + split_count + 1U);
         const std::size_t cell_idx = cells_to_visit.front();
         cells_to_visit.pop();
         if (cell_idx < enqueued_cells.size()) {
@@ -889,6 +922,7 @@ inline bool thickening_band_is_fully_refined(
         "Regularization", "thickening_band_is_fully_refined", "leaves", 1000);
     std::size_t unresolved_count = 0U;
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
         check_counter.tick();
         if (inside_mask[leaf_index] != 0U) {
             continue;
@@ -929,6 +963,7 @@ inline std::vector<double> compute_inside_clearance(
     ProgressCounter seed_counter(
         "Regularization", "compute_inside_clearance", "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
         seed_counter.tick();
         if (inside_mask[leaf_index] == 0U) {
             continue;
@@ -961,6 +996,7 @@ inline std::vector<double> compute_inside_clearance(
         "Regularization", "compute_inside_clearance", "queue pops", 10000);
 
     while (!queue.empty()) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
         wavefront_counter.tick();
         const auto [distance, leaf_index] = queue.top();
         queue.pop();
@@ -1011,6 +1047,11 @@ inline std::vector<std::uint8_t> erode_occupied_solid_leaves(
         "Regularization", "erode_occupied_solid_leaves", "leaves", 1000);
 #pragma omp parallel for schedule(static)
     for (std::size_t leaf_index = 0; leaf_index < inside_mask.size(); ++leaf_index) {
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                leaf_index)) {
+            erode_counter.tick();
+            continue;
+        }
         erode_counter.tick();
         if (inside_mask[leaf_index] == 0U) {
             continue;
@@ -1036,6 +1077,7 @@ inline std::vector<double> compute_distance_to_eroded_solid(
     ProgressCounter seed_counter(
         "Regularization", "compute_distance_to_eroded_solid", "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
         seed_counter.tick();
         if (eroded_inside[leaf_index] == 0U) {
             continue;
@@ -1065,6 +1107,7 @@ inline std::vector<double> compute_distance_to_eroded_solid(
         "Regularization", "compute_distance_to_eroded_solid", "queue pops", 10000);
 
     while (!queue.empty()) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
         wavefront_counter.tick();
         const auto [distance, leaf_index] = queue.top();
         queue.pop();
@@ -1115,6 +1158,11 @@ inline std::vector<std::uint8_t> dilate_eroded_solid_leaves(
         "Regularization", "dilate_eroded_solid_leaves", "leaves", 1000);
 #pragma omp parallel for schedule(static)
     for (std::size_t leaf_index = 0; leaf_index < eroded_inside.size(); ++leaf_index) {
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                leaf_index)) {
+            dilate_counter.tick();
+            continue;
+        }
         dilate_counter.tick();
         opened_inside[leaf_index] =
             (eroded_inside[leaf_index] != 0U ||
@@ -1141,6 +1189,7 @@ inline void prune_small_opened_components(
     ProgressCounter component_counter(
         "Regularization", "prune_small_opened_components", "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < opened_inside.size(); ++leaf_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
         component_counter.tick();
         if (opened_inside[leaf_index] == 0U || visited[leaf_index] != 0U) {
             continue;
@@ -1153,6 +1202,8 @@ inline void prune_small_opened_components(
         double component_volume = 0.0;
 
         while (!queue.empty()) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(
+                component.size() + queue.size());
             const std::size_t current = queue.front();
             queue.pop();
             component.push_back(current);
@@ -1226,6 +1277,7 @@ inline void fill_small_opened_cavities(
 
     double opened_volume = 0.0;
     for (std::size_t leaf_index = 0; leaf_index < opened_inside.size(); ++leaf_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
         if (opened_inside[leaf_index] == 0U) {
             continue;
         }

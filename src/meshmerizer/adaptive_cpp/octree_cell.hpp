@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "bounding_box.hpp"
+#include "cancellation.hpp"
 #include "hermite.hpp"
 #include "kernel_wendland_c2.hpp"
 #include "morton.hpp"
@@ -1029,6 +1030,8 @@ inline void balance_octree(
     std::size_t processed_count = 0U;
     std::size_t split_count = 0U;
     while (!queue.empty()) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(
+            processed_count + split_count + 1U);
         const std::size_t split_index = queue.back();
         queue.pop_back();
         if (split_index < enqueued.size()) {
@@ -1236,6 +1239,8 @@ refine_octree(
     };
 
     while (!leaf_queue.empty()) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(
+            all_cells.size() + leaf_queue.size());
         const std::uint32_t batch_depth =
             all_cells[leaf_queue.front()].depth;
         std::vector<std::size_t> batch_indices;
@@ -1249,6 +1254,10 @@ refine_octree(
 
 #pragma omp parallel for schedule(dynamic)
         for (std::size_t batch_i = 0; batch_i < batch_indices.size(); ++batch_i) {
+            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                    batch_i)) {
+                continue;
+            }
             const std::size_t current_index = batch_indices[batch_i];
             const OctreeCell &current_cell = all_cells[current_index];
             RefinementResult &result = batch_results[batch_i];
@@ -1334,6 +1343,7 @@ refine_octree(
         }
 
         for (std::size_t batch_i = 0; batch_i < batch_indices.size(); ++batch_i) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(batch_i);
             refine_counter.tick();
             OctreeCell &current_cell = all_cells[batch_indices[batch_i]];
             const RefinementResult &result = batch_results[batch_i];
@@ -1416,6 +1426,7 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
     initial_contributors.reserve(positions.size());
     for (std::size_t cell_index = 0; cell_index < initial_cells.size();
          ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
         OctreeCell &cell = initial_cells[cell_index];
         const std::int64_t contrib_begin = cell.contributor_begin;
         const std::int64_t contrib_end = cell.contributor_end;

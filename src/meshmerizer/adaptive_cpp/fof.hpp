@@ -45,6 +45,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cancellation.hpp"
 #include "progress_bar.hpp"
 #include "vector3d.hpp"
 
@@ -207,6 +208,7 @@ inline std::vector<std::int64_t> fof_cluster(
     Vector3d tight_min = positions[0];
     Vector3d tight_max = positions[0];
     for (std::size_t i = 1; i < n; ++i) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(i);
         tight_min.x = std::min(tight_min.x, positions[i].x);
         tight_min.y = std::min(tight_min.y, positions[i].y);
         tight_min.z = std::min(tight_min.z, positions[i].z);
@@ -247,6 +249,7 @@ inline std::vector<std::int64_t> fof_cluster(
     // Pre-compute bin coordinates for each point and insert.
     std::vector<FofGridKey> point_bins(n);
     for (std::size_t i = 0; i < n; ++i) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(i);
         const std::int32_t bx = static_cast<std::int32_t>(
             std::floor((positions[i].x - tight_min.x) * inv_ll));
         const std::int32_t by = static_cast<std::int32_t>(
@@ -266,6 +269,7 @@ inline std::vector<std::int64_t> fof_cluster(
     // For each point, check the 27 neighboring bins and union with
     // any point within the linking length.
     for (std::size_t i = 0; i < n; ++i) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(i);
         const FofGridKey &bin_i = point_bins[i];
         const Vector3d &pos_i = positions[i];
 
@@ -319,6 +323,7 @@ inline std::vector<std::int64_t> fof_cluster(
     std::vector<std::int64_t> labels(n);
     std::int64_t next_label = 0;
     for (std::size_t i = 0; i < n; ++i) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(i);
         const std::size_t root = dset.find(i);
         auto it = root_to_label.find(root);
         if (it == root_to_label.end()) {
