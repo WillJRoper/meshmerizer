@@ -311,9 +311,112 @@ def test_build_parser_supports_top_level_help() -> None:
 def test_main_without_arguments_prints_usage(capsys) -> None:
     with pytest.raises(SystemExit) as excinfo:
         main([])
-    assert excinfo.value.code == 2
+    assert excinfo.value.code == 1
     captured = capsys.readouterr()
-    assert "usage:" in captured.err
+    assert "Provide a snapshot filename or use --load-octree." in captured.out
+
+
+def test_run_adaptive_allows_missing_filename_with_loaded_octree(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        "meshmerizer.commands.adaptive_stl.import_octree",
+        lambda path: {
+            "positions": np.array(
+                [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]],
+                dtype=np.float64,
+            ),
+            "smoothing_lengths": np.full(3, 0.1, dtype=np.float64),
+            "domain_minimum": (0.0, 0.0, 0.0),
+            "domain_maximum": (2.0, 1.0, 1.0),
+            "cells": [],
+            "contributors": [],
+            "isovalue": 0.01,
+            "max_depth": 2,
+            "base_resolution": 2,
+        },
+    )
+    monkeypatch.setattr(
+        "meshmerizer.commands.adaptive_stl.reconstruct_mesh",
+        lambda *args, **kwargs: (
+            np.array(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=np.float64,
+            ),
+            np.array([[0, 1, 2]], dtype=np.uint32),
+        ),
+    )
+    monkeypatch.setattr(
+        "meshmerizer.mesh.core.trimesh.Trimesh.export",
+        lambda self, *args, **kwargs: None,
+    )
+
+    args = Namespace(
+        nthreads=None,
+        load_octree=tmp_path / "tree.hdf5",
+        save_octree=None,
+        filename=None,
+        output=None,
+        min_feature_thickness=0.0,
+        pre_thickening_radius=0.0,
+        simplify_factor=1.0,
+        target_size=None,
+        max_depth=2,
+        base_resolution=2,
+        isovalue=None,
+        surface_percentile=5.0,
+        fof=False,
+        linking_factor=0.2,
+        smoothing_iterations=0,
+        smoothing_strength=0.5,
+        max_edge_ratio=1.5,
+        min_usable_hermite_samples=3,
+        max_qef_rms_residual_ratio=0.1,
+        min_normal_alignment_threshold=0.97,
+        remove_islands_fraction=None,
+        visualise_verts=None,
+        min_fof_cluster_size=None,
+        center=None,
+        extent=None,
+        silent=False,
+    )
+
+    run_adaptive(args)
+
+
+def test_run_adaptive_errors_when_no_input_source_is_given() -> None:
+    args = Namespace(
+        nthreads=None,
+        load_octree=None,
+        save_octree=None,
+        filename=None,
+        output=None,
+        min_feature_thickness=0.0,
+        pre_thickening_radius=0.0,
+        simplify_factor=1.0,
+        target_size=None,
+        max_depth=2,
+        base_resolution=2,
+        isovalue=None,
+        surface_percentile=5.0,
+        fof=False,
+        linking_factor=0.2,
+        smoothing_iterations=0,
+        smoothing_strength=0.5,
+        max_edge_ratio=1.5,
+        min_usable_hermite_samples=3,
+        max_qef_rms_residual_ratio=0.1,
+        min_normal_alignment_threshold=0.97,
+        remove_islands_fraction=None,
+        visualise_verts=None,
+        min_fof_cluster_size=None,
+        center=None,
+        extent=None,
+        silent=False,
+    )
+
+    with pytest.raises(SystemExit):
+        run_adaptive(args)
 
 
 def test_main_accepts_snapshot_without_subcommand(monkeypatch) -> None:

@@ -729,6 +729,7 @@ inline bool thickening_band_is_fully_refined(
         }
         if (solid_leaves[leaf_index].cell_size > target_leaf_size) {
             ++unresolved_count;
+            break;
         }
     }
     check_counter.finish();

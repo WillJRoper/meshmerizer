@@ -83,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "filename",
         type=Path,
+        nargs="?",
+        default=None,
         help="Path to the SWIFT snapshot file (HDF5).",
     )
     parser.add_argument(
@@ -187,7 +189,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-depth",
-        type=_nonnegative_int,
+        type=_positive_int,
         default=4,
         help="Maximum octree refinement depth. Default: 4",
     )

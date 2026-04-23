@@ -10,6 +10,7 @@ clusters before meshing.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -478,10 +479,24 @@ def run_adaptive(args) -> None:
         abort_with_error("Config", "--center requires --extent.")
     if extent is not None and center is None:
         abort_with_error("Config", "--extent requires --center.")
+    if args.filename is None and args.load_octree is None:
+        abort_with_error(
+            "Config",
+            "Provide a snapshot filename or use --load-octree.",
+        )
 
     # Set OpenMP thread count if requested.
     if args.nthreads is not None:
-        from meshmerizer._adaptive import set_num_threads
+        try:
+            from meshmerizer._adaptive import set_num_threads
+        except Exception as exc:
+            abort_with_error(
+                "Config",
+                "Could not configure OpenMP threads because the adaptive "
+                "extension failed to import. Reinstall with "
+                "`pip install -e .` "
+                f"to build `_adaptive` ({exc}).",
+            )
 
         set_num_threads(args.nthreads)
         log_status(
@@ -832,7 +847,10 @@ def run_adaptive(args) -> None:
             # Save the STL.
             output_path = args.output
             if output_path is None:
-                output_path = args.filename.with_suffix(".stl")
+                if args.filename is not None:
+                    output_path = args.filename.with_suffix(".stl")
+                else:
+                    output_path = Path(args.load_octree).with_suffix(".stl")
 
             log_status(
                 "Saving",
@@ -1013,7 +1031,10 @@ def run_adaptive(args) -> None:
     # ------------------------------------------------------------------
     output_path = args.output
     if output_path is None:
-        output_path = args.filename.with_suffix(".stl")
+        if args.filename is not None:
+            output_path = args.filename.with_suffix(".stl")
+        else:
+            output_path = Path(args.load_octree).with_suffix(".stl")
 
     log_summary_status("Saving", f"Writing STL to {output_path}...")
     mesh.save(str(output_path))

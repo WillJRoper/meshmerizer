@@ -58,13 +58,13 @@ If `WITH_OPENMP` is unset, Meshmerizer builds in serial mode.
 The main command is:
 
 ```bash
-meshmerizer adaptive snapshot.hdf5
+meshmerizer snapshot.hdf5
 ```
 
 ### Basic example
 
 ```bash
-meshmerizer adaptive snapshot.hdf5 \
+meshmerizer snapshot.hdf5 \
   --particle-type gas \
   --base-resolution 64 \
   --max-depth 4 \
@@ -75,7 +75,7 @@ meshmerizer adaptive snapshot.hdf5 \
 ### Regularized print-ready example
 
 ```bash
-meshmerizer adaptive snapshot.hdf5 \
+meshmerizer snapshot.hdf5 \
   --particle-type gas \
   --base-resolution 128 \
   --max-depth 4 \
@@ -90,7 +90,7 @@ meshmerizer adaptive snapshot.hdf5 \
 ### Subregion extraction
 
 ```bash
-meshmerizer adaptive snapshot.hdf5 \
+meshmerizer snapshot.hdf5 \
   --center 60 60 60 \
   --extent 20 \
   --tight-bounds \
@@ -100,14 +100,13 @@ meshmerizer adaptive snapshot.hdf5 \
 ### Save and reload an octree
 
 ```bash
-meshmerizer adaptive snapshot.hdf5 \
+meshmerizer snapshot.hdf5 \
   --save-octree tree.hdf5 \
   --output first_try.stl
 ```
 
 ```bash
-meshmerizer adaptive snapshot.hdf5 \
-  --load-octree tree.hdf5 \
+meshmerizer --load-octree tree.hdf5 \
   --remove-islands-fraction 0.0 \
   --output second_try.stl
 ```

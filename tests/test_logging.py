@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from meshmerizer.logging import cli_logging_context, record_timing
+from meshmerizer.logging import (
+    CPP_STATUS_LOG_NAME,
+    cli_logging_context,
+    record_timing,
+)
 
 
 def test_cli_logging_context_writes_detailed_log(
@@ -27,5 +31,7 @@ def test_cli_logging_context_writes_detailed_log(
         record_timing("Synthetic stage", 1.25, operation="Timing")
 
     log_path = Path(tmp_path) / "meshmerizer.log"
+    cpp_log_path = Path(tmp_path) / CPP_STATUS_LOG_NAME
     assert log_path.exists()
+    assert cpp_log_path.exists()
     assert "Synthetic stage took 1.250 s" in log_path.read_text()

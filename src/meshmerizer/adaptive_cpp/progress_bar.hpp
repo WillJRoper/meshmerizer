@@ -55,6 +55,11 @@ inline std::string& status_log_path() {
     return path;
 }
 
+inline FILE*& status_log_stream() {
+    static FILE* stream = nullptr;
+    return stream;
+}
+
 inline bool& silent_mode() {
     static bool silent = false;
     return silent;
@@ -62,7 +67,18 @@ inline bool& silent_mode() {
 
 inline void set_status_log_path(const char* path) {
     std::lock_guard<std::mutex> lock(status_log_mutex());
+    if (status_log_stream() != nullptr) {
+        std::fflush(status_log_stream());
+        std::fclose(status_log_stream());
+        status_log_stream() = nullptr;
+    }
     status_log_path() = path == nullptr ? "" : std::string(path);
+    if (!status_log_path().empty()) {
+        status_log_stream() = std::fopen(status_log_path().c_str(), "a");
+        if (status_log_stream() == nullptr) {
+            status_log_path().clear();
+        }
+    }
 }
 
 inline void set_silent_mode(bool silent) {
@@ -88,23 +104,15 @@ inline void vprint_status(
     std::va_list args) {
     const std::string prefix = format_status_prefix(operation, function_name);
     std::lock_guard<std::mutex> lock(status_log_mutex());
-    const std::string path = status_log_path();
 
     FILE* stream = stdout;
-    if (!path.empty()) {
-        stream = std::fopen(path.c_str(), "a");
-        if (stream == nullptr) {
-            stream = stdout;
-        }
+    if (status_log_stream() != nullptr) {
+        stream = status_log_stream();
     }
 
     std::fprintf(stream, "%s ", prefix.c_str());
     std::vfprintf(stream, format, args);
     std::fflush(stream);
-
-    if (stream != stdout) {
-        std::fclose(stream);
-    }
 }
 
 inline bool should_render_progress() {

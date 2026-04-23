@@ -70,6 +70,7 @@ class LoggingState:
         file_handler: Active file handler, if configured.
         warnings: Deferred warning messages collected during the run.
         silent: Whether console progress output should be suppressed.
+        cpp_log_path: Path to the C++ status log file, when active.
         lock: Re-entrant lock protecting shared logging state.
     """
 
@@ -86,6 +87,7 @@ class LoggingState:
     file_handler: Optional[std_logging.Handler] = None
     warnings: list[str] = field(default_factory=list)
     silent: bool = False
+    cpp_log_path: Optional[Path] = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -373,7 +375,7 @@ def record_timing(
         resolved_operation,
         f"{label} took {elapsed:.3f} s",
         level=std_logging.DEBUG,
-        console=_STATE.silent,
+        console=False,
         _stack_offset=_stack_offset,
     )
     return elapsed
@@ -512,6 +514,7 @@ def _configure_cli_logging() -> None:
     _STATE.console_handler = console_handler
     _STATE.file_handler = file_handler
     _STATE.log_path = log_path
+    _STATE.cpp_log_path = cpp_log_path
     _STATE.timings.clear()
     _STATE.warnings.clear()
     _set_cpp_status_log_path(cpp_log_path)
@@ -531,7 +534,9 @@ def _teardown_cli_logging() -> None:
         emit_timing_summary()
         if _STATE.log_path is not None:
             log_summary_status(
-                "Logging", f"Detailed log saved to {_STATE.log_path}"
+                "Logging",
+                "Detailed logs saved to "
+                f"{_STATE.log_path} and {_STATE.cpp_log_path}",
             )
     finally:
         _set_cpp_status_log_path(None)
@@ -541,6 +546,7 @@ def _teardown_cli_logging() -> None:
         _STATE.console_handler = None
         _STATE.file_handler = None
         _STATE.log_path = None
+        _STATE.cpp_log_path = None
         _STATE.timings.clear()
         _STATE.warnings.clear()
         _STATE.silent = False
