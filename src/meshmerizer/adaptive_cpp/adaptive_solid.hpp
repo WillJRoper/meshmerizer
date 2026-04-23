@@ -477,9 +477,14 @@ inline std::vector<double> compute_outside_distance_from_inside_mask(
                 continue;
             }
 
+            const double source_size = std::max(
+                std::min(solid_leaves[leaf_index].cell_size, max_distance),
+                0.0);
+            const double neighbor_size = std::max(
+                std::min(solid_leaves[neighbor].cell_size, max_distance),
+                0.0);
             const double edge_cost = 0.5 * (
-                solid_leaves[leaf_index].cell_size +
-                solid_leaves[neighbor].cell_size);
+                source_size + neighbor_size);
             const double candidate = distance + edge_cost;
             if (candidate > max_distance) {
                 continue;
@@ -536,7 +541,8 @@ inline bool refine_thickening_band_cells(
         return false;
     }
 
-    const double refinement_halo_radius = thickening_radius + target_leaf_size;
+    const double refinement_halo_radius =
+        thickening_radius + 2.0 * target_leaf_size;
 
     const auto target_depth_for_cell =
         [&](const OccupiedSolidLeaf &leaf) -> std::uint32_t {
