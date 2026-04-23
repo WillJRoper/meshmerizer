@@ -16,6 +16,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "bounding_box.hpp"
@@ -148,7 +149,7 @@ inline double edge_crossing_parameter(double value_a, double value_b,
  */
 inline Vector3d evaluate_field_gradient_at_point(
     const Vector3d &query_point,
-    const std::vector<std::size_t> &contributor_indices,
+    std::span<const std::size_t> contributor_indices,
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths) {
     Vector3d gradient = {0.0, 0.0, 0.0};
@@ -200,7 +201,7 @@ inline std::vector<HermiteSample> compute_cell_hermite_samples(
     const BoundingBox &bounds,
     const std::array<double, 8> &corner_values,
     std::uint8_t corner_sign_mask,
-    const std::vector<std::size_t> &contributor_indices,
+    std::span<const std::size_t> contributor_indices,
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
     double isovalue) {

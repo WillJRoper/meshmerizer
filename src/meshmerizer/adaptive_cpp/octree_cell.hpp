@@ -11,7 +11,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
+#include <span>
 #include <queue>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -301,7 +303,7 @@ inline std::vector<OctreeCell> create_child_cells(const OctreeCell &parent) {
  * @return Per-child contributor lists in the same order as ``children``.
  */
 inline std::vector<std::vector<std::size_t>> filter_child_contributors(
-    const std::vector<std::size_t> &parent_contributors,
+    std::span<const std::size_t> parent_contributors,
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
     const std::vector<OctreeCell> &children) {
@@ -389,7 +391,7 @@ inline void split_octree_leaf(
  */
 inline double evaluate_field_at_point(
     const Vector3d &query_point,
-    const std::vector<std::size_t> &contributor_indices,
+    std::span<const std::size_t> contributor_indices,
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths) {
     double field_value = 0.0;
@@ -419,7 +421,7 @@ inline double evaluate_field_at_point(
  */
 inline std::array<double, 8> sample_cell_corners(
     const OctreeCell &cell,
-    const std::vector<std::size_t> &contributor_indices,
+    std::span<const std::size_t> contributor_indices,
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths) {
     std::array<double, 8> corner_values;
@@ -433,6 +435,18 @@ inline std::array<double, 8> sample_cell_corners(
             corner, contributor_indices, positions, smoothing_lengths);
     }
     return corner_values;
+}
+
+inline std::span<const std::size_t> contributor_span(
+    const std::vector<std::size_t> &all_contributors,
+    std::size_t begin,
+    std::size_t end) {
+    if (begin >= end || end > all_contributors.size()) {
+        return std::span<const std::size_t>();
+    }
+    return std::span<const std::size_t>(
+        all_contributors.data() + begin,
+        end - begin);
 }
 
 /**
@@ -1046,7 +1060,9 @@ inline void balance_octree(
                 // whether this balance-forced leaf is active.
                 if (!child_contributors[ci].empty()) {
                     child.corner_values = sample_cell_corners(
-                        child, child_contributors[ci], positions,
+                        child,
+                        std::span<const std::size_t>(child_contributors[ci]),
+                        positions,
                         smoothing_lengths);
                     child.corner_sign_mask = compute_corner_sign_mask(
                         child.corner_values, isovalue);
@@ -1206,11 +1222,8 @@ refine_octree(
             const auto safe_end = static_cast<std::size_t>(
                 std::min(contrib_end,
                          static_cast<std::int64_t>(all_contributors.size())));
-            std::vector<std::size_t> contributors(
-                all_contributors.begin() +
-                    static_cast<std::ptrdiff_t>(safe_begin),
-                all_contributors.begin() +
-                    static_cast<std::ptrdiff_t>(safe_end));
+            const std::span<const std::size_t> contributors =
+                contributor_span(all_contributors, safe_begin, safe_end);
 
             if (contributors.size() < 2) {
                 continue;

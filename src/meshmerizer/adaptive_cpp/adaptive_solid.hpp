@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <queue>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -47,22 +48,29 @@ inline std::vector<std::int64_t> build_opened_cell_to_leaf_index(
     return cell_to_leaf_index;
 }
 
-inline std::vector<std::size_t> gather_cell_contributors(
+inline std::pair<std::size_t, std::size_t> cell_contributor_bounds(
     const OctreeCell &cell,
     const std::vector<std::size_t> &all_contributors) {
     if (cell.contributor_begin < 0 ||
         cell.contributor_end <= cell.contributor_begin) {
-        return {};
+        return {0U, 0U};
     }
     const auto begin_idx = static_cast<std::size_t>(cell.contributor_begin);
     const auto end_idx = static_cast<std::size_t>(cell.contributor_end);
     if (end_idx > all_contributors.size()) {
-        return {};
+        return {0U, 0U};
     }
-    return {
-        all_contributors.begin() + static_cast<std::ptrdiff_t>(begin_idx),
-        all_contributors.begin() + static_cast<std::ptrdiff_t>(end_idx),
-    };
+    return {begin_idx, end_idx};
+}
+
+inline std::span<const std::size_t> cell_contributor_span(
+    const OctreeCell &cell,
+    const std::vector<std::size_t> &all_contributors) {
+    const auto [begin_idx, end_idx] =
+        cell_contributor_bounds(cell, all_contributors);
+    return std::span<const std::size_t>(
+        all_contributors.data() + begin_idx,
+        end_idx - begin_idx);
 }
 
 inline double cell_edge_length(const OctreeCell &cell) {
@@ -154,8 +162,8 @@ inline bool refine_surface_band_cells(
             }
 
             OctreeCell &child = all_cells[child_index];
-            const std::vector<std::size_t> contributors =
-                gather_cell_contributors(child, all_contributors);
+            const std::span<const std::size_t> contributors =
+                cell_contributor_span(child, all_contributors);
             child.is_active = false;
             child.is_topo_surface = false;
             child.representative_vertex_index = -1;
@@ -299,8 +307,8 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
             continue;
         }
 
-        const std::vector<std::size_t> contributors =
-            gather_cell_contributors(cell, all_contributors);
+        const std::span<const std::size_t> contributors =
+            cell_contributor_span(cell, all_contributors);
         const double center_value = evaluate_field_at_point(
             cell.bounds.center(), contributors, positions, smoothing_lengths);
         center_values[cell_idx] = center_value;
@@ -628,8 +636,8 @@ inline bool refine_thickening_band_cells(
             }
 
             OctreeCell &child = all_cells[child_index];
-            const std::vector<std::size_t> contributors =
-                gather_cell_contributors(child, all_contributors);
+            const std::span<const std::size_t> contributors =
+                cell_contributor_span(child, all_contributors);
             child.is_active = false;
             child.is_topo_surface = false;
             child.representative_vertex_index = -1;
@@ -2410,7 +2418,7 @@ inline HermiteSample project_opened_boundary_sample(
     const BoundingBox &bounds,
     const Vector3d &face_center,
     const Vector3d &outward_normal,
-    const std::vector<std::size_t> &contributors,
+    std::span<const std::size_t> contributors,
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
     double isovalue) {
@@ -2492,8 +2500,8 @@ inline std::vector<MeshVertex> solve_opened_leaf_vertices(
             continue;
         }
 
-        const std::vector<std::size_t> contributors =
-            gather_cell_contributors(cell, all_contributors);
+        const std::span<const std::size_t> contributors =
+            cell_contributor_span(cell, all_contributors);
         std::vector<HermiteSample> samples;
         samples.reserve(6);
         const Vector3d center = cell.bounds.center();

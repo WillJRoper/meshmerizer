@@ -49,6 +49,11 @@ def _build_adaptive_extension() -> Extension:
     compile_flags: list[str] = []
     link_flags: list[str] = []
 
+    if sys.platform == "win32":
+        compile_flags.append("/std:c++20")
+    else:
+        compile_flags.append("-std=c++20")
+
     if len(WITH_OPENMP) > 0:
         # If the value is a directory, add its include/ and lib/ paths
         # so the compiler can find <omp.h> and libomp/libgomp.

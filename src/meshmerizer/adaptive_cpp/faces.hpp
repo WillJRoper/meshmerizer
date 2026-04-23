@@ -39,6 +39,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -349,7 +350,7 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
         // all_contributors, avoiding per-element push_back overhead.
         // Validate the range to prevent out-of-bounds access from
         // corrupt cell data.
-        std::vector<std::size_t> contributors;
+        std::span<const std::size_t> contributors;
         if (cell.contributor_begin >= 0 &&
             cell.contributor_end > cell.contributor_begin) {
             const auto begin_idx =
@@ -362,13 +363,8 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
                 vertex_bar.tick();
                 continue;
             }
-            const auto begin_it =
-                all_contributors.begin() +
-                static_cast<std::ptrdiff_t>(begin_idx);
-            const auto end_it =
-                all_contributors.begin() +
-                static_cast<std::ptrdiff_t>(end_idx);
-            contributors.assign(begin_it, end_it);
+            contributors = contributor_span(
+                all_contributors, begin_idx, end_idx);
         }
 
         // If corner values were not sampled during refinement (e.g.,
@@ -637,22 +633,19 @@ inline bool sign_at_fine_vertex(
 /**
  * @brief Gather contributor indices for one cell.
  */
-inline std::vector<std::size_t> gather_face_cell_contributors(
+inline std::span<const std::size_t> gather_face_cell_contributors(
     const OctreeCell &cell,
     const std::vector<std::size_t> &all_contributors) {
     if (cell.contributor_begin < 0 ||
         cell.contributor_end <= cell.contributor_begin) {
-        return {};
+        return std::span<const std::size_t>();
     }
     const auto begin_idx = static_cast<std::size_t>(cell.contributor_begin);
     const auto end_idx = static_cast<std::size_t>(cell.contributor_end);
     if (end_idx > all_contributors.size()) {
-        return {};
+        return std::span<const std::size_t>();
     }
-    return {
-        all_contributors.begin() + static_cast<std::ptrdiff_t>(begin_idx),
-        all_contributors.begin() + static_cast<std::ptrdiff_t>(end_idx),
-    };
+    return contributor_span(all_contributors, begin_idx, end_idx);
 }
 
 /**
@@ -918,7 +911,7 @@ inline bool refine_zero_sample_incident_cells(
             continue;
         }
 
-        const std::vector<std::size_t> contributors =
+        const std::span<const std::size_t> contributors =
             gather_face_cell_contributors(cell, all_contributors);
         if (cell.corner_sign_mask == 0U && !contributors.empty()) {
             cell.corner_values = sample_cell_corners(
@@ -993,7 +986,7 @@ inline void activate_missing_incident_cells(
             continue;
         }
 
-        const std::vector<std::size_t> contributors =
+        const std::span<const std::size_t> contributors =
             gather_face_cell_contributors(cell, all_contributors);
         if (cell.corner_sign_mask == 0U && !contributors.empty()) {
             cell.corner_values = sample_cell_corners(
