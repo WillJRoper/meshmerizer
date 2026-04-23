@@ -419,6 +419,18 @@ def emit_timing_summary() -> None:
     ranked = sorted(entries, key=lambda item: item[1].total, reverse=True)
     total_time = sum(stat.total for _, stat in ranked)
     lines = [f"total instrumented time: {total_time:.3f} s"]
+    operation_totals: dict[str, float] = {}
+    for _, stat in ranked:
+        operation_totals[stat.operation] = (
+            operation_totals.get(stat.operation, 0.0) + stat.total
+        )
+    if operation_totals:
+        lines.append("by operation:")
+        for operation, elapsed in sorted(
+            operation_totals.items(), key=lambda item: item[1], reverse=True
+        ):
+            lines.append(f"  {operation}: {elapsed:.3f} s")
+        lines.append("by stage:")
     for label, stat in ranked:
         count_suffix = ""
         if stat.count > 1:

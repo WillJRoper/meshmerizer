@@ -991,9 +991,20 @@ inline void balance_octree(
     double isovalue,
     const BoundingBox &domain,
     std::uint32_t base_resolution,
-    std::uint32_t max_depth) {
+    std::uint32_t max_depth,
+    std::vector<std::uint8_t> *dirty_cells = nullptr) {
     ProgressCounter balance_counter(
         "Building", "balance_octree", "cells split", 10);
+
+    auto mark_dirty = [&](std::size_t cell_index) {
+        if (dirty_cells == nullptr) {
+            return;
+        }
+        if (dirty_cells->size() <= cell_index) {
+            dirty_cells->resize(cell_index + 1U, 0U);
+        }
+        (*dirty_cells)[cell_index] = 1U;
+    };
 
     // Build the spatial hash once; we will update it incrementally
     // as cells are split rather than rebuilding from scratch each
@@ -1056,6 +1067,7 @@ inline void balance_octree(
         all_cells[split_index].is_leaf = false;
         all_cells[split_index].child_begin =
             static_cast<std::int64_t>(all_cells.size());
+        mark_dirty(split_index);
 
         std::uint32_t pgx, pgy, pgz;
         hash.quantize(parent_snapshot.bounds.min, pgx, pgy, pgz);
@@ -1098,6 +1110,7 @@ inline void balance_octree(
             const std::size_t new_idx = all_cells.size();
             all_cells.push_back(child);
             affected_indices.push_back(new_idx);
+            mark_dirty(new_idx);
 
             std::uint32_t cgx, cgy, cgz;
             hash.quantize(child.bounds.min, cgx, cgy, cgz);

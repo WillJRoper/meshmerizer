@@ -49,9 +49,17 @@ VertexAdjacency build_triangle_mesh_adjacency(
 
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+
+inline double elapsed_seconds_since(
+    const std::chrono::steady_clock::time_point &start_time) {
+    return std::chrono::duration<double>(
+               std::chrono::steady_clock::now() - start_time)
+        .count();
+}
 
 /**
  * @brief Result of the Dual Contouring pipeline.
@@ -125,6 +133,7 @@ inline DCPipelineResult run_dc_pipeline(
 
     DCPipelineResult result;
     result.isovalue = isovalue;
+    const auto pipeline_start = std::chrono::steady_clock::now();
 
     // ================================================================
     // Step 1: Build top-level cells and query contributors.
@@ -134,6 +143,7 @@ inline DCPipelineResult run_dc_pipeline(
     // O(N).
 
     TopLevelParticleGrid grid(domain, base_resolution);
+    const auto contributor_query_start = std::chrono::steady_clock::now();
     grid.insert_particles(positions);
     grid.compute_bin_max_h(smoothing_lengths);
 
@@ -190,6 +200,11 @@ inline DCPipelineResult run_dc_pipeline(
         contrib_bar.tick();
     }
     contrib_bar.finish();
+    meshmerizer_log_detail::print_status(
+        "Timing",
+        "run_dc_pipeline",
+        "Contributor query: %.3f s\n",
+        elapsed_seconds_since(contributor_query_start));
 
     // ================================================================
     // Step 2: Refine the adaptive octree.
@@ -198,6 +213,7 @@ inline DCPipelineResult run_dc_pipeline(
     // crosses the isovalue, producing an adaptive leaf set that
     // concentrates resolution where the surface is.
 
+    const auto refine_start = std::chrono::steady_clock::now();
     auto [all_cells, all_contributors] = refine_octree(
         std::move(initial_cells),
         std::move(initial_contributors),
@@ -210,6 +226,11 @@ inline DCPipelineResult run_dc_pipeline(
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold);
+    meshmerizer_log_detail::print_status(
+        "Timing",
+        "run_dc_pipeline",
+        "Initial octree refinement: %.3f s\n",
+        elapsed_seconds_since(refine_start));
 
     if (min_feature_thickness > 0.0) {
         const Vector3d domain_extent = domain.extent();
@@ -249,6 +270,8 @@ inline DCPipelineResult run_dc_pipeline(
         std::size_t regularization_refine_pass = 0U;
         while (true) {
             ++regularization_refine_pass;
+            const auto surface_refine_pass_start =
+                std::chrono::steady_clock::now();
             meshmerizer_log_detail::print_status(
                 "Regularization",
                 "run_dc_pipeline",
@@ -270,6 +293,12 @@ inline DCPipelineResult run_dc_pipeline(
                     regularization_refine_pass);
                 break;
             }
+            meshmerizer_log_detail::print_status(
+                "Timing",
+                "run_dc_pipeline",
+                "Regularization surface refine pass %zu: %.3f s\n",
+                regularization_refine_pass,
+                elapsed_seconds_since(surface_refine_pass_start));
         }
 
         meshmerizer_log_detail::print_status(
@@ -284,12 +313,15 @@ inline DCPipelineResult run_dc_pipeline(
 
         LeafSpatialIndex solid_spatial_index;
         solid_spatial_index.build(all_cells, domain, max_depth, base_resolution);
+        OccupiedSolidClassificationCache classification_cache;
+        std::vector<std::uint8_t> dirty_cells(all_cells.size(), 1U);
+        std::vector<std::uint8_t> inside_mask;
         std::vector<OccupiedSolidLeaf> solid_leaves =
             classify_occupied_solid_leaves(
                 all_cells, all_contributors, positions,
                 smoothing_lengths, solid_spatial_index,
-                isovalue, max_depth);
-        std::vector<std::uint8_t> inside_mask = build_inside_mask(solid_leaves);
+                isovalue, max_depth, &classification_cache, &dirty_cells,
+                &inside_mask);
 
         if (pre_thickening_radius > 0.0) {
             const double thickening_leaf_size_target =
@@ -297,6 +329,8 @@ inline DCPipelineResult run_dc_pipeline(
             std::size_t thickening_refine_pass = 0U;
 
             while (true) {
+                const auto thickening_distance_start =
+                    std::chrono::steady_clock::now();
                 const std::vector<double> thickening_distance =
                     compute_outside_distance_from_inside_mask(
                         solid_leaves, inside_mask,
@@ -311,6 +345,15 @@ inline DCPipelineResult run_dc_pipeline(
                     thickening_leaf_size_target,
                     pre_thickening_radius,
                     all_cells.size());
+                meshmerizer_log_detail::print_status(
+                    "Timing",
+                    "run_dc_pipeline",
+                    "Pre-thickening distance pass %zu: %.3f s\n",
+                    thickening_refine_pass,
+                    elapsed_seconds_since(thickening_distance_start));
+                const auto thickening_refine_start =
+                    std::chrono::steady_clock::now();
+                dirty_cells.assign(all_cells.size(), 0U);
                 if (!refine_thickening_band_cells(
                         all_cells, all_contributors, positions,
                         smoothing_lengths, isovalue, max_depth,
@@ -319,7 +362,8 @@ inline DCPipelineResult run_dc_pipeline(
                         pre_thickening_radius,
                         minimum_usable_hermite_samples,
                         max_qef_rms_residual_ratio,
-                        min_normal_alignment_threshold)) {
+                        min_normal_alignment_threshold,
+                        &dirty_cells)) {
                     meshmerizer_log_detail::print_status(
                         "Regularization",
                         "run_dc_pipeline",
@@ -328,6 +372,12 @@ inline DCPipelineResult run_dc_pipeline(
                         thickening_refine_pass);
                     break;
                 }
+                meshmerizer_log_detail::print_status(
+                    "Timing",
+                    "run_dc_pipeline",
+                    "Pre-thickening refine pass %zu: %.3f s\n",
+                    thickening_refine_pass,
+                    elapsed_seconds_since(thickening_refine_start));
 
                 meshmerizer_log_detail::print_status(
                     "Regularization",
@@ -335,21 +385,44 @@ inline DCPipelineResult run_dc_pipeline(
                     "pre-thickening: balancing octree after growth-band "
                     "refinement (total_cells=%zu)\n",
                     all_cells.size());
+                const auto balance_start = std::chrono::steady_clock::now();
                 balance_octree(
                     all_cells, all_contributors, positions, smoothing_lengths,
-                    isovalue, domain, base_resolution, max_depth);
+                    isovalue, domain, base_resolution, max_depth,
+                    &dirty_cells);
+                meshmerizer_log_detail::print_status(
+                    "Timing",
+                    "run_dc_pipeline",
+                    "Pre-thickening balance pass %zu: %.3f s\n",
+                    thickening_refine_pass,
+                    elapsed_seconds_since(balance_start));
+                const auto reclassify_start = std::chrono::steady_clock::now();
                 solid_spatial_index.build(
                     all_cells, domain, max_depth, base_resolution);
                 solid_leaves = classify_occupied_solid_leaves(
                     all_cells, all_contributors, positions,
                     smoothing_lengths, solid_spatial_index,
-                    isovalue, max_depth);
-                inside_mask = build_inside_mask(solid_leaves);
+                    isovalue, max_depth, &classification_cache,
+                    &dirty_cells, &inside_mask);
+                meshmerizer_log_detail::print_status(
+                    "Timing",
+                    "run_dc_pipeline",
+                    "Pre-thickening reclassify pass %zu: %.3f s\n",
+                    thickening_refine_pass,
+                    elapsed_seconds_since(reclassify_start));
 
+                const auto strict_check_start =
+                    std::chrono::steady_clock::now();
                 const std::vector<double> strict_band_distance =
                     compute_outside_distance_from_inside_mask(
                         solid_leaves, inside_mask,
                         pre_thickening_radius);
+                meshmerizer_log_detail::print_status(
+                    "Timing",
+                    "run_dc_pipeline",
+                    "Pre-thickening strict-band distance pass %zu: %.3f s\n",
+                    thickening_refine_pass,
+                    elapsed_seconds_since(strict_check_start));
 
                 if (thickening_band_is_fully_refined(
                         solid_leaves, inside_mask,
@@ -365,10 +438,17 @@ inline DCPipelineResult run_dc_pipeline(
                 }
             }
 
+            const auto final_thickening_distance_start =
+                std::chrono::steady_clock::now();
             const std::vector<double> thickening_distance =
                 compute_outside_distance_from_inside_mask(
                     solid_leaves, inside_mask,
                     pre_thickening_radius);
+            meshmerizer_log_detail::print_status(
+                "Timing",
+                "run_dc_pipeline",
+                "Final pre-thickening distance: %.3f s\n",
+                elapsed_seconds_since(final_thickening_distance_start));
             inside_mask = dilate_inside_mask(
                 inside_mask, thickening_distance, pre_thickening_radius);
             meshmerizer_log_detail::print_status(
@@ -378,13 +458,16 @@ inline DCPipelineResult run_dc_pipeline(
                 pre_thickening_radius);
         }
 
+        const auto morphology_start = std::chrono::steady_clock::now();
         const std::vector<double> clearance =
-            compute_inside_clearance(solid_leaves, inside_mask);
+            compute_inside_clearance(
+                solid_leaves, inside_mask, opening_radius);
         const std::vector<std::uint8_t> eroded_inside =
             erode_occupied_solid_leaves(
                 inside_mask, clearance, opening_radius);
         const std::vector<double> dilation_distance =
-            compute_distance_to_eroded_solid(solid_leaves, eroded_inside);
+            compute_distance_to_eroded_solid(
+                solid_leaves, eroded_inside, opening_radius);
         std::vector<std::uint8_t> opened_inside =
             dilate_eroded_solid_leaves(
                 eroded_inside, dilation_distance, opening_radius);
@@ -392,6 +475,11 @@ inline DCPipelineResult run_dc_pipeline(
         prune_small_opened_components(solid_leaves, opened_inside);
         suppress_opened_edge_contacts(
             solid_leaves, all_cells, solid_spatial_index, opened_inside);
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "Regularization morphology: %.3f s\n",
+            elapsed_seconds_since(morphology_start));
 
         auto log_opened_count = [&]() {
             return static_cast<std::size_t>(std::count(
@@ -405,6 +493,7 @@ inline DCPipelineResult run_dc_pipeline(
             "extracting opened blocky surface (opened_inside=%zu)\n",
             log_opened_count());
 
+        const auto opened_surface_start = std::chrono::steady_clock::now();
         OpenedSurfaceMesh opened_surface = generate_opened_surface_mesh(
             solid_leaves, opened_inside, all_cells, solid_spatial_index,
             domain, base_resolution, max_depth);
@@ -421,6 +510,11 @@ inline DCPipelineResult run_dc_pipeline(
                 solid_leaves, opened_inside, all_cells, solid_spatial_index,
                 domain, base_resolution, max_depth);
         }
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "Opened surface extraction: %.3f s\n",
+            elapsed_seconds_since(opened_surface_start));
 
         meshmerizer_log_detail::print_status(
             "Regularization",
@@ -430,6 +524,7 @@ inline DCPipelineResult run_dc_pipeline(
             opened_surface.triangles.size());
 
         if (smoothing_iterations > 0 && !opened_surface.vertices.empty()) {
+            const auto smoothing_start = std::chrono::steady_clock::now();
             meshmerizer_log_detail::print_status(
                 "Cleaning",
                 "run_dc_pipeline",
@@ -444,12 +539,18 @@ inline DCPipelineResult run_dc_pipeline(
                 smoothing_iterations, smoothing_strength);
             meshmerizer_log_detail::print_status(
                 "Cleaning", "run_dc_pipeline", "smoothing done\n");
+            meshmerizer_log_detail::print_status(
+                "Timing",
+                "run_dc_pipeline",
+                "Opened-surface smoothing: %.3f s\n",
+                elapsed_seconds_since(smoothing_start));
         }
 
         std::vector<MeshTriangle> &opened_triangles = opened_surface.triangles;
         std::vector<MeshVertex> &opened_vertices = opened_surface.vertices;
 
         if (max_edge_ratio > 0.0 && !opened_triangles.empty()) {
+            const auto gap_fill_start = std::chrono::steady_clock::now();
             const std::size_t tris_before = opened_triangles.size();
             const std::size_t verts_before = opened_vertices.size();
             meshmerizer_log_detail::print_status(
@@ -467,6 +568,11 @@ inline DCPipelineResult run_dc_pipeline(
                 "gap filling done (+%zu vertices, +%zu triangles)\n",
                 opened_vertices.size() - verts_before,
                 opened_triangles.size() - tris_before);
+            meshmerizer_log_detail::print_status(
+                "Timing",
+                "run_dc_pipeline",
+                "Opened-surface gap filling: %.3f s\n",
+                elapsed_seconds_since(gap_fill_start));
         }
 
         std::size_t opened_inside_count = 0U;
@@ -513,10 +619,16 @@ inline DCPipelineResult run_dc_pipeline(
     // positioned at the best-fit intersection of Hermite data
     // from the density field.
 
+    const auto qef_solve_start = std::chrono::steady_clock::now();
     std::vector<MeshVertex> qef_vertices =
         solve_all_leaf_vertices(
             all_cells, all_contributors, positions,
             smoothing_lengths, isovalue);
+    meshmerizer_log_detail::print_status(
+        "Timing",
+        "run_dc_pipeline",
+        "QEF vertex solve: %.3f s\n",
+        elapsed_seconds_since(qef_solve_start));
 
     result.n_qef_vertices = qef_vertices.size();
 
@@ -530,9 +642,15 @@ inline DCPipelineResult run_dc_pipeline(
     // The LeafSpatialIndex hashes leaf cells by their quantized
     // min-corner so that find_leaf_at(ix, iy, iz) is O(1).
 
+    const auto spatial_index_build_start = std::chrono::steady_clock::now();
     LeafSpatialIndex spatial_index;
     spatial_index.build(all_cells, domain, max_depth,
                         base_resolution);
+    meshmerizer_log_detail::print_status(
+        "Timing",
+        "run_dc_pipeline",
+        "Leaf spatial index build: %.3f s\n",
+        elapsed_seconds_since(spatial_index_build_start));
 
     // ================================================================
     // Step 4b: Retroactively activate incident cells missing QEF vertices.
@@ -542,6 +660,7 @@ inline DCPipelineResult run_dc_pipeline(
     // vertices; otherwise face generation drops the corresponding quads and
     // produces square holes.
 
+    const auto incident_repair_start = std::chrono::steady_clock::now();
     while (refine_zero_sample_incident_cells(
         all_cells, all_contributors, positions, smoothing_lengths,
         spatial_index, max_depth, base_resolution, isovalue,
@@ -552,11 +671,22 @@ inline DCPipelineResult run_dc_pipeline(
             smoothing_lengths, isovalue);
     }
     spatial_index.build(all_cells, domain, max_depth, base_resolution);
+    meshmerizer_log_detail::print_status(
+        "Timing",
+        "run_dc_pipeline",
+        "Incident cell repair/activation prep: %.3f s\n",
+        elapsed_seconds_since(incident_repair_start));
 
+    const auto incident_activation_start = std::chrono::steady_clock::now();
     activate_missing_incident_cells(
         all_cells, qef_vertices, all_contributors,
         positions, smoothing_lengths, spatial_index,
         max_depth, base_resolution, isovalue);
+    meshmerizer_log_detail::print_status(
+        "Timing",
+        "run_dc_pipeline",
+        "Incident cell activation: %.3f s\n",
+        elapsed_seconds_since(incident_activation_start));
 
     // ================================================================
     // Step 4c: Optional Laplacian smoothing of QEF vertices.
@@ -570,6 +700,7 @@ inline DCPipelineResult run_dc_pipeline(
     // connect the smoothed positions.
 
     if (smoothing_iterations > 0) {
+        const auto qef_smoothing_start = std::chrono::steady_clock::now();
         meshmerizer_log_detail::print_status(
             "Cleaning",
             "run_dc_pipeline",
@@ -584,6 +715,11 @@ inline DCPipelineResult run_dc_pipeline(
             smoothing_iterations, smoothing_strength);
         meshmerizer_log_detail::print_status(
             "Cleaning", "run_dc_pipeline", "smoothing done\n");
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "QEF smoothing: %.3f s\n",
+            elapsed_seconds_since(qef_smoothing_start));
     }
 
     // ================================================================
@@ -596,10 +732,16 @@ inline DCPipelineResult run_dc_pipeline(
     // may be the same coarser cell, producing degenerate quads that
     // are handled by emit_quad.
 
+    const auto face_generation_start = std::chrono::steady_clock::now();
     std::vector<MeshTriangle> dc_triangles =
         generate_dual_contour_faces(
             all_cells, qef_vertices, spatial_index,
             max_depth, base_resolution, isovalue);
+    meshmerizer_log_detail::print_status(
+        "Timing",
+        "run_dc_pipeline",
+        "Dual contour face generation: %.3f s\n",
+        elapsed_seconds_since(face_generation_start));
 
     // ================================================================
     // Step 5b: Gap filling via edge subdivision.
@@ -611,6 +753,7 @@ inline DCPipelineResult run_dc_pipeline(
     // placed QEF vertices.  Always active (default ratio = 1.5).
 
     if (max_edge_ratio > 0.0 && !dc_triangles.empty()) {
+        const auto gap_fill_start = std::chrono::steady_clock::now();
         const std::size_t tris_before = dc_triangles.size();
         const std::size_t verts_before = qef_vertices.size();
         meshmerizer_log_detail::print_status(
@@ -633,6 +776,11 @@ inline DCPipelineResult run_dc_pipeline(
             "run_dc_pipeline",
             "gap filling done (+%zu vertices, +%zu triangles)\n",
             new_verts, new_tris);
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "Dual contour gap filling: %.3f s\n",
+            elapsed_seconds_since(gap_fill_start));
     }
 
     print_octree_structure_summary(all_cells);
@@ -655,6 +803,12 @@ inline DCPipelineResult run_dc_pipeline(
              static_cast<std::uint32_t>(tri.vertex_indices[1]),
              static_cast<std::uint32_t>(tri.vertex_indices[2])});
     }
+
+    meshmerizer_log_detail::print_status(
+        "Timing",
+        "run_dc_pipeline",
+        "Total C++ reconstruction core: %.3f s\n",
+        elapsed_seconds_since(pipeline_start));
 
     return result;
 }

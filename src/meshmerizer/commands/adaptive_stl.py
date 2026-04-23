@@ -778,6 +778,7 @@ def run_adaptive(args) -> None:
                 f"isovalue={isovalue}",
             )
             pipeline_start = time.perf_counter()
+            reconstruction_start = time.perf_counter()
             mesh_verts, mesh_faces = reconstruct_mesh(
                 positions,
                 smoothing_lengths,
@@ -801,6 +802,11 @@ def run_adaptive(args) -> None:
                 ),
                 min_feature_thickness=effective_min_feature_thickness,
                 pre_thickening_radius=effective_pre_thickening_radius,
+            )
+            record_elapsed(
+                "Mesh reconstruction core",
+                reconstruction_start,
+                operation="Meshing",
             )
             record_elapsed(
                 "Full pipeline",
@@ -831,10 +837,22 @@ def run_adaptive(args) -> None:
             )
 
             # Remove small disconnected islands if requested.
+            cleanup_start = time.perf_counter()
             mesh = _remove_islands(mesh, args.remove_islands_fraction)
+            record_elapsed(
+                "Island removal",
+                cleanup_start,
+                operation="Cleaning",
+            )
 
             # Simplify the final mesh if requested.
+            simplify_start = time.perf_counter()
             mesh = _simplify_mesh(mesh, args.simplify_factor)
+            record_elapsed(
+                "Mesh simplification",
+                simplify_start,
+                operation="Cleaning",
+            )
 
             # Scale the mesh to physical print size.
             if args.target_size is not None:
@@ -842,7 +860,13 @@ def run_adaptive(args) -> None:
                     "Cleaning",
                     f"Scaling mesh to {args.target_size} cm...",
                 )
+                scale_start = time.perf_counter()
                 mesh = scale_mesh_to_print(mesh, args.target_size)
+                record_elapsed(
+                    "Print scaling",
+                    scale_start,
+                    operation="Cleaning",
+                )
 
             # Save the STL.
             output_path = args.output
@@ -856,7 +880,9 @@ def run_adaptive(args) -> None:
                 "Saving",
                 f"Writing STL to {output_path}...",
             )
+            save_start = time.perf_counter()
             mesh.save(str(output_path))
+            record_elapsed("STL export", save_start, operation="Saving")
 
             record_elapsed(
                 "Total pipeline",
@@ -981,6 +1007,11 @@ def run_adaptive(args) -> None:
         pre_thickening_radius=effective_pre_thickening_radius,
     )
     record_elapsed(
+        "Mesh reconstruction core",
+        reconstruction_start,
+        operation="Meshing",
+    )
+    record_elapsed(
         "Mesh reconstruction",
         reconstruction_start,
         operation="Meshing",
@@ -1013,10 +1044,22 @@ def run_adaptive(args) -> None:
     )
 
     # Remove small disconnected islands if requested.
+    cleanup_start = time.perf_counter()
     mesh = _remove_islands(mesh, args.remove_islands_fraction)
+    record_elapsed(
+        "Island removal",
+        cleanup_start,
+        operation="Cleaning",
+    )
 
     # Simplify the final mesh if requested.
+    simplify_start = time.perf_counter()
     mesh = _simplify_mesh(mesh, args.simplify_factor)
+    record_elapsed(
+        "Mesh simplification",
+        simplify_start,
+        operation="Cleaning",
+    )
 
     # Scale the mesh to a physical print size if requested.
     if args.target_size is not None:
@@ -1024,7 +1067,13 @@ def run_adaptive(args) -> None:
             "Cleaning",
             f"Scaling mesh to {args.target_size} cm...",
         )
+        scale_start = time.perf_counter()
         mesh = scale_mesh_to_print(mesh, args.target_size)
+        record_elapsed(
+            "Print scaling",
+            scale_start,
+            operation="Cleaning",
+        )
 
     # ------------------------------------------------------------------
     # Step 6: Save the STL.
@@ -1037,7 +1086,9 @@ def run_adaptive(args) -> None:
             output_path = Path(args.load_octree).with_suffix(".stl")
 
     log_summary_status("Saving", f"Writing STL to {output_path}...")
+    save_start = time.perf_counter()
     mesh.save(str(output_path))
+    record_elapsed("STL export", save_start, operation="Saving")
 
     if args.load_octree is not None or args.save_octree is not None:
         _emit_tree_structure_summary(cells)
