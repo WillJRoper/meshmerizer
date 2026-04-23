@@ -53,6 +53,8 @@ classifiers = [
 dependencies = [
   "numpy>=1.21",
   "trimesh>=3.9",
+  "fast-simplification>=0.1",
+  "networkx>=3",
   "swiftsimio>=10.2.0",
   "h5py>=3.8",
 ]
