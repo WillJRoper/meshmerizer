@@ -55,9 +55,19 @@ inline std::string& status_log_path() {
     return path;
 }
 
+inline bool& silent_mode() {
+    static bool silent = false;
+    return silent;
+}
+
 inline void set_status_log_path(const char* path) {
     std::lock_guard<std::mutex> lock(status_log_mutex());
     status_log_path() = path == nullptr ? "" : std::string(path);
+}
+
+inline void set_silent_mode(bool silent) {
+    std::lock_guard<std::mutex> lock(status_log_mutex());
+    silent_mode() = silent;
 }
 
 inline std::string format_status_prefix(
@@ -95,6 +105,11 @@ inline void vprint_status(
     if (stream != stdout) {
         std::fclose(stream);
     }
+}
+
+inline bool should_render_progress() {
+    std::lock_guard<std::mutex> lock(status_log_mutex());
+    return !silent_mode();
 }
 
 inline void print_status(
@@ -165,9 +180,12 @@ public:
           total_(total),
           current_(0),
           last_rendered_percent_(-1),
-          finished_(false) {
+          finished_(false),
+          enabled_(meshmerizer_log_detail::should_render_progress()) {
         /* Print the initial 0% bar immediately. */
-        render(0);
+        if (enabled_) {
+            render(0);
+        }
     }
 
     /**
@@ -192,7 +210,9 @@ public:
              * gets printed twice at the same value.  We avoid a
              * mutex here to keep the hot path lock-free. */
             last_rendered_percent_ = pct;
-            render(pct);
+            if (enabled_) {
+                render(pct);
+            }
         }
     }
 
@@ -205,6 +225,7 @@ public:
     void finish() {
         if (finished_) return;
         finished_ = true;
+        if (!enabled_) return;
         render(100);
         std::fputc('\n', stdout);
         std::fflush(stdout);
@@ -229,6 +250,9 @@ private:
 
     /** Whether @c finish() has been called. */
     bool finished_;
+
+    /** Whether console rendering is enabled for this bar. */
+    bool enabled_;
 
     /**
      * @brief Render the progress bar at the given percentage.
@@ -321,8 +345,11 @@ public:
           current_(0),
           last_rendered_(0),
           update_interval_(update_interval),
-          finished_(false) {
-        render(0);
+          finished_(false),
+          enabled_(meshmerizer_log_detail::should_render_progress()) {
+        if (enabled_) {
+            render(0);
+        }
     }
 
     /**
@@ -336,7 +363,9 @@ public:
         if (now - last_rendered_.load(std::memory_order_relaxed)
             >= update_interval_) {
             last_rendered_.store(now, std::memory_order_relaxed);
-            render(now);
+            if (enabled_) {
+                render(now);
+            }
         }
     }
 
@@ -346,6 +375,7 @@ public:
     void finish() {
         if (finished_) return;
         finished_ = true;
+        if (!enabled_) return;
         render(current_.load(std::memory_order_relaxed));
         std::fputc('\n', stdout);
         std::fflush(stdout);
@@ -358,6 +388,7 @@ private:
     std::atomic<std::size_t> last_rendered_;
     std::size_t update_interval_;
     bool finished_;
+    bool enabled_;
 
     /**
      * @brief Render the counter line.

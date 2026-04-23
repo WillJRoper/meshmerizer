@@ -322,6 +322,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Scales the mesh for 3D printing."
         ),
     )
+    adaptive.add_argument(
+        "--silent",
+        action="store_true",
+        help=(
+            "Suppress per-update progress rendering. Only end-of-run "
+            "summaries are printed to stdout while detailed status remains in "
+            "the log file."
+        ),
+    )
 
     # Serialization.
     adaptive.add_argument(

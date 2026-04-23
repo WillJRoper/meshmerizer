@@ -3195,6 +3195,19 @@ static PyMethodDef adaptive_methods[] = {
         PyDoc_STR("Set the destination file for C++ status logging."),
     },
     {
+        "set_silent_mode",
+        [](PyObject *, PyObject *args) -> PyObject * {
+            int silent = 0;
+            if (!PyArg_ParseTuple(args, "p", &silent)) {
+                return NULL;
+            }
+            meshmerizer_log_detail::set_silent_mode(silent != 0);
+            Py_RETURN_NONE;
+        },
+        METH_VARARGS,
+        PyDoc_STR("Enable or disable C++ progress rendering."),
+    },
+    {
         "run_octree_pipeline",
         run_octree_pipeline_py,
         METH_VARARGS,

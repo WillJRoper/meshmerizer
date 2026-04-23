@@ -13,6 +13,7 @@ from meshmerizer.commands.adaptive_stl import (
     run_adaptive,
 )
 from meshmerizer.logging import (
+    _STATE,
     cli_logging_context,
     emit_warning_summary,
     format_status_prefix,
@@ -314,3 +315,8 @@ def test_warning_summary_is_deferred_until_end(monkeypatch) -> None:
         emit_warning_summary()
 
     assert any("deferred warning" in message for message in records)
+
+
+def test_progress_bar_respects_silent_mode() -> None:
+    with cli_logging_context(silent=True):
+        assert _STATE.silent is True

@@ -69,6 +69,7 @@ class LoggingState:
         console_handler: Active console handler, if configured.
         file_handler: Active file handler, if configured.
         warnings: Deferred warning messages collected during the run.
+        silent: Whether console progress output should be suppressed.
         lock: Re-entrant lock protecting shared logging state.
     """
 
@@ -84,6 +85,7 @@ class LoggingState:
     console_handler: Optional[std_logging.Handler] = None
     file_handler: Optional[std_logging.Handler] = None
     warnings: list[str] = field(default_factory=list)
+    silent: bool = False
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -368,6 +370,7 @@ def record_timing(
         resolved_operation,
         f"{label} took {elapsed:.3f} s",
         level=std_logging.DEBUG,
+        console=_STATE.silent,
         _stack_offset=_stack_offset,
     )
     return elapsed
@@ -460,6 +463,20 @@ def _set_cpp_status_log_path(path: Optional[Path]) -> None:
     setter(None if path is None else str(path))
 
 
+def _set_cpp_silent_mode(silent: bool) -> None:
+    """Tell the adaptive C++ extension whether to suppress progress output."""
+    try:
+        adaptive = import_module("meshmerizer._adaptive")
+    except Exception:
+        return
+
+    setter = getattr(adaptive, "set_silent_mode", None)
+    if setter is None:
+        return
+
+    setter(bool(silent))
+
+
 def _configure_cli_logging() -> None:
     """Attach tqdm-safe console and file logging handlers.
 
@@ -494,6 +511,7 @@ def _configure_cli_logging() -> None:
     _STATE.timings.clear()
     _STATE.warnings.clear()
     _set_cpp_status_log_path(log_path)
+    _set_cpp_silent_mode(_STATE.silent)
 
     log_debug_status("Logging", f"Detailed log: {log_path}")
 
@@ -513,6 +531,7 @@ def _teardown_cli_logging() -> None:
             )
     finally:
         _set_cpp_status_log_path(None)
+        _set_cpp_silent_mode(False)
         _remove_handler(_STATE.console_handler)
         _remove_handler(_STATE.file_handler)
         _STATE.console_handler = None
@@ -520,10 +539,11 @@ def _teardown_cli_logging() -> None:
         _STATE.log_path = None
         _STATE.timings.clear()
         _STATE.warnings.clear()
+        _STATE.silent = False
 
 
 @contextmanager
-def cli_logging_context() -> Iterator[None]:
+def cli_logging_context(*, silent: bool = False) -> Iterator[None]:
     """Run code with CLI logging, progress, and timing enabled.
 
     Yields:
@@ -536,6 +556,7 @@ def cli_logging_context() -> Iterator[None]:
         else:
             _STATE.active = True
             _STATE.depth = 1
+            _STATE.silent = silent
             should_configure = True
 
     if should_configure:
@@ -573,7 +594,7 @@ def progress_bar(
     Yields:
         Progress-bar object.
     """
-    show_bar = enabled and _STATE.active and total > 1
+    show_bar = enabled and _STATE.active and (not _STATE.silent) and total > 1
     bar = tqdm(
         total=total,
         desc=desc,

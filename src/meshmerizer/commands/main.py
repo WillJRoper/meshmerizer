@@ -36,5 +36,5 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     # Run the dispatched CLI command inside the shared logging context so
     # progress bars, terminal messages, and the per-run log file stay aligned.
-    with cli_logging_context():
+    with cli_logging_context(silent=getattr(args, "silent", False)):
         args.func(args)
