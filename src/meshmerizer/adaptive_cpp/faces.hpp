@@ -1088,6 +1088,45 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
     const std::uint32_t fine_res =
         static_cast<std::uint32_t>(fine_res_wide);
 
+    std::vector<std::uint64_t> candidate_origins;
+    candidate_origins.reserve(vertices.size() * 8U);
+    for (const OctreeCell &cell : all_cells) {
+        if (!cell.is_leaf || cell.representative_vertex_index < 0) {
+            continue;
+        }
+
+        std::uint32_t cell_x = 0U;
+        std::uint32_t cell_y = 0U;
+        std::uint32_t cell_z = 0U;
+        morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
+        const std::uint32_t level_shift = max_depth - cell.depth;
+        const std::uint32_t span = 1U << level_shift;
+        const std::uint32_t ix0 = cell_x << level_shift;
+        const std::uint32_t iy0 = cell_y << level_shift;
+        const std::uint32_t iz0 = cell_z << level_shift;
+
+        const std::uint32_t ix_begin = ix0 > 0U ? ix0 - 1U : 0U;
+        const std::uint32_t iy_begin = iy0 > 0U ? iy0 - 1U : 0U;
+        const std::uint32_t iz_begin = iz0 > 0U ? iz0 - 1U : 0U;
+        const std::uint32_t ix_end = std::min(fine_res, ix0 + span);
+        const std::uint32_t iy_end = std::min(fine_res, iy0 + span);
+        const std::uint32_t iz_end = std::min(fine_res, iz0 + span);
+
+        for (std::uint32_t ix = ix_begin; ix < ix_end; ++ix) {
+            for (std::uint32_t iy = iy_begin; iy < iy_end; ++iy) {
+                for (std::uint32_t iz = iz_begin; iz < iz_end; ++iz) {
+                    candidate_origins.push_back(
+                        LeafSpatialIndex::pack_grid_coords(ix, iy, iz));
+                }
+            }
+        }
+    }
+
+    std::sort(candidate_origins.begin(), candidate_origins.end());
+    candidate_origins.erase(
+        std::unique(candidate_origins.begin(), candidate_origins.end()),
+        candidate_origins.end());
+
     // Determine the number of threads.  When OpenMP is disabled the
     // stub returns 1 and the code degrades to a single-threaded path
     // with no overhead beyond the extra indirection through the
@@ -1100,7 +1139,7 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
         static_cast<std::size_t>(n_threads));
 
     ProgressBar face_bar(
-        "Meshing", "generate_faces", static_cast<std::size_t>(fine_res));
+        "Meshing", "generate_faces", candidate_origins.size());
 
     // Iterate over all fine-grid vertex positions.  Each vertex
     // position (ix, iy, iz) is the min corner of a fine-grid cell.
@@ -1112,123 +1151,118 @@ inline std::vector<MeshTriangle> generate_dual_contour_faces(
     // emit_quad reads (but never writes) shared cell/vertex data.
     // The only writes go into the thread-local triangle buffer.
 #pragma omp parallel for schedule(dynamic)
-    for (std::uint32_t ix = 0; ix < fine_res; ++ix) {
+    for (std::int64_t candidate_index = 0;
+         candidate_index < static_cast<std::int64_t>(candidate_origins.size());
+         ++candidate_index) {
         // Select this thread's triangle buffer.
         std::vector<MeshTriangle> &local_triangles =
             thread_triangles[
                 static_cast<std::size_t>(omp_get_thread_num())];
 
-        for (std::uint32_t iy = 0; iy < fine_res; ++iy) {
-            for (std::uint32_t iz = 0; iz < fine_res; ++iz) {
-                // Look up the leaf cell containing this vertex.
-                const std::size_t cell_a_idx =
-                    spatial_index.find_leaf_at(ix, iy, iz);
-                if (cell_a_idx == SIZE_MAX) {
-                    continue;
-                }
-                const OctreeCell &cell_a = all_cells[cell_a_idx];
+        const std::uint64_t packed =
+            candidate_origins[static_cast<std::size_t>(candidate_index)];
+        const std::uint32_t ix = static_cast<std::uint32_t>(packed >> 42U);
+        const std::uint32_t iy =
+            static_cast<std::uint32_t>((packed >> 21U) & ((1U << 21U) - 1U));
+        const std::uint32_t iz =
+            static_cast<std::uint32_t>(packed & ((1U << 21U) - 1U));
 
-                // Determine the sign at vertex (ix, iy, iz).
-                const bool sign_a = sign_at_fine_vertex(
-                    cell_a, ix, iy, iz, spatial_index,
-                    max_depth, isovalue);
+        // Look up the leaf cell containing this vertex.
+        const std::size_t cell_a_idx =
+            spatial_index.find_leaf_at(ix, iy, iz);
+        if (cell_a_idx == SIZE_MAX) {
+            face_bar.tick();
+            continue;
+        }
+        const OctreeCell &cell_a = all_cells[cell_a_idx];
 
-                // --- X-edge: (ix,iy,iz) -> (ix+1,iy,iz) ---
-                if (ix + 1U < fine_res) {
-                    const std::size_t cell_b_idx =
-                        spatial_index.find_leaf_at(
-                            ix + 1U, iy, iz);
-                    if (cell_b_idx != SIZE_MAX) {
-                        const bool sign_b = sign_at_fine_vertex(
-                            all_cells[cell_b_idx],
-                            ix + 1U, iy, iz,
-                            spatial_index, max_depth, isovalue);
+        // Determine the sign at vertex (ix, iy, iz).
+        const bool sign_a = sign_at_fine_vertex(
+            cell_a, ix, iy, iz, spatial_index,
+            max_depth, isovalue);
 
-                        if (sign_a != sign_b) {
-                            if (iy > 0U && iz > 0U) {
-                                const std::size_t c1 =
-                                    spatial_index.find_leaf_at(
-                                        ix, iy - 1U, iz);
-                                const std::size_t c2 =
-                                    spatial_index.find_leaf_at(
-                                        ix, iy, iz - 1U);
-                                const std::size_t c3 =
-                                    spatial_index.find_leaf_at(
-                                        ix, iy - 1U, iz - 1U);
+        // --- X-edge: (ix,iy,iz) -> (ix+1,iy,iz) ---
+        if (ix + 1U < fine_res) {
+            const std::size_t cell_b_idx =
+                spatial_index.find_leaf_at(ix + 1U, iy, iz);
+            if (cell_b_idx != SIZE_MAX) {
+                const bool sign_b = sign_at_fine_vertex(
+                    all_cells[cell_b_idx],
+                    ix + 1U, iy, iz,
+                    spatial_index, max_depth, isovalue);
 
-                                emit_quad(
-                                    all_cells, vertices,
-                                    local_triangles,
-                                    cell_a_idx, c2, c3, c1,
-                                    sign_a);
-                            }
-                        }
+                if (sign_a != sign_b) {
+                    if (iy > 0U && iz > 0U) {
+                        const std::size_t c1 =
+                            spatial_index.find_leaf_at(ix, iy - 1U, iz);
+                        const std::size_t c2 =
+                            spatial_index.find_leaf_at(ix, iy, iz - 1U);
+                        const std::size_t c3 =
+                            spatial_index.find_leaf_at(ix, iy - 1U, iz - 1U);
+
+                        emit_quad(
+                            all_cells, vertices,
+                            local_triangles,
+                            cell_a_idx, c2, c3, c1,
+                            sign_a);
                     }
                 }
+            }
+        }
 
-                // --- Y-edge: (ix,iy,iz) -> (ix,iy+1,iz) ---
-                if (iy + 1U < fine_res) {
-                    const std::size_t cell_c_idx =
-                        spatial_index.find_leaf_at(
-                            ix, iy + 1U, iz);
-                    if (cell_c_idx != SIZE_MAX) {
-                        const bool sign_c = sign_at_fine_vertex(
-                            all_cells[cell_c_idx],
-                            ix, iy + 1U, iz,
-                            spatial_index, max_depth, isovalue);
+        // --- Y-edge: (ix,iy,iz) -> (ix,iy+1,iz) ---
+        if (iy + 1U < fine_res) {
+            const std::size_t cell_c_idx =
+                spatial_index.find_leaf_at(ix, iy + 1U, iz);
+            if (cell_c_idx != SIZE_MAX) {
+                const bool sign_c = sign_at_fine_vertex(
+                    all_cells[cell_c_idx],
+                    ix, iy + 1U, iz,
+                    spatial_index, max_depth, isovalue);
 
-                        if (sign_a != sign_c) {
-                            if (ix > 0U && iz > 0U) {
-                                const std::size_t c1 =
-                                    spatial_index.find_leaf_at(
-                                        ix - 1U, iy, iz);
-                                const std::size_t c2 =
-                                    spatial_index.find_leaf_at(
-                                        ix, iy, iz - 1U);
-                                const std::size_t c3 =
-                                    spatial_index.find_leaf_at(
-                                        ix - 1U, iy, iz - 1U);
+                if (sign_a != sign_c) {
+                    if (ix > 0U && iz > 0U) {
+                        const std::size_t c1 =
+                            spatial_index.find_leaf_at(ix - 1U, iy, iz);
+                        const std::size_t c2 =
+                            spatial_index.find_leaf_at(ix, iy, iz - 1U);
+                        const std::size_t c3 =
+                            spatial_index.find_leaf_at(ix - 1U, iy, iz - 1U);
 
-                                emit_quad(
-                                    all_cells, vertices,
-                                    local_triangles,
-                                    cell_a_idx, c1, c3, c2,
-                                    sign_a);
-                            }
-                        }
+                        emit_quad(
+                            all_cells, vertices,
+                            local_triangles,
+                            cell_a_idx, c1, c3, c2,
+                            sign_a);
                     }
                 }
+            }
+        }
 
-                // --- Z-edge: (ix,iy,iz) -> (ix,iy,iz+1) ---
-                if (iz + 1U < fine_res) {
-                    const std::size_t cell_d_idx =
-                        spatial_index.find_leaf_at(
-                            ix, iy, iz + 1U);
-                    if (cell_d_idx != SIZE_MAX) {
-                        const bool sign_d = sign_at_fine_vertex(
-                            all_cells[cell_d_idx],
-                            ix, iy, iz + 1U,
-                            spatial_index, max_depth, isovalue);
+        // --- Z-edge: (ix,iy,iz) -> (ix,iy,iz+1) ---
+        if (iz + 1U < fine_res) {
+            const std::size_t cell_d_idx =
+                spatial_index.find_leaf_at(ix, iy, iz + 1U);
+            if (cell_d_idx != SIZE_MAX) {
+                const bool sign_d = sign_at_fine_vertex(
+                    all_cells[cell_d_idx],
+                    ix, iy, iz + 1U,
+                    spatial_index, max_depth, isovalue);
 
-                        if (sign_a != sign_d) {
-                            if (ix > 0U && iy > 0U) {
-                                const std::size_t c1 =
-                                    spatial_index.find_leaf_at(
-                                        ix - 1U, iy, iz);
-                                const std::size_t c2 =
-                                    spatial_index.find_leaf_at(
-                                        ix, iy - 1U, iz);
-                                const std::size_t c3 =
-                                    spatial_index.find_leaf_at(
-                                        ix - 1U, iy - 1U, iz);
+                if (sign_a != sign_d) {
+                    if (ix > 0U && iy > 0U) {
+                        const std::size_t c1 =
+                            spatial_index.find_leaf_at(ix - 1U, iy, iz);
+                        const std::size_t c2 =
+                            spatial_index.find_leaf_at(ix, iy - 1U, iz);
+                        const std::size_t c3 =
+                            spatial_index.find_leaf_at(ix - 1U, iy - 1U, iz);
 
-                                emit_quad(
-                                    all_cells, vertices,
-                                    local_triangles,
-                                    cell_a_idx, c2, c3, c1,
-                                    sign_a);
-                            }
-                        }
+                        emit_quad(
+                            all_cells, vertices,
+                            local_triangles,
+                            cell_a_idx, c2, c3, c1,
+                            sign_a);
                     }
                 }
             }
