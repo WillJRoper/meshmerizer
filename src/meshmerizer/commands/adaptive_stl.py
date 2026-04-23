@@ -1,17 +1,14 @@
 """Adaptive meshing CLI command.
 
-This module implements the ``adaptive`` subcommand which runs the new
-adaptive octree pipeline from a SWIFT snapshot to an STL file.  It can
-optionally use particle-level FOF clustering either to reconstruct
-distinct objects independently or to discard small detached fluff
-clusters before meshing.
+This legacy module still hosts the adaptive CLI execution path while the code
+base is being moved into the dedicated ``meshmerizer.cli`` and
+``meshmerizer.io`` packages.
 """
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -22,452 +19,35 @@ from meshmerizer.adaptive_core import (
     refine_octree,
     solve_vertices,
 )
+from meshmerizer.cli.diagnostics import (
+    emit_tree_structure_summary,
+    visualize_vertices,
+)
+from meshmerizer.cli.particles import (
+    filter_small_particle_fof_clusters,
+    load_particles_for_adaptive,
+)
+from meshmerizer.cli.units import convert_print_length_to_native_units
+from meshmerizer.io import export_octree, import_octree, save_mesh_output
 from meshmerizer.logging import (
     abort_with_error,
     log_status,
     log_summary_status,
     record_elapsed,
 )
-from meshmerizer.mesh.core import Mesh
+from meshmerizer.mesh import Mesh
+from meshmerizer.mesh.operations import remove_islands, simplify_mesh
 from meshmerizer.printing import scale_mesh_to_print
 from meshmerizer.reconstruct import reconstruct_mesh
-from meshmerizer.serialize import export_octree, import_octree
 
-
-def _compute_print_scale_factor_cm(
-    domain_min: tuple[float, float, float],
-    domain_max: tuple[float, float, float],
-    target_size_cm: float,
-) -> float:
-    """Return scale factor from native units to print millimetres.
-
-    The adaptive pipeline runs in native snapshot units. When a target print
-    size is requested, we convert user-facing print-length controls back into
-    native units using the same longest-dimension scale factor that will later
-    be applied to the final mesh.
-
-    Args:
-        domain_min: Lower corner of the working domain.
-        domain_max: Upper corner of the working domain.
-        target_size_cm: Requested longest print dimension in centimetres.
-
-    Returns:
-        Uniform scale factor mapping native units to output millimetres.
-
-    Raises:
-        ValueError: If the working domain has zero extent.
-    """
-    extents = np.asarray(domain_max, dtype=np.float64) - np.asarray(
-        domain_min, dtype=np.float64
-    )
-    max_dimension = float(np.max(extents))
-    if max_dimension <= 0.0:
-        raise ValueError("working domain has zero extent")
-    target_size_mm = float(target_size_cm) * 10.0
-    return target_size_mm / max_dimension
-
-
-def _convert_print_length_to_native_units(
-    length_cm: float,
-    domain_min: tuple[float, float, float],
-    domain_max: tuple[float, float, float],
-    target_size_cm: float,
-) -> float:
-    """Convert a print-space centimetre length to native meshing units."""
-    scale_factor = _compute_print_scale_factor_cm(
-        domain_min, domain_max, target_size_cm
-    )
-    return (float(length_cm) * 10.0) / scale_factor
-
-
-def _remove_islands(
-    mesh: Mesh,
-    remove_islands_fraction: Optional[float],
-) -> Mesh:
-    """Remove small disconnected components from a mesh.
-
-    Args:
-        mesh: Input mesh.
-        remove_islands_fraction: Fraction of the largest component
-            volume below which a connected component is discarded.
-            ``0.0`` keeps only the largest component. ``None``
-            disables island removal entirely.
-
-    Returns:
-        A new ``Mesh`` with small islands removed, or the original
-        mesh unchanged when removal is disabled.
-    """
-    if remove_islands_fraction is None:
-        return mesh
-
-    def _component_reference_volume(component) -> float:
-        """Return a robust size estimate for island filtering.
-
-        Prefer the true enclosed volume for watertight meshes. When a
-        component is not watertight, fall back to its convex-hull volume so
-        that a large but imperfect main body is not incorrectly treated as
-        having zero size.
-        """
-        if component.is_watertight:
-            volume = abs(float(component.volume))
-            if np.isfinite(volume):
-                return volume
-
-        try:
-            hull_volume = abs(float(component.convex_hull.volume))
-        except Exception:
-            hull_volume = 0.0
-        return hull_volume if np.isfinite(hull_volume) else 0.0
-
-    # Split into connected components via trimesh.
-    tm = mesh.mesh
-    components = tm.split(only_watertight=False)
-    if len(components) <= 1:
-        return mesh
-
-    if remove_islands_fraction == 0.0:
-        # Keep only the single largest component by volume.
-        largest = max(
-            components,
-            key=_component_reference_volume,
-        )
-        log_status(
-            "Cleaning",
-            f"Kept largest of {len(components)} components.",
-        )
-        return Mesh(mesh=largest)
-
-    # Keep components whose volume fraction exceeds the threshold relative to
-    # the largest resolved object, not the sum of all objects.
-    volumes = [_component_reference_volume(comp) for comp in components]
-    largest_volume = max(volumes, default=0.0)
-    if largest_volume == 0.0:
-        return mesh
-
-    kept = [
-        c
-        for c, v in zip(components, volumes)
-        if v / largest_volume >= remove_islands_fraction
-    ]
-    if not kept:
-        # Keep at least the largest if nothing passes the threshold.
-        kept = [
-            max(
-                components,
-                key=_component_reference_volume,
-            )
-        ]
-    log_status(
-        "Cleaning",
-        f"Kept {len(kept)} of {len(components)} components "
-        f"(fraction >= {remove_islands_fraction} of largest volume).",
-    )
-    import trimesh
-
-    combined = trimesh.util.concatenate(kept)
-    return Mesh(mesh=combined)
-
-
-def _simplify_mesh(mesh: Mesh, simplify_factor: float) -> Mesh:
-    """Optionally simplify the mesh after extraction and cleanup."""
-    if simplify_factor == 1.0:
-        return mesh
-
-    log_status(
-        "Cleaning",
-        f"Simplifying mesh to retain factor {simplify_factor:.6g}...",
-    )
-    before_faces = len(mesh.faces)
-    mesh.simplify(factor=simplify_factor)
-    after_faces = len(mesh.faces)
-    log_status(
-        "Cleaning",
-        f"Simplified mesh faces: {before_faces} -> {after_faces}",
-    )
-    return mesh
-
-
-def _load_particles_for_adaptive(args):
-    """Load and prepare particles for the adaptive pipeline.
-
-    This reuses the existing ``load_swift_particles`` function from
-    the loading module, then converts the outputs into the format
-    expected by the adaptive C++ core.
-
-    Args:
-        args: Parsed CLI namespace.
-
-    Returns:
-        Tuple of ``(positions, smoothing_lengths, domain_min,
-        domain_max, origin)`` where positions is a list of 3-tuples,
-        smoothing_lengths is a list of floats, domain_min and
-        domain_max are 3-tuples, and origin is a numpy array.
-    """
-    from meshmerizer.commands.loading import load_swift_particles
-
-    coords, h, effective_box_size, origin = load_swift_particles(
-        filename=args.filename,
-        particle_type=args.particle_type,
-        smoothing_factor=args.smoothing_factor,
-        box_size=args.box_size,
-        shift=list(args.shift),
-        wrap_shift=args.wrap_shift,
-        center=args.center,
-        extent=args.extent,
-        periodic=args.periodic,
-        tight_bounds=args.tight_bounds,
-    )
-
-    if h is None:
-        abort_with_error(
-            "Loading",
-            "Smoothing lengths are required for the adaptive pipeline but "
-            "could not be determined.",
-        )
-
-    n_particles = coords.shape[0]
-    if n_particles == 0:
-        abort_with_error(
-            "Loading",
-            "No particles selected. Check domain selection flags.",
-        )
-
-    log_status(
-        "Loading",
-        f"Prepared {n_particles} particles for adaptive meshing.",
-    )
-
-    # Ensure positions are a contiguous float64 (N, 3) array and
-    # smoothing lengths are a contiguous float64 (N,) array so the
-    # C++ extension can read them via the buffer protocol in a single
-    # memcpy instead of per-element PyFloat_AsDouble calls.
-    positions = np.ascontiguousarray(coords, dtype=np.float64)
-    smoothing_lengths = np.ascontiguousarray(h, dtype=np.float64)
-
-    # The adaptive pipeline uses an explicit domain bounding box.
-    # After loading, coordinates live in [0, effective_box_size)^3.
-    domain_min = (0.0, 0.0, 0.0)
-    domain_max = (
-        float(effective_box_size),
-        float(effective_box_size),
-        float(effective_box_size),
-    )
-
-    return positions, smoothing_lengths, domain_min, domain_max, origin
-
-
-def _filter_small_particle_fof_clusters(
-    positions: np.ndarray,
-    smoothing_lengths: np.ndarray,
-    domain_min: tuple[float, float, float],
-    domain_max: tuple[float, float, float],
-    linking_factor: float,
-    min_cluster_size: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Discard particle FOF clusters smaller than ``min_cluster_size``.
-
-    Args:
-        positions: Particle positions as an ``(N, 3)`` float64 array.
-        smoothing_lengths: Per-particle smoothing lengths as ``(N,)``.
-        domain_min: Lower corner of the working domain.
-        domain_max: Upper corner of the working domain.
-        linking_factor: FOF linking factor.
-        min_cluster_size: Minimum number of particles required for a
-            cluster to be retained.
-
-    Returns:
-        Tuple of filtered ``(positions, smoothing_lengths)`` arrays.
-
-    Raises:
-        ValueError: If ``min_cluster_size`` is not positive.
-    """
-    if min_cluster_size <= 0:
-        raise ValueError(
-            f"min_cluster_size must be positive, got {min_cluster_size}"
-        )
-
-    if len(positions) == 0:
-        return positions, smoothing_lengths
-
-    labels = fof_cluster(positions, domain_min, domain_max, linking_factor)
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    kept_labels = unique_labels[counts >= min_cluster_size]
-
-    n_groups = int(unique_labels.size)
-    n_kept_groups = int(kept_labels.size)
-    n_removed_groups = n_groups - n_kept_groups
-    kept_mask = np.isin(labels, kept_labels)
-    n_kept_particles = int(np.count_nonzero(kept_mask))
-    n_removed_particles = int(len(positions) - n_kept_particles)
-
-    log_status(
-        "Clustering",
-        (
-            f"FOF particle filtering: kept {n_kept_groups}/{n_groups} groups "
-            f"and {n_kept_particles}/{len(positions)} particles "
-            f"(removed {n_removed_groups} groups, {n_removed_particles} "
-            f"particles; min size = {min_cluster_size})."
-        ),
-    )
-
-    if n_kept_particles == 0:
-        return positions[:0], smoothing_lengths[:0]
-
-    return positions[kept_mask], smoothing_lengths[kept_mask]
-
-
-def _visualize_vertices(vert_positions, output_path: str) -> None:
-    """Save a 6-panel figure showing QEF vertices from each face.
-
-    Each panel is a 2D scatter plot of the vertex positions
-    projected along one of the six axis-aligned directions
-    (+X, -X, +Y, -Y, +Z, -Z), giving a complete view of the
-    vertex distribution from every side of the bounding box.
-    All panels use equal aspect ratio so the geometry is not
-    distorted.
-
-    Args:
-        vert_positions: (N, 3) float64 array of vertex positions.
-        output_path: File path to save the figure to (e.g.
-            ``"qef_vertices.png"``).
-    """
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        abort_with_error(
-            "Meshing",
-            "matplotlib is required for --visualise-verts. Install it with: "
-            "pip install matplotlib",
-        )
-
-    # Define the six face views.  Each entry is:
-    #   (title, horizontal_axis_index, vertical_axis_index,
-    #    horizontal_label, vertical_label)
-    # The axis indices select columns from the Nx3 positions array.
-    views = [
-        ("+X face (Y-Z)", 1, 2, "Y", "Z"),
-        ("-X face (Y-Z)", 1, 2, "Y", "Z"),
-        ("+Y face (X-Z)", 0, 2, "X", "Z"),
-        ("-Y face (X-Z)", 0, 2, "X", "Z"),
-        ("+Z face (X-Y)", 0, 1, "X", "Y"),
-        ("-Z face (X-Y)", 0, 1, "X", "Y"),
-    ]
-
-    n_pts = len(vert_positions)
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle(
-        f"QEF Vertices ({n_pts:,} points)",
-        fontsize=14,
-        fontweight="bold",
-    )
-
-    for ax, (title, hi, vi, hlabel, vlabel) in zip(axes.flat, views):
-        ax.scatter(
-            vert_positions[:, hi],
-            vert_positions[:, vi],
-            s=0.5,
-            alpha=0.4,
-            color="C0",
-            edgecolors="none",
-            rasterized=True,
-        )
-        ax.set_xlabel(hlabel)
-        ax.set_ylabel(vlabel)
-        ax.set_title(title)
-        ax.set_aspect("equal")
-
-    plt.tight_layout()
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    log_summary_status(
-        "Saving", f"Saved vertex visualisation to {output_path}"
-    )
-
-
-def _emit_tree_structure_summary(cells) -> None:
-    """Log a concise per-depth summary of the octree structure.
-
-    Args:
-        cells: Iterable of octree cell dictionaries.
-    """
-    if not cells:
-        log_status(
-            "Tree",
-            "Summary:\n"
-            "total=0 leaf=0 internal=0 active=0 inactive=0 surface=0",
-        )
-        return
-
-    max_depth = max(int(cell.get("depth", 0)) for cell in cells)
-    per_depth = [
-        {
-            "total": 0,
-            "leaf": 0,
-            "active": 0,
-            "surface": 0,
-        }
-        for _ in range(max_depth + 1)
-    ]
-
-    total_leaf = 0
-    total_active = 0
-    total_surface = 0
-
-    for cell in cells:
-        depth = int(cell.get("depth", 0))
-        summary = per_depth[depth]
-        summary["total"] += 1
-        is_leaf = bool(cell.get("is_leaf", False))
-        is_active = bool(cell.get("is_active", False))
-        has_surface = bool(cell.get("has_surface", False))
-        if is_leaf:
-            summary["leaf"] += 1
-            total_leaf += 1
-        if is_active:
-            summary["active"] += 1
-            total_active += 1
-        if has_surface:
-            summary["surface"] += 1
-            total_surface += 1
-
-    lines = [
-        "Summary:",
-        (
-            f"total={len(cells)} leaf={total_leaf} "
-            f"internal={len(cells) - total_leaf} "
-            f"active={total_active} inactive={len(cells) - total_active} "
-            f"surface={total_surface}"
-        ),
-    ]
-    for depth, summary in enumerate(per_depth):
-        lines.append(
-            (
-                f"depth {depth}: total={summary['total']} "
-                f"leaf={summary['leaf']} "
-                f"internal={summary['total'] - summary['leaf']} "
-                f"active={summary['active']} "
-                f"inactive={summary['total'] - summary['active']} "
-                f"surface={summary['surface']}"
-            )
-        )
-
-    log_summary_status("Tree", "\n".join(lines))
-
-
-def _save_mesh_output(mesh: Mesh, output_path: Path) -> None:
-    """Write mesh output atomically to avoid partial files on cancel."""
-    temp_path = output_path.with_name(
-        f"{output_path.stem}.tmp{output_path.suffix}"
-    )
-    try:
-        mesh.save(str(temp_path))
-        temp_path.replace(output_path)
-    except BaseException:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+_convert_print_length_to_native_units = convert_print_length_to_native_units
+_remove_islands = remove_islands
+_simplify_mesh = simplify_mesh
+_load_particles_for_adaptive = load_particles_for_adaptive
+_filter_small_particle_fof_clusters = filter_small_particle_fof_clusters
+_visualize_vertices = visualize_vertices
+_emit_tree_structure_summary = emit_tree_structure_summary
+_save_mesh_output = save_mesh_output
 
 
 def run_adaptive(args) -> None:

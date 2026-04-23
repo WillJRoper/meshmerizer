@@ -7,14 +7,14 @@ import numpy as np
 import pytest
 import trimesh
 
+from meshmerizer.cli.args import build_parser
+from meshmerizer.cli.main import main
 from meshmerizer.commands.adaptive_stl import (
     _convert_print_length_to_native_units,
     _remove_islands,
     _simplify_mesh,
     run_adaptive,
 )
-from meshmerizer.commands.args import build_parser
-from meshmerizer.commands.main import main
 from meshmerizer.logging import (
     _STATE,
     cli_logging_context,
@@ -423,7 +423,7 @@ def test_main_accepts_snapshot_without_subcommand(monkeypatch) -> None:
     called = {}
 
     monkeypatch.setattr(
-        "meshmerizer.commands.args.run_adaptive",
+        "meshmerizer.cli.args.run_adaptive",
         lambda args: called.setdefault("filename", args.filename),
     )
 
@@ -434,7 +434,7 @@ def test_main_accepts_snapshot_without_subcommand(monkeypatch) -> None:
 
 def test_main_exits_cleanly_on_keyboard_interrupt(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
-        "meshmerizer.commands.args.run_adaptive",
+        "meshmerizer.cli.args.run_adaptive",
         lambda args: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
 
@@ -455,7 +455,7 @@ def test_run_adaptive_removes_temporary_output_on_interrupt(
     positions = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]])
     smoothing_lengths = np.full(3, 0.1)
     output_path = tmp_path / "out.stl"
-    temp_path = tmp_path / "out.stl.tmp"
+    temp_path = tmp_path / "out.tmp.stl"
 
     monkeypatch.setattr(
         "meshmerizer.commands.adaptive_stl._load_particles_for_adaptive",

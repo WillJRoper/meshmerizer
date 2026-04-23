@@ -1,15 +1,8 @@
-"""High-level Python API for composing meshmerizer pipelines.
-
-This module provides the public, Python-friendly API for building adaptive
-meshing workflows in stages. The goal is to let users either run the whole
-pipeline with a single call or stop at well-defined intermediate products and
-modify them in Python before continuing.
-"""
+"""High-level Python API for composing meshmerizer pipelines."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -22,59 +15,9 @@ from meshmerizer.adaptive_core import (
     generate_mesh,
     run_full_pipeline,
 )
-from meshmerizer.commands.adaptive_stl import _remove_islands
-from meshmerizer.mesh.core import Mesh
-
-Vec3 = Tuple[float, float, float]
-
-
-@dataclass
-class TreeState:
-    """Adaptive tree plus the particle/domain metadata needed downstream."""
-
-    cells: tuple[dict[str, object], ...]
-    contributors: tuple[int, ...]
-    positions: np.ndarray
-    smoothing_lengths: np.ndarray
-    domain_min: Vec3
-    domain_max: Vec3
-    base_resolution: int
-    max_depth: int
-    isovalue: float
-    minimum_usable_hermite_samples: int = 3
-    max_qef_rms_residual_ratio: float = 0.1
-    min_normal_alignment_threshold: float = 0.97
-
-
-@dataclass
-class TopologyState:
-    """Regularized opened-solid topology derived from a tree state."""
-
-    tree: TreeState
-    occupancy: np.ndarray
-    depths: np.ndarray
-    centers: np.ndarray
-    sizes: np.ndarray
-    clearance: np.ndarray
-    thickening_distance: np.ndarray
-    thickened_inside: np.ndarray
-    eroded_inside: np.ndarray
-    dilation_distance: np.ndarray
-    opened_inside: np.ndarray
-    sample_positions: np.ndarray
-    sample_normals: np.ndarray
-    mesh_vertices: np.ndarray
-    mesh_faces: np.ndarray
-    min_feature_thickness: float
-
-
-@dataclass
-class MeshResult:
-    """Mesh plus lightweight metadata from the reconstruction pipeline."""
-
-    mesh: Mesh
-    isovalue: float
-    n_qef_vertices: int
+from meshmerizer.mesh import Mesh
+from meshmerizer.mesh.operations import remove_islands as remove_small_islands
+from meshmerizer.state import MeshResult, TopologyState, TreeState, Vec3
 
 
 def _as_positions(positions: Sequence[Sequence[float]]) -> np.ndarray:
@@ -354,7 +297,7 @@ def remove_islands(
     remove_islands_fraction: Optional[float],
 ) -> Mesh:
     """Remove connected components below a fraction of the largest volume."""
-    return _remove_islands(mesh, remove_islands_fraction)
+    return remove_small_islands(mesh, remove_islands_fraction)
 
 
 def subdivide_long_edges(mesh: Mesh, iterations: int = 1) -> Mesh:
