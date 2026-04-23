@@ -196,6 +196,9 @@ public:
      * the percentage check avoids lock contention on stdout.
      */
     void tick() {
+        if (total_ == 0) {
+            return;
+        }
         /* Atomic increment; returns the value *before* increment. */
         std::size_t prev = current_.fetch_add(1, std::memory_order_relaxed);
         std::size_t now = prev + 1;

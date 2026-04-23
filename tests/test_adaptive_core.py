@@ -1311,3 +1311,36 @@ def test_opened_solid_generates_surface_mesh() -> None:
     assert len(faces) > 0
     assert vertices.shape[1] == 3
     assert faces.shape[1] == 3
+
+
+def test_pre_thickening_increases_leaf_count_when_refinement_is_needed() -> (
+    None
+):
+    """Pre-thickening refinement should add resolution near the growth band."""
+    positions, smoothing_lengths = _make_solid_sphere_particles(h=0.12)
+
+    baseline = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        2,
+        erosion_radius=0.0,
+        pre_thickening_radius=0.0,
+    )
+    thickened = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        2,
+        erosion_radius=0.0,
+        pre_thickening_radius=0.25,
+    )
+
+    assert thickened["n_leaves"] >= baseline["n_leaves"]
+    assert thickened["n_thickened_inside"] >= thickened["n_inside"]

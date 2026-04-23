@@ -300,7 +300,7 @@ inline DCPipelineResult run_dc_pipeline(
                 const std::vector<double> thickening_distance =
                     compute_outside_distance_from_inside_mask(
                         solid_leaves, inside_mask,
-                        pre_thickening_radius);
+                        pre_thickening_radius + thickening_leaf_size_target);
                 ++thickening_refine_pass;
                 meshmerizer_log_detail::print_status(
                     "Regularization",
