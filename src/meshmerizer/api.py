@@ -1,4 +1,10 @@
-"""High-level Python API for composing meshmerizer pipelines."""
+"""High-level Python API for composing meshmerizer pipelines.
+
+This module defines the intended public, Python-friendly workflow for the
+adaptive meshing pipeline. Callers can either run the full particles-to-mesh
+path in one shot or stop at explicit intermediate states for inspection and
+editing.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +27,17 @@ from meshmerizer.state import MeshResult, TopologyState, TreeState, Vec3
 
 
 def _as_positions(positions: Sequence[Sequence[float]]) -> np.ndarray:
+    """Normalize particle positions to a contiguous ``(N, 3)`` array.
+
+    Args:
+        positions: Sequence of XYZ coordinate triplets.
+
+    Returns:
+        Contiguous float64 array with shape ``(N, 3)``.
+
+    Raises:
+        ValueError: If the input cannot be interpreted as ``(N, 3)``.
+    """
     arr = np.ascontiguousarray(positions, dtype=np.float64)
     if arr.ndim != 2 or arr.shape[1] != 3:
         raise ValueError("positions must have shape (N, 3)")
@@ -28,6 +45,17 @@ def _as_positions(positions: Sequence[Sequence[float]]) -> np.ndarray:
 
 
 def _as_smoothing_lengths(smoothing_lengths: Sequence[float]) -> np.ndarray:
+    """Normalize smoothing lengths to a contiguous ``(N,)`` array.
+
+    Args:
+        smoothing_lengths: Sequence of per-particle support radii.
+
+    Returns:
+        Contiguous float64 array with shape ``(N,)``.
+
+    Raises:
+        ValueError: If the input is not one-dimensional.
+    """
     arr = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
     if arr.ndim != 1:
         raise ValueError("smoothing_lengths must have shape (N,)")
@@ -38,6 +66,18 @@ def _validate_particle_arrays(
     positions: Sequence[Sequence[float]],
     smoothing_lengths: Sequence[float],
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Validate and normalize particle arrays used by the public API.
+
+    Args:
+        positions: Sequence of particle positions.
+        smoothing_lengths: Sequence of per-particle smoothing lengths.
+
+    Returns:
+        Tuple of validated ``(positions, smoothing_lengths)`` arrays.
+
+    Raises:
+        ValueError: If the arrays have incompatible shapes or lengths.
+    """
     pos = _as_positions(positions)
     sml = _as_smoothing_lengths(smoothing_lengths)
     if pos.shape[0] != sml.shape[0]:
@@ -49,6 +89,14 @@ def _validate_particle_arrays(
 
 
 def _mesh_result_from_pipeline_dict(result: dict) -> MeshResult:
+    """Convert a native pipeline result dictionary into ``MeshResult``.
+
+    Args:
+        result: Mapping returned by ``run_full_pipeline``.
+
+    Returns:
+        Public ``MeshResult`` wrapper.
+    """
     return MeshResult(
         mesh=Mesh(vertices=result["vertices"], faces=result["faces"]),
         isovalue=float(result["isovalue"]),
@@ -68,7 +116,26 @@ def build_and_refine_tree(
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
 ) -> TreeState:
-    """Build and refine the adaptive tree without extracting a final mesh."""
+    """Build and refine the adaptive tree without extracting a final mesh.
+
+    Args:
+        positions: Particle positions with shape ``(N, 3)``.
+        smoothing_lengths: Per-particle support radii with shape ``(N,)``.
+        domain_min: Inclusive lower corner of the working domain.
+        domain_max: Exclusive upper corner of the working domain.
+        base_resolution: Number of top-level cells per axis.
+        isovalue: Scalar field threshold used for refinement decisions.
+        max_depth: Maximum octree refinement depth.
+        minimum_usable_hermite_samples: Minimum usable Hermite sample count
+            required before a corner-crossing cell may stop refining.
+        max_qef_rms_residual_ratio: Maximum RMS QEF residual as a fraction of
+            the local cell radius.
+        min_normal_alignment_threshold: Minimum allowed alignment between
+            usable Hermite normals and their mean direction.
+
+    Returns:
+        ``TreeState`` containing the refined tree and validated inputs.
+    """
     pos, sml = _validate_particle_arrays(positions, smoothing_lengths)
     cells, contributors = build_refined_tree(
         pos,
@@ -104,7 +171,17 @@ def erode_and_dilate(
     *,
     pre_thickening_radius: float = 0.0,
 ) -> TopologyState:
-    """Build the opened-solid topology used by the regularized pipeline."""
+    """Build the opened-solid topology used by the regularized pipeline.
+
+    Args:
+        tree: Previously built tree state.
+        min_feature_thickness: Minimum feature thickness to preserve.
+        pre_thickening_radius: Optional outward thickening radius applied
+            before the opening stage.
+
+    Returns:
+        ``TopologyState`` representing the regularized opened solid.
+    """
     erosion_radius = 0.5 * float(min_feature_thickness)
     result = classify_occupied_solid(
         tree.positions,
@@ -151,7 +228,25 @@ def get_mesh_from_tree(
     pre_thickening_radius: float = 0.0,
     remove_islands_fraction: Optional[float] = None,
 ) -> MeshResult:
-    """Extract a mesh from an already-built tree state."""
+    """Extract a mesh from an already-built tree state.
+
+    This function uses the fast direct mesh-generation path when the tree can
+    be meshed without additional regularization. Otherwise it re-runs the full
+    pipeline using the tree state's stored inputs and refinement parameters.
+
+    Args:
+        tree: Previously built tree state.
+        smoothing_iterations: Number of smoothing iterations to apply.
+        smoothing_strength: Laplacian smoothing strength in ``(0, 1]``.
+        max_edge_ratio: Maximum edge length as a multiple of local cell size.
+        min_feature_thickness: Minimum feature thickness to preserve.
+        pre_thickening_radius: Optional outward thickening radius.
+        remove_islands_fraction: Optional connected-component filtering
+            threshold.
+
+    Returns:
+        ``MeshResult`` containing the extracted mesh.
+    """
     if (
         tree.cells
         and tree.contributors
@@ -207,7 +302,16 @@ def get_mesh_from_topology(
     *,
     remove_islands_fraction: Optional[float] = None,
 ) -> MeshResult:
-    """Extract a mesh from a Python-editable topology state."""
+    """Extract a mesh from a Python-editable topology state.
+
+    Args:
+        topology: Opened-solid topology to extract.
+        remove_islands_fraction: Optional connected-component filtering
+            threshold.
+
+    Returns:
+        ``MeshResult`` containing the extracted opened-surface mesh.
+    """
     vertices, faces = extract_opened_surface_mesh(
         topology.tree.positions,
         topology.tree.smoothing_lengths,
@@ -252,7 +356,30 @@ def get_mesh(
     pre_thickening_radius: float = 0.0,
     remove_islands_fraction: Optional[float] = None,
 ) -> MeshResult:
-    """Run the full public particles-to-mesh workflow."""
+    """Run the full public particles-to-mesh workflow.
+
+    Args:
+        positions: Particle positions with shape ``(N, 3)``.
+        smoothing_lengths: Per-particle support radii with shape ``(N,)``.
+        domain_min: Inclusive lower corner of the working domain.
+        domain_max: Exclusive upper corner of the working domain.
+        base_resolution: Number of top-level cells per axis.
+        max_depth: Maximum octree refinement depth.
+        isovalue: Scalar field threshold for surface extraction.
+        smoothing_iterations: Number of smoothing iterations to apply.
+        smoothing_strength: Laplacian smoothing strength in ``(0, 1]``.
+        max_edge_ratio: Maximum edge length as a multiple of local cell size.
+        minimum_usable_hermite_samples: Minimum usable Hermite sample count.
+        max_qef_rms_residual_ratio: Maximum RMS QEF residual ratio.
+        min_normal_alignment_threshold: Minimum usable-normal alignment.
+        min_feature_thickness: Minimum feature thickness to preserve.
+        pre_thickening_radius: Optional outward thickening radius.
+        remove_islands_fraction: Optional connected-component filtering
+            threshold.
+
+    Returns:
+        ``MeshResult`` containing the final extracted mesh.
+    """
     pos, sml = _validate_particle_arrays(positions, smoothing_lengths)
     result = run_full_pipeline(
         pos,
@@ -286,7 +413,16 @@ def smooth_mesh(
     *,
     inplace: bool = False,
 ) -> Mesh:
-    """Apply the existing mesh-repair smoothing workflow to a mesh."""
+    """Apply the existing mesh-repair smoothing workflow to a mesh.
+
+    Args:
+        mesh: Mesh to smooth.
+        iterations: Number of repair/smoothing iterations.
+        inplace: Whether to modify the input mesh directly.
+
+    Returns:
+        Smoothed mesh instance.
+    """
     target = mesh if inplace else Mesh(mesh=mesh.mesh.copy())
     target.repair(smoothing_iters=iterations)
     return target
@@ -296,12 +432,29 @@ def remove_islands(
     mesh: Mesh,
     remove_islands_fraction: Optional[float],
 ) -> Mesh:
-    """Remove connected components below a fraction of the largest volume."""
+    """Remove connected components below a fraction of the largest volume.
+
+    Args:
+        mesh: Mesh to filter.
+        remove_islands_fraction: Optional threshold relative to the largest
+            connected component volume.
+
+    Returns:
+        Filtered mesh.
+    """
     return remove_small_islands(mesh, remove_islands_fraction)
 
 
 def subdivide_long_edges(mesh: Mesh, iterations: int = 1) -> Mesh:
-    """Subdivide mesh edges using the existing trimesh-based subdivision."""
+    """Subdivide mesh edges using the existing trimesh-based subdivision.
+
+    Args:
+        mesh: Mesh to subdivide.
+        iterations: Number of subdivision passes.
+
+    Returns:
+        Subdivided mesh copy.
+    """
     result = Mesh(mesh=mesh.mesh.copy())
     result.subdivide(iterations=iterations)
     return result

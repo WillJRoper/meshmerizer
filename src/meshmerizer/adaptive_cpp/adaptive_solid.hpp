@@ -1,3 +1,20 @@
+/**
+ * @file adaptive_solid.hpp
+ * @brief Adaptive opened-solid regularization helpers.
+ *
+ * This header implements the topology-regularization path used to remove thin
+ * or fragile features before final surface extraction. The core workflow is:
+ *
+ * 1. classify octree leaves as inside, outside, or boundary-adjacent,
+ * 2. optionally refine a narrow surface band to improve local resolution,
+ * 3. compute erosion and dilation distances on the occupied solid, and
+ * 4. extract an opened, print-friendly surface from the modified topology.
+ *
+ * The data structures below capture the per-leaf state reused across those
+ * phases. Dense comments are especially important here because topology edits
+ * depend on invariants shared between several passes.
+ */
+
 #ifndef MESHMERIZER_ADAPTIVE_CPP_ADAPTIVE_SOLID_HPP_
 #define MESHMERIZER_ADAPTIVE_CPP_ADAPTIVE_SOLID_HPP_
 
@@ -16,6 +33,9 @@
 #include "faces.hpp"
 #include "octree_cell.hpp"
 
+/**
+ * @brief Occupancy classification used by the opened-solid pipeline.
+ */
 enum class OccupancyState : std::uint8_t {
     kOutside = 0U,
     kInside = 1U,
@@ -23,28 +43,60 @@ enum class OccupancyState : std::uint8_t {
     kBoundaryOutside = 3U,
 };
 
+/**
+ * @brief Compact per-leaf record for occupied-solid operations.
+ */
 struct OccupiedSolidLeaf {
+    /** Index into the global ``all_cells`` array. */
     std::size_t cell_index;
+    /** Scalar field value sampled at the leaf centre. */
     double center_value;
+    /** Leaf edge length in domain units. */
     double cell_size;
+    /** Octree depth of the leaf. */
     std::uint32_t depth;
+    /** Occupancy classification assigned to this leaf. */
     OccupancyState occupancy;
+    /** Neighbor leaf indices for the six axis-aligned faces, or -1 if absent. */
     std::array<std::int64_t, 6> face_neighbor_leaf_indices;
 };
 
+/**
+ * @brief Cached classification arrays aligned with the full octree.
+ *
+ * These vectors let later topology passes reuse occupancy decisions without
+ * repeatedly walking and reclassifying the whole tree.
+ */
 struct OccupiedSolidClassificationCache {
+    /** Boolean inside/outside flags for all cells. */
     std::vector<std::uint8_t> inside_flags;
+    /** Scalar field values sampled at cell centres. */
     std::vector<double> center_values;
+    /** Occupancy state values for all cells. */
     std::vector<std::uint8_t> occupancy_states;
+    /** Face-neighbor lookup into the global cell array. */
     std::vector<std::array<std::size_t, 6>> face_neighbor_cell_indices;
 };
 
+/**
+ * @brief Boundary sample emitted from the opened solid.
+ */
 struct OpenedBoundarySample {
+    /** Sample position on the opened boundary. */
     Vector3d position;
+    /** Outward-facing normal at the sample position. */
     Vector3d outward_normal;
+    /** Index of the source occupied-solid leaf. */
     std::size_t leaf_index;
 };
 
+/**
+ * @brief Build a reverse lookup from global cell index to occupied-solid leaf.
+ *
+ * @param all_cells Complete octree cell array.
+ * @param solid_leaves Occupied-solid leaf records.
+ * @return Vector mapping cell index to leaf index, or ``-1`` when absent.
+ */
 inline std::vector<std::int64_t> build_opened_cell_to_leaf_index(
     const std::vector<OctreeCell> &all_cells,
     const std::vector<OccupiedSolidLeaf> &solid_leaves) {
@@ -56,6 +108,13 @@ inline std::vector<std::int64_t> build_opened_cell_to_leaf_index(
     return cell_to_leaf_index;
 }
 
+/**
+ * @brief Return the contributor slice bounds for one cell.
+ *
+ * @param cell Cell whose contributor range is requested.
+ * @param all_contributors Global flat contributor array.
+ * @return Pair ``(begin, end)`` into ``all_contributors``.
+ */
 inline std::pair<std::size_t, std::size_t> cell_contributor_bounds(
     const OctreeCell &cell,
     const std::vector<std::size_t> &all_contributors) {
@@ -71,6 +130,13 @@ inline std::pair<std::size_t, std::size_t> cell_contributor_bounds(
     return {begin_idx, end_idx};
 }
 
+/**
+ * @brief Return the contributor span for one cell.
+ *
+ * @param cell Cell whose contributor span is requested.
+ * @param all_contributors Global flat contributor array.
+ * @return View over the cell's contributor indices.
+ */
 inline std::span<const std::size_t> cell_contributor_span(
     const OctreeCell &cell,
     const std::vector<std::size_t> &all_contributors) {
@@ -81,10 +147,39 @@ inline std::span<const std::size_t> cell_contributor_span(
         end_idx - begin_idx);
 }
 
+/**
+ * @brief Return the edge length of a cubic octree cell.
+ *
+ * @param cell Input cell.
+ * @return Cell edge length in domain units.
+ */
 inline double cell_edge_length(const OctreeCell &cell) {
     return cell.bounds.max.x - cell.bounds.min.x;
 }
 
+/**
+ * @brief Refine surface-adjacent leaves until they satisfy a target size.
+ *
+ * This is the first major regularization step. It focuses extra resolution in
+ * a narrow band around the implicit surface so later morphological operations
+ * can measure thickness on cells that are small enough to be meaningful.
+ *
+ * Cells are re-sampled immediately after splitting so the queue always contains
+ * leaves whose current corner data and contributor ranges are valid.
+ *
+ * @param all_cells Complete octree cell array to update in place.
+ * @param all_contributors Global flat contributor array to update in place.
+ * @param positions Particle positions.
+ * @param smoothing_lengths Per-particle support radii.
+ * @param isovalue Scalar field threshold for surface detection.
+ * @param max_depth Maximum octree refinement depth.
+ * @param max_surface_leaf_size Largest acceptable surface-band leaf size.
+ * @param minimum_usable_hermite_samples Minimum usable Hermite sample count.
+ * @param max_qef_rms_residual_ratio Maximum allowed RMS QEF residual ratio.
+ * @param min_normal_alignment_threshold Minimum allowed Hermite normal
+ *     alignment.
+ * @return ``true`` when at least one split was performed.
+ */
 inline bool refine_surface_band_cells(
     std::vector<OctreeCell> &all_cells,
     std::vector<std::size_t> &all_contributors,

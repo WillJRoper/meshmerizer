@@ -1,11 +1,11 @@
 /**
  * @file _adaptive.cpp
- * @brief Minimal C++ extension scaffold for the adaptive meshing rewrite.
+ * @brief Python bindings for the adaptive meshing native core.
  *
- * This file intentionally exposes only a tiny Python API at the start of the
- * rewrite. Its purpose is to prove that the repository can build and import a
- * dedicated C++ extension for the adaptive meshing path before larger classes
- * and algorithms are added.
+ * This translation unit bridges Python and the native adaptive meshing
+ * pipeline. It owns NumPy buffer parsing, Python-facing argument validation,
+ * and the exported wrappers for octree construction, topology regularization,
+ * and final mesh extraction.
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -323,17 +323,17 @@ static PyObject *build_octree_cell_dict(const OctreeCell &cell) {
 /**
  * @brief Return the name of the adaptive core status.
  *
- * The first rewrite stage exposes a very small function so tests can verify
- * that the C++ extension builds and imports successfully.
+ * This lightweight status endpoint gives Python callers and tests a reliable
+ * way to verify that the compiled adaptive core imported successfully.
  *
  * @param self Unused Python self/module object.
  * @param args Unused Python argument tuple.
- * @return Python unicode object describing the current scaffold state.
+ * @return Python unicode object describing the native core status.
  */
 static PyObject *adaptive_status(PyObject *self, PyObject *args) {
     (void)self;
     (void)args;
-    return PyUnicode_FromString("adaptive core scaffold ready");
+    return PyUnicode_FromString("adaptive core ready");
 }
 
 /**
@@ -3307,7 +3307,7 @@ static PyMethodDef adaptive_methods[] = {
 static struct PyModuleDef adaptive_module = {
     PyModuleDef_HEAD_INIT,
     "_adaptive",
-    "Low-level adaptive meshing scaffold.",
+    "Low-level adaptive meshing bindings and pipeline helpers.",
     -1,
     adaptive_methods,
 };

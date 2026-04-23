@@ -1,4 +1,8 @@
-"""Output helpers for writing generated assets safely."""
+"""Output helpers for writing generated assets safely.
+
+The CLI writes mesh outputs through this module so atomic-save policy lives in
+one place instead of being reimplemented across command handlers.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,15 @@ from meshmerizer.mesh import Mesh
 
 
 def save_mesh_output(mesh: Mesh, output_path: Path) -> None:
-    """Write mesh output atomically to avoid partial files on cancel."""
+    """Write mesh output atomically to avoid partial files on cancel.
+
+    Args:
+        mesh: Mesh to serialize.
+        output_path: Final desired output path.
+
+    Returns:
+        ``None``. The mesh is written to disk.
+    """
     temp_path = output_path.with_name(
         f"{output_path.stem}.tmp{output_path.suffix}"
     )

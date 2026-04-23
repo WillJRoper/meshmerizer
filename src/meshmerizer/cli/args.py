@@ -10,6 +10,7 @@ from meshmerizer.cli.adaptive import run_adaptive
 
 
 def _positive_int(value: str) -> int:
+    """Parse a strictly positive integer CLI value."""
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be a positive integer")
@@ -17,6 +18,7 @@ def _positive_int(value: str) -> int:
 
 
 def _nonnegative_int(value: str) -> int:
+    """Parse a non-negative integer CLI value."""
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError(
@@ -26,6 +28,7 @@ def _nonnegative_int(value: str) -> int:
 
 
 def _finite_float(value: str) -> float:
+    """Parse a finite floating-point CLI value."""
     parsed = float(value)
     if not math.isfinite(parsed):
         raise argparse.ArgumentTypeError("value must be finite")
@@ -33,6 +36,7 @@ def _finite_float(value: str) -> float:
 
 
 def _positive_float(value: str) -> float:
+    """Parse a strictly positive floating-point CLI value."""
     parsed = _finite_float(value)
     if parsed <= 0.0:
         raise argparse.ArgumentTypeError("value must be > 0")
@@ -40,6 +44,7 @@ def _positive_float(value: str) -> float:
 
 
 def _nonnegative_float(value: str) -> float:
+    """Parse a non-negative floating-point CLI value."""
     parsed = _finite_float(value)
     if parsed < 0.0:
         raise argparse.ArgumentTypeError("value must be >= 0")
@@ -47,6 +52,7 @@ def _nonnegative_float(value: str) -> float:
 
 
 def _fraction_or_zero(value: str) -> float:
+    """Parse a value constrained to the closed unit interval."""
     parsed = _nonnegative_float(value)
     if parsed > 1.0:
         raise argparse.ArgumentTypeError("value must lie in [0, 1]")
@@ -54,6 +60,7 @@ def _fraction_or_zero(value: str) -> float:
 
 
 def _unit_interval_open_closed(value: str) -> float:
+    """Parse a value constrained to ``(0, 1]``."""
     parsed = _finite_float(value)
     if parsed <= 0.0 or parsed > 1.0:
         raise argparse.ArgumentTypeError("value must lie in (0, 1]")
@@ -61,6 +68,7 @@ def _unit_interval_open_closed(value: str) -> float:
 
 
 def _percentile(value: str) -> float:
+    """Parse a percentile value constrained to ``[0, 100]``."""
     parsed = _finite_float(value)
     if parsed < 0.0 or parsed > 100.0:
         raise argparse.ArgumentTypeError("value must lie in [0, 100]")

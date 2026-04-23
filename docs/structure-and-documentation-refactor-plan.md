@@ -32,6 +32,10 @@ backward compatibility, or transitional warnings**.
 - Moved snapshot-loading code into `meshmerizer.io.swift`.
 - Added compatibility wrappers for the old `meshmerizer.commands.*` import
   paths while the refactor proceeds.
+- Started the documentation pass by expanding Python API/state docstrings and
+  adding Doxygen coverage to key native regularization and cancellation headers.
+- Updated stale native binding terminology so `_adaptive.cpp` now describes the
+  current binding layer instead of historical scaffold/rewrite language.
 
 ### Commit 1: Reorganize package layout around clear layers
 
