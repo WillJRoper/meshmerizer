@@ -3,9 +3,68 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 from .adaptive_stl import run_adaptive
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(
+            "value must be a non-negative integer"
+        )
+    return parsed
+
+
+def _finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("value must be finite")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = _finite_float(value)
+    if parsed <= 0.0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
+
+
+def _nonnegative_float(value: str) -> float:
+    parsed = _finite_float(value)
+    if parsed < 0.0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
+def _fraction_or_zero(value: str) -> float:
+    parsed = _nonnegative_float(value)
+    if parsed > 1.0:
+        raise argparse.ArgumentTypeError("value must lie in [0, 1]")
+    return parsed
+
+
+def _unit_interval_open_closed(value: str) -> float:
+    parsed = _finite_float(value)
+    if parsed <= 0.0 or parsed > 1.0:
+        raise argparse.ArgumentTypeError("value must lie in (0, 1]")
+    return parsed
+
+
+def _percentile(value: str) -> float:
+    parsed = _finite_float(value)
+    if parsed < 0.0 or parsed > 100.0:
+        raise argparse.ArgumentTypeError("value must lie in [0, 100]")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,24 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # -----------------------------------------------------------------
-    # ``adaptive`` subcommand — adaptive octree pipeline.
-    # -----------------------------------------------------------------
-    adaptive = subparsers.add_parser(
-        "adaptive",
-        help=(
-            "Convert a SWIFT snapshot to an STL mesh using the "
-            "adaptive octree + dual contouring pipeline"
-        ),
-    )
-    adaptive.add_argument(
+    parser.add_argument(
         "filename",
         type=Path,
         help="Path to the SWIFT snapshot file (HDF5).",
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--output",
         "-o",
         type=Path,
@@ -46,10 +93,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output STL filename. Defaults to <input_name>.stl",
     )
 
-    # Domain selection flags.
-    adaptive.add_argument(
+    parser.add_argument(
         "--center",
-        type=float,
+        type=_finite_float,
         nargs=3,
         default=None,
         metavar=("X", "Y", "Z"),
@@ -58,16 +104,16 @@ def build_parser() -> argparse.ArgumentParser:
             "units. Requires --extent."
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--extent",
-        type=float,
+        type=_positive_float,
         default=None,
         help=(
             "Side length of an extracted cubic subregion in "
             "simulation units. Requires --center."
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--tight-bounds",
         action="store_true",
         help=(
@@ -75,9 +121,9 @@ def build_parser() -> argparse.ArgumentParser:
             "bounds after any shift/crop."
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--shift",
-        type=float,
+        type=_finite_float,
         nargs=3,
         default=(0.0, 0.0, 0.0),
         metavar=("DX", "DY", "DZ"),
@@ -86,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
             "before cropping. Default: 0 0 0"
         ),
     )
-    wrap_group = adaptive.add_mutually_exclusive_group()
+    wrap_group = parser.add_mutually_exclusive_group()
     wrap_group.add_argument(
         "--wrap-shift",
         dest="wrap_shift",
@@ -102,17 +148,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Do not wrap coordinates after shifting.",
     )
-    adaptive.set_defaults(wrap_shift=True)
-    adaptive.add_argument(
+    parser.set_defaults(wrap_shift=True)
+    parser.add_argument(
         "--no-periodic",
         dest="periodic",
         action="store_false",
         help="Disable periodic wrapping for subregion selection.",
     )
-    adaptive.set_defaults(periodic=True)
+    parser.set_defaults(periodic=True)
 
-    # Particle selection.
-    adaptive.add_argument(
+    parser.add_argument(
         "--particle-type",
         "-p",
         type=str,
@@ -120,46 +165,45 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["gas", "dark_matter", "stars", "black_holes"],
         help="Particle type to extract. Default: 'gas'",
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--box-size",
         "-b",
-        type=float,
+        type=_positive_float,
         default=None,
         help="Physical size of the simulation box override.",
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--smoothing-factor",
-        type=float,
+        type=_positive_float,
         default=1.0,
-        help=("Multiplier for particle smoothing lengths. Default: 1.0"),
+        help="Multiplier for particle smoothing lengths. Default: 1.0",
     )
 
-    # Adaptive pipeline flags.
-    adaptive.add_argument(
+    parser.add_argument(
         "--base-resolution",
-        type=int,
+        type=_positive_int,
         default=4,
-        help=("Number of top-level octree cells per axis. Default: 4"),
+        help="Number of top-level octree cells per axis. Default: 4",
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--max-depth",
-        type=int,
+        type=_nonnegative_int,
         default=4,
         help="Maximum octree refinement depth. Default: 4",
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--isovalue",
         "-t",
-        type=float,
+        type=_finite_float,
         default=None,
         help=(
             "Isosurface threshold for mesh extraction. "
             "Overrides --surface-percentile when set."
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--surface-percentile",
-        type=float,
+        type=_percentile,
         default=5.0,
         help=(
             "Automatically compute the isovalue from the Nth "
@@ -169,9 +213,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Default: 5.0"
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--min-usable-hermite-samples",
-        type=int,
+        type=_positive_int,
         default=3,
         help=(
             "Minimum number of usable Hermite samples required before "
@@ -180,9 +224,9 @@ def build_parser() -> argparse.ArgumentParser:
             "improves or --max-depth is reached. Default: 3"
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--max-qef-rms-residual-ratio",
-        type=float,
+        type=_nonnegative_float,
         default=0.1,
         help=(
             "Maximum RMS QEF plane residual as a fraction of the local "
@@ -191,9 +235,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Default: 0.1"
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--min-normal-alignment-threshold",
-        type=float,
+        type=_unit_interval_open_closed,
         default=0.97,
         help=(
             "Minimum alignment between usable Hermite normals and their "
@@ -203,10 +247,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # Post-processing.
-    adaptive.add_argument(
+    parser.add_argument(
         "--smoothing-iterations",
-        type=int,
+        type=_nonnegative_int,
         default=0,
         help=(
             "Number of Laplacian smoothing iterations applied "
@@ -214,9 +257,9 @@ def build_parser() -> argparse.ArgumentParser:
             "smoothing. Default: 0"
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--smoothing-strength",
-        type=float,
+        type=_unit_interval_open_closed,
         default=0.5,
         help=(
             "Laplacian smoothing strength lambda in (0, 1]. "
@@ -225,9 +268,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Default: 0.5"
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--min-feature-thickness",
-        type=float,
+        type=_nonnegative_float,
         default=0.0,
         help=(
             "Minimum physical feature thickness to preserve via adaptive "
@@ -237,9 +280,9 @@ def build_parser() -> argparse.ArgumentParser:
             "0 disables the regularizer. Default: 0.0"
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--pre-thickening-radius",
-        type=float,
+        type=_nonnegative_float,
         default=0.0,
         help=(
             "Optional outward pre-thickening radius applied to the leaf-wise "
@@ -250,9 +293,9 @@ def build_parser() -> argparse.ArgumentParser:
             "0 disables pre-thickening. Default: 0.0"
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--max-edge-ratio",
-        type=float,
+        type=_positive_float,
         default=1.5,
         help=(
             "Maximum triangle edge length as a multiple of the "
@@ -260,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
             "subdivided to fill gaps. Default: 1.5"
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--fof",
         action="store_true",
         help=(
@@ -270,9 +313,9 @@ def build_parser() -> argparse.ArgumentParser:
             "to discard small fluff populations before meshing."
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--min-fof-cluster-size",
-        type=int,
+        type=_positive_int,
         default=None,
         help=(
             "Discard particle FOF clusters smaller than this many "
@@ -282,9 +325,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Disabled by default."
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--linking-factor",
-        type=float,
+        type=_positive_float,
         default=0.2,
         help=(
             "FOF linking factor: multiplier on mean inter-point "
@@ -292,9 +335,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Used by --fof and --min-fof-cluster-size. Default: 0.2"
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--remove-islands-fraction",
-        type=float,
+        type=_fraction_or_zero,
         default=None,
         help=(
             "Remove connected components whose volume is below this "
@@ -302,9 +345,9 @@ def build_parser() -> argparse.ArgumentParser:
             "only the largest component."
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--simplify-factor",
-        type=float,
+        type=_unit_interval_open_closed,
         default=1.0,
         help=(
             "Fraction of faces to keep during final mesh simplification. "
@@ -312,17 +355,17 @@ def build_parser() -> argparse.ArgumentParser:
             "1.0 disables simplification. Default: 1.0"
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--target-size",
         "-s",
-        type=float,
+        type=_positive_float,
         default=None,
         help=(
             "Target size for the longest mesh dimension (cm). "
             "Scales the mesh for 3D printing."
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--silent",
         action="store_true",
         help=(
@@ -332,8 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # Serialization.
-    adaptive.add_argument(
+    parser.add_argument(
         "--save-octree",
         type=Path,
         default=None,
@@ -343,7 +385,7 @@ def build_parser() -> argparse.ArgumentParser:
             "particle data."
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--load-octree",
         type=Path,
         default=None,
@@ -356,7 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
             "default."
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--visualise-verts",
         nargs="?",
         const="qef_vertices.png",
@@ -370,9 +412,9 @@ def build_parser() -> argparse.ArgumentParser:
             "'qef_vertices.png'."
         ),
     )
-    adaptive.add_argument(
+    parser.add_argument(
         "--nthreads",
-        type=int,
+        type=_positive_int,
         default=None,
         help=(
             "Number of OpenMP threads. Defaults to all available "
@@ -380,6 +422,5 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    adaptive.set_defaults(func=run_adaptive)
-
+    parser.set_defaults(func=run_adaptive)
     return parser
