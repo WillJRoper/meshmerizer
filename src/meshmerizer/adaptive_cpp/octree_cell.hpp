@@ -882,6 +882,77 @@ inline bool needs_balance_split(
     return false;
 }
 
+inline void enqueue_balance_neighbors(
+    std::size_t cell_index,
+    const std::vector<OctreeCell> &all_cells,
+    const BalanceSpatialHash &hash,
+    std::uint32_t max_depth,
+    std::vector<std::size_t> &queue,
+    std::vector<std::uint8_t> &enqueued) {
+    if (cell_index >= all_cells.size()) {
+        return;
+    }
+
+    auto enqueue_index = [&](std::size_t candidate) {
+        if (candidate >= all_cells.size()) {
+            return;
+        }
+        if (!all_cells[candidate].is_leaf) {
+            return;
+        }
+        if (candidate >= enqueued.size()) {
+            enqueued.resize(all_cells.size(), 0U);
+        }
+        if (enqueued[candidate] != 0U) {
+            return;
+        }
+        enqueued[candidate] = 1U;
+        queue.push_back(candidate);
+    };
+
+    enqueue_index(cell_index);
+
+    const OctreeCell &cell = all_cells[cell_index];
+    if (!cell.is_leaf) {
+        return;
+    }
+
+    const std::uint32_t span = 1U << (max_depth - cell.depth);
+    std::uint32_t gx, gy, gz;
+    hash.quantize(cell.bounds.min, gx, gy, gz);
+
+    const std::uint32_t half = span > 1U ? span / 2U : 0U;
+    struct Probe {
+        std::int64_t dx, dy, dz;
+    };
+    const Probe probes[6] = {
+        {static_cast<std::int64_t>(span), static_cast<std::int64_t>(half), static_cast<std::int64_t>(half)},
+        {-1, static_cast<std::int64_t>(half), static_cast<std::int64_t>(half)},
+        {static_cast<std::int64_t>(half), static_cast<std::int64_t>(span), static_cast<std::int64_t>(half)},
+        {static_cast<std::int64_t>(half), -1, static_cast<std::int64_t>(half)},
+        {static_cast<std::int64_t>(half), static_cast<std::int64_t>(half), static_cast<std::int64_t>(span)},
+        {static_cast<std::int64_t>(half), static_cast<std::int64_t>(half), -1},
+    };
+
+    for (const Probe &probe : probes) {
+        const std::int64_t px = static_cast<std::int64_t>(gx) + probe.dx;
+        const std::int64_t py = static_cast<std::int64_t>(gy) + probe.dy;
+        const std::int64_t pz = static_cast<std::int64_t>(gz) + probe.dz;
+        if (px < 0 || py < 0 || pz < 0) {
+            continue;
+        }
+
+        const std::size_t neighbor_idx = hash.find_leaf_at(
+            static_cast<std::uint32_t>(px),
+            static_cast<std::uint32_t>(py),
+            static_cast<std::uint32_t>(pz));
+        if (neighbor_idx == SIZE_MAX) {
+            continue;
+        }
+        enqueue_index(neighbor_idx);
+    }
+}
+
 /**
  * @brief Enforce the 2:1 octree balance rule on a refined octree.
  *
@@ -930,172 +1001,132 @@ inline void balance_octree(
     BalanceSpatialHash hash;
     hash.build(all_cells, domain, max_depth, base_resolution);
 
-    bool any_split = true;
-    std::size_t balance_pass = 0;
-    while (any_split) {
-        ++balance_pass;
-        any_split = false;
+    std::vector<std::size_t> queue;
+    queue.reserve(all_cells.size());
+    std::vector<std::uint8_t> enqueued(all_cells.size(), 0U);
+    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+        if (!all_cells[cell_idx].is_leaf) {
+            continue;
+        }
+        if (all_cells[cell_idx].depth >= max_depth) {
+            continue;
+        }
+        queue.push_back(cell_idx);
+        enqueued[cell_idx] = 1U;
+    }
 
-        const std::size_t cells_before_pass = all_cells.size();
-        meshmerizer_log_detail::print_status(
-            "Building",
-            "balance_octree",
-            "pass %zu: scanning %zu cells for 2:1 violations\n",
-            balance_pass,
-            cells_before_pass);
+    std::size_t processed_count = 0U;
+    std::size_t split_count = 0U;
+    while (!queue.empty()) {
+        const std::size_t split_index = queue.back();
+        queue.pop_back();
+        if (split_index < enqueued.size()) {
+            enqueued[split_index] = 0U;
+        }
+        ++processed_count;
 
-        // Collect indices of leaf cells that violate the 2:1 rule.
-        std::vector<std::size_t> to_split;
-        const int n_threads = omp_get_max_threads();
-        std::vector<std::vector<std::size_t>> thread_splits(
-            static_cast<std::size_t>(n_threads));
-
-#pragma omp parallel for schedule(dynamic)
-        for (std::int64_t i = 0;
-             i < static_cast<std::int64_t>(all_cells.size()); ++i) {
-            if (!all_cells[static_cast<std::size_t>(i)].is_leaf) {
-                continue;
-            }
-            if (all_cells[static_cast<std::size_t>(i)].depth >= max_depth) {
-                continue;
-            }
-            if (needs_balance_split(
-                    static_cast<std::size_t>(i), all_cells, hash,
-                    max_depth)) {
-                thread_splits[static_cast<std::size_t>(omp_get_thread_num())]
-                    .push_back(static_cast<std::size_t>(i));
-            }
+        if (split_index >= all_cells.size()) {
+            continue;
+        }
+        if (!all_cells[split_index].is_leaf) {
+            continue;
+        }
+        if (all_cells[split_index].depth >= max_depth) {
+            continue;
+        }
+        if (!needs_balance_split(split_index, all_cells, hash, max_depth)) {
+            continue;
         }
 
-        for (const auto &thread_vec : thread_splits) {
-            if (!thread_vec.empty()) {
-                any_split = true;
-                to_split.insert(
-                    to_split.end(), thread_vec.begin(), thread_vec.end());
+        const OctreeCell parent_snapshot = all_cells[split_index];
+        const std::span<const std::size_t> parent_contributors =
+            contributor_span(
+                all_contributors,
+                parent_snapshot.contributor_begin < 0 ? 0U :
+                    static_cast<std::size_t>(parent_snapshot.contributor_begin),
+                parent_snapshot.contributor_end <= parent_snapshot.contributor_begin ? 0U :
+                    static_cast<std::size_t>(parent_snapshot.contributor_end));
+
+        const std::vector<OctreeCell> children =
+            create_child_cells(parent_snapshot);
+        const std::vector<std::vector<std::size_t>> child_contributors =
+            filter_child_contributors(
+                parent_contributors, positions, smoothing_lengths, children);
+
+        all_cells[split_index].is_leaf = false;
+        all_cells[split_index].child_begin =
+            static_cast<std::int64_t>(all_cells.size());
+
+        std::uint32_t pgx, pgy, pgz;
+        hash.quantize(parent_snapshot.bounds.min, pgx, pgy, pgz);
+        hash.map.erase(balance_pack_coords(pgx, pgy, pgz));
+
+        std::vector<std::size_t> affected_indices;
+        affected_indices.reserve(1U + children.size());
+        affected_indices.push_back(split_index);
+
+        for (std::size_t ci = 0; ci < children.size(); ++ci) {
+            OctreeCell child = children[ci];
+
+            const std::int64_t contrib_begin =
+                static_cast<std::int64_t>(all_contributors.size());
+            for (std::size_t pidx : child_contributors[ci]) {
+                all_contributors.push_back(pidx);
             }
+            const std::int64_t contrib_end =
+                static_cast<std::int64_t>(all_contributors.size());
+
+            child.contributor_begin = contrib_begin;
+            child.contributor_end = contrib_end;
+            child.is_leaf = true;
+            child.is_active = false;
+            child.has_surface = false;
+            child.is_topo_surface = false;
+
+            if (!child_contributors[ci].empty()) {
+                child.corner_values = sample_cell_corners(
+                    child,
+                    std::span<const std::size_t>(child_contributors[ci]),
+                    positions,
+                    smoothing_lengths);
+                child.corner_sign_mask = compute_corner_sign_mask(
+                    child.corner_values, isovalue);
+                child.has_surface = cell_may_contain_isosurface(
+                    child.corner_values, isovalue);
+            }
+
+            const std::size_t new_idx = all_cells.size();
+            all_cells.push_back(child);
+            affected_indices.push_back(new_idx);
+
+            std::uint32_t cgx, cgy, cgz;
+            hash.quantize(child.bounds.min, cgx, cgy, cgz);
+            hash.map[balance_pack_coords(cgx, cgy, cgz)] = new_idx;
         }
 
-        meshmerizer_log_detail::print_status(
-            "Building",
-            "balance_octree",
-            "pass %zu: found %zu violating leaves\n",
-            balance_pass,
-            to_split.size());
-
-        if (!any_split) {
-            break;
+        if (enqueued.size() < all_cells.size()) {
+            enqueued.resize(all_cells.size(), 0U);
+        }
+        for (std::size_t affected_index : affected_indices) {
+            enqueue_balance_neighbors(
+                affected_index,
+                all_cells,
+                hash,
+                max_depth,
+                queue,
+                enqueued);
         }
 
-        // Split each violating cell. The parent is copied before any
-        // push_back that could reallocate the vector, ensuring that the
-        // parent snapshot stays valid while children are appended.
-        for (std::size_t split_index : to_split) {
-            // Another split earlier in this batch may have already converted
-            // this cell to an internal node; skip it in that case.
-            if (!all_cells[split_index].is_leaf) {
-                continue;
-            }
-            if (all_cells[split_index].depth >= max_depth) {
-                continue;
-            }
-
-            const OctreeCell parent_snapshot = all_cells[split_index];
-
-            // Gather the parent's contributor particle indices.
-            std::vector<std::size_t> parent_contributors;
-            if (parent_snapshot.contributor_begin >= 0 &&
-                parent_snapshot.contributor_end >
-                    parent_snapshot.contributor_begin) {
-                parent_contributors.reserve(static_cast<std::size_t>(
-                    parent_snapshot.contributor_end -
-                    parent_snapshot.contributor_begin));
-                for (std::int64_t k = parent_snapshot.contributor_begin;
-                     k < parent_snapshot.contributor_end; ++k) {
-                    parent_contributors.push_back(
-                        all_contributors[static_cast<std::size_t>(k)]);
-                }
-            }
-
-            const std::vector<OctreeCell> children =
-                create_child_cells(parent_snapshot);
-            const std::vector<std::vector<std::size_t>> child_contributors =
-                filter_child_contributors(parent_contributors, positions,
-                                          smoothing_lengths, children);
-
-            // Mark the parent as internal before appending children.
-            // Accessing by index (not by reference) is safe even if
-            // push_back triggers a vector reallocation below.
-            all_cells[split_index].is_leaf = false;
-            all_cells[split_index].child_begin =
-                static_cast<std::int64_t>(all_cells.size());
-
-            // Remove the parent from the spatial hash since it is no
-            // longer a leaf.
-            {
-                std::uint32_t pgx, pgy, pgz;
-                hash.quantize(parent_snapshot.bounds.min, pgx, pgy, pgz);
-                hash.map.erase(
-                    balance_pack_coords(pgx, pgy, pgz));
-            }
-
-            for (std::size_t ci = 0; ci < children.size(); ++ci) {
-                OctreeCell child = children[ci];
-
-                const std::int64_t contrib_begin =
-                    static_cast<std::int64_t>(all_contributors.size());
-                for (std::size_t pidx : child_contributors[ci]) {
-                    all_contributors.push_back(pidx);
-                }
-                const std::int64_t contrib_end =
-                    static_cast<std::int64_t>(all_contributors.size());
-
-                child.contributor_begin = contrib_begin;
-                child.contributor_end = contrib_end;
-                child.is_leaf = true;
-                child.is_active = false;
-                child.has_surface = false;
-                child.is_topo_surface = false;
-
-                // Sample corners so surface extraction can later determine
-                // whether this balance-forced leaf is active.
-                if (!child_contributors[ci].empty()) {
-                    child.corner_values = sample_cell_corners(
-                        child,
-                        std::span<const std::size_t>(child_contributors[ci]),
-                        positions,
-                        smoothing_lengths);
-                    child.corner_sign_mask = compute_corner_sign_mask(
-                        child.corner_values, isovalue);
-                    child.has_surface = cell_may_contain_isosurface(
-                        child.corner_values, isovalue);
-                }
-
-                // Insert the new child leaf into the spatial hash
-                // so subsequent splits in this batch and future
-                // iterations can find it for neighbor lookups.
-                const std::size_t new_idx = all_cells.size();
-                all_cells.push_back(child);
-
-                std::uint32_t cgx, cgy, cgz;
-                hash.quantize(child.bounds.min, cgx, cgy, cgz);
-                hash.map[balance_pack_coords(cgx, cgy, cgz)] = new_idx;
-            }
-            balance_counter.tick();
-        }
-
-        meshmerizer_log_detail::print_status(
-            "Building",
-            "balance_octree",
-            "pass %zu: complete (total_cells_now=%zu)\n",
-            balance_pass,
-            all_cells.size());
+        ++split_count;
+        balance_counter.tick();
     }
 
     meshmerizer_log_detail::print_status(
         "Building",
         "balance_octree",
-        "complete after %zu passes (total_cells=%zu)\n",
-        balance_pass,
+        "local closure processed=%zu split=%zu (total_cells=%zu)\n",
+        processed_count,
+        split_count,
         all_cells.size());
     balance_counter.finish();
 }
