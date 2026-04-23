@@ -456,7 +456,9 @@ def _emit_tree_structure_summary(cells) -> None:
 
 def _save_mesh_output(mesh: Mesh, output_path: Path) -> None:
     """Write mesh output atomically to avoid partial files on cancel."""
-    temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    temp_path = output_path.with_name(
+        f"{output_path.stem}.tmp{output_path.suffix}"
+    )
     try:
         mesh.save(str(temp_path))
         temp_path.replace(output_path)
