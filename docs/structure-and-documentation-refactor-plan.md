@@ -40,6 +40,11 @@ backward compatibility, or transitional warnings**.
   of `meshmerizer.commands.adaptive_stl` into `meshmerizer.cli.adaptive` and
   splitting the control flow into focused helpers for configuration, input
   loading, octree construction, direct pipeline execution, and mesh output.
+- Continued Commit 3 in order by splitting the old monolithic
+  `meshmerizer.adaptive_core` wrapper into focused modules under
+  `meshmerizer.adaptive` for low-level bindings, tree/meshing wrappers,
+  topology helpers, and high-level pipeline calls, while keeping a
+  compatibility facade at the historical import path.
 
 ### Commit 1: Reorganize package layout around clear layers
 

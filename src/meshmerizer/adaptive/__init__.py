@@ -1,39 +1,37 @@
-"""Compatibility facade for the adaptive native-core wrappers.
+"""Focused wrappers around the native adaptive meshing core."""
 
-The implementation now lives in focused modules under ``meshmerizer.adaptive``.
-This module re-exports the historical API while the codebase is being migrated
-away from the original monolithic wrapper file.
-"""
-
-from meshmerizer.adaptive import (
+from .bindings import (
     adaptive_status,
     bounding_box_contains,
     bounding_box_overlaps,
-    build_refined_tree,
     cell_may_contain_isosurface,
-    classify_occupied_solid,
-    compute_isovalue_from_percentile,
     corner_sign_mask,
-    create_child_cells,
-    create_top_level_cells,
-    create_top_level_cells_with_contributors,
-    extract_opened_surface_mesh,
-    filter_child_contributors,
-    fof_cluster,
-    generate_mesh,
-    hermite_samples_for_cell,
     morton_decode_3d,
     morton_encode_3d,
     particle_fields,
     query_cell_contributors,
-    refine_octree,
-    run_full_pipeline,
-    run_octree_pipeline,
-    solve_qef_for_leaf,
-    solve_vertices,
     top_level_bin_counts,
     wendland_c2_gradient,
     wendland_c2_value,
+)
+from .pipeline import (
+    compute_isovalue_from_percentile,
+    fof_cluster,
+    run_full_pipeline,
+)
+from .topology import classify_occupied_solid, extract_opened_surface_mesh
+from .tree import (
+    build_refined_tree,
+    create_child_cells,
+    create_top_level_cells,
+    create_top_level_cells_with_contributors,
+    filter_child_contributors,
+    generate_mesh,
+    hermite_samples_for_cell,
+    refine_octree,
+    run_octree_pipeline,
+    solve_qef_for_leaf,
+    solve_vertices,
 )
 
 __all__ = [
