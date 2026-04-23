@@ -299,7 +299,8 @@ inline DCPipelineResult run_dc_pipeline(
             while (true) {
                 const std::vector<double> thickening_distance =
                     compute_outside_distance_from_inside_mask(
-                        solid_leaves, inside_mask);
+                        solid_leaves, inside_mask,
+                        pre_thickening_radius);
                 ++thickening_refine_pass;
                 meshmerizer_log_detail::print_status(
                     "Regularization",
@@ -344,11 +345,29 @@ inline DCPipelineResult run_dc_pipeline(
                     smoothing_lengths, solid_spatial_index,
                     isovalue, max_depth);
                 inside_mask = build_inside_mask(solid_leaves);
+
+                const std::vector<double> strict_band_distance =
+                    compute_outside_distance_from_inside_mask(
+                        solid_leaves, inside_mask,
+                        pre_thickening_radius);
+                if (thickening_band_is_fully_refined(
+                        solid_leaves, inside_mask,
+                        strict_band_distance,
+                        thickening_leaf_size_target,
+                        pre_thickening_radius)) {
+                    meshmerizer_log_detail::print_status(
+                        "Regularization",
+                        "run_dc_pipeline",
+                        "pre-thickening pass %zu: strict growth band fully refined; stopping iterations early\n",
+                        thickening_refine_pass);
+                    break;
+                }
             }
 
             const std::vector<double> thickening_distance =
                 compute_outside_distance_from_inside_mask(
-                    solid_leaves, inside_mask);
+                    solid_leaves, inside_mask,
+                    pre_thickening_radius);
             inside_mask = dilate_inside_mask(
                 inside_mask, thickening_distance, pre_thickening_radius);
             meshmerizer_log_detail::print_status(

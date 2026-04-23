@@ -401,7 +401,8 @@ inline std::vector<std::uint8_t> build_inside_mask(
 
 inline std::vector<double> compute_outside_distance_from_inside_mask(
     const std::vector<OccupiedSolidLeaf> &solid_leaves,
-    const std::vector<std::uint8_t> &inside_mask) {
+    const std::vector<std::uint8_t> &inside_mask,
+    double max_distance = std::numeric_limits<double>::infinity()) {
     const double inf = std::numeric_limits<double>::infinity();
     std::vector<double> distance_from_inside(solid_leaves.size(), inf);
     using QueueEntry = std::pair<double, std::size_t>;
@@ -452,6 +453,9 @@ inline std::vector<double> compute_outside_distance_from_inside_mask(
         if (distance > distance_from_inside[leaf_index]) {
             continue;
         }
+        if (distance > max_distance) {
+            continue;
+        }
 
         for (std::int64_t neighbor_leaf_index :
              solid_leaves[leaf_index].face_neighbor_leaf_indices) {
@@ -469,6 +473,9 @@ inline std::vector<double> compute_outside_distance_from_inside_mask(
                 solid_leaves[leaf_index].cell_size +
                 solid_leaves[neighbor].cell_size);
             const double candidate = distance + edge_cost;
+            if (candidate > max_distance) {
+                continue;
+            }
             if (candidate < distance_from_inside[neighbor]) {
                 distance_from_inside[neighbor] = candidate;
                 queue.push({candidate, neighbor});
@@ -521,28 +528,48 @@ inline bool refine_thickening_band_cells(
         return false;
     }
 
+    const double refinement_halo_radius = thickening_radius + target_leaf_size;
+
+    const auto target_depth_for_cell =
+        [&](const OccupiedSolidLeaf &leaf) -> std::uint32_t {
+            std::uint32_t target_depth = leaf.depth;
+            double size = leaf.cell_size;
+            while (target_depth < max_depth && size > target_leaf_size) {
+                size *= 0.5;
+                ++target_depth;
+            }
+            return target_depth;
+        };
+
     std::queue<std::size_t> cells_to_visit;
+    std::vector<std::uint32_t> queued_target_depths(all_cells.size(), 0U);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
         if (inside_mask[leaf_index] != 0U) {
             continue;
         }
-        if (distance_from_inside[leaf_index] > thickening_radius) {
+        if (distance_from_inside[leaf_index] > refinement_halo_radius) {
             continue;
         }
         if (solid_leaves[leaf_index].depth >= max_depth ||
             solid_leaves[leaf_index].cell_size <= target_leaf_size) {
             continue;
         }
-        cells_to_visit.push(solid_leaves[leaf_index].cell_index);
+        const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
+        cells_to_visit.push(cell_index);
+        if (cell_index < queued_target_depths.size()) {
+            queued_target_depths[cell_index] = target_depth_for_cell(
+                solid_leaves[leaf_index]);
+        }
     }
 
     if (cells_to_visit.empty()) {
         meshmerizer_log_detail::print_status(
             "Regularization",
             "refine_thickening_band_cells",
-            "no growth-band splits needed (leaf_size_target=%.6g, radius=%.6g, total_cells=%zu)\n",
+            "no growth-band splits needed (leaf_size_target=%.6g, radius=%.6g, halo_radius=%.6g, total_cells=%zu)\n",
             target_leaf_size,
             thickening_radius,
+            refinement_halo_radius,
             all_cells.size());
         return false;
     }
@@ -550,10 +577,11 @@ inline bool refine_thickening_band_cells(
     meshmerizer_log_detail::print_status(
         "Regularization",
         "refine_thickening_band_cells",
-        "starting from %zu growth-band cells to reach leaf_size<=%.6g (radius=%.6g, total_cells_before=%zu)\n",
+        "starting from %zu growth-band cells to reach leaf_size<=%.6g (radius=%.6g, halo_radius=%.6g, total_cells_before=%zu)\n",
         cells_to_visit.size(),
         target_leaf_size,
         thickening_radius,
+        refinement_halo_radius,
         all_cells.size());
 
     ProgressCounter refine_counter(
@@ -576,6 +604,11 @@ inline bool refine_thickening_band_cells(
             cell_edge_length(cell) <= target_leaf_size) {
             continue;
         }
+
+        const std::uint32_t target_depth =
+            cell_idx < queued_target_depths.size() ?
+                queued_target_depths[cell_idx] :
+                cell.depth;
 
         split_octree_leaf(
             cell_idx, all_cells, all_contributors, positions,
@@ -621,7 +654,8 @@ inline bool refine_thickening_band_cells(
 
             bool should_continue_refining =
                 child.depth < max_depth &&
-                cell_edge_length(child) > target_leaf_size;
+                (cell_edge_length(child) > target_leaf_size ||
+                 child.depth < target_depth);
 
             if (!should_continue_refining && child.depth < max_depth &&
                 corner_surface) {
@@ -649,6 +683,10 @@ inline bool refine_thickening_band_cells(
             }
 
             if (should_continue_refining) {
+                if (child_index >= queued_target_depths.size()) {
+                    queued_target_depths.resize(all_cells.size(), 0U);
+                }
+                queued_target_depths[child_index] = target_depth;
                 cells_to_visit.push(child_index);
             } else {
                 child.is_active = true;
@@ -666,6 +704,44 @@ inline bool refine_thickening_band_cells(
         split_count,
         all_cells.size());
     return split_count > 0U;
+}
+
+inline bool thickening_band_is_fully_refined(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<std::uint8_t> &inside_mask,
+    const std::vector<double> &distance_from_inside,
+    double target_leaf_size,
+    double thickening_radius) {
+    if (target_leaf_size <= 0.0 || thickening_radius <= 0.0) {
+        return true;
+    }
+
+    ProgressCounter check_counter(
+        "Regularization", "thickening_band_is_fully_refined", "leaves", 1000);
+    std::size_t unresolved_count = 0U;
+    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        check_counter.tick();
+        if (inside_mask[leaf_index] != 0U) {
+            continue;
+        }
+        if (distance_from_inside[leaf_index] > thickening_radius) {
+            continue;
+        }
+        if (solid_leaves[leaf_index].cell_size > target_leaf_size) {
+            ++unresolved_count;
+        }
+    }
+    check_counter.finish();
+
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "thickening_band_is_fully_refined",
+        "unresolved strict-band leaves=%zu (target_leaf_size=%.6g, radius=%.6g)\n",
+        unresolved_count,
+        target_leaf_size,
+        thickening_radius);
+
+    return unresolved_count == 0U;
 }
 
 inline std::vector<double> compute_inside_clearance(
