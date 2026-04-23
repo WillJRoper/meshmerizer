@@ -346,13 +346,9 @@ inline DCPipelineResult run_dc_pipeline(
                     isovalue, max_depth);
                 inside_mask = build_inside_mask(solid_leaves);
 
-                const std::vector<double> strict_band_distance =
-                    compute_outside_distance_from_inside_mask(
-                        solid_leaves, inside_mask,
-                        pre_thickening_radius);
                 if (thickening_band_is_fully_refined(
                         solid_leaves, inside_mask,
-                        strict_band_distance,
+                        thickening_distance,
                         thickening_leaf_size_target,
                         pre_thickening_radius)) {
                     meshmerizer_log_detail::print_status(
