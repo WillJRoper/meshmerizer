@@ -1,13 +1,14 @@
 """Adaptive mesh reconstruction wrappers.
 
-This module provides thin Python wrappers around the C++ adaptive meshing
-pipeline. The current backend performs adaptive octree refinement, optional
-minimum-thickness regularization, mesh extraction, smoothing, and gap filling.
+This module provides thin Python wrappers around the native adaptive meshing
+pipeline for callers that still want raw ``(vertices, faces)`` arrays rather
+than the newer higher-level public API objects.
 
-The two primary entry points are:
+It remains useful for:
 
-- ``reconstruct_group``: reconstruct a mesh for one particle group.
-- ``reconstruct_mesh``: reconstruct one or more groups and merge them.
+- CLI orchestration that wants direct NumPy arrays,
+- tests that assert on raw mesh buffers, and
+- internal compatibility during the staged API redesign.
 """
 
 from __future__ import annotations
@@ -68,6 +69,9 @@ def reconstruct_group(
     Raises:
         ValueError: If positions has fewer than 3 points.
     """
+    # Keep the compatibility layer defensive: it accepts direct NumPy
+    # inputs and normalizes them before crossing into the native
+    # full-pipeline wrapper.
     positions = np.ascontiguousarray(positions, dtype=np.float64)
     smoothing_lengths = np.ascontiguousarray(
         smoothing_lengths, dtype=np.float64
@@ -164,6 +168,10 @@ def reconstruct_mesh(
     Returns:
         Tuple of ``(vertices, faces)`` merged across all groups.
     """
+    # This compatibility helper reconstructs each group independently and then
+    # concatenates the resulting vertex/face buffers. That preserves the
+    # historical behavior of avoiding spurious bridges between disconnected FOF
+    # groups without exposing the group loop at the public API level.
     positions = np.ascontiguousarray(positions, dtype=np.float64)
     smoothing_lengths = np.ascontiguousarray(
         smoothing_lengths, dtype=np.float64

@@ -23,6 +23,16 @@ backward compatibility, or transitional warnings**.
 
 ## Progress updates
 
+### 2026-04-24
+
+- Started Commit 9 in order by expanding Python module and helper docstrings in
+  `meshmerizer.cli.adaptive`, `meshmerizer.adaptive.pipeline`,
+  `meshmerizer.io.octree`, and `meshmerizer.reconstruct`.
+- Replaced stale wording in the compatibility-facing reconstruction wrappers so
+  their current role relative to the redesigned public API is explicit.
+- Documented the adaptive CLI flow, print-space regularization conversion, and
+  octree import/export helper contracts more fully before validation.
+
 ### 2026-04-23
 
 - Started Commit 1 work by introducing `meshmerizer.cli/`,

@@ -81,7 +81,15 @@ MeshVertex = Tuple[Vec3, Vec3]
 
 
 def _as_position_array(positions: Sequence[Vec3]) -> np.ndarray:
-    """Normalize particle positions for HDF5 storage."""
+    """Normalize particle positions for HDF5 storage.
+
+    Args:
+        positions: Particle positions as an arbitrary Python sequence.
+
+    Returns:
+        Float64 ``(N, 3)`` array, with empty inputs normalized to the expected
+        two-dimensional shape.
+    """
     array = np.asarray(positions, dtype=np.float64)
     if array.ndim == 1 and array.size == 0:
         return array.reshape((0, 3))
@@ -91,7 +99,14 @@ def _as_position_array(positions: Sequence[Vec3]) -> np.ndarray:
 def _as_optional_vertex_array(
     values: Optional[Sequence],
 ) -> Optional[np.ndarray]:
-    """Normalize optional ``(N, 3)`` vertex-like arrays for storage."""
+    """Normalize optional ``(N, 3)`` vertex-like arrays for storage.
+
+    Args:
+        values: Optional array-like object of vertex positions or normals.
+
+    Returns:
+        Float64 ``(N, 3)`` array or ``None``.
+    """
     if values is None:
         return None
     array = np.asarray(values, dtype=np.float64)
@@ -110,6 +125,18 @@ def _encode_cells(
     HDF5 writes and predictable schema evolution. Contributor slices are
     reconstructed by matching each cell's contributor tuple against the flat
     contributor array returned by the native octree builder.
+
+    Args:
+        cells: Historical cell dictionaries returned by the Python/native
+            bridge.
+        contributors: Flat contributor index array referenced by the cells.
+
+    Returns:
+        Mapping of HDF5 dataset names to columnar NumPy arrays.
+
+    Raises:
+        ValueError: If a cell's contributor slice cannot be matched back to the
+            flat contributor array.
     """
     n_cells = len(cells)
     morton_keys = np.empty(n_cells, dtype=np.uint64)
@@ -183,7 +210,15 @@ def _encode_cells(
 
 
 def _decode_cells(tree, contributor_indices: np.ndarray) -> list[CellDict]:
-    """Reconstruct historical cell dictionaries from the columnar layout."""
+    """Reconstruct historical cell dictionaries from the columnar layout.
+
+    Args:
+        tree: HDF5 octree group.
+        contributor_indices: Flat contributor array loaded from disk.
+
+    Returns:
+        Cell dictionaries matching the historical Python/native bridge format.
+    """
     morton_keys = tree["morton_keys"][:]
     depths = tree["depths"][:]
     bounds_min = tree["bounds_min"][:]
@@ -241,7 +276,24 @@ def export_octree(
     group_labels: Optional[Sequence[int]] = None,
     version: str = "",
 ) -> None:
-    """Write the full adaptive octree state to an HDF5 file."""
+    """Write the full adaptive octree state to an HDF5 file.
+
+    Args:
+        path: Destination file path.
+        isovalue: Surface threshold used during refinement/extraction.
+        base_resolution: Number of top-level cells per axis.
+        max_depth: Maximum refinement depth.
+        domain_minimum: Lower corner of the working domain.
+        domain_maximum: Upper corner of the working domain.
+        positions: Particle positions.
+        smoothing_lengths: Per-particle smoothing lengths.
+        cells: Octree cell dictionaries.
+        contributors: Flat contributor index array.
+        vertices: Optional stored QEF vertex positions.
+        normals: Optional stored QEF vertex normals.
+        group_labels: Optional stored FOF group labels.
+        version: Optional producer version string.
+    """
     position_array = _as_position_array(positions)
     smoothing_array = np.asarray(smoothing_lengths, dtype=np.float64)
     contributor_array = np.asarray(contributors, dtype=np.int64)
@@ -293,7 +345,14 @@ def export_octree(
 
 
 def import_octree(path: str) -> dict:
-    """Reload the adaptive octree state from an HDF5 file."""
+    """Reload the adaptive octree state from an HDF5 file.
+
+    Args:
+        path: Path to an HDF5 file written by :func:`export_octree`.
+
+    Returns:
+        Dictionary matching the historical Python-facing octree state format.
+    """
     with h5py.File(path, "r") as handle:
         metadata = handle["metadata"]
         isovalue = float(metadata.attrs["isovalue"])

@@ -1,9 +1,18 @@
 """Adaptive CLI execution flow.
 
-This module owns the application-layer orchestration for the adaptive CLI. It
-keeps argument handling, I/O coordination, native pipeline dispatch, and final
-mesh output in one dedicated place instead of scattering that control flow
-across legacy command modules.
+This module is the application-layer entry point for the adaptive command-line
+workflow. It owns the sequencing of:
+
+- input loading from either SWIFT snapshots or saved octree files,
+- conversion of user-facing print-space controls into native units,
+- dispatch into the native adaptive reconstruction pipeline,
+- optional octree persistence and diagnostic output, and
+- final mesh post-processing and STL export.
+
+The CLI deliberately stays thin relative to the library layer: all heavy
+geometry and topology work is delegated to native bindings or reusable library
+helpers, while this module focuses on user-facing orchestration and progress
+reporting.
 """
 
 from __future__ import annotations
@@ -43,7 +52,11 @@ from meshmerizer.reconstruct import reconstruct_mesh
 
 
 def _configure_threads(args) -> None:
-    """Configure OpenMP threads for the native extension when requested."""
+    """Configure OpenMP threads for the native extension when requested.
+
+    Args:
+        args: Parsed CLI namespace.
+    """
     if args.nthreads is None:
         return
 
@@ -62,7 +75,14 @@ def _configure_threads(args) -> None:
 
 
 def _resolve_output_path(args) -> Path:
-    """Resolve the final mesh output path from CLI arguments."""
+    """Resolve the final mesh output path from CLI arguments.
+
+    Args:
+        args: Parsed CLI namespace.
+
+    Returns:
+        Final mesh output path, either explicit or derived from the input.
+    """
     if args.output is not None:
         return Path(args.output)
     if args.filename is not None:
@@ -77,7 +97,19 @@ def _convert_regularization_lengths(
     min_feature_thickness: float,
     pre_thickening_radius: float,
 ) -> tuple[float, float]:
-    """Convert print-space regularization controls back to native units."""
+    """Convert print-space regularization controls back to native units.
+
+    Args:
+        args: Parsed CLI namespace.
+        domain_min: Lower corner of the working domain.
+        domain_max: Upper corner of the working domain.
+        min_feature_thickness: Requested minimum feature thickness.
+        pre_thickening_radius: Requested outward pre-thickening radius.
+
+    Returns:
+        Tuple of ``(min_feature_thickness, pre_thickening_radius)`` in native
+        meshing units.
+    """
     if args.target_size is None:
         return min_feature_thickness, pre_thickening_radius
 
@@ -116,7 +148,15 @@ def _convert_regularization_lengths(
 
 
 def _postprocess_mesh(mesh: Mesh, args) -> Mesh:
-    """Apply cleanup and print-scaling steps to a reconstructed mesh."""
+    """Apply cleanup and print-scaling steps to a reconstructed mesh.
+
+    Args:
+        mesh: Reconstructed mesh in native units.
+        args: Parsed CLI namespace.
+
+    Returns:
+        Post-processed mesh ready for export.
+    """
     cleanup_start = time.perf_counter()
     mesh = _remove_islands(mesh, args.remove_islands_fraction)
     record_elapsed("Island removal", cleanup_start, operation="Cleaning")
@@ -139,13 +179,29 @@ def _postprocess_mesh(mesh: Mesh, args) -> Mesh:
 
 
 def _build_mesh(mesh_verts, mesh_faces, origin: np.ndarray) -> Mesh:
-    """Translate native vertices back to world space and wrap them."""
+    """Translate native vertices back to world space and wrap them.
+
+    Args:
+        mesh_verts: Vertex positions returned by native reconstruction.
+        mesh_faces: Triangle indices returned by native reconstruction.
+        origin: Offset that restores snapshot/world coordinates.
+
+    Returns:
+        Mesh wrapper in world-space coordinates.
+    """
     mesh_verts += origin
     return Mesh(vertices=mesh_verts, faces=mesh_faces)
 
 
 def _save_final_mesh(mesh: Mesh, output_path: Path, *, summary: bool) -> None:
-    """Write the final mesh and emit the appropriate CLI status message."""
+    """Write the final mesh and emit the appropriate CLI status message.
+
+    Args:
+        mesh: Mesh to export.
+        output_path: Destination path.
+        summary: Whether to emit summary-style rather than standard status
+            logging.
+    """
     if summary:
         log_summary_status("Saving", f"Writing STL to {output_path}...")
     else:
@@ -171,7 +227,12 @@ def _run_full_pipeline_path(
     pre_thickening_radius: float,
     total_start: float,
 ) -> None:
-    """Run the direct particles-to-mesh path without octree reuse."""
+    """Run the direct particles-to-mesh path without octree reuse.
+
+    This is the fast path used when the user does not request octree save/load
+    behavior. It keeps the whole reconstruction in the native pipeline and only
+    returns to Python for post-processing and export.
+    """
     if getattr(args, "fof", False):
         log_status(
             "Clustering",
@@ -251,7 +312,15 @@ def _run_full_pipeline_path(
 
 
 def _load_or_prepare_inputs(args):
-    """Load inputs either from a saved octree or from a SWIFT snapshot."""
+    """Load inputs either from a saved octree or from a SWIFT snapshot.
+
+    Args:
+        args: Parsed CLI namespace.
+
+    Returns:
+        Dictionary containing normalized particle/domain state plus optional
+        pre-built octree state.
+    """
     if args.load_octree is not None:
         log_status("Loading", f"Loading octree from {args.load_octree}")
         load_start = time.perf_counter()
@@ -359,7 +428,23 @@ def _build_and_optionally_save_octree(
     min_feature_thickness: float,
     pre_thickening_radius: float,
 ):
-    """Build and optionally persist an octree from particle inputs."""
+    """Build and optionally persist an octree from particle inputs.
+
+    Args:
+        args: Parsed CLI namespace.
+        positions: Particle positions.
+        smoothing_lengths: Per-particle smoothing lengths.
+        domain_min: Lower corner of the working domain.
+        domain_max: Upper corner of the working domain.
+        base_resolution: Number of top-level cells per axis.
+        max_depth: Maximum octree refinement depth.
+        isovalue: Scalar field threshold used during refinement.
+        min_feature_thickness: Regularization control in native units.
+        pre_thickening_radius: Optional pre-thickening control in native units.
+
+    Returns:
+        Tuple ``(cells, contributors)`` describing the refined octree.
+    """
     log_status(
         "Building",
         f"Building octree: base_resolution={base_resolution}, "
@@ -448,7 +533,12 @@ def _run_octree_backed_pipeline(
     pre_thickening_radius: float,
     total_start: float,
 ) -> None:
-    """Run the octree-backed reconstruction path used after save/load."""
+    """Run the octree-backed reconstruction path used after save/load.
+
+    This path is used when the CLI either loads an octree from disk or builds
+    one explicitly for persistence or diagnostics before reconstructing the
+    final mesh.
+    """
     if getattr(args, "visualise_verts", None):
         log_status("Meshing", "Solving QEF vertices for visualization...")
         mesh_start = time.perf_counter()
@@ -557,7 +647,11 @@ def _run_octree_backed_pipeline(
 
 
 def run_adaptive(args) -> None:
-    """Run the adaptive meshing pipeline from CLI arguments."""
+    """Run the adaptive meshing pipeline from CLI arguments.
+
+    Args:
+        args: Parsed CLI namespace for the adaptive command.
+    """
     total_start = time.perf_counter()
 
     center = getattr(args, "center", None)

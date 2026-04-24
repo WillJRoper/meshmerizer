@@ -1,4 +1,10 @@
-"""High-level adaptive pipeline wrappers and helper calculations."""
+"""High-level adaptive pipeline wrappers and helper calculations.
+
+This module contains the smallest possible Python wrappers around the native
+adaptive pipeline entry points. It intentionally groups together
+operations that conceptually run on whole particle sets rather than on
+pre-built octree state.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +17,23 @@ def compute_isovalue_from_percentile(
     smoothing_lengths: np.ndarray,
     percentile: float,
 ) -> float:
-    """Compute an isovalue from a density percentile of the particles."""
+    """Compute an isovalue from a density percentile of the particles.
+
+    The adaptive pipeline often chooses an isovalue from the percentile of the
+    particles' self-density proxy rather than requiring callers to guess a raw
+    threshold.
+
+    Args:
+        smoothing_lengths: Per-particle smoothing lengths.
+        percentile: Percentile of the self-density proxy in ``[0, 100]``.
+
+    Returns:
+        Isovalue suitable for passing to the adaptive pipeline.
+
+    Raises:
+        ValueError: If ``percentile`` is outside ``[0, 100]`` or the input is
+            empty.
+    """
     if percentile < 0.0 or percentile > 100.0:
         raise ValueError(f"percentile must be in [0, 100], got {percentile}")
     h = np.asarray(smoothing_lengths, dtype=np.float64)
@@ -28,7 +50,18 @@ def fof_cluster(
     domain_max: tuple[float, float, float],
     linking_factor: float = 1.5,
 ) -> np.ndarray:
-    """Cluster points using a friends-of-friends algorithm."""
+    """Cluster points using a friends-of-friends algorithm.
+
+    Args:
+        positions: Particle positions with shape ``(N, 3)``.
+        domain_min: Lower corner of the nominal domain.
+        domain_max: Upper corner of the nominal domain.
+        linking_factor: Multiplicative factor applied to the characteristic
+            linking length.
+
+    Returns:
+        ``(N,)`` array of integer cluster labels.
+    """
     pos = np.ascontiguousarray(positions, dtype=np.float64)
     return _adaptive.fof_cluster(pos, domain_min, domain_max, linking_factor)
 
@@ -50,7 +83,30 @@ def run_full_pipeline(
     min_feature_thickness: float = 0.0,
     pre_thickening_radius: float = 0.0,
 ) -> dict:
-    """Run the full particles-to-mesh pipeline in C++."""
+    """Run the full particles-to-mesh pipeline in C++.
+
+    Args:
+        positions: Particle positions with shape ``(N, 3)``.
+        smoothing_lengths: Per-particle smoothing lengths with shape ``(N,)``.
+        domain_min: Lower corner of the working domain.
+        domain_max: Upper corner of the working domain.
+        base_resolution: Number of top-level cells per axis.
+        isovalue: Scalar field threshold for reconstruction.
+        max_depth: Maximum octree refinement depth.
+        smoothing_iterations: Number of smoothing iterations.
+        smoothing_strength: Laplacian smoothing strength in ``(0, 1]``.
+        max_edge_ratio: Maximum permitted edge length relative to local cell
+            size.
+        minimum_usable_hermite_samples: Minimum usable Hermite sample count.
+        max_qef_rms_residual_ratio: Maximum QEF RMS residual ratio.
+        min_normal_alignment_threshold: Minimum usable-normal alignment.
+        min_feature_thickness: Minimum preserved feature thickness.
+        pre_thickening_radius: Optional outward pre-thickening radius.
+
+    Returns:
+        Native result dictionary containing mesh arrays and lightweight
+        metadata.
+    """
     pos = np.ascontiguousarray(positions, dtype=np.float64)
     sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
     return _adaptive.run_full_pipeline(
