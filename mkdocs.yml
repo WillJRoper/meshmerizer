@@ -1,0 +1,18 @@
+site_name: Meshmerizer
+site_description: Adaptive particle-to-mesh reconstruction for STL generation
+repo_url: https://github.com/willroper/meshmerizer
+site_url: https://willroper.github.io/meshmerizer/
+theme:
+  name: material
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - CLI: cli.md
+  - Python API: python-api.md
+  - Architecture: architecture.md
+  - Release & Deployment: release.md
+markdown_extensions:
+  - admonition
+  - codehilite
+  - toc:
+      permalink: true
