@@ -10,7 +10,7 @@ from meshmerizer.adaptive_core import (
     refine_octree,
     solve_vertices,
 )
-from meshmerizer.serialize import export_octree, import_octree
+from meshmerizer.io.octree import export_octree, import_octree
 
 
 def _build_sphere_octree(

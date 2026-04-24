@@ -49,6 +49,9 @@ backward compatibility, or transitional warnings**.
   smaller workflow vocabulary: `build_tree`, `regularize`, `extract_mesh`,
   and `generate_mesh`, with `cluster_particles` as the explicit public FOF
   helper.
+- Started Commit 6 in order by moving the actual HDF5 octree schema
+  implementation into `meshmerizer.io.octree`, documenting the full on-disk
+  layout there, and reducing `meshmerizer.serialize` to a compatibility shim.
 
 ### Commit 1: Reorganize package layout around clear layers
 
