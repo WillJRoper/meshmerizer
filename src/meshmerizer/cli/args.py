@@ -10,7 +10,19 @@ from meshmerizer.cli.adaptive import run_adaptive
 
 
 def _positive_int(value: str) -> int:
-    """Parse a strictly positive integer CLI value."""
+    """Parse a strictly positive integer CLI value.
+
+    Args:
+        value: Raw CLI string value.
+
+    Returns:
+        Parsed positive integer.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is not strictly positive.
+    """
+    # Parse first, then validate the sign so argparse can surface a targeted
+    # error message for this specific constraint.
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be a positive integer")
@@ -18,7 +30,19 @@ def _positive_int(value: str) -> int:
 
 
 def _nonnegative_int(value: str) -> int:
-    """Parse a non-negative integer CLI value."""
+    """Parse a non-negative integer CLI value.
+
+    Args:
+        value: Raw CLI string value.
+
+    Returns:
+        Parsed non-negative integer.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is negative.
+    """
+    # Non-negative integer parsing is used for iteration counts and similar
+    # knobs that legitimately allow zero.
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError(
@@ -28,7 +52,19 @@ def _nonnegative_int(value: str) -> int:
 
 
 def _finite_float(value: str) -> float:
-    """Parse a finite floating-point CLI value."""
+    """Parse a finite floating-point CLI value.
+
+    Args:
+        value: Raw CLI string value.
+
+    Returns:
+        Parsed finite float.
+
+    Raises:
+        argparse.ArgumentTypeError: If the parsed float is not finite.
+    """
+    # Parse once centrally so the other float validators can layer additional
+    # range checks on top of a shared finite-number rule.
     parsed = float(value)
     if not math.isfinite(parsed):
         raise argparse.ArgumentTypeError("value must be finite")
@@ -36,7 +72,19 @@ def _finite_float(value: str) -> float:
 
 
 def _positive_float(value: str) -> float:
-    """Parse a strictly positive floating-point CLI value."""
+    """Parse a strictly positive floating-point CLI value.
+
+    Args:
+        value: Raw CLI string value.
+
+    Returns:
+        Parsed positive float.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is not strictly positive.
+    """
+    # Reuse the finite-float parser so positivity checks never need to handle
+    # NaN or infinity explicitly.
     parsed = _finite_float(value)
     if parsed <= 0.0:
         raise argparse.ArgumentTypeError("value must be > 0")
@@ -44,7 +92,19 @@ def _positive_float(value: str) -> float:
 
 
 def _nonnegative_float(value: str) -> float:
-    """Parse a non-negative floating-point CLI value."""
+    """Parse a non-negative floating-point CLI value.
+
+    Args:
+        value: Raw CLI string value.
+
+    Returns:
+        Parsed non-negative float.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is negative.
+    """
+    # This variant is used for thresholds and radii where zero is a meaningful
+    # "disabled" value.
     parsed = _finite_float(value)
     if parsed < 0.0:
         raise argparse.ArgumentTypeError("value must be >= 0")
@@ -52,7 +112,19 @@ def _nonnegative_float(value: str) -> float:
 
 
 def _fraction_or_zero(value: str) -> float:
-    """Parse a value constrained to the closed unit interval."""
+    """Parse a value constrained to the closed unit interval.
+
+    Args:
+        value: Raw CLI string value.
+
+    Returns:
+        Parsed float in ``[0, 1]``.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value lies outside ``[0, 1]``.
+    """
+    # Island-removal fractions use the closed interval so ``0`` can mean
+    # "keep only the largest component".
     parsed = _nonnegative_float(value)
     if parsed > 1.0:
         raise argparse.ArgumentTypeError("value must lie in [0, 1]")
@@ -60,7 +132,19 @@ def _fraction_or_zero(value: str) -> float:
 
 
 def _unit_interval_open_closed(value: str) -> float:
-    """Parse a value constrained to ``(0, 1]``."""
+    """Parse a value constrained to ``(0, 1]``.
+
+    Args:
+        value: Raw CLI string value.
+
+    Returns:
+        Parsed float in ``(0, 1]``.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value lies outside ``(0, 1]``.
+    """
+    # This validator is used for strengths and fractions where zero would make
+    # the option semantically meaningless.
     parsed = _finite_float(value)
     if parsed <= 0.0 or parsed > 1.0:
         raise argparse.ArgumentTypeError("value must lie in (0, 1]")
@@ -68,7 +152,19 @@ def _unit_interval_open_closed(value: str) -> float:
 
 
 def _percentile(value: str) -> float:
-    """Parse a percentile value constrained to ``[0, 100]``."""
+    """Parse a percentile value constrained to ``[0, 100]``.
+
+    Args:
+        value: Raw CLI string value.
+
+    Returns:
+        Parsed percentile.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value lies outside ``[0, 100]``.
+    """
+    # Percentile parsing is kept separate from generic fraction parsing because
+    # the CLI exposes percent values in the user-facing convention.
     parsed = _finite_float(value)
     if parsed < 0.0 or parsed > 100.0:
         raise argparse.ArgumentTypeError("value must lie in [0, 100]")
@@ -81,6 +177,8 @@ def build_parser() -> argparse.ArgumentParser:
     Returns:
         Configured top-level parser.
     """
+    # Build the parser in one place so the CLI entrypoint and any tests share
+    # the exact same option definitions.
     parser = argparse.ArgumentParser(
         description=(
             "Convert SWIFT simulation snapshots to 3D-printable "
@@ -88,6 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
 
+    # Positional and output-path arguments define the overall data source and
+    # default export location.
     parser.add_argument(
         "filename",
         type=Path,

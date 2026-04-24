@@ -57,12 +57,16 @@ def _configure_threads(args) -> None:
     Args:
         args: Parsed CLI namespace.
     """
+    # Leave the runtime default untouched unless the user explicitly requests a
+    # thread count override.
     if args.nthreads is None:
         return
 
     try:
         from meshmerizer._adaptive import set_num_threads
     except Exception as exc:
+        # Thread configuration only makes sense if the compiled extension is
+        # present, so turn import failure into a clear CLI error.
         abort_with_error(
             "Config",
             "Could not configure OpenMP threads because the adaptive "
@@ -70,6 +74,7 @@ def _configure_threads(args) -> None:
             f"to build `_adaptive` ({exc}).",
         )
 
+    # Apply the requested setting once the extension import succeeds.
     set_num_threads(args.nthreads)
     log_status("Config", f"OpenMP threads set to {args.nthreads}.")
 
@@ -83,10 +88,13 @@ def _resolve_output_path(args) -> Path:
     Returns:
         Final mesh output path, either explicit or derived from the input.
     """
+    # Prefer an explicit user path when present.
     if args.output is not None:
         return Path(args.output)
+    # Otherwise derive the STL name from the snapshot path.
     if args.filename is not None:
         return args.filename.with_suffix(".stl")
+    # Octree-only runs derive their default output from the saved octree path.
     return Path(args.load_octree).with_suffix(".stl")
 
 
@@ -110,12 +118,16 @@ def _convert_regularization_lengths(
         Tuple of ``(min_feature_thickness, pre_thickening_radius)`` in native
         meshing units.
     """
+    # Without a print target there is no print/native conversion to perform.
     if args.target_size is None:
         return min_feature_thickness, pre_thickening_radius
 
+    # Track converted values separately so logging can still refer back to the
+    # original user-facing CLI inputs.
     effective_min_feature_thickness = min_feature_thickness
     effective_pre_thickening_radius = pre_thickening_radius
 
+    # Convert the opening thickness only when the user actually enabled it.
     if effective_min_feature_thickness > 0.0:
         effective_min_feature_thickness = convert_print_length_to_native_units(
             effective_min_feature_thickness,
@@ -130,6 +142,8 @@ def _convert_regularization_lengths(
             f"{effective_min_feature_thickness:.6g} native units",
         )
 
+    # Convert the optional pre-thickening radius using the same scale factor so
+    # both regularization controls remain physically consistent.
     if effective_pre_thickening_radius > 0.0:
         effective_pre_thickening_radius = convert_print_length_to_native_units(
             effective_pre_thickening_radius,
@@ -157,6 +171,8 @@ def _postprocess_mesh(mesh: Mesh, args) -> Mesh:
     Returns:
         Post-processed mesh ready for export.
     """
+    # Apply cleanup in the same order as the CLI messaging: island removal,
+    # simplification, then optional print scaling.
     cleanup_start = time.perf_counter()
     mesh = _remove_islands(mesh, args.remove_islands_fraction)
     record_elapsed("Island removal", cleanup_start, operation="Cleaning")
@@ -169,6 +185,8 @@ def _postprocess_mesh(mesh: Mesh, args) -> Mesh:
         operation="Cleaning",
     )
 
+    # Print scaling is intentionally last so cleanup thresholds operate in the
+    # native reconstruction coordinate system.
     if args.target_size is not None:
         log_status("Cleaning", f"Scaling mesh to {args.target_size} cm...")
         scale_start = time.perf_counter()
@@ -189,6 +207,8 @@ def _build_mesh(mesh_verts, mesh_faces, origin: np.ndarray) -> Mesh:
     Returns:
         Mesh wrapper in world-space coordinates.
     """
+    # The native pipeline works in local coordinates, so shift vertices back to
+    # snapshot/world coordinates before wrapping them for export.
     mesh_verts += origin
     return Mesh(vertices=mesh_verts, faces=mesh_faces)
 
@@ -202,11 +222,15 @@ def _save_final_mesh(mesh: Mesh, output_path: Path, *, summary: bool) -> None:
         summary: Whether to emit summary-style rather than standard status
             logging.
     """
+    # Choose the log style first so silent-mode summary behavior stays
+    # centralized in one helper.
     if summary:
         log_summary_status("Saving", f"Writing STL to {output_path}...")
     else:
         log_status("Saving", f"Writing STL to {output_path}...")
 
+    # Route all writes through the atomic output helper so partial files
+    # are not left behind on cancellation or failure.
     save_start = time.perf_counter()
     save_mesh_output(mesh, output_path)
     record_elapsed("STL export", save_start, operation="Saving")

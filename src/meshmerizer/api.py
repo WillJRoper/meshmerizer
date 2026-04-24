@@ -233,7 +233,25 @@ def _extract_mesh_from_tree(
     pre_thickening_radius: float = 0.0,
     remove_islands_fraction: Optional[float] = None,
 ) -> MeshResult:
-    """Extract a mesh from a tree state."""
+    """Extract a mesh from a tree state.
+
+    Args:
+        tree: Refined tree state to extract from.
+        smoothing_iterations: Number of smoothing iterations for the full
+            pipeline fallback.
+        smoothing_strength: Laplacian smoothing strength for the fallback path.
+        max_edge_ratio: Maximum permitted edge length relative to local cell
+            size on the fallback path.
+        min_feature_thickness: Minimum feature thickness to preserve.
+        pre_thickening_radius: Optional outward pre-thickening radius.
+        remove_islands_fraction: Optional connected-component filtering
+            threshold.
+
+    Returns:
+        ``MeshResult`` extracted from the provided tree state.
+    """
+    # Use the lighter direct mesh-generation path when the caller already has a
+    # refined tree and does not request regularization.
     if (
         tree.cells
         and tree.contributors
@@ -251,12 +269,16 @@ def _extract_mesh_from_tree(
             tree.max_depth,
             tree.base_resolution,
         )
+        # Wrap the direct native arrays immediately so the rest of the function
+        # can treat both branches uniformly.
         mesh_result = MeshResult(
             mesh=Mesh(vertices=vertices, faces=faces.astype(np.uint32)),
             isovalue=tree.isovalue,
             n_qef_vertices=int(vertices.shape[0]),
         )
     else:
+        # Fall back to the whole-pipeline entry point when regularization
+        # or smoothing requests mean the direct shortcut is insufficient.
         result = run_full_pipeline(
             tree.positions,
             tree.smoothing_lengths,
@@ -276,6 +298,8 @@ def _extract_mesh_from_tree(
         )
         mesh_result = _mesh_result_from_pipeline_dict(result)
 
+    # Apply optional island filtering last so both extraction branches
+    # share the same cleanup semantics.
     if remove_islands_fraction is not None:
         mesh_result.mesh = remove_islands(
             mesh_result.mesh,
@@ -289,7 +313,18 @@ def _extract_mesh_from_topology(
     *,
     remove_islands_fraction: Optional[float] = None,
 ) -> MeshResult:
-    """Extract a mesh from a topology state."""
+    """Extract a mesh from a topology state.
+
+    Args:
+        topology: Regularized topology state to extract from.
+        remove_islands_fraction: Optional connected-component filtering
+            threshold.
+
+    Returns:
+        ``MeshResult`` extracted from the opened-solid topology.
+    """
+    # Topology extraction always uses the opened-solid mesh path because the
+    # caller has already committed to the regularized occupancy state.
     vertices, faces = extract_opened_surface_mesh(
         topology.tree.positions,
         topology.tree.smoothing_lengths,
@@ -303,11 +338,14 @@ def _extract_mesh_from_topology(
         topology.tree.max_qef_rms_residual_ratio,
         topology.tree.min_normal_alignment_threshold,
     )
+    # The opened-surface extractor does not solve a fresh QEF vertex cloud in
+    # the same sense as the full tree pipeline, so report zero here.
     mesh_result = MeshResult(
         mesh=Mesh(vertices=vertices, faces=faces),
         isovalue=topology.tree.isovalue,
         n_qef_vertices=0,
     )
+    # Apply the same optional cleanup hook as the tree-based extraction path.
     if remove_islands_fraction is not None:
         mesh_result.mesh = remove_islands(
             mesh_result.mesh,
@@ -349,6 +387,8 @@ def extract_mesh(
     Raises:
         TypeError: If ``state`` is not a supported staged public state.
     """
+    # Dispatch on the staged state type so callers can use one public
+    # extraction entry point regardless of where they stopped.
     if isinstance(state, TreeState):
         return _extract_mesh_from_tree(
             state,
@@ -412,7 +452,11 @@ def generate_mesh(
     Returns:
         ``MeshResult`` containing the final extracted mesh.
     """
+    # Validate the particle arrays once at the public boundary so the rest of
+    # the workflow can assume matched, contiguous inputs.
     pos, sml = _validate_particle_arrays(positions, smoothing_lengths)
+    # The one-shot API is intentionally a thin wrapper over the native full
+    # pipeline followed by optional mesh cleanup.
     result = run_full_pipeline(
         pos,
         sml,
@@ -431,6 +475,8 @@ def generate_mesh(
         pre_thickening_radius=pre_thickening_radius,
     )
     mesh_result = _mesh_result_from_pipeline_dict(result)
+    # Apply cleanup after wrapping the result so the public return type stays
+    # consistent regardless of whether filtering is requested.
     if remove_islands_fraction is not None:
         mesh_result.mesh = remove_islands(
             mesh_result.mesh,
@@ -456,6 +502,8 @@ def cluster_particles(
     Returns:
         ``(N,)`` int64 array of cluster labels.
     """
+    # Reuse the public position normalizer so clustering follows the same input
+    # contract as the rest of the API.
     pos = _as_positions(positions)
     return fof_cluster(
         pos, tuple(domain_min), tuple(domain_max), linking_factor
@@ -478,6 +526,8 @@ def smooth_mesh(
     Returns:
         Smoothed mesh instance.
     """
+    # Copy by default so smoothing behaves like a pure helper unless the caller
+    # explicitly opts into in-place modification.
     target = mesh if inplace else Mesh(mesh=mesh.mesh.copy())
     target.repair(smoothing_iters=iterations)
     return target
@@ -497,6 +547,8 @@ def remove_islands(
     Returns:
         Filtered mesh.
     """
+    # Delegate to the shared mesh-operations helper so CLI and public API keep
+    # identical island-filtering semantics.
     return remove_small_islands(mesh, remove_islands_fraction)
 
 
@@ -510,6 +562,8 @@ def subdivide_long_edges(mesh: Mesh, iterations: int = 1) -> Mesh:
     Returns:
         Subdivided mesh copy.
     """
+    # Operate on a copy so subdivision does not mutate the caller's mesh unless
+    # they choose to keep the returned object.
     result = Mesh(mesh=mesh.mesh.copy())
     result.subdivide(iterations=iterations)
     return result

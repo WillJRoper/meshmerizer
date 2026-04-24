@@ -10,7 +10,17 @@ from meshmerizer.logging import (
 
 
 def visualize_vertices(vert_positions, output_path: str) -> None:
-    """Save a 6-panel figure showing QEF vertices from each face."""
+    """Save a 6-panel figure showing QEF vertices from each face.
+
+    Args:
+        vert_positions: Vertex positions with shape ``(N, 3)``.
+        output_path: Destination image path.
+
+    Returns:
+        ``None``. The figure is written to disk.
+    """
+    # Import matplotlib lazily because this is a diagnostic-only feature and
+    # most CLI runs do not need the dependency.
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -20,6 +30,8 @@ def visualize_vertices(vert_positions, output_path: str) -> None:
             "pip install matplotlib",
         )
 
+    # Define the six orthographic projections once so the plotting loop only
+    # needs to map axes and labels into each panel.
     views = [
         ("+X face (Y-Z)", 1, 2, "Y", "Z"),
         ("-X face (Y-Z)", 1, 2, "Y", "Z"),
@@ -29,6 +41,8 @@ def visualize_vertices(vert_positions, output_path: str) -> None:
         ("-Z face (X-Y)", 0, 1, "X", "Y"),
     ]
 
+    # Build all subplots up front so the diagnostic output always has a stable
+    # layout regardless of the number of vertices.
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     fig.suptitle(
         f"QEF Vertices ({len(vert_positions):,} points)",
@@ -36,6 +50,8 @@ def visualize_vertices(vert_positions, output_path: str) -> None:
         fontweight="bold",
     )
 
+    # Plot each face projection as a very small scatter so dense QEF
+    # clouds stay readable without huge vector output files.
     for axis, (title, horizontal, vertical, xlabel, ylabel) in zip(
         axes.flat, views
     ):
@@ -53,6 +69,7 @@ def visualize_vertices(vert_positions, output_path: str) -> None:
         axis.set_title(title)
         axis.set_aspect("equal")
 
+    # Tight layout keeps labels readable across the six-panel grid.
     plt.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -62,7 +79,16 @@ def visualize_vertices(vert_positions, output_path: str) -> None:
 
 
 def emit_tree_structure_summary(cells) -> None:
-    """Log a concise per-depth summary of the octree structure."""
+    """Log a concise per-depth summary of the octree structure.
+
+    Args:
+        cells: Sequence of octree cell dictionaries.
+
+    Returns:
+        ``None``. A formatted summary is emitted through the CLI logger.
+    """
+    # Handle the empty-tree case explicitly so callers get a predictable
+    # summary instead of an exception from ``max()`` below.
     if not cells:
         log_status(
             "Tree",
@@ -71,6 +97,8 @@ def emit_tree_structure_summary(cells) -> None:
         )
         return
 
+    # Size the per-depth summary table from the deepest observed cell so the
+    # later aggregation loop can index by depth directly.
     max_depth = max(int(cell.get("depth", 0)) for cell in cells)
     per_depth = [
         {"total": 0, "leaf": 0, "active": 0, "surface": 0}
@@ -81,6 +109,8 @@ def emit_tree_structure_summary(cells) -> None:
     total_active = 0
     total_surface = 0
 
+    # Aggregate the same counters used in the human-readable total summary and
+    # the depth-by-depth breakdown.
     for cell in cells:
         depth = int(cell.get("depth", 0))
         summary = per_depth[depth]
@@ -98,6 +128,8 @@ def emit_tree_structure_summary(cells) -> None:
             summary["surface"] += 1
             total_surface += 1
 
+    # Build the output as lines first so the final log call stays simple
+    # and the summary formatting remains easy to tweak.
     lines = [
         "Summary:",
         (

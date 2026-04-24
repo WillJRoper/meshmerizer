@@ -100,7 +100,7 @@ def crop_particles_to_region(
     extent: float,
     box_size: float,
     periodic: bool,
-) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]:
+) -> tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
     """Crop particle arrays to an axis-aligned cubic region.
 
     Args:
@@ -144,6 +144,9 @@ def crop_particles_to_region(
         delta = (delta + 0.5 * box_size) % box_size - 0.5 * box_size
         mask = np.all(np.abs(delta) <= half, axis=1)
 
+        # Re-express the periodic selection in a local cube ``[0, extent)`` so
+        # the downstream adaptive code sees the same coordinate convention as a
+        # non-periodic crop.
         local = delta + half
         origin = np.mod(mins, box_size)
     else:
@@ -151,6 +154,8 @@ def crop_particles_to_region(
             raise ValueError(
                 "Non-periodic region must lie within [0, box_size]"
             )
+        # In the non-periodic case the world-space minimum corner is
+        # already the correct local origin.
         origin = mins
         mask = np.all((coords_arr >= mins) & (coords_arr < maxs), axis=1)
         local = coords_arr - origin
@@ -161,6 +166,8 @@ def crop_particles_to_region(
     if smoothing_lengths is None:
         cropped_h = None
     else:
+        # Preserve the original smoothing-length dtype here because this helper
+        # only performs selection, not numeric kernel evaluation.
         h_arr = np.asarray(smoothing_lengths)
         cropped_h = h_arr[mask]
 
@@ -276,7 +283,6 @@ def load_swift_particles(
 ) -> tuple[
     np.ndarray,
     np.ndarray,
-    Optional[np.ndarray],
     float,
     np.ndarray,
 ]:
@@ -302,6 +308,8 @@ def load_swift_particles(
         RuntimeError: If the snapshot cannot be loaded or has no usable box.
         ValueError: If argument combinations are inconsistent.
     """
+    # Import SWIFT lazily so importing the package or using non-SWIFT codepaths
+    # does not pay the dependency cost up front.
     import swiftsimio as sw
     from swiftsimio.visualisation import generate_smoothing_lengths
 
@@ -324,6 +332,8 @@ def load_swift_particles(
     # bounds all operate in one consistent coordinate system.
     full_box_size_source: str
     if box_size is not None:
+        # Prefer an explicit user override when present so the CLI can repair
+        # incomplete snapshot metadata.
         box_size_source = "--box-size"
     else:
         meta_box = None
@@ -336,6 +346,8 @@ def load_swift_particles(
                 "Pass --box-size to define the physical volume."
             )
 
+        # Normalize the metadata representation once here because SWIFT can
+        # expose box size as either scalar or vector-like quantities.
         box_size = boxsize_to_float(meta_box)
         box_size_source = "snapshot metadata"
 
@@ -344,6 +356,7 @@ def load_swift_particles(
 
     # Map the CLI particle-family name to the corresponding SWIFT dataset.
     if particle_type == "gas":
+        # Map the CLI spelling directly to the loaded SWIFT particle container.
         part_data = data.gas
     elif particle_type == "dark_matter":
         part_data = data.dark_matter
@@ -388,6 +401,8 @@ def load_swift_particles(
     # Prefer snapshot smoothing lengths when available. Only fall back to
     # regeneration when the particle family does not store them explicitly.
     if hasattr(part_data, "smoothing_lengths"):
+        # If smoothing lengths are already present, keep the snapshot's own
+        # values and only apply the CLI multiplier.
         smoothing_start = time.perf_counter()
         h = part_data.smoothing_lengths.value * smoothing_factor
         record_elapsed(
@@ -396,6 +411,8 @@ def load_swift_particles(
             operation="Loading",
         )
     else:
+        # Some particle families do not carry smoothing lengths. Fall back to a
+        # generated estimate so the adaptive pipeline can still proceed.
         log_status("Loading", "Smoothing lengths not found. Generating...")
         boxsize = data.metadata.boxsize
         smoothing_start = time.perf_counter()
@@ -421,6 +438,9 @@ def load_swift_particles(
                 "Loading",
                 "Falling back to point deposition.",
             )
+            # Preserve a ``None`` sentinel on failure so the caller can decide
+            # whether this pipeline requires smoothing lengths or can degrade
+            # gracefully.
             h = None
             record_elapsed(
                 "Smoothing-length generation",
@@ -446,6 +466,8 @@ def load_swift_particles(
         assert extent is not None
         center_arr = np.asarray(center, dtype=np.float64)
         extent_f = float(extent)
+        # Convert the requested world-space crop into a local working cube and
+        # track the world-space origin so final meshes can be shifted back.
         coords, h, origin = crop_particles_to_region(
             coords,
             h,
@@ -485,6 +507,8 @@ def load_swift_particles(
     # on the actual region that will be reconstructed.
     if tight_bounds:
         tighten_start = time.perf_counter()
+        # Tight bounds are a second-stage optimization: first crop if
+        # requested, then shrink the occupied cube.
         coords, h, origin_offset, effective_box_size = tighten_working_bounds(
             coords,
             h,

@@ -18,6 +18,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     Returns:
         ``None``. This function dispatches to the selected subcommand.
     """
+    # Build and parse the CLI once here so subcommands receive a fully
+    # validated namespace.
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -27,6 +29,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         try:
             args.func(args)
         except KeyboardInterrupt as exc:
+            # Translate Ctrl-C into the conventional shell exit code
+            # while still emitting a clean summary line.
             log_summary_status(
                 "Cancelled",
                 "Interrupted by user; cancelled without writing output.",
