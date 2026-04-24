@@ -17,7 +17,7 @@ from collections import Counter
 import numpy as np
 import trimesh
 
-from meshmerizer.adaptive_core import run_full_pipeline
+from meshmerizer.adaptive import fof_cluster, run_full_pipeline
 
 # -------------------------------------------------------------------
 # Helpers
@@ -155,8 +155,6 @@ def _filter_small_fof_clusters(
     min_cluster_size: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Filter particle clusters by FOF size for integration tests."""
-    from meshmerizer.adaptive_core import fof_cluster
-
     labels = fof_cluster(positions, domain_min, domain_max, linking_factor)
     unique_labels, counts = np.unique(labels, return_counts=True)
     kept_labels = unique_labels[counts >= min_cluster_size]

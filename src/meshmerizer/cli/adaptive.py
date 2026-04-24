@@ -22,11 +22,12 @@ from pathlib import Path
 
 import numpy as np
 
-from meshmerizer.adaptive_core import (
+from meshmerizer.adaptive import (
     compute_isovalue_from_percentile,
     create_top_level_cells_with_contributors,
     fof_cluster,
     refine_octree,
+    run_full_pipeline,
     solve_vertices,
 )
 from meshmerizer.cli.diagnostics import (
@@ -48,7 +49,6 @@ from meshmerizer.logging import (
 from meshmerizer.mesh import Mesh
 from meshmerizer.mesh.operations import remove_islands, simplify_mesh
 from meshmerizer.printing import scale_mesh_to_print
-from meshmerizer.reconstruct import reconstruct_mesh
 
 
 def _configure_threads(args) -> None:
@@ -174,11 +174,11 @@ def _postprocess_mesh(mesh: Mesh, args) -> Mesh:
     # Apply cleanup in the same order as the CLI messaging: island removal,
     # simplification, then optional print scaling.
     cleanup_start = time.perf_counter()
-    mesh = _remove_islands(mesh, args.remove_islands_fraction)
+    mesh = remove_islands(mesh, args.remove_islands_fraction)
     record_elapsed("Island removal", cleanup_start, operation="Cleaning")
 
     simplify_start = time.perf_counter()
-    mesh = _simplify_mesh(mesh, args.simplify_factor)
+    mesh = simplify_mesh(mesh, args.simplify_factor)
     record_elapsed(
         "Mesh simplification",
         simplify_start,
@@ -236,6 +236,119 @@ def _save_final_mesh(mesh: Mesh, output_path: Path, *, summary: bool) -> None:
     record_elapsed("STL export", save_start, operation="Saving")
 
 
+def _reconstruct_mesh(
+    positions: np.ndarray,
+    smoothing_lengths: np.ndarray,
+    domain_min: tuple[float, float, float],
+    domain_max: tuple[float, float, float],
+    base_resolution: int,
+    isovalue: float,
+    max_depth: int,
+    *,
+    group_labels: np.ndarray | None = None,
+    smoothing_iterations: int = 0,
+    smoothing_strength: float = 0.5,
+    max_edge_ratio: float = 1.5,
+    minimum_usable_hermite_samples: int = 3,
+    max_qef_rms_residual_ratio: float = 0.1,
+    min_normal_alignment_threshold: float = 0.97,
+    min_feature_thickness: float = 0.0,
+    pre_thickening_radius: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reconstruct and merge one or more particle groups for the CLI.
+
+    Args:
+        positions: Particle positions with shape ``(N, 3)``.
+        smoothing_lengths: Per-particle smoothing lengths with shape ``(N,)``.
+        domain_min: Lower corner of the working domain.
+        domain_max: Upper corner of the working domain.
+        base_resolution: Number of top-level cells per axis.
+        isovalue: Scalar field threshold for extraction.
+        max_depth: Maximum octree refinement depth.
+        group_labels: Optional per-particle group labels.
+        smoothing_iterations: Number of smoothing iterations.
+        smoothing_strength: Laplacian smoothing strength in ``(0, 1]``.
+        max_edge_ratio: Maximum permitted edge length relative to cell size.
+        minimum_usable_hermite_samples: Minimum usable Hermite sample count.
+        max_qef_rms_residual_ratio: Maximum acceptable QEF residual ratio.
+        min_normal_alignment_threshold: Minimum acceptable normal alignment.
+        min_feature_thickness: Minimum preserved feature thickness.
+        pre_thickening_radius: Optional outward pre-thickening radius.
+
+    Returns:
+        Tuple of merged ``(vertices, faces)`` arrays.
+    """
+    # Normalize the raw buffers once so repeated group slices preserve the
+    # native bridge's expected dtype and contiguity guarantees.
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
+
+    # Default to a single implicit group when no clustering labels are passed.
+    if group_labels is None:
+        labels = np.zeros(len(pos), dtype=np.int64)
+    else:
+        labels = np.asarray(group_labels, dtype=np.int64)
+        if labels.shape != (pos.shape[0],):
+            raise ValueError(
+                f"group_labels must have shape (N,), got {labels.shape}"
+            )
+
+    # Reconstruct each group independently so disconnected FOF structures are
+    # not accidentally bridged by one global extraction pass.
+    all_vertices = []
+    all_faces = []
+    vertex_offset = 0
+    for group_id in np.unique(labels):
+        mask = labels == group_id
+        group_pos = pos[mask]
+        group_sml = sml[mask]
+
+        # The native pipeline cannot form a mesh from fewer than three
+        # particles, so skip undersized groups explicitly.
+        if group_pos.shape[0] < 3:
+            continue
+
+        # Run the canonical adaptive pipeline for this group and collect
+        # the raw arrays for later merge.
+        result = run_full_pipeline(
+            group_pos,
+            group_sml,
+            domain_min,
+            domain_max,
+            base_resolution,
+            isovalue,
+            max_depth,
+            smoothing_iterations=smoothing_iterations,
+            smoothing_strength=smoothing_strength,
+            max_edge_ratio=max_edge_ratio,
+            minimum_usable_hermite_samples=minimum_usable_hermite_samples,
+            max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
+            min_normal_alignment_threshold=min_normal_alignment_threshold,
+            min_feature_thickness=min_feature_thickness,
+            pre_thickening_radius=pre_thickening_radius,
+        )
+        verts = result["vertices"]
+        faces = result["faces"].astype(np.int64)
+
+        # Empty group results are ignored so weak or filtered groups do not add
+        # degenerate entries to the final mesh buffers.
+        if verts.shape[0] == 0:
+            continue
+
+        all_vertices.append(verts)
+        all_faces.append(faces + vertex_offset)
+        vertex_offset += verts.shape[0]
+
+    # Preserve the historical empty-mesh contract if no group produced faces.
+    if not all_vertices:
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 3), dtype=np.int64),
+        )
+
+    return np.vstack(all_vertices), np.vstack(all_faces)
+
+
 def _run_full_pipeline_path(
     args,
     *,
@@ -283,7 +396,7 @@ def _run_full_pipeline_path(
     )
     pipeline_start = time.perf_counter()
     reconstruction_start = time.perf_counter()
-    mesh_verts, mesh_faces = reconstruct_mesh(
+    mesh_verts, mesh_faces = _reconstruct_mesh(
         positions,
         smoothing_lengths,
         domain_min,
@@ -381,7 +494,7 @@ def _load_or_prepare_inputs(args):
         }
 
     positions, smoothing_lengths, domain_min, domain_max, origin = (
-        _load_particles_for_adaptive(args)
+        load_particles_for_adaptive(args)
     )
     min_fof_cluster_size = getattr(args, "min_fof_cluster_size", None)
     if min_fof_cluster_size is not None:
@@ -613,7 +726,7 @@ def _run_octree_backed_pipeline(
         f"(depth={reconstruction_depth})...",
     )
     reconstruction_start = time.perf_counter()
-    mesh_verts, mesh_faces = reconstruct_mesh(
+    mesh_verts, mesh_faces = _reconstruct_mesh(
         positions,
         smoothing_lengths,
         domain_min,
@@ -770,17 +883,4 @@ def run_adaptive(args) -> None:
     )
 
 
-__all__ = [
-    "_convert_print_length_to_native_units",
-    "_load_particles_for_adaptive",
-    "_remove_islands",
-    "_save_mesh_output",
-    "_simplify_mesh",
-    "run_adaptive",
-]
-
-_convert_print_length_to_native_units = convert_print_length_to_native_units
-_remove_islands = remove_islands
-_simplify_mesh = simplify_mesh
-_load_particles_for_adaptive = load_particles_for_adaptive
-_save_mesh_output = save_mesh_output
+__all__ = ["run_adaptive"]

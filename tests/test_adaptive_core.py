@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from meshmerizer.adaptive_core import (
+from meshmerizer.adaptive import (
     adaptive_status,
     bounding_box_contains,
     bounding_box_overlaps,

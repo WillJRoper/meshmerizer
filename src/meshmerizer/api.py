@@ -15,7 +15,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from meshmerizer.adaptive_core import (
+from meshmerizer.adaptive import (
     build_refined_tree,
     classify_occupied_solid,
     compute_isovalue_from_percentile,
@@ -23,7 +23,7 @@ from meshmerizer.adaptive_core import (
     fof_cluster,
     run_full_pipeline,
 )
-from meshmerizer.adaptive_core import (
+from meshmerizer.adaptive import (
     generate_mesh as generate_native_mesh,
 )
 from meshmerizer.mesh import Mesh

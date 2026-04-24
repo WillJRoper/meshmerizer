@@ -5,7 +5,7 @@ import tempfile
 
 import numpy as np
 
-from meshmerizer.adaptive_core import (
+from meshmerizer.adaptive import (
     create_top_level_cells,
     refine_octree,
     solve_vertices,

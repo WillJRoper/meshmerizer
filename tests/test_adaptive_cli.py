@@ -7,14 +7,10 @@ import numpy as np
 import pytest
 import trimesh
 
-from meshmerizer.cli.adaptive import (
-    _convert_print_length_to_native_units,
-    _remove_islands,
-    _simplify_mesh,
-    run_adaptive,
-)
+from meshmerizer.cli.adaptive import run_adaptive
 from meshmerizer.cli.args import build_parser
 from meshmerizer.cli.main import main
+from meshmerizer.cli.units import convert_print_length_to_native_units
 from meshmerizer.logging import (
     _STATE,
     cli_logging_context,
@@ -23,6 +19,7 @@ from meshmerizer.logging import (
     log_warning_status,
 )
 from meshmerizer.mesh.core import Mesh
+from meshmerizer.mesh.operations import remove_islands, simplify_mesh
 
 
 def test_remove_islands_fraction_uses_largest_component_reference() -> None:
@@ -32,7 +29,7 @@ def test_remove_islands_fraction_uses_largest_component_reference() -> None:
     fluff.apply_translation((30.0, 0.0, 0.0))
     combined = trimesh.util.concatenate([main, fluff])
 
-    cleaned = _remove_islands(
+    cleaned = remove_islands(
         Mesh(mesh=combined.copy()), remove_islands_fraction=0.1
     )
 
@@ -53,7 +50,7 @@ def test_remove_islands_keeps_large_nonwatertight_main_component() -> None:
     fluff.apply_translation((30.0, 0.0, 0.0))
     combined = trimesh.util.concatenate([nonwatertight_main, fluff])
 
-    cleaned = _remove_islands(
+    cleaned = remove_islands(
         Mesh(mesh=combined.copy()), remove_islands_fraction=0.1
     )
 
@@ -70,7 +67,7 @@ def test_run_adaptive_passes_pre_thickening_radius(
     captured = {}
 
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive._load_particles_for_adaptive",
+        "meshmerizer.cli.adaptive.load_particles_for_adaptive",
         lambda args: (
             positions.copy(),
             smoothing_lengths.copy(),
@@ -95,7 +92,7 @@ def test_run_adaptive_passes_pre_thickening_radius(
         )
 
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive.reconstruct_mesh",
+        "meshmerizer.cli.adaptive._reconstruct_mesh",
         fake_reconstruct_mesh,
     )
     monkeypatch.setattr(
@@ -144,7 +141,7 @@ def test_run_adaptive_converts_pre_thickening_in_print_units(
     captured = {}
 
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive._load_particles_for_adaptive",
+        "meshmerizer.cli.adaptive.load_particles_for_adaptive",
         lambda args: (
             positions.copy(),
             smoothing_lengths.copy(),
@@ -169,7 +166,7 @@ def test_run_adaptive_converts_pre_thickening_in_print_units(
         )
 
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive.reconstruct_mesh",
+        "meshmerizer.cli.adaptive._reconstruct_mesh",
         fake_reconstruct_mesh,
     )
     monkeypatch.setattr(
@@ -206,7 +203,7 @@ def test_run_adaptive_converts_pre_thickening_in_print_units(
 
     run_adaptive(args)
 
-    expected = _convert_print_length_to_native_units(
+    expected = convert_print_length_to_native_units(
         0.4,
         (0.0, 0.0, 0.0),
         (2.0, 1.0, 1.0),
@@ -238,7 +235,7 @@ def test_run_adaptive_converts_regularization_lengths_for_loaded_octree(
         },
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive.reconstruct_mesh",
+        "meshmerizer.cli.adaptive._reconstruct_mesh",
         lambda *args, **kwargs: (
             captured.update(kwargs),
             np.array(
@@ -285,13 +282,13 @@ def test_run_adaptive_converts_regularization_lengths_for_loaded_octree(
 
     run_adaptive(args)
 
-    expected_thickening = _convert_print_length_to_native_units(
+    expected_thickening = convert_print_length_to_native_units(
         0.4,
         (0.0, 0.0, 0.0),
         (2.0, 1.0, 1.0),
         10.0,
     )
-    expected_thickness = _convert_print_length_to_native_units(
+    expected_thickness = convert_print_length_to_native_units(
         0.2,
         (0.0, 0.0, 0.0),
         (2.0, 1.0, 1.0),
@@ -337,7 +334,7 @@ def test_run_adaptive_allows_missing_filename_with_loaded_octree(
         },
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive.reconstruct_mesh",
+        "meshmerizer.cli.adaptive._reconstruct_mesh",
         lambda *args, **kwargs: (
             np.array(
                 [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -458,7 +455,7 @@ def test_run_adaptive_removes_temporary_output_on_interrupt(
     temp_path = tmp_path / "out.tmp.stl"
 
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive._load_particles_for_adaptive",
+        "meshmerizer.cli.adaptive.load_particles_for_adaptive",
         lambda args: (
             positions.copy(),
             smoothing_lengths.copy(),
@@ -472,7 +469,7 @@ def test_run_adaptive_removes_temporary_output_on_interrupt(
         lambda smoothing_lengths, percentile: 0.01,
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive.reconstruct_mesh",
+        "meshmerizer.cli.adaptive._reconstruct_mesh",
         lambda *args, **kwargs: (
             np.array(
                 [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -535,7 +532,7 @@ def test_simplify_mesh_noop_when_factor_is_one() -> None:
     mesh = Mesh(mesh=trimesh.creation.box())
     original_faces = len(mesh.faces)
 
-    result = _simplify_mesh(mesh, 1.0)
+    result = simplify_mesh(mesh, 1.0)
 
     assert result is mesh
     assert len(mesh.faces) == original_faces
@@ -547,7 +544,7 @@ def test_run_adaptive_applies_simplify_factor(monkeypatch, tmp_path) -> None:
     simplified = {}
 
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive._load_particles_for_adaptive",
+        "meshmerizer.cli.adaptive.load_particles_for_adaptive",
         lambda args: (
             positions.copy(),
             smoothing_lengths.copy(),
@@ -561,7 +558,7 @@ def test_run_adaptive_applies_simplify_factor(monkeypatch, tmp_path) -> None:
         lambda smoothing_lengths, percentile: 0.01,
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive.reconstruct_mesh",
+        "meshmerizer.cli.adaptive._reconstruct_mesh",
         lambda *args, **kwargs: (
             np.array(
                 [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -571,7 +568,7 @@ def test_run_adaptive_applies_simplify_factor(monkeypatch, tmp_path) -> None:
         ),
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive._simplify_mesh",
+        "meshmerizer.cli.adaptive.simplify_mesh",
         lambda mesh, factor: (simplified.setdefault("factor", factor), mesh)[
             1
         ],

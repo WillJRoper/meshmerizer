@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from meshmerizer.adaptive_core import fof_cluster
+from meshmerizer.adaptive import fof_cluster
 from meshmerizer.io.swift import load_swift_particles
 from meshmerizer.logging import abort_with_error, log_status
 

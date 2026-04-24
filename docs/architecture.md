@@ -50,14 +50,6 @@ This layer provides focused Python wrappers around the compiled extension.
 This is where the performance-critical octree, topology, and extraction logic
 lives.
 
-## Compatibility modules
-
-These still exist, but they are no longer the preferred home for new code:
-
-- `meshmerizer.commands.*`
-- `meshmerizer.serialize`
-- `meshmerizer.adaptive_core`
-
 ## Repository shape
 
 ```text
