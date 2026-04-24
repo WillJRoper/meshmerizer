@@ -25,9 +25,13 @@ backward compatibility, or transitional warnings**.
 
 ### 2026-04-24
 
+- Completed the final cleanup pass by removing temporary compatibility layers
+  (`meshmerizer.commands.*`, `meshmerizer.adaptive_core`,
+  `meshmerizer.serialize`, and `meshmerizer.reconstruct`) and retargeting the
+  remaining runtime code and tests to the canonical modules.
 - Started Commit 9 in order by expanding Python module and helper docstrings in
   `meshmerizer.cli.adaptive`, `meshmerizer.adaptive.pipeline`,
-  `meshmerizer.io.octree`, and `meshmerizer.reconstruct`.
+  `meshmerizer.io.octree`, and the low-level adaptive/CLI layers.
 - Replaced stale wording in the compatibility-facing reconstruction wrappers so
   their current role relative to the redesigned public API is explicit.
 - Documented the adaptive CLI flow, print-space regularization conversion, and
@@ -339,11 +343,10 @@ This keeps the history readable and makes regressions easier to isolate.
 
 The highest-value early targets are:
 
-- `src/meshmerizer/commands/adaptive_stl.py`
-- `src/meshmerizer/adaptive_core.py`
+- `src/meshmerizer/cli/adaptive.py`
+- `src/meshmerizer/adaptive/`
 - `src/meshmerizer/api.py`
-- `src/meshmerizer/reconstruct.py`
-- `src/meshmerizer/serialize.py`
+- `src/meshmerizer/io/octree.py`
 - `src/meshmerizer/_adaptive.cpp`
 - `src/meshmerizer/adaptive_cpp/adaptive_solid.hpp`
 - `src/meshmerizer/adaptive_cpp/octree_cell.hpp`

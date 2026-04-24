@@ -39,7 +39,6 @@ automation.
 **Current gaps:**
 
 - `pyproject.toml` is missing `project.urls`
-- entrypoint still uses the compatibility wrapper path
 - there is no checked-in `LICENSE` file
 - classifiers and metadata are still fairly minimal
 
@@ -154,8 +153,7 @@ health.
 
 **Current gaps:**
 
-- no repository CI is described
-- no automated artifact build verification
+- CI exists, but build-artifact validation is still incomplete
 
 **Changes:**
 
@@ -258,16 +256,15 @@ For this project, Option B is likely the better end state.
 
 **Current gaps:**
 
-- no deployment script/workflow exists
-- no trusted publishing or token-based upload path is defined
+- PyPI publishing exists, but a TestPyPI path is still not defined
 
 **Recommended approach:**
 
 Use **GitHub Actions + PyPI trusted publishing** rather than a local deploy
 script as the primary publishing path.
 
-You can still provide a local helper script for dry runs and TestPyPI uploads,
-but the canonical release path should be CI-driven.
+You can still provide small local validation helpers if needed, but the
+canonical release path should be CI-driven.
 
 **Changes:**
 
@@ -277,9 +274,7 @@ but the canonical release path should be CI-driven.
 - Restrict PyPI publishing to:
   - tags only
   - or GitHub release events only
-- Add a local helper script if desired, e.g.:
-  - `scripts/release-check.sh`
-  - `scripts/publish-testpypi.sh`
+- Add a local helper script only if it genuinely adds value beyond CI.
 
 **Deliverables:**
 
@@ -333,8 +328,8 @@ users will install it.
 
 **Current gaps:**
 
-- no docs site
-- no structured user/developer documentation
+- the docs site exists, but it still needs broader contributor-facing and
+  release/process coverage
 
 **Recommended approach:**
 
