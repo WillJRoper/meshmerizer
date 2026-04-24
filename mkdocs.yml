@@ -8,7 +8,43 @@ nav:
   - Home: index.md
   - Installation: installation.md
   - CLI: cli.md
-  - CLI Option Reference: cli-options.md
+  - CLI Option Reference:
+      - Overview: cli-options/index.md
+      - filename: cli-options/filename.md
+      - --output: cli-options/output.md
+      - --center: cli-options/center.md
+      - --extent: cli-options/extent.md
+      - --tight-bounds: cli-options/tight-bounds.md
+      - --shift: cli-options/shift.md
+      - --wrap-shift: cli-options/wrap-shift.md
+      - --no-wrap-shift: cli-options/no-wrap-shift.md
+      - --no-periodic: cli-options/no-periodic.md
+      - --particle-type: cli-options/particle-type.md
+      - --box-size: cli-options/box-size.md
+      - --smoothing-factor: cli-options/smoothing-factor.md
+      - --base-resolution: cli-options/base-resolution.md
+      - --max-depth: cli-options/max-depth.md
+      - --isovalue: cli-options/isovalue.md
+      - --surface-percentile: cli-options/surface-percentile.md
+      - --min-usable-hermite-samples: cli-options/min-usable-hermite-samples.md
+      - --max-qef-rms-residual-ratio: cli-options/max-qef-rms-residual-ratio.md
+      - --min-normal-alignment-threshold: cli-options/min-normal-alignment-threshold.md
+      - --smoothing-iterations: cli-options/smoothing-iterations.md
+      - --smoothing-strength: cli-options/smoothing-strength.md
+      - --min-feature-thickness: cli-options/min-feature-thickness.md
+      - --pre-thickening-radius: cli-options/pre-thickening-radius.md
+      - --max-edge-ratio: cli-options/max-edge-ratio.md
+      - --remove-islands-fraction: cli-options/remove-islands-fraction.md
+      - --simplify-factor: cli-options/simplify-factor.md
+      - --target-size: cli-options/target-size.md
+      - --fof: cli-options/fof.md
+      - --min-fof-cluster-size: cli-options/min-fof-cluster-size.md
+      - --linking-factor: cli-options/linking-factor.md
+      - --save-octree: cli-options/save-octree.md
+      - --load-octree: cli-options/load-octree.md
+      - --visualise-verts: cli-options/visualise-verts.md
+      - --nthreads: cli-options/nthreads.md
+      - --silent: cli-options/silent.md
   - Python API: python-api.md
   - Architecture: architecture.md
   - Release & Deployment: release.md

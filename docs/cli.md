@@ -9,7 +9,7 @@ meshmerizer snapshot.hdf5
 The CLI is intended for end-to-end snapshot-to-STL usage.
 
 For detailed per-option behavior, see the
-[CLI option reference](cli-options.md).
+[CLI option reference](cli-options/index.md).
 
 ## Workflow
 
@@ -105,78 +105,78 @@ post-processing and export behavior rather than on the tree construction.
 ## Important options
 
 The options below link to the full
-[CLI option reference](cli-options.md), where each option is described in more
-detail.
+[CLI option reference](cli-options/index.md), where each option is described in
+more detail.
 
 ### Geometry and refinement
 
-- [`--base-resolution`](cli-options.md#base-resolution): number of top-level
+- [`--base-resolution`](cli-options/base-resolution.md): number of top-level
   cells per axis
-- [`--max-depth`](cli-options.md#max-depth): maximum octree depth
-- [`--isovalue`](cli-options.md#isovalue): explicit isosurface threshold
-- [`--surface-percentile`](cli-options.md#surface-percentile): derive isovalue
+- [`--max-depth`](cli-options/max-depth.md): maximum octree depth
+- [`--isovalue`](cli-options/isovalue.md): explicit isosurface threshold
+- [`--surface-percentile`](cli-options/surface-percentile.md): derive isovalue
   from particle self-density percentile
-- [`--min-usable-hermite-samples`](cli-options.md#min-usable-hermite-samples):
+- [`--min-usable-hermite-samples`](cli-options/min-usable-hermite-samples.md):
   controls how aggressively underconstrained cells continue refining
-- [`--max-qef-rms-residual-ratio`](cli-options.md#max-qef-rms-residual-ratio):
+- [`--max-qef-rms-residual-ratio`](cli-options/max-qef-rms-residual-ratio.md):
   forces refinement when QEF fit quality is poor
-- [`--min-normal-alignment-threshold`](cli-options.md#min-normal-alignment-threshold):
+- [`--min-normal-alignment-threshold`](cli-options/min-normal-alignment-threshold.md):
   forces refinement when surface normals are too inconsistent
 
 ### Region selection
 
-- [`--center`](cli-options.md#center),
-  [`--extent`](cli-options.md#extent): crop to a cubic subregion
-- [`--tight-bounds`](cli-options.md#tight-bounds): shrink the working cube
+- [`--center`](cli-options/center.md),
+  [`--extent`](cli-options/extent.md): crop to a cubic subregion
+- [`--tight-bounds`](cli-options/tight-bounds.md): shrink the working cube
   after crop/shift
-- [`--shift`](cli-options.md#shift): shift coordinates before cropping
-- [`--wrap-shift`](cli-options.md#wrap-shift) /
-  [`--no-wrap-shift`](cli-options.md#no-wrap-shift): control periodic wrap
+- [`--shift`](cli-options/shift.md): shift coordinates before cropping
+- [`--wrap-shift`](cli-options/wrap-shift.md) /
+  [`--no-wrap-shift`](cli-options/no-wrap-shift.md): control periodic wrap
   after shifting
-- [`--no-periodic`](cli-options.md#no-periodic): disable periodic subregion
+- [`--no-periodic`](cli-options/no-periodic.md): disable periodic subregion
   selection
 
 ### Topology and cleanup
 
-- [`--min-feature-thickness`](cli-options.md#min-feature-thickness): remove
+- [`--min-feature-thickness`](cli-options/min-feature-thickness.md): remove
   fragile thin features
-- [`--pre-thickening-radius`](cli-options.md#pre-thickening-radius): thicken
+- [`--pre-thickening-radius`](cli-options/pre-thickening-radius.md): thicken
   the occupied solid before opening
-- [`--smoothing-iterations`](cli-options.md#smoothing-iterations): smooth the
+- [`--smoothing-iterations`](cli-options/smoothing-iterations.md): smooth the
   extracted mesh
-- [`--smoothing-strength`](cli-options.md#smoothing-strength): smoothing lambda
-- [`--max-edge-ratio`](cli-options.md#max-edge-ratio): subdivide long edges
+- [`--smoothing-strength`](cli-options/smoothing-strength.md): smoothing lambda
+- [`--max-edge-ratio`](cli-options/max-edge-ratio.md): subdivide long edges
   relative to local cell size
-- [`--remove-islands-fraction`](cli-options.md#remove-islands-fraction): remove
+- [`--remove-islands-fraction`](cli-options/remove-islands-fraction.md): remove
   small connected components
-- [`--simplify-factor`](cli-options.md#simplify-factor): simplify the final
+- [`--simplify-factor`](cli-options/simplify-factor.md): simplify the final
   mesh
-- [`--target-size`](cli-options.md#target-size): scale the final mesh to a
+- [`--target-size`](cli-options/target-size.md): scale the final mesh to a
   print size in cm
 
 ### Clustering
 
-- [`--fof`](cli-options.md#fof): reconstruct FOF groups independently
-- [`--min-fof-cluster-size`](cli-options.md#min-fof-cluster-size): drop small
+- [`--fof`](cli-options/fof.md): reconstruct FOF groups independently
+- [`--min-fof-cluster-size`](cli-options/min-fof-cluster-size.md): drop small
   fluff populations before meshing
-- [`--linking-factor`](cli-options.md#linking-factor): FOF linking-length
+- [`--linking-factor`](cli-options/linking-factor.md): FOF linking-length
   multiplier
 
 ### Saved octrees and diagnostics
 
-- [`--save-octree`](cli-options.md#save-octree): write a reusable HDF5 octree
+- [`--save-octree`](cli-options/save-octree.md): write a reusable HDF5 octree
   snapshot
-- [`--load-octree`](cli-options.md#load-octree): reuse saved octree state
+- [`--load-octree`](cli-options/load-octree.md): reuse saved octree state
   instead of reloading particles
-- [`--visualise-verts`](cli-options.md#visualise-verts): save QEF vertex
+- [`--visualise-verts`](cli-options/visualise-verts.md): save QEF vertex
   diagnostics
-- [`--nthreads`](cli-options.md#nthreads): set OpenMP thread count
-- [`--silent`](cli-options.md#silent): reduce stdout chatter while keeping logs
+- [`--nthreads`](cli-options/nthreads.md): set OpenMP thread count
+- [`--silent`](cli-options/silent.md): reduce stdout chatter while keeping logs
 
 ## Full option reference
 
 For per-option usage and behavior, including input/output flags and simpler
-controls, see [CLI option reference](cli-options.md).
+controls, see [CLI option reference](cli-options/index.md).
 
 ## Notes on units
 
