@@ -67,11 +67,16 @@ dev = [
   "black>=22.1.0",
   "flake8>=4.0.1",
   "mypy>=0.971",
+  "build>=1.2",
+]
+docs = [
+  "mkdocs>=1.6",
+  "mkdocs-material>=9.5",
 ]
 
 # Entry points
 [project.scripts]
-meshmerizer = "meshmerizer.commands.main:main"
+meshmerizer = "meshmerizer.cli.main:main"
 
 # Set up the build system
 [build-system]
