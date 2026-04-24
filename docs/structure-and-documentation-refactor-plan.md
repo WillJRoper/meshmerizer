@@ -32,6 +32,9 @@ backward compatibility, or transitional warnings**.
   their current role relative to the redesigned public API is explicit.
 - Documented the adaptive CLI flow, print-space regularization conversion, and
   octree import/export helper contracts more fully before validation.
+- Completed Commit 10 by rewriting `README.md` around the refactored package
+  layout, the current public API (`generate_mesh`, `build_tree`, `regularize`,
+  `extract_mesh`), the CLI workflow, and the native/core boundary.
 
 ### 2026-04-23
 
