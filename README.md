@@ -1,6 +1,6 @@
 # Meshmerizer
 
-[Documentation](https://willroper.github.io/meshmerizer/)
+[Documentation](https://willjroper.github.io/meshmerizer/)
 
 Meshmerizer converts particle-based simulation outputs into watertight STL
 meshes for visualization and 3D printing.
