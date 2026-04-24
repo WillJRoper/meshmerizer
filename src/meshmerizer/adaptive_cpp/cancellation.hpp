@@ -29,6 +29,14 @@
 namespace meshmerizer_cancel_detail {
 
 /**
+ * @brief Internal namespace for cross-thread cancellation state.
+ *
+ * All helpers here are intentionally header-only because they must be callable
+ * from tight serial and OpenMP-parallel loops without introducing link-time
+ * coordination or separate translation-unit state.
+ */
+
+/**
  * @brief Return the process-wide cooperative cancellation flag.
  *
  * The flag is intentionally shared across all native pipeline stages so a

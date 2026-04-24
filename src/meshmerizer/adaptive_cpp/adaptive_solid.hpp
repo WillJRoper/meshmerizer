@@ -45,6 +45,10 @@ enum class OccupancyState : std::uint8_t {
 
 /**
  * @brief Compact per-leaf record for occupied-solid operations.
+ *
+ * Each record stores the minimum state needed to run morphology and reopened
+ * surface extraction on octree leaves without repeatedly rewalking the full
+ * adaptive tree.
  */
 struct OccupiedSolidLeaf {
     /** Index into the global ``all_cells`` array. */
@@ -80,6 +84,10 @@ struct OccupiedSolidClassificationCache {
 
 /**
  * @brief Boundary sample emitted from the opened solid.
+ *
+ * These samples act as the reopened analogue of classic Hermite samples: they
+ * provide a boundary position and outward-facing normal that later QEF solves
+ * can use to place representative mesh vertices.
  */
 struct OpenedBoundarySample {
     /** Sample position on the opened boundary. */
@@ -167,6 +175,10 @@ inline double cell_edge_length(const OctreeCell &cell) {
  * Cells are re-sampled immediately after splitting so the queue always contains
  * leaves whose current corner data and contributor ranges are valid.
  *
+ * This refinement is intentionally local: it improves the fidelity of the
+ * topology-regularization stage near the implicit surface without forcing the
+ * whole octree to refine to the same size threshold.
+ *
  * @param all_cells Complete octree cell array to update in place.
  * @param all_contributors Global flat contributor array to update in place.
  * @param positions Particle positions.
@@ -230,6 +242,8 @@ inline bool refine_surface_band_cells(
     std::size_t split_count = 0U;
     std::size_t processed_count = 0U;
 
+    // Process only the surface-focused work queue so the refinement cost scales
+    // with the morphology band rather than the full tree size.
     while (!cells_to_visit.empty()) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(
             processed_count + split_count + 1U);
@@ -250,6 +264,9 @@ inline bool refine_surface_band_cells(
             continue;
         }
 
+        // Splitting appends children into the flat arrays, so we always re-read
+        // the parent from ``all_cells`` after the mutation before inspecting
+        // child offsets.
         split_octree_leaf(
             cell_idx, all_cells, all_contributors,
             positions, smoothing_lengths);

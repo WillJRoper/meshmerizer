@@ -1,6 +1,17 @@
 /**
  * @file octree_cell.hpp
  * @brief Core adaptive octree cell type and refinement helpers.
+ *
+ * This header defines the flat-array octree representation used throughout the
+ * adaptive meshing pipeline. The design goals are deterministic child ordering,
+ * cache-friendly storage of cells and contributor ranges, and reusable helper
+ * routines for refinement, balancing, and diagnostics.
+ *
+ * The flat representation is important: instead of storing child pointers and
+ * nested ownership, cells are appended to one vector and reference child ranges
+ * and contributor slices by integer offsets. That representation is reused by
+ * the Python binding layer, serialization code, and topology regularization
+ * stages.
  */
 
 #ifndef MESHMERIZER_ADAPTIVE_CPP_OCTREE_CELL_HPP_
@@ -30,20 +41,44 @@
 
 /**
  * @brief One adaptive octree cell in flat-array storage.
+ *
+ * Invariants:
+ * - ``morton_key`` and ``depth`` identify the logical cell location.
+ * - ``bounds`` stores the geometric extent in domain coordinates.
+ * - leaf cells have ``child_begin < 0`` and may carry contributor ranges.
+ * - internal cells have ``child_begin`` pointing to the first of eight
+ *   consecutively stored children.
+ * - ``contributor_begin`` / ``contributor_end`` index a half-open slice in the
+ *   shared contributor vector when contributor data is available.
+ * - ``corner_values`` and ``corner_sign_mask`` describe the sampled field state
+ *   used for refinement and meshing decisions.
  */
 struct OctreeCell {
+    /** Morton-compatible key encoding the cell's logical grid position. */
     std::uint64_t morton_key;
+    /** Refinement depth measured from the top-level grid. */
     std::uint32_t depth;
+    /** Geometric extent of the cell in world/domain coordinates. */
     BoundingBox bounds;
+    /** Whether the cell currently has no children in the flat array. */
     bool is_leaf;
+    /** Whether the cell is considered active for direct contour extraction. */
     bool is_active;
+    /** Whether the sampled field suggests that a surface crosses the cell. */
     bool has_surface;
+    /** Whether topology regularization marks the cell as a topology surface. */
     bool is_topo_surface;
+    /** Index of the first child in ``all_cells``, or ``-1`` for leaves. */
     std::int64_t child_begin;
+    /** Begin offset into the flat contributor array. */
     std::int64_t contributor_begin;
+    /** End offset into the flat contributor array. */
     std::int64_t contributor_end;
+    /** Representative mesh vertex index assigned during vertex solving. */
     std::int64_t representative_vertex_index;
+    /** Scalar field samples at the eight cell corners. */
     std::array<double, 8> corner_values;
+    /** Bit mask encoding ``corner_values >= isovalue``. */
     std::uint8_t corner_sign_mask;
 };
 
@@ -325,6 +360,18 @@ inline std::vector<std::vector<std::size_t>> filter_child_contributors(
 
 /**
  * @brief Split one leaf cell and append its children to the flat arrays.
+ *
+ * This helper is the core structural mutation primitive used during adaptive
+ * refinement. It preserves the flat-array storage model by decoding the parent
+ * contributor slice, filtering those contributors into each child, appending
+ * child contributor ranges to the shared contributor array, and then appending
+ * the child cells contiguously to ``all_cells``.
+ *
+ * @param split_index Index of the leaf to split.
+ * @param all_cells Flat cell array updated in place.
+ * @param all_contributors Flat contributor array updated in place.
+ * @param positions Particle positions in world space.
+ * @param smoothing_lengths Per-particle support radii.
  */
 inline void split_octree_leaf(
     std::size_t split_index,
@@ -456,6 +503,11 @@ inline std::span<const std::size_t> contributor_span(
  * Closed bounds are used intentionally here so that parent-derived crossing
  * positions or provisional representative vertices lying exactly on a child
  * boundary can seed all relevant children as refinement candidates.
+ *
+ * @param bounds Candidate cell bounds.
+ * @param point Query point.
+ * @param epsilon Tolerance used for inclusive face checks.
+ * @return ``true`` when the point lies inside or on the cell boundary.
  */
 inline bool point_in_cell_closed(const BoundingBox &bounds,
                                  const Vector3d &point,
@@ -476,6 +528,11 @@ inline bool point_in_cell_closed(const BoundingBox &bounds,
  * children prematurely, inherit surface consideration when either a parent
  * Hermite crossing or the parent's provisional QEF vertex lies inside the
  * child.
+ *
+ * @param child Candidate child cell.
+ * @param parent_samples Hermite samples computed on the parent.
+ * @param parent_vertex Parent provisional QEF vertex.
+ * @return ``true`` when the child should continue surface-focused refinement.
  */
 inline bool child_inherits_surface_hint(
     const OctreeCell &child,
@@ -498,6 +555,9 @@ inline bool child_inherits_surface_hint(
  * Values near 1 indicate locally coherent normals (flatter surface patch);
  * smaller values indicate stronger curvature or conflicting constraints, which
  * are signals that one representative vertex may be insufficient.
+ *
+ * @param samples Hermite samples used for one cell.
+ * @return Minimum dot-product alignment against the mean usable normal.
  */
 inline double minimum_hermite_normal_alignment(
     const std::vector<HermiteSample> &samples) {

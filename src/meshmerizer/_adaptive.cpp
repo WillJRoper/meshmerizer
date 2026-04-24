@@ -6,6 +6,19 @@
  * pipeline. It owns NumPy buffer parsing, Python-facing argument validation,
  * and the exported wrappers for octree construction, topology regularization,
  * and final mesh extraction.
+ *
+ * Organization
+ * ------------
+ *
+ * The file is structured in four layers:
+ * 1. exception translation helpers,
+ * 2. Python-to-C++ parsing and conversion helpers,
+ * 3. result builders that package native data back into Python objects, and
+ * 4. exported wrapper functions registered in the module method table.
+ *
+ * The binding layer deliberately centralizes common parsing logic so all public
+ * wrappers accept the same dictionary and array conventions. That keeps the
+ * Python API stable even when the internal native pipeline evolves.
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -417,6 +430,8 @@ static bool parse_octree_cell_dict(PyObject *dictionary,
         return false;
     }
 
+    // Start from a zeroed cell so missing optional Python keys fall back to the
+    // same defaults used by the native refinement pipeline.
     cell = OctreeCell{};
     cell.morton_key = PyLong_AsUnsignedLongLong(
         PyDict_GetItemString(dictionary, "morton_key"));
@@ -486,6 +501,8 @@ static bool parse_octree_cell_dict(PyObject *dictionary,
         cell.contributor_end = static_cast<std::int64_t>(
             PyLong_AsLong(contributor_end_object));
     } else {
+        // Historical Python paths sometimes serialize contributors inline per
+        // cell. Convert that representation back into the flat native form.
         PyObject *inline_contributors = PyDict_GetItemString(
             dictionary, "contributors");
         if (inline_contributors != NULL) {
@@ -1380,6 +1397,11 @@ static PyObject *build_vertices_numpy_result(
 
 /**
  * @brief Refine the octree using breadth-first refinement.
+ *
+ * This wrapper is the resumable, Python-visible counterpart to the fully
+ * native pipeline. It accepts Python cell dictionaries describing an initial
+ * frontier and returns the refined flat cell/contributor arrays in the same
+ * dictionary-based representation.
  */
 static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
     PyObject *initial_cells_object = NULL;
@@ -1588,6 +1610,10 @@ static PyObject *hermite_samples_for_cell_py(PyObject *self, PyObject *args) {
  * This binding mirrors the first half of ``run_octree_pipeline`` but returns
  * the refined cell dictionaries and flat contributor array so Python callers
  * can continue the pipeline from an explicit tree state.
+ *
+ * @param args Python tuple containing particles, domain bounds, resolution,
+ *     isovalue, depth, and refinement-quality thresholds.
+ * @return Python tuple ``(cells, contributors)``.
  */
 static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
     PyObject *positions_object = NULL;
@@ -1694,6 +1720,10 @@ static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
  *
  * This lets Python callers modify the opened-solid topology and then hand the
  * mask back to C++ for consistent mesh extraction and ambiguity cleanup.
+ *
+ * @param args Python tuple containing particles, domain bounds, meshing
+ *     controls, and the opened-solid mask.
+ * @return Python tuple ``(vertices, faces)`` packed as NumPy arrays.
  */
 static PyObject *extract_opened_surface_mesh_py(
     PyObject * /* self */, PyObject *args) {
@@ -2214,6 +2244,10 @@ static PyObject *build_vertices_numpy_result(
  * refine_octree + solve_all_leaf_vertices into one C++ call,
  * eliminating the massive serialization overhead of passing octree
  * cells and contributor arrays through Python dictionaries.
+ *
+ * @param self Unused Python module object.
+ * @param args Python argument tuple.
+ * @return Python tuple ``(positions, normals)`` as NumPy arrays.
  */
 static PyObject *run_octree_pipeline_py(
         PyObject *self, PyObject *args) {

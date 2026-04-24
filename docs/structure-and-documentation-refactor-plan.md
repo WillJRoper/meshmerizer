@@ -55,6 +55,9 @@ backward compatibility, or transitional warnings**.
 - Started Commit 7 in order by reorganizing `_adaptive.cpp` into clearer helper
   sections and extracting shared parsing/bridge helpers for bounds parsing,
   cell decoding, contributor decoding, and initial-cell construction.
+- Started Commit 8 in order by expanding Doxygen coverage and invariant notes in
+  the priority native files: `octree_cell.hpp`, `adaptive_solid.hpp`,
+  `cancellation.hpp`, and `_adaptive.cpp`.
 
 ### Commit 1: Reorganize package layout around clear layers
 
