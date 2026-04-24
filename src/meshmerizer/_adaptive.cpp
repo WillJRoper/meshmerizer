@@ -37,6 +37,10 @@
 #include "adaptive_cpp/cancellation.hpp"
 #include "adaptive_cpp/qef.hpp"
 
+// ---------------------------------------------------------------------------
+// Exception translation helpers.
+// ---------------------------------------------------------------------------
+
 static PyObject *raise_cancelled_exception() {
     meshmerizer_cancel_detail::reset_cancel_state();
     PyErr_SetNone(PyExc_KeyboardInterrupt);
@@ -54,6 +58,10 @@ static PyObject *raise_unknown_cpp_exception() {
     PyErr_SetString(PyExc_RuntimeError, "unhandled C++ exception");
     return NULL;
 }
+
+// ---------------------------------------------------------------------------
+// Python parsing and conversion helpers.
+// ---------------------------------------------------------------------------
 
 /**
  * @brief Parse a Python `(x, y, z)` tuple into a `Vector3d`.
@@ -291,11 +299,319 @@ static bool parse_positions(PyObject *object,
  * element-by-element sequence parser for plain Python lists.
  */
 static bool parse_doubles(PyObject *object,
-                          std::vector<double> &output) {
+                           std::vector<double> &output) {
     if (try_parse_doubles_buffer(object, output)) {
         return true;
     }
     return parse_double_sequence(object, output);
+}
+
+/**
+ * @brief Parse a Python ``((min), (max))`` bounds pair into a bounding box.
+ *
+ * @param object Python object expected to be a pair of 3-tuples.
+ * @param output Parsed bounding box destination.
+ * @param label Human-readable label used in error messages.
+ * @return ``true`` when parsing succeeds.
+ */
+static bool parse_bounds_pair(PyObject *object,
+                              BoundingBox &output,
+                              const char *label) {
+    if (!PyTuple_Check(object) || PyTuple_Size(object) != 2) {
+        PyErr_Format(PyExc_TypeError,
+                     "%s must be a pair of 3-tuples",
+                     label);
+        return false;
+    }
+    if (!parse_vector3d(PyTuple_GetItem(object, 0), output.min) ||
+        !parse_vector3d(PyTuple_GetItem(object, 1), output.max)) {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Parse a Python sequence of contributor indices into ``size_t``.
+ *
+ * @param object Python sequence of non-negative integers.
+ * @param output Parsed contributor index vector.
+ * @return ``true`` when parsing succeeds.
+ */
+static bool parse_contributor_indices(PyObject *object,
+                                      std::vector<std::size_t> &output) {
+    PyObject *fast = PySequence_Fast(object, "expected a sequence of ints");
+    if (fast == NULL) {
+        return false;
+    }
+    const Py_ssize_t count = PySequence_Fast_GET_SIZE(fast);
+    output.reserve(output.size() + static_cast<std::size_t>(count));
+    for (Py_ssize_t index = 0; index < count; ++index) {
+        const long value = PyLong_AsLong(PySequence_Fast_GET_ITEM(fast, index));
+        if (value == -1 && PyErr_Occurred()) {
+            Py_DECREF(fast);
+            return false;
+        }
+        if (value < 0) {
+            Py_DECREF(fast);
+            PyErr_SetString(PyExc_ValueError,
+                            "contributor indices must be non-negative");
+            return false;
+        }
+        output.push_back(static_cast<std::size_t>(value));
+    }
+    Py_DECREF(fast);
+    return true;
+}
+
+/**
+ * @brief Append inline contributor indices from a cell dictionary.
+ *
+ * @param contributor_object Python sequence under the ``contributors`` key.
+ * @param output Flat contributor vector to append to.
+ * @param begin Output begin offset for the appended range.
+ * @param end Output end offset for the appended range.
+ * @return ``true`` when parsing succeeds.
+ */
+static bool append_inline_contributors(PyObject *contributor_object,
+                                       std::vector<std::size_t> &output,
+                                       std::int64_t &begin,
+                                       std::int64_t &end) {
+    PyObject *fast = PySequence_Fast(contributor_object, "contributors");
+    if (fast == NULL) {
+        return false;
+    }
+    const Py_ssize_t count = PySequence_Fast_GET_SIZE(fast);
+    begin = static_cast<std::int64_t>(output.size());
+    for (Py_ssize_t index = 0; index < count; ++index) {
+        const long value = PyLong_AsLong(PySequence_Fast_GET_ITEM(fast, index));
+        if (value == -1 && PyErr_Occurred()) {
+            Py_DECREF(fast);
+            return false;
+        }
+        output.push_back(static_cast<std::size_t>(value));
+    }
+    end = static_cast<std::int64_t>(output.size());
+    Py_DECREF(fast);
+    return true;
+}
+
+/**
+ * @brief Parse one Python cell dictionary into an ``OctreeCell``.
+ *
+ * The binding layer accepts two equivalent contributor encodings:
+ * explicit ``contributor_begin``/``contributor_end`` offsets or an inline
+ * ``contributors`` sequence. The latter is appended into the flat output
+ * contributor array so downstream native routines can use one consistent
+ * representation.
+ *
+ * @param dictionary Python dictionary describing one cell.
+ * @param contributors Flat contributor vector, extended if needed.
+ * @param cell Parsed output cell.
+ * @return ``true`` when parsing succeeds.
+ */
+static bool parse_octree_cell_dict(PyObject *dictionary,
+                                   std::vector<std::size_t> &contributors,
+                                   OctreeCell &cell) {
+    if (!PyDict_Check(dictionary)) {
+        PyErr_SetString(PyExc_TypeError, "each cell must be a dictionary");
+        return false;
+    }
+
+    cell = OctreeCell{};
+    cell.morton_key = PyLong_AsUnsignedLongLong(
+        PyDict_GetItemString(dictionary, "morton_key"));
+    cell.depth = static_cast<std::uint32_t>(PyLong_AsUnsignedLong(
+        PyDict_GetItemString(dictionary, "depth")));
+
+    PyObject *bounds_object = PyDict_GetItemString(dictionary, "bounds");
+    if (bounds_object != NULL &&
+        !parse_bounds_pair(bounds_object, cell.bounds, "bounds")) {
+        return false;
+    }
+
+    PyObject *is_leaf_object = PyDict_GetItemString(dictionary, "is_leaf");
+    cell.is_leaf = is_leaf_object != NULL
+        ? (PyLong_AsLong(is_leaf_object) != 0)
+        : true;
+
+    PyObject *has_surface_object = PyDict_GetItemString(
+        dictionary, "has_surface");
+    cell.has_surface = has_surface_object != NULL
+        ? (PyLong_AsLong(has_surface_object) != 0)
+        : false;
+
+    PyObject *is_active_object = PyDict_GetItemString(dictionary, "is_active");
+    cell.is_active = is_active_object != NULL
+        ? (PyLong_AsLong(is_active_object) != 0)
+        : false;
+
+    PyObject *is_topo_surface_object = PyDict_GetItemString(
+        dictionary, "is_topo_surface");
+    cell.is_topo_surface = is_topo_surface_object != NULL
+        ? (PyLong_AsLong(is_topo_surface_object) != 0)
+        : false;
+
+    PyObject *child_begin_object = PyDict_GetItemString(dictionary, "child_begin");
+    cell.child_begin = child_begin_object != NULL
+        ? static_cast<std::int64_t>(PyLong_AsLong(child_begin_object))
+        : -1;
+
+    cell.representative_vertex_index = -1;
+
+    PyObject *sign_mask_object = PyDict_GetItemString(
+        dictionary, "corner_sign_mask");
+    cell.corner_sign_mask = sign_mask_object != NULL
+        ? static_cast<std::uint8_t>(PyLong_AsUnsignedLong(sign_mask_object))
+        : 0U;
+
+    PyObject *corner_values_object = PyDict_GetItemString(
+        dictionary, "corner_values");
+    if (corner_values_object != NULL) {
+        std::vector<double> parsed_corner_values;
+        if (parse_doubles(corner_values_object, parsed_corner_values) &&
+            parsed_corner_values.size() == 8U) {
+            std::copy(parsed_corner_values.begin(),
+                      parsed_corner_values.end(),
+                      cell.corner_values.begin());
+        }
+    }
+
+    PyObject *contributor_begin_object = PyDict_GetItemString(
+        dictionary, "contributor_begin");
+    PyObject *contributor_end_object = PyDict_GetItemString(
+        dictionary, "contributor_end");
+    if (contributor_begin_object != NULL && contributor_end_object != NULL) {
+        cell.contributor_begin = static_cast<std::int64_t>(
+            PyLong_AsLong(contributor_begin_object));
+        cell.contributor_end = static_cast<std::int64_t>(
+            PyLong_AsLong(contributor_end_object));
+    } else {
+        PyObject *inline_contributors = PyDict_GetItemString(
+            dictionary, "contributors");
+        if (inline_contributors != NULL) {
+            if (!append_inline_contributors(inline_contributors,
+                                            contributors,
+                                            cell.contributor_begin,
+                                            cell.contributor_end)) {
+                return false;
+            }
+        } else {
+            cell.contributor_begin = -1;
+            cell.contributor_end = -1;
+        }
+    }
+
+    return !PyErr_Occurred();
+}
+
+/**
+ * @brief Parse a Python sequence of cell dictionaries.
+ *
+ * @param object Python sequence of dictionaries.
+ * @param contributors Flat contributor vector, extended if needed.
+ * @param cells Parsed output cells.
+ * @return ``true`` when parsing succeeds.
+ */
+static bool parse_octree_cell_sequence(PyObject *object,
+                                       std::vector<std::size_t> &contributors,
+                                       std::vector<OctreeCell> &cells) {
+    PyObject *fast = PySequence_Fast(object, "expected a sequence of cell dicts");
+    if (fast == NULL) {
+        return false;
+    }
+    const Py_ssize_t count = PySequence_Fast_GET_SIZE(fast);
+    cells.reserve(static_cast<std::size_t>(count));
+    for (Py_ssize_t index = 0; index < count; ++index) {
+        OctreeCell cell{};
+        if (!parse_octree_cell_dict(PySequence_Fast_GET_ITEM(fast, index),
+                                    contributors,
+                                    cell)) {
+            Py_DECREF(fast);
+            return false;
+        }
+        cells.push_back(cell);
+    }
+    Py_DECREF(fast);
+    return true;
+}
+
+/**
+ * @brief Build top-level cells plus flat contributor ranges in one pass.
+ *
+ * This helper centralizes the binding-layer bridge between Python particle
+ * arrays and the native routines that expect an initial octree plus a flat
+ * contributor vector.
+ *
+ * @param domain Working domain bounds.
+ * @param positions Particle positions.
+ * @param smoothing_lengths Per-particle smoothing lengths.
+ * @param base_resolution Number of top-level cells per axis.
+ * @param progress_operation Logging operation label.
+ * @param progress_function Logging function label.
+ * @param initial_cells Output cells with contributor ranges.
+ * @param initial_contributors Output flat contributor vector.
+ */
+static void build_initial_cells_with_contributors(
+    const BoundingBox &domain,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    std::uint32_t base_resolution,
+    const char *progress_operation,
+    const char *progress_function,
+    std::vector<OctreeCell> &initial_cells,
+    std::vector<std::size_t> &initial_contributors) {
+    TopLevelParticleGrid grid(domain, base_resolution);
+    grid.insert_particles(positions);
+    grid.compute_bin_max_h(smoothing_lengths);
+
+    std::vector<OctreeCell> top_cells =
+        create_top_level_cells(domain, base_resolution);
+    initial_cells.clear();
+    initial_cells.reserve(top_cells.size());
+    initial_contributors.clear();
+
+    ProgressBar progress_bar(
+        progress_operation, progress_function, top_cells.size());
+    for (std::size_t cell_index = 0; cell_index < top_cells.size(); ++cell_index) {
+        OctreeCell cell = top_cells[cell_index];
+
+        std::uint32_t start_x = 0U, start_y = 0U, start_z = 0U;
+        std::uint32_t end_x = 0U, end_y = 0U, end_z = 0U;
+        grid.contributor_bin_span(cell.bounds,
+                                  smoothing_lengths,
+                                  start_x,
+                                  start_y,
+                                  start_z,
+                                  end_x,
+                                  end_y,
+                                  end_z);
+
+        const std::int64_t begin = static_cast<std::int64_t>(
+            initial_contributors.size());
+        for (std::uint32_t ix = start_x; ix <= end_x; ++ix) {
+            for (std::uint32_t iy = start_y; iy <= end_y; ++iy) {
+                for (std::uint32_t iz = start_z; iz <= end_z; ++iz) {
+                    const TopLevelBin &bin =
+                        grid.bins[grid.flatten_index(ix, iy, iz)];
+                    for (std::size_t particle_index : bin.particle_indices) {
+                        if (particle_support_overlaps_box(
+                                positions[particle_index],
+                                smoothing_lengths[particle_index],
+                                cell.bounds)) {
+                            initial_contributors.push_back(particle_index);
+                        }
+                    }
+                }
+            }
+        }
+
+        cell.contributor_begin = begin;
+        cell.contributor_end = static_cast<std::int64_t>(
+            initial_contributors.size());
+        initial_cells.push_back(cell);
+        progress_bar.tick();
+    }
+    progress_bar.finish();
 }
 
 /**
@@ -319,6 +635,10 @@ static PyObject *build_octree_cell_dict(const OctreeCell &cell) {
         cell.bounds.max.y,
         cell.bounds.max.z);
 }
+
+// ---------------------------------------------------------------------------
+// Python object builders for native results.
+// ---------------------------------------------------------------------------
 
 /**
  * @brief Return the name of the adaptive core status.
@@ -1035,6 +1355,30 @@ static PyObject *build_octree_cell_dict_with_contributors(
 }
 
 /**
+ * @brief Build NumPy ``(positions, normals, triangles)`` arrays.
+ *
+ * @param vertices Native mesh vertices.
+ * @param triangles Native mesh triangles.
+ * @return Python tuple containing NumPy arrays, or ``NULL`` on failure.
+ */
+static PyObject *build_mesh_numpy_result(
+    const std::vector<MeshVertex> &vertices,
+    const std::vector<MeshTriangle> &triangles);
+
+/**
+ * @brief Build NumPy ``(positions, normals)`` arrays from solved vertices.
+ *
+ * @param vertices Native QEF vertices.
+ * @return Python tuple containing NumPy arrays, or ``NULL`` on failure.
+ */
+static PyObject *build_vertices_numpy_result(
+    const std::vector<MeshVertex> &vertices);
+
+// ---------------------------------------------------------------------------
+// Binding wrappers for octree construction and per-cell helpers.
+// ---------------------------------------------------------------------------
+
+/**
  * @brief Refine the octree using breadth-first refinement.
  */
 static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
@@ -1071,74 +1415,17 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    // Parse domain bounding box from a 2-tuple of 3-tuples:
-    // ((min_x, min_y, min_z), (max_x, max_y, max_z)).
     BoundingBox domain;
-    if (!PyTuple_Check(domain_object) || PyTuple_Size(domain_object) != 2) {
-        PyErr_SetString(PyExc_TypeError,
-                        "domain must be a 2-tuple of 3-tuples");
-        return NULL;
-    }
-    if (!parse_vector3d(PyTuple_GetItem(domain_object, 0), domain.min) ||
-        !parse_vector3d(PyTuple_GetItem(domain_object, 1), domain.max)) {
+    if (!parse_bounds_pair(domain_object, domain, "domain")) {
         return NULL;
     }
 
-    PyObject *cells_fast = PySequence_Fast(initial_cells_object,
-                                            "expected a sequence of cell dicts");
-    if (cells_fast == NULL) {
+    std::vector<std::size_t> ignored_contributors;
+    if (!parse_octree_cell_sequence(initial_cells_object,
+                                    ignored_contributors,
+                                    initial_cells)) {
         return NULL;
     }
-    const Py_ssize_t num_cells = PySequence_Fast_GET_SIZE(cells_fast);
-    initial_cells.reserve(static_cast<std::size_t>(num_cells));
-
-    for (Py_ssize_t i = 0; i < num_cells; ++i) {
-        PyObject *cell_dict = PySequence_Fast_GET_ITEM(cells_fast, i);
-        if (!PyDict_Check(cell_dict)) {
-            Py_DECREF(cells_fast);
-            PyErr_SetString(PyExc_TypeError, "each cell must be a dictionary");
-            return NULL;
-        }
-
-        PyObject *morton_key_obj = PyDict_GetItemString(cell_dict, "morton_key");
-        PyObject *depth_obj = PyDict_GetItemString(cell_dict, "depth");
-        PyObject *bounds_obj = PyDict_GetItemString(cell_dict, "bounds");
-        PyObject *contrib_begin_obj = PyDict_GetItemString(cell_dict, "contributor_begin");
-        PyObject *contrib_end_obj = PyDict_GetItemString(cell_dict, "contributor_end");
-
-        if (!morton_key_obj || !depth_obj || !bounds_obj || !contrib_begin_obj || !contrib_end_obj) {
-            Py_DECREF(cells_fast);
-            PyErr_SetString(PyExc_ValueError, "cell dict missing required fields");
-            return NULL;
-        }
-
-        OctreeCell cell{};
-        cell.morton_key = PyLong_AsUnsignedLongLong(morton_key_obj);
-        cell.depth = static_cast<std::uint32_t>(PyLong_AsUnsignedLong(depth_obj));
-        cell.is_leaf = true;
-        cell.is_active = false;
-        cell.has_surface = false;
-        cell.child_begin = -1;
-        cell.representative_vertex_index = -1;
-        cell.corner_sign_mask = 0U;
-
-        if (PyTuple_Check(bounds_obj) && PyTuple_Size(bounds_obj) == 2) {
-            if (!parse_vector3d(PyTuple_GetItem(bounds_obj, 0), cell.bounds.min) ||
-                !parse_vector3d(PyTuple_GetItem(bounds_obj, 1), cell.bounds.max)) {
-                Py_DECREF(cells_fast);
-                return NULL;
-            }
-        } else {
-            Py_DECREF(cells_fast);
-            PyErr_SetString(PyExc_TypeError, "bounds must be a pair of 3-tuples");
-            return NULL;
-        }
-
-        cell.contributor_begin = static_cast<std::int64_t>(PyLong_AsLong(contrib_begin_obj));
-        cell.contributor_end = static_cast<std::int64_t>(PyLong_AsLong(contrib_end_obj));
-        initial_cells.push_back(cell);
-    }
-    Py_DECREF(cells_fast);
 
     auto [all_cells, all_contributors] = refine_octree(
         std::move(initial_cells),
@@ -1346,55 +1633,17 @@ static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
         return NULL;
     }
 
-    TopLevelParticleGrid grid(domain, base_resolution);
-    grid.insert_particles(positions);
-    grid.compute_bin_max_h(smoothing_lengths);
-
-    std::vector<OctreeCell> top_cells =
-        create_top_level_cells(domain, base_resolution);
     std::vector<OctreeCell> initial_cells;
-    initial_cells.reserve(top_cells.size());
     std::vector<std::size_t> initial_contributors;
-
-    ProgressBar pipeline_contrib_bar(
-        "Building", "generate_mesh_py", top_cells.size());
-    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
-        OctreeCell cell = top_cells[ci];
-
-        std::uint32_t sx = 0, sy = 0, sz = 0;
-        std::uint32_t ex = 0, ey = 0, ez = 0;
-        grid.contributor_bin_span(
-            cell.bounds, smoothing_lengths,
-            sx, sy, sz, ex, ey, ez);
-
-        const std::int64_t begin = static_cast<std::int64_t>(
-            initial_contributors.size());
-
-        for (std::uint32_t ix = sx; ix <= ex; ++ix) {
-            for (std::uint32_t iy = sy; iy <= ey; ++iy) {
-                for (std::uint32_t iz = sz; iz <= ez; ++iz) {
-                    const TopLevelBin &bin =
-                        grid.bins[grid.flatten_index(ix, iy, iz)];
-                    for (std::size_t pi : bin.particle_indices) {
-                        if (particle_support_overlaps_box(
-                                positions[pi],
-                                smoothing_lengths[pi],
-                                cell.bounds)) {
-                            initial_contributors.push_back(pi);
-                        }
-                    }
-                }
-            }
-        }
-
-        const std::int64_t end = static_cast<std::int64_t>(
-            initial_contributors.size());
-        cell.contributor_begin = begin;
-        cell.contributor_end = end;
-        initial_cells.push_back(cell);
-        pipeline_contrib_bar.tick();
-    }
-    pipeline_contrib_bar.finish();
+    build_initial_cells_with_contributors(domain,
+                                          positions,
+                                          smoothing_lengths,
+                                          static_cast<std::uint32_t>(
+                                              base_resolution),
+                                          "Building",
+                                          "generate_mesh_py",
+                                          initial_cells,
+                                          initial_contributors);
 
     auto [all_cells, all_contributors] = refine_octree(
         std::move(initial_cells),
@@ -1502,52 +1751,17 @@ static PyObject *extract_opened_surface_mesh_py(
         opened_inside.push_back(value != 0.0 ? 1U : 0U);
     }
 
-    TopLevelParticleGrid grid(domain, base_resolution);
-    grid.insert_particles(positions);
-    grid.compute_bin_max_h(smoothing_lengths);
-
-    std::vector<OctreeCell> top_cells =
-        create_top_level_cells(domain, base_resolution);
     std::vector<OctreeCell> initial_cells;
-    initial_cells.reserve(top_cells.size());
     std::vector<std::size_t> initial_contributors;
-
-    ProgressBar pipeline_contrib_bar(
-        "Building", "classify_occupied_solid_py", top_cells.size());
-    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
-        OctreeCell cell = top_cells[ci];
-
-        std::uint32_t sx = 0, sy = 0, sz = 0;
-        std::uint32_t ex = 0, ey = 0, ez = 0;
-        grid.contributor_bin_span(
-            cell.bounds, smoothing_lengths,
-            sx, sy, sz, ex, ey, ez);
-
-        const std::int64_t begin = static_cast<std::int64_t>(
-            initial_contributors.size());
-        for (std::uint32_t ix = sx; ix <= ex; ++ix) {
-            for (std::uint32_t iy = sy; iy <= ey; ++iy) {
-                for (std::uint32_t iz = sz; iz <= ez; ++iz) {
-                    const TopLevelBin &bin =
-                        grid.bins[grid.flatten_index(ix, iy, iz)];
-                    for (std::size_t pi : bin.particle_indices) {
-                        if (particle_support_overlaps_box(
-                                positions[pi], smoothing_lengths[pi],
-                                cell.bounds)) {
-                            initial_contributors.push_back(pi);
-                        }
-                    }
-                }
-            }
-        }
-        const std::int64_t end = static_cast<std::int64_t>(
-            initial_contributors.size());
-        cell.contributor_begin = begin;
-        cell.contributor_end = end;
-        initial_cells.push_back(cell);
-        pipeline_contrib_bar.tick();
-    }
-    pipeline_contrib_bar.finish();
+    build_initial_cells_with_contributors(domain,
+                                          positions,
+                                          smoothing_lengths,
+                                          static_cast<std::uint32_t>(
+                                              base_resolution),
+                                          "Building",
+                                          "classify_occupied_solid_py",
+                                          initial_cells,
+                                          initial_contributors);
 
     auto [all_cells, all_contributors] = refine_octree(
         std::move(initial_cells), std::move(initial_contributors),
@@ -1685,10 +1899,6 @@ static PyObject *solve_qef_for_leaf_py(PyObject *self, PyObject *args) {
  * Returns (positions_Nx3_float64, normals_Nx3_float64, triangles_Mx3_int64).
  * On failure sets a Python exception and returns NULL.
  */
-
-/* Forward declaration — used by solve_vertices_py before definition. */
-static PyObject *build_vertices_numpy_result(
-    const std::vector<MeshVertex> &vertices);
 
 static PyObject *build_mesh_numpy_result(
     const std::vector<MeshVertex> &vertices,
@@ -1831,166 +2041,12 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    // Parse the contributor array.
-    PyObject *contrib_fast = PySequence_Fast(
-        contributors_object, "expected a sequence of ints");
-    if (contrib_fast == NULL) {
-        return NULL;
-    }
-    const Py_ssize_t num_contrib =
-        PySequence_Fast_GET_SIZE(contrib_fast);
     std::vector<std::size_t> all_contributors;
-    all_contributors.reserve(static_cast<std::size_t>(num_contrib));
-    for (Py_ssize_t i = 0; i < num_contrib; ++i) {
-        long val = PyLong_AsLong(
-            PySequence_Fast_GET_ITEM(contrib_fast, i));
-        if (val == -1 && PyErr_Occurred()) {
-            Py_DECREF(contrib_fast);
-            return NULL;
-        }
-        if (val < 0) {
-            Py_DECREF(contrib_fast);
-            PyErr_SetString(PyExc_ValueError,
-                            "contributor indices must be non-negative");
-            return NULL;
-        }
-        all_contributors.push_back(static_cast<std::size_t>(val));
-    }
-    Py_DECREF(contrib_fast);
-
-    // Parse the cells array.
-    PyObject *cells_fast = PySequence_Fast(
-        cells_object, "expected a sequence of cell dicts");
-    if (cells_fast == NULL) {
+    std::vector<OctreeCell> all_cells;
+    if (!parse_contributor_indices(contributors_object, all_contributors) ||
+        !parse_octree_cell_sequence(cells_object, all_contributors, all_cells)) {
         return NULL;
     }
-    const Py_ssize_t num_cells =
-        PySequence_Fast_GET_SIZE(cells_fast);
-    std::vector<OctreeCell> all_cells;
-    all_cells.reserve(static_cast<std::size_t>(num_cells));
-
-    for (Py_ssize_t i = 0; i < num_cells; ++i) {
-        PyObject *d = PySequence_Fast_GET_ITEM(cells_fast, i);
-        if (!PyDict_Check(d)) {
-            Py_DECREF(cells_fast);
-            PyErr_SetString(PyExc_TypeError,
-                            "each cell must be a dictionary");
-            return NULL;
-        }
-
-        OctreeCell cell{};
-        cell.morton_key = PyLong_AsUnsignedLongLong(
-            PyDict_GetItemString(d, "morton_key"));
-        cell.depth = static_cast<std::uint32_t>(
-            PyLong_AsUnsignedLong(
-                PyDict_GetItemString(d, "depth")));
-
-        PyObject *bounds_obj = PyDict_GetItemString(d, "bounds");
-        if (bounds_obj && PyTuple_Check(bounds_obj) &&
-            PyTuple_Size(bounds_obj) == 2) {
-            parse_vector3d(
-                PyTuple_GetItem(bounds_obj, 0), cell.bounds.min);
-            parse_vector3d(
-                PyTuple_GetItem(bounds_obj, 1), cell.bounds.max);
-        }
-
-        PyObject *is_leaf_obj =
-            PyDict_GetItemString(d, "is_leaf");
-        cell.is_leaf = is_leaf_obj
-            ? (PyLong_AsLong(is_leaf_obj) != 0)
-            : true;
-
-        PyObject *has_surface_obj =
-            PyDict_GetItemString(d, "has_surface");
-        cell.has_surface = has_surface_obj
-            ? (PyLong_AsLong(has_surface_obj) != 0)
-            : false;
-
-        PyObject *is_active_obj =
-            PyDict_GetItemString(d, "is_active");
-        cell.is_active = is_active_obj
-            ? (PyLong_AsLong(is_active_obj) != 0)
-            : false;
-
-        PyObject *child_begin_obj =
-            PyDict_GetItemString(d, "child_begin");
-        cell.child_begin = child_begin_obj
-            ? static_cast<std::int64_t>(
-                  PyLong_AsLong(child_begin_obj))
-            : -1;
-
-        cell.representative_vertex_index = -1;
-
-        // Parse corner_sign_mask.
-        PyObject *csm_obj =
-            PyDict_GetItemString(d, "corner_sign_mask");
-        cell.corner_sign_mask = csm_obj
-            ? static_cast<std::uint8_t>(
-                  PyLong_AsUnsignedLong(csm_obj))
-            : 0U;
-
-        // Parse corner_values.
-        PyObject *cv_obj =
-            PyDict_GetItemString(d, "corner_values");
-        if (cv_obj) {
-            std::vector<double> cv;
-            if (parse_doubles(cv_obj, cv) &&
-                cv.size() == 8U) {
-                std::copy(cv.begin(), cv.end(),
-                          cell.corner_values.begin());
-            }
-        }
-
-        // Parse contributor range.
-        PyObject *cb_obj =
-            PyDict_GetItemString(d, "contributor_begin");
-        PyObject *ce_obj =
-            PyDict_GetItemString(d, "contributor_end");
-        if (cb_obj && ce_obj) {
-            cell.contributor_begin =
-                static_cast<std::int64_t>(
-                    PyLong_AsLong(cb_obj));
-            cell.contributor_end =
-                static_cast<std::int64_t>(
-                    PyLong_AsLong(ce_obj));
-        } else {
-            // Fall back to contributors list if present.
-            PyObject *contribs_obj =
-                PyDict_GetItemString(d, "contributors");
-            if (contribs_obj) {
-                PyObject *cfast = PySequence_Fast(
-                    contribs_obj, "contributors");
-                if (cfast) {
-                    Py_ssize_t nc =
-                        PySequence_Fast_GET_SIZE(cfast);
-                    cell.contributor_begin =
-                        static_cast<std::int64_t>(
-                            all_contributors.size());
-                    for (Py_ssize_t ci = 0; ci < nc; ++ci) {
-                        long v = PyLong_AsLong(
-                            PySequence_Fast_GET_ITEM(
-                                cfast, ci));
-                        all_contributors.push_back(
-                            static_cast<std::size_t>(v));
-                    }
-                    cell.contributor_end =
-                        static_cast<std::int64_t>(
-                            all_contributors.size());
-                    Py_DECREF(cfast);
-                }
-            } else {
-                cell.contributor_begin = -1;
-                cell.contributor_end = -1;
-            }
-        }
-
-        if (PyErr_Occurred()) {
-            Py_DECREF(cells_fast);
-            return NULL;
-        }
-        all_cells.push_back(cell);
-    }
-    Py_DECREF(cells_fast);
 
     // Run the mesh generation pipeline.
     auto [vertices, triangles] = generate_mesh(
@@ -2057,166 +2113,12 @@ static PyObject *solve_vertices_py(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    // Parse the contributor array.
-    PyObject *contrib_fast = PySequence_Fast(
-        contributors_object, "expected a sequence of ints");
-    if (contrib_fast == NULL) {
-        return NULL;
-    }
-    const Py_ssize_t num_contrib =
-        PySequence_Fast_GET_SIZE(contrib_fast);
     std::vector<std::size_t> all_contributors;
-    all_contributors.reserve(static_cast<std::size_t>(num_contrib));
-    for (Py_ssize_t i = 0; i < num_contrib; ++i) {
-        long val = PyLong_AsLong(
-            PySequence_Fast_GET_ITEM(contrib_fast, i));
-        if (val == -1 && PyErr_Occurred()) {
-            Py_DECREF(contrib_fast);
-            return NULL;
-        }
-        if (val < 0) {
-            Py_DECREF(contrib_fast);
-            PyErr_SetString(PyExc_ValueError,
-                            "contributor indices must be non-negative");
-            return NULL;
-        }
-        all_contributors.push_back(static_cast<std::size_t>(val));
-    }
-    Py_DECREF(contrib_fast);
-
-    // Parse the cells array.
-    PyObject *cells_fast = PySequence_Fast(
-        cells_object, "expected a sequence of cell dicts");
-    if (cells_fast == NULL) {
+    std::vector<OctreeCell> all_cells;
+    if (!parse_contributor_indices(contributors_object, all_contributors) ||
+        !parse_octree_cell_sequence(cells_object, all_contributors, all_cells)) {
         return NULL;
     }
-    const Py_ssize_t num_cells =
-        PySequence_Fast_GET_SIZE(cells_fast);
-    std::vector<OctreeCell> all_cells;
-    all_cells.reserve(static_cast<std::size_t>(num_cells));
-
-    for (Py_ssize_t i = 0; i < num_cells; ++i) {
-        PyObject *d = PySequence_Fast_GET_ITEM(cells_fast, i);
-        if (!PyDict_Check(d)) {
-            Py_DECREF(cells_fast);
-            PyErr_SetString(PyExc_TypeError,
-                            "each cell must be a dictionary");
-            return NULL;
-        }
-
-        OctreeCell cell{};
-        cell.morton_key = PyLong_AsUnsignedLongLong(
-            PyDict_GetItemString(d, "morton_key"));
-        cell.depth = static_cast<std::uint32_t>(
-            PyLong_AsUnsignedLong(
-                PyDict_GetItemString(d, "depth")));
-
-        PyObject *bounds_obj = PyDict_GetItemString(d, "bounds");
-        if (bounds_obj && PyTuple_Check(bounds_obj) &&
-            PyTuple_Size(bounds_obj) == 2) {
-            parse_vector3d(
-                PyTuple_GetItem(bounds_obj, 0), cell.bounds.min);
-            parse_vector3d(
-                PyTuple_GetItem(bounds_obj, 1), cell.bounds.max);
-        }
-
-        PyObject *is_leaf_obj =
-            PyDict_GetItemString(d, "is_leaf");
-        cell.is_leaf = is_leaf_obj
-            ? (PyLong_AsLong(is_leaf_obj) != 0)
-            : true;
-
-        PyObject *has_surface_obj =
-            PyDict_GetItemString(d, "has_surface");
-        cell.has_surface = has_surface_obj
-            ? (PyLong_AsLong(has_surface_obj) != 0)
-            : false;
-
-        PyObject *is_active_obj =
-            PyDict_GetItemString(d, "is_active");
-        cell.is_active = is_active_obj
-            ? (PyLong_AsLong(is_active_obj) != 0)
-            : false;
-
-        PyObject *child_begin_obj =
-            PyDict_GetItemString(d, "child_begin");
-        cell.child_begin = child_begin_obj
-            ? static_cast<std::int64_t>(
-                  PyLong_AsLong(child_begin_obj))
-            : -1;
-
-        cell.representative_vertex_index = -1;
-
-        // Parse corner_sign_mask.
-        PyObject *csm_obj =
-            PyDict_GetItemString(d, "corner_sign_mask");
-        cell.corner_sign_mask = csm_obj
-            ? static_cast<std::uint8_t>(
-                  PyLong_AsUnsignedLong(csm_obj))
-            : 0U;
-
-        // Parse corner_values.
-        PyObject *cv_obj =
-            PyDict_GetItemString(d, "corner_values");
-        if (cv_obj) {
-            std::vector<double> cv;
-            if (parse_doubles(cv_obj, cv) &&
-                cv.size() == 8U) {
-                std::copy(cv.begin(), cv.end(),
-                          cell.corner_values.begin());
-            }
-        }
-
-        // Parse contributor range.
-        PyObject *cb_obj =
-            PyDict_GetItemString(d, "contributor_begin");
-        PyObject *ce_obj =
-            PyDict_GetItemString(d, "contributor_end");
-        if (cb_obj && ce_obj) {
-            cell.contributor_begin =
-                static_cast<std::int64_t>(
-                    PyLong_AsLong(cb_obj));
-            cell.contributor_end =
-                static_cast<std::int64_t>(
-                    PyLong_AsLong(ce_obj));
-        } else {
-            // Fall back to contributors list if present.
-            PyObject *contribs_obj =
-                PyDict_GetItemString(d, "contributors");
-            if (contribs_obj) {
-                PyObject *cfast = PySequence_Fast(
-                    contribs_obj, "contributors");
-                if (cfast) {
-                    Py_ssize_t nc =
-                        PySequence_Fast_GET_SIZE(cfast);
-                    cell.contributor_begin =
-                        static_cast<std::int64_t>(
-                            all_contributors.size());
-                    for (Py_ssize_t ci = 0; ci < nc; ++ci) {
-                        long v = PyLong_AsLong(
-                            PySequence_Fast_GET_ITEM(
-                                cfast, ci));
-                        all_contributors.push_back(
-                            static_cast<std::size_t>(v));
-                    }
-                    cell.contributor_end =
-                        static_cast<std::int64_t>(
-                            all_contributors.size());
-                    Py_DECREF(cfast);
-                }
-            } else {
-                cell.contributor_begin = -1;
-                cell.contributor_end = -1;
-            }
-        }
-
-        if (PyErr_Occurred()) {
-            Py_DECREF(cells_fast);
-            return NULL;
-        }
-        all_cells.push_back(cell);
-    }
-    Py_DECREF(cells_fast);
 
     // Solve QEF vertices only (no face generation).
     std::vector<MeshVertex> vertices = solve_all_leaf_vertices(
@@ -2374,64 +2276,17 @@ static PyObject *run_octree_pipeline_py(
     PyThreadState *_save = PyEval_SaveThread();
     try {
         // -- Step 1: Create top-level cells + query contributors --
-        TopLevelParticleGrid grid(domain, base_resolution);
-        grid.insert_particles(positions);
-        grid.compute_bin_max_h(smoothing_lengths);
-
-        std::vector<OctreeCell> top_cells =
-            create_top_level_cells(domain, base_resolution);
-
-        // Build initial cells with contributor ranges stored in a
-        // flat vector that refine_octree can consume directly.
         std::vector<OctreeCell> initial_cells;
-        initial_cells.reserve(top_cells.size());
         std::vector<std::size_t> initial_contributors;
-
-        ProgressBar pipeline_contrib_bar(
-            "Building", "extract_opened_surface_mesh_py", top_cells.size());
-        for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
-            OctreeCell cell = top_cells[ci];
-
-            std::uint32_t sx = 0, sy = 0, sz = 0;
-            std::uint32_t ex = 0, ey = 0, ez = 0;
-            grid.contributor_bin_span(
-                cell.bounds, smoothing_lengths,
-                sx, sy, sz, ex, ey, ez);
-
-            const std::int64_t begin =
-                static_cast<std::int64_t>(
-                    initial_contributors.size());
-
-            for (std::uint32_t ix = sx; ix <= ex; ++ix) {
-                for (std::uint32_t iy = sy; iy <= ey; ++iy) {
-                    for (std::uint32_t iz = sz;
-                         iz <= ez; ++iz) {
-                        const TopLevelBin &bin =
-                            grid.bins[grid.flatten_index(
-                                ix, iy, iz)];
-                        for (std::size_t pi :
-                             bin.particle_indices) {
-                            if (particle_support_overlaps_box(
-                                    positions[pi],
-                                    smoothing_lengths[pi],
-                                    cell.bounds)) {
-                                initial_contributors.push_back(
-                                    pi);
-                            }
-                        }
-                    }
-                }
-            }
-
-            const std::int64_t end =
-                static_cast<std::int64_t>(
-                    initial_contributors.size());
-            cell.contributor_begin = begin;
-            cell.contributor_end = end;
-            initial_cells.push_back(cell);
-            pipeline_contrib_bar.tick();
-        }
-        pipeline_contrib_bar.finish();
+        build_initial_cells_with_contributors(domain,
+                                              positions,
+                                              smoothing_lengths,
+                                              static_cast<std::uint32_t>(
+                                                  base_resolution),
+                                              "Building",
+                                              "extract_opened_surface_mesh_py",
+                                              initial_cells,
+                                              initial_contributors);
 
         // -- Step 2: Refine octree (uses the overload that accepts
         //    pre-built initial contributors) --

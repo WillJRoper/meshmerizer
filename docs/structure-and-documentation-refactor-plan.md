@@ -52,6 +52,9 @@ backward compatibility, or transitional warnings**.
 - Started Commit 6 in order by moving the actual HDF5 octree schema
   implementation into `meshmerizer.io.octree`, documenting the full on-disk
   layout there, and reducing `meshmerizer.serialize` to a compatibility shim.
+- Started Commit 7 in order by reorganizing `_adaptive.cpp` into clearer helper
+  sections and extracting shared parsing/bridge helpers for bounds parsing,
+  cell decoding, contributor decoding, and initial-cell construction.
 
 ### Commit 1: Reorganize package layout around clear layers
 
