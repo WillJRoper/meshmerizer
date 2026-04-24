@@ -1,9 +1,12 @@
-"""High-level Python API for composing meshmerizer pipelines.
+"""High-level public API for adaptive mesh generation.
 
-This module defines the intended public, Python-friendly workflow for the
-adaptive meshing pipeline. Callers can either run the full particles-to-mesh
-path in one shot or stop at explicit intermediate states for inspection and
-editing.
+The public Python surface is intentionally organized around two workflows:
+
+- ``generate_mesh`` for the common particles-to-mesh path.
+- ``build_tree`` -> ``regularize`` -> ``extract_mesh`` for staged use cases.
+
+This keeps the intended usage small and consistent while still supporting
+inspection and editing of intermediate states when needed.
 """
 
 from __future__ import annotations
@@ -18,8 +21,10 @@ from meshmerizer.adaptive_core import (
     compute_isovalue_from_percentile,
     extract_opened_surface_mesh,
     fof_cluster,
-    generate_mesh,
     run_full_pipeline,
+)
+from meshmerizer.adaptive_core import (
+    generate_mesh as generate_native_mesh,
 )
 from meshmerizer.mesh import Mesh
 from meshmerizer.mesh.operations import remove_islands as remove_small_islands
@@ -104,7 +109,7 @@ def _mesh_result_from_pipeline_dict(result: dict) -> MeshResult:
     )
 
 
-def build_and_refine_tree(
+def build_tree(
     positions: Sequence[Sequence[float]],
     smoothing_lengths: Sequence[float],
     domain_min: Vec3,
@@ -165,7 +170,7 @@ def build_and_refine_tree(
     )
 
 
-def erode_and_dilate(
+def regularize(
     tree: TreeState,
     min_feature_thickness: float,
     *,
@@ -218,7 +223,7 @@ def erode_and_dilate(
     )
 
 
-def get_mesh_from_tree(
+def _extract_mesh_from_tree(
     tree: TreeState,
     *,
     smoothing_iterations: int = 0,
@@ -228,32 +233,14 @@ def get_mesh_from_tree(
     pre_thickening_radius: float = 0.0,
     remove_islands_fraction: Optional[float] = None,
 ) -> MeshResult:
-    """Extract a mesh from an already-built tree state.
-
-    This function uses the fast direct mesh-generation path when the tree can
-    be meshed without additional regularization. Otherwise it re-runs the full
-    pipeline using the tree state's stored inputs and refinement parameters.
-
-    Args:
-        tree: Previously built tree state.
-        smoothing_iterations: Number of smoothing iterations to apply.
-        smoothing_strength: Laplacian smoothing strength in ``(0, 1]``.
-        max_edge_ratio: Maximum edge length as a multiple of local cell size.
-        min_feature_thickness: Minimum feature thickness to preserve.
-        pre_thickening_radius: Optional outward thickening radius.
-        remove_islands_fraction: Optional connected-component filtering
-            threshold.
-
-    Returns:
-        ``MeshResult`` containing the extracted mesh.
-    """
+    """Extract a mesh from a tree state."""
     if (
         tree.cells
         and tree.contributors
         and min_feature_thickness <= 0.0
         and pre_thickening_radius <= 0.0
     ):
-        vertices, _, faces = generate_mesh(
+        vertices, _, faces = generate_native_mesh(
             tree.cells,
             tree.contributors,
             tree.positions,
@@ -297,21 +284,12 @@ def get_mesh_from_tree(
     return mesh_result
 
 
-def get_mesh_from_topology(
+def _extract_mesh_from_topology(
     topology: TopologyState,
     *,
     remove_islands_fraction: Optional[float] = None,
 ) -> MeshResult:
-    """Extract a mesh from a Python-editable topology state.
-
-    Args:
-        topology: Opened-solid topology to extract.
-        remove_islands_fraction: Optional connected-component filtering
-            threshold.
-
-    Returns:
-        ``MeshResult`` containing the extracted opened-surface mesh.
-    """
+    """Extract a mesh from a topology state."""
     vertices, faces = extract_opened_surface_mesh(
         topology.tree.positions,
         topology.tree.smoothing_lengths,
@@ -338,7 +316,61 @@ def get_mesh_from_topology(
     return mesh_result
 
 
-def get_mesh(
+def extract_mesh(
+    state: TreeState | TopologyState,
+    *,
+    smoothing_iterations: int = 0,
+    smoothing_strength: float = 0.5,
+    max_edge_ratio: float = 1.5,
+    min_feature_thickness: float = 0.0,
+    pre_thickening_radius: float = 0.0,
+    remove_islands_fraction: Optional[float] = None,
+) -> MeshResult:
+    """Extract a mesh from either staged public state object.
+
+    Args:
+        state: ``TreeState`` or ``TopologyState`` to extract from.
+        smoothing_iterations: Number of smoothing iterations to apply when
+            extracting from a tree state.
+        smoothing_strength: Laplacian smoothing strength in ``(0, 1]`` when
+            extracting from a tree state.
+        max_edge_ratio: Maximum edge length as a multiple of local cell size
+            when extracting from a tree state.
+        min_feature_thickness: Minimum feature thickness to preserve when
+            extracting from a tree state.
+        pre_thickening_radius: Optional outward thickening radius when
+            extracting from a tree state.
+        remove_islands_fraction: Optional connected-component filtering
+            threshold.
+
+    Returns:
+        ``MeshResult`` containing the extracted mesh.
+
+    Raises:
+        TypeError: If ``state`` is not a supported staged public state.
+    """
+    if isinstance(state, TreeState):
+        return _extract_mesh_from_tree(
+            state,
+            smoothing_iterations=smoothing_iterations,
+            smoothing_strength=smoothing_strength,
+            max_edge_ratio=max_edge_ratio,
+            min_feature_thickness=min_feature_thickness,
+            pre_thickening_radius=pre_thickening_radius,
+            remove_islands_fraction=remove_islands_fraction,
+        )
+    if isinstance(state, TopologyState):
+        return _extract_mesh_from_topology(
+            state,
+            remove_islands_fraction=remove_islands_fraction,
+        )
+    raise TypeError(
+        "state must be a TreeState or TopologyState, "
+        f"got {type(state).__name__}"
+    )
+
+
+def generate_mesh(
     positions: Sequence[Sequence[float]],
     smoothing_lengths: Sequence[float],
     domain_min: Vec3,
@@ -407,6 +439,29 @@ def get_mesh(
     return mesh_result
 
 
+def cluster_particles(
+    positions: Sequence[Sequence[float]],
+    domain_min: Vec3,
+    domain_max: Vec3,
+    linking_factor: float = 1.5,
+) -> np.ndarray:
+    """Cluster particle positions with friends-of-friends.
+
+    Args:
+        positions: Particle positions with shape ``(N, 3)``.
+        domain_min: Inclusive lower corner of the working domain.
+        domain_max: Exclusive upper corner of the working domain.
+        linking_factor: Multiplicative FOF linking factor.
+
+    Returns:
+        ``(N,)`` int64 array of cluster labels.
+    """
+    pos = _as_positions(positions)
+    return fof_cluster(
+        pos, tuple(domain_min), tuple(domain_max), linking_factor
+    )
+
+
 def smooth_mesh(
     mesh: Mesh,
     iterations: int = 10,
@@ -464,14 +519,13 @@ __all__ = [
     "MeshResult",
     "TopologyState",
     "TreeState",
-    "build_and_refine_tree",
+    "build_tree",
+    "cluster_particles",
     "compute_isovalue_from_percentile",
-    "erode_and_dilate",
-    "fof_cluster",
-    "get_mesh",
-    "get_mesh_from_tree",
-    "get_mesh_from_topology",
+    "extract_mesh",
+    "generate_mesh",
     "remove_islands",
+    "regularize",
     "smooth_mesh",
     "subdivide_long_edges",
 ]

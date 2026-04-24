@@ -6,11 +6,11 @@ from meshmerizer import (
     MeshResult,
     TopologyState,
     TreeState,
-    build_and_refine_tree,
-    erode_and_dilate,
-    get_mesh,
-    get_mesh_from_topology,
-    get_mesh_from_tree,
+    build_tree,
+    cluster_particles,
+    extract_mesh,
+    generate_mesh,
+    regularize,
     remove_islands,
     smooth_mesh,
     subdivide_long_edges,
@@ -36,9 +36,9 @@ def _simple_particles() -> tuple[np.ndarray, np.ndarray]:
     return positions, smoothing_lengths
 
 
-def test_build_and_refine_tree_returns_tree_state() -> None:
+def test_build_tree_returns_tree_state() -> None:
     positions, smoothing_lengths = _simple_particles()
-    tree = build_and_refine_tree(
+    tree = build_tree(
         positions,
         smoothing_lengths,
         domain_min=(0.0, 0.0, 0.0),
@@ -52,9 +52,9 @@ def test_build_and_refine_tree_returns_tree_state() -> None:
     assert tree.smoothing_lengths.shape == smoothing_lengths.shape
 
 
-def test_erode_and_dilate_returns_topology_state() -> None:
+def test_regularize_returns_topology_state() -> None:
     positions, smoothing_lengths = _simple_particles()
-    tree = build_and_refine_tree(
+    tree = build_tree(
         positions,
         smoothing_lengths,
         domain_min=(0.0, 0.0, 0.0),
@@ -63,14 +63,14 @@ def test_erode_and_dilate_returns_topology_state() -> None:
         isovalue=0.01,
         max_depth=2,
     )
-    topology = erode_and_dilate(tree, min_feature_thickness=0.2)
+    topology = regularize(tree, min_feature_thickness=0.2)
     assert isinstance(topology, TopologyState)
     assert topology.opened_inside.ndim == 1
 
 
-def test_erode_and_dilate_supports_pre_thickening() -> None:
+def test_regularize_supports_pre_thickening() -> None:
     positions, smoothing_lengths = _simple_particles()
-    tree = build_and_refine_tree(
+    tree = build_tree(
         positions,
         smoothing_lengths,
         domain_min=(0.0, 0.0, 0.0),
@@ -79,8 +79,8 @@ def test_erode_and_dilate_supports_pre_thickening() -> None:
         isovalue=0.01,
         max_depth=2,
     )
-    baseline = erode_and_dilate(tree, min_feature_thickness=0.2)
-    thickened = erode_and_dilate(
+    baseline = regularize(tree, min_feature_thickness=0.2)
+    thickened = regularize(
         tree,
         min_feature_thickness=0.2,
         pre_thickening_radius=0.2,
@@ -92,9 +92,9 @@ def test_erode_and_dilate_supports_pre_thickening() -> None:
     )
 
 
-def test_get_mesh_returns_mesh_result() -> None:
+def test_generate_mesh_returns_mesh_result() -> None:
     positions, smoothing_lengths = _simple_particles()
-    result = get_mesh(
+    result = generate_mesh(
         positions,
         smoothing_lengths,
         domain_min=(0.0, 0.0, 0.0),
@@ -108,9 +108,9 @@ def test_get_mesh_returns_mesh_result() -> None:
     assert result.mesh.faces.shape[1] == 3
 
 
-def test_get_mesh_supports_pre_thickening() -> None:
+def test_generate_mesh_supports_pre_thickening() -> None:
     positions, smoothing_lengths = _simple_particles()
-    result = get_mesh(
+    result = generate_mesh(
         positions,
         smoothing_lengths,
         domain_min=(0.0, 0.0, 0.0),
@@ -125,9 +125,9 @@ def test_get_mesh_supports_pre_thickening() -> None:
     assert result.mesh.faces.shape[1] == 3
 
 
-def test_get_mesh_from_tree_returns_mesh_result() -> None:
+def test_extract_mesh_from_tree_returns_mesh_result() -> None:
     positions, smoothing_lengths = _simple_particles()
-    tree = build_and_refine_tree(
+    tree = build_tree(
         positions,
         smoothing_lengths,
         domain_min=(0.0, 0.0, 0.0),
@@ -136,14 +136,14 @@ def test_get_mesh_from_tree_returns_mesh_result() -> None:
         isovalue=0.01,
         max_depth=2,
     )
-    result = get_mesh_from_tree(tree)
+    result = extract_mesh(tree)
     assert isinstance(result, MeshResult)
     assert result.mesh.faces.shape[1] == 3
 
 
-def test_get_mesh_from_topology_returns_mesh_result() -> None:
+def test_extract_mesh_from_topology_returns_mesh_result() -> None:
     positions, smoothing_lengths = _simple_particles()
-    tree = build_and_refine_tree(
+    tree = build_tree(
         positions,
         smoothing_lengths,
         domain_min=(0.0, 0.0, 0.0),
@@ -152,10 +152,20 @@ def test_get_mesh_from_topology_returns_mesh_result() -> None:
         isovalue=0.01,
         max_depth=2,
     )
-    topology = erode_and_dilate(tree, min_feature_thickness=0.2)
-    result = get_mesh_from_topology(topology)
+    topology = regularize(tree, min_feature_thickness=0.2)
+    result = extract_mesh(topology)
     assert isinstance(result, MeshResult)
     assert result.mesh.faces.shape[1] == 3
+
+
+def test_cluster_particles_returns_labels() -> None:
+    positions, _ = _simple_particles()
+    labels = cluster_particles(
+        positions,
+        domain_min=(0.0, 0.0, 0.0),
+        domain_max=(2.0, 2.0, 2.0),
+    )
+    assert labels.shape == (positions.shape[0],)
 
 
 def test_mesh_helpers_return_mesh_instances() -> None:

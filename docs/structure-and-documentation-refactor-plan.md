@@ -45,6 +45,10 @@ backward compatibility, or transitional warnings**.
   `meshmerizer.adaptive` for low-level bindings, tree/meshing wrappers,
   topology helpers, and high-level pipeline calls, while keeping a
   compatibility facade at the historical import path.
+- Started Commit 4 in order by collapsing the public Python API around a
+  smaller workflow vocabulary: `build_tree`, `regularize`, `extract_mesh`,
+  and `generate_mesh`, with `cluster_particles` as the explicit public FOF
+  helper.
 
 ### Commit 1: Reorganize package layout around clear layers
 
