@@ -90,7 +90,12 @@ def _build_adaptive_extension() -> Extension:
 
     return Extension(
         "meshmerizer._adaptive",
-        sources=["src/meshmerizer/_adaptive.cpp"],
+        sources=[
+            "src/meshmerizer/_adaptive.cpp",
+            "src/meshmerizer/adaptive_cpp/refinement_work_queue.cpp",
+            "src/meshmerizer/adaptive_cpp/refinement_context.cpp",
+            "src/meshmerizer/adaptive_cpp/refinement_closure.cpp",
+        ],
         include_dirs=include_dirs,
         language="c++",
         extra_compile_args=compile_flags,

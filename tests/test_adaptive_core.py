@@ -397,6 +397,60 @@ def test_refine_octree_balance_does_not_exceed_max_depth() -> None:
     assert violations == []
 
 
+def test_refine_octree_balances_multiple_shared_face_patches() -> None:
+    """Multiple particles near one face should still preserve 2:1 balance."""
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+
+    for cell in cells:
+        cell["contributor_begin"] = 0
+        cell["contributor_end"] = 4
+
+    refined_cells, _ = refine_octree(
+        cells,
+        positions=[
+            (0.99, 0.05, 0.05),
+            (0.99, 0.45, 0.05),
+            (0.99, 0.05, 0.45),
+            (0.99, 0.45, 0.45),
+        ],
+        smoothing_lengths=[0.02, 0.02, 0.02, 0.02],
+        isovalue=0.5,
+        max_depth=4,
+        domain=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        base_resolution=2,
+    )
+
+    violations = _check_balance_invariant(refined_cells)
+    assert violations == []
+
+
+def test_refine_octree_balances_orthogonal_face_refinement_near_corner() -> (
+    None
+):
+    """Corner-adjacent particles should still preserve 2:1 balance."""
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+
+    for cell in cells:
+        cell["contributor_begin"] = 0
+        cell["contributor_end"] = 2
+
+    refined_cells, _ = refine_octree(
+        cells,
+        positions=[
+            (0.99, 0.99, 0.25),
+            (0.99, 0.99, 0.45),
+        ],
+        smoothing_lengths=[0.02, 0.02],
+        isovalue=0.5,
+        max_depth=4,
+        domain=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        base_resolution=2,
+    )
+
+    violations = _check_balance_invariant(refined_cells)
+    assert violations == []
+
+
 def test_neighbor_morton_key_returns_adjacent_cell() -> None:
     """Morton neighbor at depth 0 should step by one coordinate unit."""
     # At depth 0, coordinates are in [0, root_resolution).
