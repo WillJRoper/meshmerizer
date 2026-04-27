@@ -38,6 +38,11 @@ struct ChildSlotReservation {
     std::size_t count = 0U;
 };
 
+struct PreparedChildPublication {
+    OctreeCell cell;
+    std::uint32_t required_depth = 0U;
+};
+
 class ClosureStorage {
 public:
     explicit ClosureStorage(RefinementContext &context) : context_(context) {}
@@ -97,6 +102,30 @@ public:
         return new_index;
     }
 
+    std::vector<std::size_t> publish_child_batch(
+        const ChildSlotReservation &reservation,
+        std::vector<PreparedChildPublication> prepared_children) {
+        if (prepared_children.size() > reservation.count) {
+            throw std::runtime_error(
+                "child batch publication exceeded reserved count");
+        }
+
+        std::vector<std::size_t> published_indices;
+        published_indices.reserve(prepared_children.size());
+
+        for (std::size_t offset = 0; offset < prepared_children.size(); ++offset) {
+            PreparedChildPublication &prepared = prepared_children[offset];
+            const std::size_t new_index = publish_cell(
+                reservation,
+                offset,
+                std::move(prepared.cell));
+            context_.raise_required_depth_to(new_index, prepared.required_depth);
+            published_indices.push_back(new_index);
+        }
+
+        return published_indices;
+    }
+
     RefinementContext &context() { return context_; }
 
 private:
@@ -131,6 +160,8 @@ public:
         published.child_indices.reserve(source_children.size());
         const ChildSlotReservation child_slots =
             storage_.reserve_children(source_children.size());
+        std::vector<PreparedChildPublication> prepared_children;
+        prepared_children.reserve(source_children.size());
 
         for (std::size_t child_index = 0;
              child_index < source_children.size();
@@ -165,11 +196,20 @@ public:
                     child.corner_values, isovalue_);
             }
 
-            const std::size_t new_index = storage_.publish_cell(
-                child_slots, child_index, child);
-            storage_.context().raise_required_depth_to(
-                new_index,
-                std::max(child.depth, parent_required_depth));
+            PreparedChildPublication prepared_child;
+            prepared_child.cell = std::move(child);
+            prepared_child.required_depth = std::max(
+                source_children[child_index].depth,
+                parent_required_depth);
+            prepared_children.push_back(std::move(prepared_child));
+        }
+
+        const std::vector<std::size_t> published_indices =
+            storage_.publish_child_batch(
+                child_slots,
+                std::move(prepared_children));
+
+        for (std::size_t new_index : published_indices) {
             if (storage_.context().mark_queued(new_index)) {
                 queue_.push({
                     new_index,
@@ -181,8 +221,9 @@ public:
             published.child_indices.push_back(new_index);
             published.affected_indices.push_back(new_index);
 
+            const OctreeCell &published_child = storage_.context().cells()[new_index];
             std::uint32_t cgx, cgy, cgz;
-            hash_.quantize(child.bounds.min, cgx, cgy, cgz);
+            hash_.quantize(published_child.bounds.min, cgx, cgy, cgz);
             hash_.map[balance_pack_coords(cgx, cgy, cgz)] = new_index;
         }
 
