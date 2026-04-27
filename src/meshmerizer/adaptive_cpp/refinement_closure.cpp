@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <set>
 #include <span>
 
 #include "octree_cell.hpp"
@@ -127,6 +128,9 @@ inline void schedule_balance_neighbors_for_cell(
         if (!all_cells[candidate].is_leaf) {
             return;
         }
+        if (context.get_required_depth(candidate) >= demanded_depth) {
+            return;
+        }
         context.raise_required_depth_to(candidate, demanded_depth);
         if (context.mark_queued(candidate)) {
             queue.push({
@@ -147,6 +151,8 @@ inline void schedule_balance_neighbors_for_cell(
     const std::uint32_t span = 1U << (max_depth - cell.depth);
     std::uint32_t gx, gy, gz;
     hash.quantize(cell.bounds.min, gx, gy, gz);
+    std::set<std::tuple<int, bool, std::uint32_t, std::uint32_t, std::uint32_t,
+                        std::uint32_t>> visited_patches;
 
     auto recurse_face_patch = [&](auto &&self,
                                   int axis,
@@ -156,6 +162,16 @@ inline void schedule_balance_neighbors_for_cell(
                                   std::uint32_t patch_u_size,
                                   std::uint32_t patch_v_size) -> void {
         if (patch_u_size == 0U || patch_v_size == 0U) {
+            return;
+        }
+        const auto patch_key = std::make_tuple(
+            axis,
+            positive_direction,
+            patch_u_min,
+            patch_v_min,
+            patch_u_size,
+            patch_v_size);
+        if (!visited_patches.insert(patch_key).second) {
             return;
         }
 
