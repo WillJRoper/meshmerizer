@@ -171,7 +171,8 @@ more detail.
 - [`--visualise-verts`](cli-options/visualise-verts.md): save QEF vertex
   diagnostics
 - [`--nthreads`](cli-options/nthreads.md): set OpenMP thread count
-- [`--silent`](cli-options/silent.md): reduce stdout chatter while keeping logs
+- [`--silent`](cli-options/silent.md): hide progress bars while keeping status
+  logs on stdout
 
 ## Full option reference
 

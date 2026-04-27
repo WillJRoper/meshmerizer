@@ -202,7 +202,7 @@ inline DCPipelineResult run_dc_pipeline(
         contrib_bar.tick();
     }
     contrib_bar.finish();
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Timing",
         "run_dc_pipeline",
         "Contributor query: %.3f s\n",
@@ -228,7 +228,7 @@ inline DCPipelineResult run_dc_pipeline(
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold);
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Timing",
         "run_dc_pipeline",
         "Initial octree refinement: %.3f s\n",
@@ -290,14 +290,14 @@ inline DCPipelineResult run_dc_pipeline(
                     minimum_usable_hermite_samples,
                     max_qef_rms_residual_ratio,
                     min_normal_alignment_threshold)) {
-                meshmerizer_log_detail::print_status(
-                    "Regularization",
-                    "run_dc_pipeline",
-                    "pass %zu: no further surface-band refinement required\n",
+                    meshmerizer_log_detail::print_status(
+                        "Regularization",
+                        "run_dc_pipeline",
+                        "pass %zu: no further surface-band refinement required\n",
                     regularization_refine_pass);
                 break;
             }
-            meshmerizer_log_detail::print_status(
+            meshmerizer_log_detail::print_debug_status(
                 "Timing",
                 "run_dc_pipeline",
                 "Regularization surface refine pass %zu: %.3f s\n",
@@ -351,7 +351,7 @@ inline DCPipelineResult run_dc_pipeline(
                     thickening_leaf_size_target,
                     pre_thickening_radius,
                     all_cells.size());
-                meshmerizer_log_detail::print_status(
+                meshmerizer_log_detail::print_debug_status(
                     "Timing",
                     "run_dc_pipeline",
                     "Pre-thickening distance pass %zu: %.3f s\n",
@@ -378,7 +378,7 @@ inline DCPipelineResult run_dc_pipeline(
                         thickening_refine_pass);
                     break;
                 }
-                meshmerizer_log_detail::print_status(
+                meshmerizer_log_detail::print_debug_status(
                     "Timing",
                     "run_dc_pipeline",
                     "Pre-thickening refine pass %zu: %.3f s\n",
@@ -396,7 +396,7 @@ inline DCPipelineResult run_dc_pipeline(
                     all_cells, all_contributors, positions, smoothing_lengths,
                     isovalue, domain, base_resolution, max_depth,
                     &dirty_cells);
-                meshmerizer_log_detail::print_status(
+                meshmerizer_log_detail::print_debug_status(
                     "Timing",
                     "run_dc_pipeline",
                     "Pre-thickening balance pass %zu: %.3f s\n",
@@ -410,7 +410,7 @@ inline DCPipelineResult run_dc_pipeline(
                     smoothing_lengths, solid_spatial_index,
                     isovalue, max_depth, &classification_cache,
                     &dirty_cells, &inside_mask);
-                meshmerizer_log_detail::print_status(
+                meshmerizer_log_detail::print_debug_status(
                     "Timing",
                     "run_dc_pipeline",
                     "Pre-thickening reclassify pass %zu: %.3f s\n",
@@ -423,7 +423,7 @@ inline DCPipelineResult run_dc_pipeline(
                     compute_outside_distance_from_inside_mask(
                         solid_leaves, inside_mask,
                         pre_thickening_radius);
-                meshmerizer_log_detail::print_status(
+                meshmerizer_log_detail::print_debug_status(
                     "Timing",
                     "run_dc_pipeline",
                     "Pre-thickening strict-band distance pass %zu: %.3f s\n",
@@ -450,7 +450,7 @@ inline DCPipelineResult run_dc_pipeline(
                 compute_outside_distance_from_inside_mask(
                     solid_leaves, inside_mask,
                     pre_thickening_radius);
-            meshmerizer_log_detail::print_status(
+            meshmerizer_log_detail::print_debug_status(
                 "Timing",
                 "run_dc_pipeline",
                 "Final pre-thickening distance: %.3f s\n",
@@ -481,7 +481,7 @@ inline DCPipelineResult run_dc_pipeline(
         prune_small_opened_components(solid_leaves, opened_inside);
         suppress_opened_edge_contacts(
             solid_leaves, all_cells, solid_spatial_index, opened_inside);
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Timing",
             "run_dc_pipeline",
             "Regularization morphology: %.3f s\n",
@@ -516,7 +516,7 @@ inline DCPipelineResult run_dc_pipeline(
                 solid_leaves, opened_inside, all_cells, solid_spatial_index,
                 domain, base_resolution, max_depth);
         }
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Timing",
             "run_dc_pipeline",
             "Opened surface extraction: %.3f s\n",
@@ -545,7 +545,7 @@ inline DCPipelineResult run_dc_pipeline(
                 smoothing_iterations, smoothing_strength);
             meshmerizer_log_detail::print_status(
                 "Cleaning", "run_dc_pipeline", "smoothing done\n");
-            meshmerizer_log_detail::print_status(
+            meshmerizer_log_detail::print_debug_status(
                 "Timing",
                 "run_dc_pipeline",
                 "Opened-surface smoothing: %.3f s\n",
@@ -574,7 +574,7 @@ inline DCPipelineResult run_dc_pipeline(
                 "gap filling done (+%zu vertices, +%zu triangles)\n",
                 opened_vertices.size() - verts_before,
                 opened_triangles.size() - tris_before);
-            meshmerizer_log_detail::print_status(
+            meshmerizer_log_detail::print_debug_status(
                 "Timing",
                 "run_dc_pipeline",
                 "Opened-surface gap filling: %.3f s\n",
@@ -630,7 +630,7 @@ inline DCPipelineResult run_dc_pipeline(
         solve_all_leaf_vertices(
             all_cells, all_contributors, positions,
             smoothing_lengths, isovalue);
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Timing",
         "run_dc_pipeline",
         "QEF vertex solve: %.3f s\n",
@@ -652,7 +652,7 @@ inline DCPipelineResult run_dc_pipeline(
     LeafSpatialIndex spatial_index;
     spatial_index.build(all_cells, domain, max_depth,
                         base_resolution);
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Timing",
         "run_dc_pipeline",
         "Leaf spatial index build: %.3f s\n",
@@ -679,7 +679,7 @@ inline DCPipelineResult run_dc_pipeline(
             smoothing_lengths, isovalue);
     }
     spatial_index.build(all_cells, domain, max_depth, base_resolution);
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Timing",
         "run_dc_pipeline",
         "Incident cell repair/activation prep: %.3f s\n",
@@ -690,7 +690,7 @@ inline DCPipelineResult run_dc_pipeline(
         all_cells, qef_vertices, all_contributors,
         positions, smoothing_lengths, spatial_index,
         max_depth, base_resolution, isovalue);
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Timing",
         "run_dc_pipeline",
         "Incident cell activation: %.3f s\n",
@@ -723,7 +723,7 @@ inline DCPipelineResult run_dc_pipeline(
             smoothing_iterations, smoothing_strength);
         meshmerizer_log_detail::print_status(
             "Cleaning", "run_dc_pipeline", "smoothing done\n");
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Timing",
             "run_dc_pipeline",
             "QEF smoothing: %.3f s\n",
@@ -745,7 +745,7 @@ inline DCPipelineResult run_dc_pipeline(
         generate_dual_contour_faces(
             all_cells, qef_vertices, spatial_index,
             max_depth, base_resolution, isovalue);
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Timing",
         "run_dc_pipeline",
         "Dual contour face generation: %.3f s\n",
@@ -784,7 +784,7 @@ inline DCPipelineResult run_dc_pipeline(
             "run_dc_pipeline",
             "gap filling done (+%zu vertices, +%zu triangles)\n",
             new_verts, new_tris);
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Timing",
             "run_dc_pipeline",
             "Dual contour gap filling: %.3f s\n",
@@ -812,7 +812,7 @@ inline DCPipelineResult run_dc_pipeline(
              static_cast<std::uint32_t>(tri.vertex_indices[2])});
     }
 
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Timing",
         "run_dc_pipeline",
         "Total C++ reconstruction core: %.3f s\n",

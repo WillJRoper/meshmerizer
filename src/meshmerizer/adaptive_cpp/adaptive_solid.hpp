@@ -220,7 +220,7 @@ inline bool refine_surface_band_cells(
     }
 
     if (cells_to_visit.empty()) {
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Regularization",
             "refine_surface_band_cells",
             "no surface-band splits needed (leaf_size_target=%.6g, total_cells=%zu)\n",
@@ -229,7 +229,7 @@ inline bool refine_surface_band_cells(
         return false;
     }
 
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Regularization",
         "refine_surface_band_cells",
         "starting from %zu surface-band cells to reach leaf_size<=%.6g (total_cells_before=%zu)\n",
@@ -351,7 +351,7 @@ inline bool refine_surface_band_cells(
 
     refine_counter.finish();
 
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Regularization",
         "refine_surface_band_cells",
         "processed=%zu split=%zu (total_cells_after_refine=%zu)\n",
@@ -864,7 +864,7 @@ inline bool refine_thickening_band_cells(
     }
 
     if (cells_to_visit.empty()) {
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Regularization",
             "refine_thickening_band_cells",
             "no growth-band splits needed (leaf_size_target=%.6g, radius=%.6g, halo_radius=%.6g, total_cells=%zu)\n",
@@ -875,7 +875,7 @@ inline bool refine_thickening_band_cells(
         return false;
     }
 
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Regularization",
         "refine_thickening_band_cells",
         "starting from %zu growth-band cells to reach leaf_size<=%.6g (radius=%.6g, halo_radius=%.6g, total_cells_before=%zu)\n",
@@ -1010,7 +1010,7 @@ inline bool refine_thickening_band_cells(
 
     refine_counter.finish();
 
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Regularization",
         "refine_thickening_band_cells",
         "processed=%zu split=%zu (total_cells_after_refine=%zu)\n",
@@ -1049,7 +1049,7 @@ inline bool thickening_band_is_fully_refined(
     }
     check_counter.finish();
 
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Regularization",
         "thickening_band_is_fully_refined",
         "unresolved strict-band leaves=%zu (target_leaf_size=%.6g, radius=%.6g)\n",
@@ -1369,7 +1369,7 @@ inline void prune_small_opened_components(
     }
 
     if (removed_components > 0U) {
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Regularization",
             "prune_small_opened_components",
             "removed %zu small components (%zu leaves, threshold=%.6g of largest volume)\n",
@@ -1467,7 +1467,7 @@ inline void fill_small_opened_cavities(
     }
 
     if (filled_components > 0U) {
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Regularization",
             "fill_small_opened_cavities",
             "filled %zu enclosed cavities (%zu leaves, threshold=%.6g of opened volume)\n",
@@ -1617,7 +1617,7 @@ inline void suppress_opened_edge_contacts(
         ++removed;
     }
 
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Regularization",
         "suppress_opened_edge_contacts",
         "removed %zu highly exposed leaves\n",
@@ -1931,7 +1931,7 @@ inline bool resolve_opened_edge_ambiguities(
     }
 
     if (applied > 0U) {
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Regularization",
             "resolve_opened_edge_ambiguities",
             "filled %zu leaves\n",

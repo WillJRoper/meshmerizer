@@ -868,7 +868,7 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
             }
         }
         closure_counter.finish();
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Meshing",
             "close_incident_neighbourhood",
             "iteration %zu complete (+%zu cells)\n",
@@ -952,7 +952,7 @@ inline bool refine_zero_sample_incident_cells(
     }
     refine_counter.finish();
 
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Meshing",
         "refine_zero_sample_incident_cells",
         "missing=%zu zero_sample=%zu split=%zu\n",
@@ -1027,7 +1027,7 @@ inline void activate_missing_incident_cells(
         ++activated_count;
     }
 
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Meshing",
         "activate_missing_incident_cells",
         "missing=%zu already_present=%zu zero_sample=%zu added=%zu\n",

@@ -30,10 +30,17 @@ import sys
 import numpy
 from setuptools import Extension, setup
 
-# Read the WITH_OPENMP environment variable.  An empty string or unset
-# means "no OpenMP".  Any non-empty value enables it; if that value is
-# an existing directory path it is treated as the OpenMP install prefix.
+# Read build-time feature flags from the environment.
+#
+# WITH_OPENMP:
+#   An empty string or unset means "no OpenMP". Any non-empty value enables
+#   it; if that value is an existing directory path it is treated as the
+#   OpenMP install prefix.
+# DEBUG_LOG:
+#   Any non-empty value enables compilation of optional native debug-log file
+#   support. When unset, native debug-only diagnostics are compiled out.
 WITH_OPENMP = os.environ.get("WITH_OPENMP", "")
+DEBUG_LOG = os.environ.get("DEBUG_LOG", "")
 
 
 def _build_adaptive_extension() -> Extension:
@@ -77,6 +84,9 @@ def _build_adaptive_extension() -> Extension:
         # Define a preprocessor macro so C++ code can guard OpenMP
         # pragmas behind ``#ifdef WITH_OPENMP``.
         compile_flags.append("-DWITH_OPENMP")
+
+    if len(DEBUG_LOG) > 0:
+        compile_flags.append("-DDEBUG_LOG")
 
     return Extension(
         "meshmerizer._adaptive",

@@ -479,9 +479,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--silent",
         action="store_true",
         help=(
-            "Suppress per-update progress rendering. Only end-of-run "
-            "summaries are printed to stdout while detailed status remains in "
-            "the log file."
+            "Suppress per-update progress rendering while keeping Python "
+            "status logs on stdout."
         ),
     )
 

@@ -30,3 +30,14 @@ WITH_OPENMP=/opt/homebrew/opt/libomp pip install -e .
 ```
 
 If `WITH_OPENMP` is unset, Meshmerizer builds in serial mode.
+
+## Native debug-log builds
+
+If you want optional native debug-log file support, set `DEBUG_LOG` before
+install.
+
+```bash
+DEBUG_LOG=1 pip install -e .
+```
+
+If `DEBUG_LOG` is unset, native debug-only diagnostics are compiled out.

@@ -51,6 +51,8 @@ inline std::mutex& status_log_mutex() {
     return mutex;
 }
 
+#ifdef DEBUG_LOG
+
 inline std::string& status_log_path() {
     static std::string path;
     return path;
@@ -61,10 +63,14 @@ inline FILE*& status_log_stream() {
     return stream;
 }
 
+#endif
+
 inline bool& silent_mode() {
     static bool silent = false;
     return silent;
 }
+
+#ifdef DEBUG_LOG
 
 inline void set_status_log_path(const char* path) {
     std::lock_guard<std::mutex> lock(status_log_mutex());
@@ -81,6 +87,12 @@ inline void set_status_log_path(const char* path) {
         }
     }
 }
+
+#else
+
+inline void set_status_log_path(const char* /*path*/) {}
+
+#endif
 
 inline void set_silent_mode(bool silent) {
     std::lock_guard<std::mutex> lock(status_log_mutex());
@@ -105,16 +117,30 @@ inline void vprint_status(
     std::va_list args) {
     const std::string prefix = format_status_prefix(operation, function_name);
     std::lock_guard<std::mutex> lock(status_log_mutex());
+    std::fprintf(stdout, "%s ", prefix.c_str());
+    std::vfprintf(stdout, format, args);
+    std::fflush(stdout);
+}
 
-    FILE* stream = stdout;
-    if (status_log_stream() != nullptr) {
-        stream = status_log_stream();
+#ifdef DEBUG_LOG
+
+inline void vprint_debug_status(
+    const std::string& operation,
+    const std::string& function_name,
+    const char* format,
+    std::va_list args) {
+    std::lock_guard<std::mutex> lock(status_log_mutex());
+    if (status_log_stream() == nullptr) {
+        return;
     }
 
-    std::fprintf(stream, "%s ", prefix.c_str());
-    std::vfprintf(stream, format, args);
-    std::fflush(stream);
+    const std::string prefix = format_status_prefix(operation, function_name);
+    std::fprintf(status_log_stream(), "%s ", prefix.c_str());
+    std::vfprintf(status_log_stream(), format, args);
+    std::fflush(status_log_stream());
 }
+
+#endif
 
 inline bool should_render_progress() {
     std::lock_guard<std::mutex> lock(status_log_mutex());
@@ -131,6 +157,29 @@ inline void print_status(
     vprint_status(operation, function_name, format, args);
     va_end(args);
 }
+
+#ifdef DEBUG_LOG
+
+inline void print_debug_status(
+    const std::string& operation,
+    const std::string& function_name,
+    const char* format,
+    ...) {
+    std::va_list args;
+    va_start(args, format);
+    vprint_debug_status(operation, function_name, format, args);
+    va_end(args);
+}
+
+#else
+
+inline void print_debug_status(
+    const std::string&,
+    const std::string&,
+    const char*,
+    ...) {}
+
+#endif
 
 /**
  * @brief Query the terminal width in columns.

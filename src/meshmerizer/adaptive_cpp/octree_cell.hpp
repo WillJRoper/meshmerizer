@@ -134,7 +134,7 @@ inline void print_octree_structure_summary(
         }
     }
 
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Tree",
         "print_octree_structure_summary",
         "total=%zu leaf=%zu internal=%zu active=%zu inactive=%zu surface=%zu\n",
@@ -146,7 +146,7 @@ inline void print_octree_structure_summary(
         total_surface);
     for (std::uint32_t depth = 0; depth < per_depth.size(); ++depth) {
         const DepthSummary &summary = per_depth[depth];
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Tree",
             "print_octree_structure_summary",
             "depth %u: total=%zu leaf=%zu internal=%zu active=%zu inactive=%zu surface=%zu\n",
@@ -1197,7 +1197,7 @@ inline void balance_octree(
         balance_counter.tick();
     }
 
-    meshmerizer_log_detail::print_status(
+    meshmerizer_log_detail::print_debug_status(
         "Building",
         "balance_octree",
         "local closure processed=%zu split=%zu (total_cells=%zu)\n",
