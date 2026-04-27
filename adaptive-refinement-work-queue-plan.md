@@ -21,11 +21,13 @@ Rules for using this plan:
 
 ## Current Status
 
-- Current implementation phase: **Phase 3 - Tree-Guided Neighbor Traversal**
+- Current implementation phase: **Phase 4 preparation - Structural mutation
+  refactor before parallel workers**
 - Work in progress now:
-  - beginning Phase 4 preparation work
-  - refactoring the serial closure loop into clearer coordinator/worker pieces
-  - preparing the control flow for later multi-worker execution
+  - refactoring the serial closure engine toward cleaner worker/coordinator and
+    publication/storage boundaries
+  - preparing the control flow and mutation surfaces for later multi-worker
+    execution
 
 Reporting-note:
 
@@ -1257,19 +1259,44 @@ This phase is about algorithmic correctness, not speed.
 
 ## Phase 3 - Tree-Guided Neighbor Traversal
 
-- [ ] Implement the face-overlap branch traversal described above.
-- [ ] Avoid finest-grid raster scanning.
-- [ ] Add pruning based on `required_depth >= demanded_depth`.
-- [ ] Add tests covering pathological coarse/fine propagation layouts.
-- [ ] Confirm that balance closure is local and monotone.
+- [x] Implement the face-overlap branch traversal described above.
+- [x] Avoid finest-grid raster scanning.
+- [x] Add pruning based on `required_depth >= demanded_depth`.
+- [x] Add tests covering pathological coarse/fine propagation layouts.
+- [x] Confirm that balance closure is local and monotone.
+
+### Phase 3 completion note
+
+- The serial closure scheduler now uses recursive face-patch traversal rather
+  than single-point face probing.
+- Queue-driven balance propagation prunes duplicate work using existing
+  `required_depth` state.
+- Additional adaptive-core regressions were added for more difficult face and
+  corner refinement layouts.
+- Focused adaptive-core and watertight integration regressions are green.
 
 ## Phase 4 - Parallel Structural Mutation
 
-- [ ] Refactor cell storage so parallel child creation is safe.
-- [ ] Refactor contributor storage so concurrent append/reservation is safe.
-- [ ] Ensure side-car state grows consistently with cell creation.
+- [~] Refactor cell storage so parallel child creation is safe.
+- [~] Refactor contributor storage so concurrent append/reservation is safe.
+- [~] Ensure side-car state grows consistently with cell creation.
 - [ ] Publish child blocks atomically enough that workers never see partial
       structure.
+
+### Phase 4 progress update
+
+- Child publication and contributor append logic have been moved behind a
+  closure-side publisher abstraction.
+- Storage mutation has been separated from publication policy via a
+  `ClosureStorage` backend.
+- Reservation/publication boundaries now exist explicitly for contributors and
+  child slots, with validation for child-slot publication order.
+- The serial closure loop has been refactored into clearer worker/coordinator
+  helpers, which should make later multi-worker execution easier to introduce.
+- A batched-contributor-publication experiment was attempted and then reverted
+  after exposing instability in the regularization/integration path; for now,
+  contributor publication remains structurally prepared for batching but not
+  forced into a stronger ordering model.
 
 ## Phase 5 - Parallel Workers
 

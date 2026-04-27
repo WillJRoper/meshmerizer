@@ -239,6 +239,15 @@ private:
     double isovalue_;
 };
 
+struct ClosureWorkerState {
+    RefinementContext &context;
+    BalanceSpatialHash &hash;
+    const std::vector<Vector3d> &positions;
+    const std::vector<double> &smoothing_lengths;
+    const RefinementClosureConfig &config;
+    RefinementWorkQueue &queue;
+};
+
 inline RefinementResult evaluate_refinement_for_leaf(
     const OctreeCell &current_cell,
     const std::vector<std::size_t> &all_contributors,
@@ -490,12 +499,9 @@ inline void schedule_balance_neighbors_for_cell(
 
 inline void apply_balance_split(
     std::size_t split_index,
-    RefinementContext &context,
-    BalanceSpatialHash &hash,
-    const std::vector<Vector3d> &positions,
-    const std::vector<double> &smoothing_lengths,
-    const RefinementClosureConfig &config,
-    RefinementWorkQueue &queue) {
+    ClosureWorkerState &worker) {
+    RefinementContext &context = worker.context;
+    BalanceSpatialHash &hash = worker.hash;
     OctreeCell &current_cell = context.cells()[split_index];
     const OctreeCell parent_snapshot = current_cell;
     const std::uint32_t parent_required_depth =
@@ -510,7 +516,10 @@ inline void apply_balance_split(
     const std::vector<OctreeCell> children = create_child_cells(parent_snapshot);
     const std::vector<std::vector<std::size_t>> child_contributors =
         filter_child_contributors(
-            parent_contributors, positions, smoothing_lengths, children);
+            parent_contributors,
+            worker.positions,
+            worker.smoothing_lengths,
+            children);
 
     current_cell.is_leaf = false;
     current_cell.child_begin = static_cast<std::int64_t>(context.cells().size());
@@ -521,7 +530,12 @@ inline void apply_balance_split(
 
     ClosureStorage storage(context);
     ClosurePublisher publisher(
-        storage, hash, queue, positions, smoothing_lengths, config.isovalue);
+        storage,
+        hash,
+        worker.queue,
+        worker.positions,
+        worker.smoothing_lengths,
+        worker.config.isovalue);
 
     const PublishedChildren published =
         publisher.publish_children(
@@ -536,21 +550,18 @@ inline void apply_balance_split(
             affected_index,
             context.cells(),
             hash,
-            config.max_depth,
+            worker.config.max_depth,
             context,
-            queue);
+            worker.queue);
     }
 }
 
 inline void apply_surface_split(
     std::size_t split_index,
     const RefinementResult &result,
-    RefinementContext &context,
-    BalanceSpatialHash &hash,
-    const std::vector<Vector3d> &positions,
-    const std::vector<double> &smoothing_lengths,
-    const RefinementClosureConfig &config,
-    RefinementWorkQueue &queue) {
+    ClosureWorkerState &worker) {
+    RefinementContext &context = worker.context;
+    BalanceSpatialHash &hash = worker.hash;
     OctreeCell &current_cell = context.cells()[split_index];
     const OctreeCell parent_snapshot = current_cell;
     const std::uint32_t parent_required_depth =
@@ -568,7 +579,12 @@ inline void apply_surface_split(
 
     ClosureStorage storage(context);
     ClosurePublisher publisher(
-        storage, hash, queue, positions, smoothing_lengths, config.isovalue);
+        storage,
+        hash,
+        worker.queue,
+        worker.positions,
+        worker.smoothing_lengths,
+        worker.config.isovalue);
 
     const PublishedChildren published =
         publisher.publish_children(
@@ -583,26 +599,22 @@ inline void apply_surface_split(
             affected_index,
             context.cells(),
             hash,
-            config.max_depth,
+            worker.config.max_depth,
             context,
-            queue);
+            worker.queue);
     }
 }
 
-inline void maybe_shutdown_queue(RefinementWorkQueue &queue) {
-    if (queue.empty()) {
-        queue.shutdown();
+inline void maybe_shutdown_queue(ClosureWorkerState &worker) {
+    if (worker.queue.empty()) {
+        worker.queue.shutdown();
     }
 }
 
 inline void process_closure_task(
     const RefinementTask &task,
-    RefinementContext &context,
-    BalanceSpatialHash &hash,
-    const std::vector<Vector3d> &positions,
-    const std::vector<double> &smoothing_lengths,
-    const RefinementClosureConfig &config,
-    RefinementWorkQueue &queue) {
+    ClosureWorkerState &worker) {
+    RefinementContext &context = worker.context;
     if (!context.mark_processing(task.cell_index)) {
         return;
     }
@@ -613,30 +625,23 @@ inline void process_closure_task(
     OctreeCell &current_cell = context.cells()[task.cell_index];
     if (!current_cell.is_leaf) {
         context.mark_retired(task.cell_index);
-        maybe_shutdown_queue(queue);
+        maybe_shutdown_queue(worker);
         return;
     }
 
     if (current_cell.depth < context.get_required_depth(task.cell_index)) {
-        apply_balance_split(
-            task.cell_index,
-            context,
-            hash,
-            positions,
-            smoothing_lengths,
-            config,
-            queue);
+        apply_balance_split(task.cell_index, worker);
         context.mark_retired(task.cell_index);
-        maybe_shutdown_queue(queue);
+        maybe_shutdown_queue(worker);
         return;
     }
 
     const RefinementResult result = evaluate_refinement_for_leaf(
         current_cell,
         context.contributors(),
-        positions,
-        smoothing_lengths,
-        config);
+        worker.positions,
+        worker.smoothing_lengths,
+        worker.config);
 
     current_cell.corner_values = result.corner_values;
     current_cell.corner_sign_mask = result.corner_sign_mask;
@@ -648,7 +653,7 @@ inline void process_closure_task(
         current_cell.is_topo_surface = false;
         current_cell.child_begin = -1;
         context.mark_idle(task.cell_index);
-        maybe_shutdown_queue(queue);
+        maybe_shutdown_queue(worker);
         return;
     }
 
@@ -659,22 +664,14 @@ inline void process_closure_task(
         current_cell.is_topo_surface = false;
         current_cell.child_begin = -1;
         context.mark_idle(task.cell_index);
-        maybe_shutdown_queue(queue);
+        maybe_shutdown_queue(worker);
         return;
     }
 
-    apply_surface_split(
-        task.cell_index,
-        result,
-        context,
-        hash,
-        positions,
-        smoothing_lengths,
-        config,
-        queue);
+    apply_surface_split(task.cell_index, result, worker);
 
     context.mark_retired(task.cell_index);
-    maybe_shutdown_queue(queue);
+    maybe_shutdown_queue(worker);
 }
 
 }  // namespace
@@ -712,16 +709,18 @@ refine_with_closure(
         }
     }
 
+    ClosureWorkerState worker = {
+        context,
+        hash,
+        positions,
+        smoothing_lengths,
+        config,
+        queue,
+    };
+
     RefinementTask task;
     while (queue.pop(task)) {
-        process_closure_task(
-            task,
-            context,
-            hash,
-            positions,
-            smoothing_lengths,
-            config,
-            queue);
+        process_closure_task(task, worker);
     }
 
     return {
