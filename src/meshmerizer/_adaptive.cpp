@@ -1411,6 +1411,7 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
     unsigned int base_resolution = 0U;
+    unsigned int worker_count = 1U;
     unsigned int minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
@@ -1419,9 +1420,10 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
     std::vector<OctreeCell> initial_cells;
     (void)self;
 
-    if (!PyArg_ParseTuple(args, "OOOdIOI|Idd", &initial_cells_object,
+    if (!PyArg_ParseTuple(args, "OOOdIOI|IIdd", &initial_cells_object,
                           &positions_object, &smoothing_object, &isovalue,
                           &max_depth, &domain_object, &base_resolution,
+                          &worker_count,
                           &minimum_usable_hermite_samples,
                           &max_qef_rms_residual_ratio,
                           &min_normal_alignment_threshold)) {
@@ -1457,6 +1459,7 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
         max_depth,
         domain,
         static_cast<std::uint32_t>(base_resolution),
+        static_cast<std::uint32_t>(worker_count),
         static_cast<std::uint32_t>(minimum_usable_hermite_samples),
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold);

@@ -50,10 +50,10 @@ struct RefinementWorkQueueStats {
 class RefinementWorkQueue {
 public:
     /** Push one task and wake one waiter. */
-    void push(const RefinementTask &task);
+    bool push(const RefinementTask &task);
 
     /** Push several tasks and wake all waiters. */
-    void push_batch(const std::vector<RefinementTask> &tasks);
+    std::size_t push_batch(const std::vector<RefinementTask> &tasks);
 
     /**
      * @brief Pop one task if available.
@@ -67,6 +67,9 @@ public:
 
     /** Request queue shutdown and wake all waiters. */
     void shutdown();
+
+    /** Request shutdown only if no queued or in-flight work remains. */
+    bool try_shutdown_if_idle();
 
     /** Return true when the queue currently holds no tasks. */
     bool empty() const;

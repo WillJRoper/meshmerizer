@@ -609,9 +609,7 @@ inline void apply_surface_split(
 }
 
 inline void maybe_shutdown_queue(ClosureWorkerState &worker) {
-    if (worker.queue.is_idle()) {
-        worker.queue.shutdown();
-    }
+    worker.queue.try_shutdown_if_idle();
 }
 
 inline void process_closure_task(
@@ -619,24 +617,26 @@ inline void process_closure_task(
     ClosureWorkerState &worker) {
     std::lock_guard<std::mutex> mutation_lock(worker.mutation_mutex);
     RefinementContext &context = worker.context;
+    if (task.cell_index >= context.size()) {
+        return;
+    }
     if (!context.mark_processing(task.cell_index)) {
         return;
     }
     if (task.cell_index >= context.cells().size()) {
+        context.mark_idle(task.cell_index);
         return;
     }
 
     OctreeCell &current_cell = context.cells()[task.cell_index];
     if (!current_cell.is_leaf) {
         context.mark_retired(task.cell_index);
-        maybe_shutdown_queue(worker);
         return;
     }
 
     if (current_cell.depth < context.get_required_depth(task.cell_index)) {
         apply_balance_split(task.cell_index, worker);
         context.mark_retired(task.cell_index);
-        maybe_shutdown_queue(worker);
         return;
     }
 
@@ -657,7 +657,6 @@ inline void process_closure_task(
         current_cell.is_topo_surface = false;
         current_cell.child_begin = -1;
         context.mark_idle(task.cell_index);
-        maybe_shutdown_queue(worker);
         return;
     }
 
@@ -668,14 +667,12 @@ inline void process_closure_task(
         current_cell.is_topo_surface = false;
         current_cell.child_begin = -1;
         context.mark_idle(task.cell_index);
-        maybe_shutdown_queue(worker);
         return;
     }
 
     apply_surface_split(task.cell_index, result, worker);
 
     context.mark_retired(task.cell_index);
-    maybe_shutdown_queue(worker);
 }
 
 inline void run_closure_worker_loop(ClosureWorkerState &worker) {

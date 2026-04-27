@@ -168,6 +168,7 @@ def refine_octree(
     max_depth: int,
     domain: tuple[tuple[float, float, float], tuple[float, float, float]],
     base_resolution: int,
+    worker_count: int = 1,
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
@@ -182,6 +183,9 @@ def refine_octree(
         max_depth: Maximum permitted refinement depth.
         domain: Full working-domain bounds.
         base_resolution: Number of top-level cells per axis.
+        worker_count: Experimental worker count for the native closure engine.
+            Defaults to ``1`` and is primarily intended for testing and
+            diagnostics while the threaded path is still being hardened.
         minimum_usable_hermite_samples: Minimum usable Hermite sample count.
         max_qef_rms_residual_ratio: Maximum acceptable RMS QEF residual ratio.
         min_normal_alignment_threshold: Minimum acceptable normal alignment.
@@ -199,6 +203,7 @@ def refine_octree(
         max_depth,
         domain,
         base_resolution,
+        worker_count,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,

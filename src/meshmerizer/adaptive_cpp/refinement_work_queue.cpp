@@ -2,30 +2,40 @@
 
 #include <algorithm>
 
-void RefinementWorkQueue::push(const RefinementTask &task) {
+bool RefinementWorkQueue::push(const RefinementTask &task) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (shutdown_requested_) {
+            return false;
+        }
         tasks_.push_back(task);
         ++stats_.push_count;
         stats_.high_watermark = std::max(stats_.high_watermark, tasks_.size());
     }
     condition_.notify_one();
+    return true;
 }
 
-void RefinementWorkQueue::push_batch(const std::vector<RefinementTask> &tasks) {
+std::size_t RefinementWorkQueue::push_batch(const std::vector<RefinementTask> &tasks) {
     if (tasks.empty()) {
-        return;
+        return 0U;
     }
 
+    std::size_t pushed_count = 0U;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (shutdown_requested_) {
+            return 0U;
+        }
         for (const RefinementTask &task : tasks) {
             tasks_.push_back(task);
         }
         stats_.push_count += tasks.size();
+        pushed_count = tasks.size();
         stats_.high_watermark = std::max(stats_.high_watermark, tasks_.size());
     }
     condition_.notify_all();
+    return pushed_count;
 }
 
 bool RefinementWorkQueue::pop(RefinementTask &task) {
@@ -61,6 +71,21 @@ void RefinementWorkQueue::shutdown() {
         shutdown_requested_ = true;
     }
     condition_.notify_all();
+}
+
+bool RefinementWorkQueue::try_shutdown_if_idle() {
+    bool did_shutdown = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (tasks_.empty() && in_flight_tasks_ == 0U && !shutdown_requested_) {
+            shutdown_requested_ = true;
+            did_shutdown = true;
+        }
+    }
+    if (did_shutdown) {
+        condition_.notify_all();
+    }
+    return did_shutdown;
 }
 
 bool RefinementWorkQueue::empty() const {

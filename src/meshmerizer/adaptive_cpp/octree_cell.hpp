@@ -1264,6 +1264,7 @@ refine_octree_legacy_impl(
     std::uint32_t max_depth,
     const BoundingBox &domain,
     std::uint32_t base_resolution,
+    std::uint32_t worker_count = 1U,
     std::uint32_t minimum_usable_hermite_samples = 3U,
     double max_qef_rms_residual_ratio = 0.1,
     double min_normal_alignment_threshold = 0.97) {
@@ -1478,6 +1479,7 @@ refine_octree(
     std::uint32_t max_depth,
     const BoundingBox &domain,
     std::uint32_t base_resolution,
+    std::uint32_t worker_count = 1U,
     std::uint32_t minimum_usable_hermite_samples = 3U,
     double max_qef_rms_residual_ratio = 0.1,
     double min_normal_alignment_threshold = 0.97) {
@@ -1486,7 +1488,7 @@ refine_octree(
         max_depth,
         domain,
         base_resolution,
-        1U,
+        worker_count,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
@@ -1508,6 +1510,7 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
     std::uint32_t max_depth,
     const BoundingBox &domain,
     std::uint32_t base_resolution,
+    std::uint32_t worker_count = 1U,
     std::uint32_t minimum_usable_hermite_samples = 3U,
     double max_qef_rms_residual_ratio = 0.1,
     double min_normal_alignment_threshold = 0.97) {
@@ -1542,7 +1545,7 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
     return refine_octree(
         std::move(initial_cells), std::move(initial_contributors),
         positions, smoothing_lengths, isovalue, max_depth,
-        domain, base_resolution,
+        domain, base_resolution, worker_count,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold);

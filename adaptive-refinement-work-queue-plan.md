@@ -21,12 +21,11 @@ Rules for using this plan:
 
 ## Current Status
 
-- Current implementation phase: **Phase 4 preparation - Structural mutation
-  refactor before parallel workers**
+- Current implementation phase: **Phase 5 - Parallel Workers**
 - Work in progress now:
-  - strengthening queue lifecycle and idle-detection semantics
-  - hardening shared mutation paths under the new threaded scaffold
-  - prioritizing correctness over performance before enabling real parallel use
+  - Phase 4 is complete
+  - the next focus is thread-count robustness and parallel-worker correctness
+    checks rather than further architectural preparation
 
 Reporting-note:
 
@@ -34,7 +33,7 @@ Reporting-note:
   while Phase 2 serial closure correctness continues
 - Not started yet:
   - replacing regularization refinement paths
-  - parallel workers
+  - production-ready parallel workers
 
 ## Problem Statement
 
@@ -1276,11 +1275,16 @@ This phase is about algorithmic correctness, not speed.
 
 ## Phase 4 - Parallel Structural Mutation
 
-- [~] Refactor cell storage so parallel child creation is safe.
-- [~] Refactor contributor storage so concurrent append/reservation is safe.
-- [~] Ensure side-car state grows consistently with cell creation.
-- [ ] Publish child blocks atomically enough that workers never see partial
-      structure.
+- [x] Introduce a closure-side publisher abstraction.
+- [x] Introduce a closure-side storage backend abstraction.
+- [x] Introduce explicit reservation/publication boundaries for child slots.
+- [x] Add queue in-flight accounting and atomic shutdown-if-idle semantics.
+- [x] Introduce closure worker state and shared worker-step logic.
+- [x] Add a conservative threaded execution scaffold behind `worker_count`.
+- [x] Add coarse shared-mutation serialization for the threaded scaffold.
+- [x] Add a low-level threaded sphere smoke test.
+- [x] Finish the mutation/publication boundary review so child publication cannot
+      expose partial state to future finer-grained workers.
 
 ### Phase 4 progress update
 
@@ -1292,37 +1296,95 @@ This phase is about algorithmic correctness, not speed.
   child slots, with validation for child-slot publication order.
 - The serial closure loop has been refactored into clearer worker/coordinator
   helpers, which should make later multi-worker execution easier to introduce.
+- A conservative threaded execution scaffold now exists behind
+  `RefinementClosureConfig::worker_count`, but shared mutation is still
+  serialized and the path is not yet treated as production-ready parallelism.
+- Queue lifecycle has been strengthened with in-flight accounting and atomic
+  shutdown-if-idle semantics.
+- A low-level threaded sphere smoke test has succeeded through the native
+  `refine_octree` path with `worker_count=2`; this is a milestone for scaffold
+  viability, but not yet a substitute for real regression coverage.
 - A batched-contributor-publication experiment was attempted and then reverted
   after exposing instability in the regularization/integration path; for now,
   contributor publication remains structurally prepared for batching but not
   forced into a stronger ordering model.
 
+### Phase 4 exit criteria
+
+Phase 4 is complete when all of the following are true:
+
+1. shared mutation paths have explicit ownership boundaries
+2. queue lifecycle semantics are robust enough for multiple workers to drain the
+   queue without obvious race/lifecycle bugs
+3. the low-level threaded sphere regression passes reliably
+4. focused adaptive-core and watertight integration regressions remain green
+
+### Phase 4 completion note
+
+- Phase 4 is now considered complete.
+- The closure engine has explicit publication/storage abstractions, worker state,
+  queue lifecycle hardening, conservative shared-mutation serialization, and a
+  threaded sphere regression.
+- The code is now ready to move into Phase 5 thread-count robustness work.
+
 ## Phase 5 - Parallel Workers
 
-- [ ] Run multiple worker threads over the shared queue.
-- [ ] Make stale-task discard cheap and correct.
-- [ ] Ensure duplicate queue requests collapse via `required_depth` updates.
-- [ ] Add deterministic regression tests across thread counts.
-- [ ] Measure scaling and contention hotspots.
+- [ ] Add a direct correctness test comparing low-level refinement with
+      `worker_count=1` and `worker_count=2` on the same sphere setup.
+- [ ] Verify both threaded and serial runs satisfy the 2:1 balance invariant.
+- [ ] Verify both runs respect `max_depth`.
+- [ ] Verify both runs complete without deadlock or livelock.
+- [ ] Decide and document whether exact append-order determinism is required or
+      whether compatibility-level equivalence is sufficient.
+- [ ] Add at least one repeated threaded regression to catch flaky queue/worker
+      behavior.
+- [ ] Measure basic contention/scaling once correctness is trusted.
+
+### Phase 5 exit criteria
+
+Phase 5 is complete when all of the following are true:
+
+1. low-level threaded refinement has dedicated correctness regressions
+2. thread-count robustness checks pass for at least `worker_count=1` and `2`
+3. the acceptable determinism/compatibility target is explicitly documented
+4. no deadlock/livelock issues are observed in the threaded regression set
 
 ## Phase 6 - Pipeline Integration
 
-- [ ] Replace initial refinement entry points with the new closure-based engine.
-- [ ] Replace iterative refine-then-balance loops in regularization paths with
-      the same closure engine.
-- [ ] Remove explicit production calls to `balance_octree(...)` from the main
-      refinement flow.
-- [ ] Keep debug-only invariant verification available.
+- [ ] Confirm all initial octree refinement entry points use the closure engine.
+- [ ] Replace surface-band regularization refinement with the closure engine.
+- [ ] Replace thickening/pre-thickening refinement with the closure engine.
+- [ ] Keep debug-only invariant verification available after those replacements.
 - [ ] Replace queue-phase `ProgressCounter` output with periodic table rows.
 - [ ] Add and wire the `--table-cadence` CLI argument.
+- [ ] Verify the regularized sphere integration path still produces a watertight
+      mesh after the regularization/pre-thickening routing changes.
+
+### Phase 6 exit criteria
+
+Phase 6 is complete when all of the following are true:
+
+1. all intended production refinement paths use the closure engine
+2. no production path depends on a post-refinement `balance_octree(...)` call
+3. periodic table reporting replaces queue-phase progress-counter output
+4. the regularized sphere integration path remains green
 
 ## Phase 7 - Cleanup
 
-- [ ] Delete obsolete balance-specific scheduling code that the new engine
-      supersedes.
-- [ ] Retain only the pieces of old balance logic still needed for validation or
-      tests.
+- [ ] Delete obsolete balance-specific scheduling code superseded by the closure
+      engine.
+- [ ] Retain only the old balance logic still justified for validation/tests.
+- [ ] Remove dead or misleading helper paths introduced during intermediate
+      migration stages.
 - [ ] Update design docs and developer-facing architecture notes.
+
+### Phase 7 exit criteria
+
+Phase 7 is complete when all of the following are true:
+
+1. no obsolete production balance-scheduling path remains
+2. remaining old balance code has an explicit validation/test justification
+3. docs describe the final architecture rather than transitional states
 
 ## Validation Plan
 

@@ -781,6 +781,7 @@ def _build_sphere_octree(
     base_resolution=4,
     max_depth=2,
     isovalue=0.5,
+    worker_count=1,
 ):
     """Helper: build a refined octree from a cluster of particles.
 
@@ -829,6 +830,7 @@ def _build_sphere_octree(
         max_depth,
         domain=(domain_min, domain_max),
         base_resolution=base_resolution,
+        worker_count=worker_count,
     )
 
     return (
@@ -933,6 +935,19 @@ def test_refine_octree_quality_stop_preserves_mixed_leaf_depths() -> None:
     assert surface_leaf_depths, "Expected at least one surface leaf"
     assert any(depth < max_depth for depth in surface_leaf_depths)
     assert len(set(surface_leaf_depths)) > 1
+
+
+def test_refine_octree_threaded_sphere_smoke_test() -> None:
+    """Threaded low-level sphere refinement should remain balanced."""
+    cells, _, _, _, _, _, _, _, _ = _build_sphere_octree(
+        base_resolution=4,
+        max_depth=3,
+        worker_count=2,
+    )
+
+    assert len(cells) > 0
+    assert any(cell.get("is_leaf") for cell in cells)
+    assert _check_balance_invariant(cells) == []
 
 
 # ---------------------------------------------------------------------------
