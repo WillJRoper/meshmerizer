@@ -1412,7 +1412,7 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
     unsigned int max_depth = 0U;
     unsigned int base_resolution = 0U;
     unsigned int worker_count = 1U;
-    double table_cadence = 20.0;
+    double table_cadence = 10.0;
     unsigned int minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
@@ -2272,7 +2272,7 @@ static PyObject *run_octree_pipeline_py(
     unsigned int base_resolution = 0U;
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
-    double table_cadence = 20.0;
+    double table_cadence = 10.0;
     unsigned int minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
@@ -2853,7 +2853,7 @@ static PyObject *run_full_pipeline_py(
     double min_normal_alignment_threshold = 0.97;
     double min_feature_thickness = 0.0;
     double pre_thickening_radius = 0.0;
-    double table_cadence = 20.0;
+    double table_cadence = 10.0;
 
     if (!PyArg_ParseTuple(args, "OOOOIdI|dIddIdddd",
                           &positions_object,
@@ -2911,7 +2911,6 @@ static PyObject *run_full_pipeline_py(
             static_cast<std::uint32_t>(base_resolution),
             isovalue,
             static_cast<std::uint32_t>(max_depth),
-            table_cadence,
             static_cast<std::uint32_t>(smoothing_iterations),
             smoothing_strength,
             max_edge_ratio,
@@ -2919,7 +2918,8 @@ static PyObject *run_full_pipeline_py(
             max_qef_rms_residual_ratio,
             min_normal_alignment_threshold,
             min_feature_thickness,
-            pre_thickening_radius);
+            pre_thickening_radius,
+            table_cadence);
     } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
         PyEval_RestoreThread(_save);
         return raise_cancelled_exception();

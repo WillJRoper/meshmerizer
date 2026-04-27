@@ -864,7 +864,7 @@ refine_octree(
     const BoundingBox &domain,
     std::uint32_t base_resolution,
     std::uint32_t worker_count = 1U,
-    double table_cadence_seconds = 20.0,
+    double table_cadence_seconds = 10.0,
     std::uint32_t minimum_usable_hermite_samples = 3U,
     double max_qef_rms_residual_ratio = 0.1,
     double min_normal_alignment_threshold = 0.97) {
@@ -900,7 +900,7 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
     const BoundingBox &domain,
     std::uint32_t base_resolution,
     std::uint32_t worker_count = 1U,
-    double table_cadence_seconds = 20.0,
+    double table_cadence_seconds = 10.0,
     std::uint32_t minimum_usable_hermite_samples = 3U,
     double max_qef_rms_residual_ratio = 0.1,
     double min_normal_alignment_threshold = 0.97) {

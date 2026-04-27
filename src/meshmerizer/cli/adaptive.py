@@ -254,7 +254,7 @@ def _reconstruct_mesh(
     min_normal_alignment_threshold: float = 0.97,
     min_feature_thickness: float = 0.0,
     pre_thickening_radius: float = 0.0,
-    table_cadence: float = 20.0,
+    table_cadence: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Reconstruct and merge one or more particle groups for the CLI.
 
@@ -423,7 +423,7 @@ def _run_full_pipeline_path(
         ),
         min_feature_thickness=min_feature_thickness,
         pre_thickening_radius=pre_thickening_radius,
-        table_cadence=getattr(args, "table_cadence", 20.0),
+        table_cadence=getattr(args, "table_cadence", 10.0),
     )
     record_elapsed(
         "Mesh reconstruction core",
@@ -629,7 +629,7 @@ def _build_and_optionally_save_octree(
         ),
         min_feature_thickness=min_feature_thickness,
         pre_thickening_radius=pre_thickening_radius,
-        table_cadence=getattr(args, "table_cadence", 20.0),
+        table_cadence=getattr(args, "table_cadence", 10.0),
     )
     record_elapsed("Octree construction", tree_start, operation="Building")
 

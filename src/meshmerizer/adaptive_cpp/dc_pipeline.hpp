@@ -131,7 +131,7 @@ inline DCPipelineResult run_dc_pipeline(
     double min_normal_alignment_threshold = 0.97,
     double min_feature_thickness = 0.0,
     double pre_thickening_radius = 0.0,
-    double table_cadence_seconds = 20.0) {
+    double table_cadence_seconds = 10.0) {
 
     DCPipelineResult result;
     result.isovalue = isovalue;

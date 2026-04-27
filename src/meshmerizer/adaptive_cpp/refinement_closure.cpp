@@ -264,6 +264,20 @@ struct ClosureWorkerState {
     std::mutex &run_stats_mutex;
 };
 
+constexpr int kTableElapsedWidth = 9;
+constexpr int kTablePhaseWidth = 20;
+constexpr int kTableCountWidth = 12;
+
+inline void poll_closure_cancellation(
+    const ClosureWorkerState &worker,
+    std::size_t counter,
+    std::size_t interval) {
+    if (worker.config.worker_count > 1U) {
+        return;
+    }
+    meshmerizer_cancel_detail::poll_for_cancellation_serial(counter, interval);
+}
+
 class ClosureStatusReporter {
 public:
     ClosureStatusReporter(
@@ -279,6 +293,13 @@ public:
           stats_mutex_(stats_mutex),
           start_time_(std::chrono::steady_clock::now()),
           last_emit_(start_time_),
+          next_emit_(
+              start_time_ +
+              std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                  std::chrono::duration<double>(
+                      config.table_cadence_seconds > 0.0 ?
+                          config.table_cadence_seconds :
+                          0.0))),
           header_printed_(false) {}
 
     void maybe_emit() {
@@ -286,19 +307,62 @@ public:
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        const double elapsed_since_last =
-            std::chrono::duration<double>(now - last_emit_).count();
-        if (elapsed_since_last < config_.table_cadence_seconds) {
+        if (now < next_emit_) {
             return;
         }
         emit_row(now);
+        do {
+            next_emit_ +=
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(config_.table_cadence_seconds));
+        } while (next_emit_ <= now);
     }
 
     void finish() {
+        if (config_.table_cadence_seconds <= 0.0) {
+            return;
+        }
         emit_row(std::chrono::steady_clock::now());
     }
 
 private:
+    void emit_header() {
+        meshmerizer_log_detail::print_status(
+            config_.status_operation,
+            config_.status_function,
+            "queue status table follows (cadence=%.1fs, phase=%s)\n",
+            config_.table_cadence_seconds,
+            config_.phase_name.c_str());
+        meshmerizer_log_detail::print_status(
+            config_.status_operation,
+            config_.status_function,
+            "%*s %-*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s\n",
+            kTableElapsedWidth,
+            "elapsed_s",
+            kTablePhaseWidth,
+            "phase",
+            kTableCountWidth,
+            "queue",
+            kTableCountWidth,
+            "in_flight",
+            kTableCountWidth,
+            "pushed",
+            kTableCountWidth,
+            "popped",
+            kTableCountWidth,
+            "stale",
+            kTableCountWidth,
+            "processed",
+            kTableCountWidth,
+            "split",
+            kTableCountWidth,
+            "total_cells",
+            kTableCountWidth,
+            "required",
+            kTableCountWidth,
+            "peak_queue");
+    }
+
     void emit_row(const std::chrono::steady_clock::time_point &now) {
         const RefinementWorkQueueStats queue_stats = queue_.stats();
         ClosureRunStats run_stats_snapshot;
@@ -308,16 +372,7 @@ private:
         }
 
         if (!header_printed_) {
-            meshmerizer_log_detail::print_status(
-                config_.status_operation,
-                config_.status_function,
-                "queue status table follows (cadence=%.1fs, phase=%s)\n",
-                config_.table_cadence_seconds,
-                config_.phase_name.c_str());
-            meshmerizer_log_detail::print_status(
-                config_.status_operation,
-                config_.status_function,
-                "elapsed_s phase queue in_flight pushed popped stale processed split total_cells required_raises high_water\n");
+            emit_header();
             header_printed_ = true;
         }
 
@@ -326,18 +381,31 @@ private:
         meshmerizer_log_detail::print_status(
             config_.status_operation,
             config_.status_function,
-            "%8.1f %s %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu\n",
+            "%*.1f %-*.*s %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu\n",
+            kTableElapsedWidth,
             elapsed_seconds,
+            kTablePhaseWidth,
+            kTablePhaseWidth,
             config_.phase_name.c_str(),
+            kTableCountWidth,
             queue_stats.queue_size,
+            kTableCountWidth,
             queue_stats.in_flight_count,
+            kTableCountWidth,
             queue_stats.push_count,
+            kTableCountWidth,
             queue_stats.pop_count,
+            kTableCountWidth,
             run_stats_snapshot.stale_task_count,
+            kTableCountWidth,
             run_stats_snapshot.processed_leaf_count,
+            kTableCountWidth,
             run_stats_snapshot.split_count,
+            kTableCountWidth,
             context_.cells().size(),
+            kTableCountWidth,
             run_stats_snapshot.required_depth_raise_count,
+            kTableCountWidth,
             queue_stats.high_watermark);
         last_emit_ = now;
     }
@@ -349,6 +417,7 @@ private:
     std::mutex &stats_mutex_;
     std::chrono::steady_clock::time_point start_time_;
     std::chrono::steady_clock::time_point last_emit_;
+    std::chrono::steady_clock::time_point next_emit_;
     bool header_printed_;
 };
 
@@ -728,6 +797,7 @@ inline void maybe_shutdown_queue(ClosureWorkerState &worker) {
 inline void process_closure_task(
     const RefinementTask &task,
     ClosureWorkerState &worker) {
+    poll_closure_cancellation(worker, task.cell_index, 4096U);
     std::lock_guard<std::mutex> mutation_lock(worker.mutation_mutex);
     RefinementContext &context = worker.context;
     if (task.cell_index >= context.size()) {
@@ -811,7 +881,9 @@ inline void run_closure_worker_loop(
     ClosureWorkerState &worker,
     ClosureStatusReporter &reporter) {
     RefinementTask task;
+    std::size_t processed_count = 0U;
     while (true) {
+        poll_closure_cancellation(worker, processed_count, 4096U);
         std::lock_guard<std::mutex> worker_loop_lock(worker.worker_loop_mutex);
         if (!worker.queue.pop(task)) {
             break;
@@ -820,6 +892,7 @@ inline void run_closure_worker_loop(
         worker.queue.task_done();
         maybe_shutdown_queue(worker);
         reporter.maybe_emit();
+        ++processed_count;
     }
 }
 
@@ -901,6 +974,7 @@ refine_with_closure(
 
     RefinementWorkQueue queue;
     for (std::size_t cell_index = 0; cell_index < context.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
         if (context.raise_required_depth_to(
             cell_index,
             initial_cells[cell_index].depth)) {
@@ -952,6 +1026,7 @@ bool refine_surface_band_with_closure(
     RefinementWorkQueue queue;
     bool queued_any = false;
     for (std::size_t cell_index = 0; cell_index < context.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
         const OctreeCell &cell = context.cells()[cell_index];
         if (!cell.is_leaf || !cell.has_surface || cell.depth >= config.max_depth) {
             continue;
@@ -1020,6 +1095,7 @@ bool refine_thickening_band_with_closure(
     RefinementWorkQueue queue;
     bool queued_any = false;
     for (std::size_t cell_index = 0; cell_index < context.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
         const OctreeCell &cell = context.cells()[cell_index];
         if (!cell.is_leaf || cell.depth >= config.max_depth) {
             continue;
@@ -1086,6 +1162,7 @@ bool refine_cells_to_next_depth_with_closure(
     RefinementWorkQueue queue;
     bool queued_any = false;
     for (std::size_t cell_index : seed_cell_indices) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
         if (cell_index >= context.size()) {
             continue;
         }

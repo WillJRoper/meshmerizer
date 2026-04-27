@@ -102,7 +102,7 @@ def test_run_adaptive_passes_pre_thickening_radius(
 
     args = Namespace(
         nthreads=None,
-        table_cadence=20.0,
+        table_cadence=10.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -177,7 +177,7 @@ def test_run_adaptive_converts_pre_thickening_in_print_units(
 
     args = Namespace(
         nthreads=None,
-        table_cadence=20.0,
+        table_cadence=10.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -254,7 +254,7 @@ def test_run_adaptive_converts_regularization_lengths_for_loaded_octree(
 
     args = Namespace(
         nthreads=None,
-        table_cadence=20.0,
+        table_cadence=10.0,
         load_octree=tmp_path / "tree.hdf5",
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -361,7 +361,7 @@ def test_run_adaptive_allows_missing_filename_with_loaded_octree(
 
     args = Namespace(
         nthreads=None,
-        table_cadence=20.0,
+        table_cadence=10.0,
         load_octree=tmp_path / "tree.hdf5",
         save_octree=None,
         filename=None,
@@ -396,7 +396,7 @@ def test_run_adaptive_allows_missing_filename_with_loaded_octree(
 def test_run_adaptive_errors_when_no_input_source_is_given() -> None:
     args = Namespace(
         nthreads=None,
-        table_cadence=20.0,
+        table_cadence=10.0,
         load_octree=None,
         save_octree=None,
         filename=None,
@@ -503,7 +503,7 @@ def test_run_adaptive_removes_temporary_output_on_interrupt(
 
     args = Namespace(
         nthreads=None,
-        table_cadence=20.0,
+        table_cadence=10.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -594,7 +594,7 @@ def test_run_adaptive_applies_simplify_factor(monkeypatch, tmp_path) -> None:
 
     args = Namespace(
         nthreads=None,
-        table_cadence=20.0,
+        table_cadence=10.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),

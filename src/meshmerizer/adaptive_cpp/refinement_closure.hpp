@@ -18,7 +18,7 @@ struct RefinementClosureConfig {
     std::uint32_t minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
-    double table_cadence_seconds = 20.0;
+    double table_cadence_seconds = 10.0;
     std::string status_operation = "Building";
     std::string status_function = "refine_octree";
     std::string phase_name = "refine_octree";
