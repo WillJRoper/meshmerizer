@@ -27,16 +27,46 @@ struct PublishedChildren {
     std::vector<std::size_t> affected_indices;
 };
 
+class ClosureStorage {
+public:
+    explicit ClosureStorage(RefinementContext &context) : context_(context) {}
+
+    std::int64_t append_contributors(
+        const std::vector<std::size_t> &contributors,
+        std::int64_t &contrib_end_out) {
+        const std::int64_t contrib_begin =
+            static_cast<std::int64_t>(context_.contributors().size());
+        for (std::size_t contributor_index : contributors) {
+            context_.contributors().push_back(contributor_index);
+        }
+        contrib_end_out =
+            static_cast<std::int64_t>(context_.contributors().size());
+        return contrib_begin;
+    }
+
+    std::size_t append_cell(OctreeCell cell) {
+        const std::size_t new_index = context_.cells().size();
+        context_.cells().push_back(std::move(cell));
+        context_.sync_cell_state_size();
+        return new_index;
+    }
+
+    RefinementContext &context() { return context_; }
+
+private:
+    RefinementContext &context_;
+};
+
 class ClosurePublisher {
 public:
     ClosurePublisher(
-        RefinementContext &context,
+        ClosureStorage &storage,
         BalanceSpatialHash &hash,
         RefinementWorkQueue &queue,
         const std::vector<Vector3d> &positions,
         const std::vector<double> &smoothing_lengths,
         double isovalue)
-        : context_(context),
+        : storage_(storage),
           hash_(hash),
           queue_(queue),
           positions_(positions),
@@ -58,14 +88,9 @@ public:
              child_index < source_children.size();
              ++child_index) {
             OctreeCell child = source_children[child_index];
-            const std::int64_t contrib_begin =
-                static_cast<std::int64_t>(context_.contributors().size());
-            for (std::size_t contributor_index :
-                 source_child_contributors[child_index]) {
-                context_.contributors().push_back(contributor_index);
-            }
-            const std::int64_t contrib_end =
-                static_cast<std::int64_t>(context_.contributors().size());
+            std::int64_t contrib_end = 0;
+            const std::int64_t contrib_begin = storage_.append_contributors(
+                source_child_contributors[child_index], contrib_end);
 
             child.contributor_begin = contrib_begin;
             child.contributor_end = contrib_end;
@@ -88,16 +113,14 @@ public:
                     child.corner_values, isovalue_);
             }
 
-            const std::size_t new_index = context_.cells().size();
-            context_.cells().push_back(child);
-            context_.sync_cell_state_size();
-            context_.raise_required_depth_to(
+            const std::size_t new_index = storage_.append_cell(child);
+            storage_.context().raise_required_depth_to(
                 new_index,
                 std::max(child.depth, parent_required_depth));
-            if (context_.mark_queued(new_index)) {
+            if (storage_.context().mark_queued(new_index)) {
                 queue_.push({
                     new_index,
-                    context_.get_required_depth(new_index),
+                    storage_.context().get_required_depth(new_index),
                     0U,
                 });
             }
@@ -114,7 +137,7 @@ public:
     }
 
 private:
-    RefinementContext &context_;
+    ClosureStorage &storage_;
     BalanceSpatialHash &hash_;
     RefinementWorkQueue &queue_;
     const std::vector<Vector3d> &positions_;
@@ -402,8 +425,9 @@ inline void apply_balance_split(
     hash.quantize(parent_snapshot.bounds.min, pgx, pgy, pgz);
     hash.map.erase(balance_pack_coords(pgx, pgy, pgz));
 
+    ClosureStorage storage(context);
     ClosurePublisher publisher(
-        context, hash, queue, positions, smoothing_lengths, config.isovalue);
+        storage, hash, queue, positions, smoothing_lengths, config.isovalue);
 
     const PublishedChildren published =
         publisher.publish_children(
@@ -448,8 +472,9 @@ inline void apply_surface_split(
     hash.quantize(parent_snapshot.bounds.min, pgx, pgy, pgz);
     hash.map.erase(balance_pack_coords(pgx, pgy, pgz));
 
+    ClosureStorage storage(context);
     ClosurePublisher publisher(
-        context, hash, queue, positions, smoothing_lengths, config.isovalue);
+        storage, hash, queue, positions, smoothing_lengths, config.isovalue);
 
     const PublishedChildren published =
         publisher.publish_children(
