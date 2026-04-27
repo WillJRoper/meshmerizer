@@ -24,8 +24,8 @@ Rules for using this plan:
 - Current implementation phase: **Phase 3 - Tree-Guided Neighbor Traversal**
 - Work in progress now:
   - beginning Phase 4 preparation work
-  - introducing a closure-side storage backend object
-  - separating storage mutation from publication policy
+  - introducing reservation/publication style storage APIs
+  - reducing dependence on one-by-one append semantics
 
 Reporting-note:
 

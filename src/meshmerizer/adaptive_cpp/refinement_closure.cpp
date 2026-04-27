@@ -31,24 +31,35 @@ class ClosureStorage {
 public:
     explicit ClosureStorage(RefinementContext &context) : context_(context) {}
 
-    std::int64_t append_contributors(
+    std::pair<std::int64_t, std::int64_t> publish_contributors(
         const std::vector<std::size_t> &contributors,
-        std::int64_t &contrib_end_out) {
+        std::size_t reserve_hint = 0U) {
+        if (reserve_hint > 0U) {
+            context_.contributors().reserve(
+                context_.contributors().size() + reserve_hint);
+        }
         const std::int64_t contrib_begin =
             static_cast<std::int64_t>(context_.contributors().size());
         for (std::size_t contributor_index : contributors) {
             context_.contributors().push_back(contributor_index);
         }
-        contrib_end_out =
+        const std::int64_t contrib_end =
             static_cast<std::int64_t>(context_.contributors().size());
-        return contrib_begin;
+        return {contrib_begin, contrib_end};
     }
 
-    std::size_t append_cell(OctreeCell cell) {
+    std::size_t publish_cell(OctreeCell cell) {
         const std::size_t new_index = context_.cells().size();
         context_.cells().push_back(std::move(cell));
         context_.sync_cell_state_size();
         return new_index;
+    }
+
+    void reserve_children(std::size_t child_count) {
+        if (child_count == 0U) {
+            return;
+        }
+        context_.cells().reserve(context_.cells().size() + child_count);
     }
 
     RefinementContext &context() { return context_; }
@@ -83,14 +94,16 @@ public:
         published.affected_indices.reserve(1U + source_children.size());
         published.affected_indices.push_back(parent_index);
         published.child_indices.reserve(source_children.size());
+        storage_.reserve_children(source_children.size());
 
         for (std::size_t child_index = 0;
              child_index < source_children.size();
              ++child_index) {
             OctreeCell child = source_children[child_index];
-            std::int64_t contrib_end = 0;
-            const std::int64_t contrib_begin = storage_.append_contributors(
-                source_child_contributors[child_index], contrib_end);
+            const auto [contrib_begin, contrib_end] =
+                storage_.publish_contributors(
+                    source_child_contributors[child_index],
+                    source_child_contributors[child_index].size());
 
             child.contributor_begin = contrib_begin;
             child.contributor_end = contrib_end;
@@ -113,7 +126,7 @@ public:
                     child.corner_values, isovalue_);
             }
 
-            const std::size_t new_index = storage_.append_cell(child);
+            const std::size_t new_index = storage_.publish_cell(child);
             storage_.context().raise_required_depth_to(
                 new_index,
                 std::max(child.depth, parent_required_depth));
