@@ -1486,6 +1486,7 @@ refine_octree(
         max_depth,
         domain,
         base_resolution,
+        1U,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,

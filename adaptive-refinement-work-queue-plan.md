@@ -25,7 +25,8 @@ Rules for using this plan:
   refactor before parallel workers**
 - Work in progress now:
   - strengthening queue lifecycle and idle-detection semantics
-  - preparing the coordinator loop for later multi-worker execution
+  - adding the first conservative multi-worker execution scaffold
+  - keeping worker logic shared while threaded orchestration is introduced
 
 Reporting-note:
 

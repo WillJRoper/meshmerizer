@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <set>
 #include <span>
+#include <thread>
 
 #include "octree_cell.hpp"
 #include "refinement_context.hpp"
@@ -674,6 +675,15 @@ inline void process_closure_task(
     maybe_shutdown_queue(worker);
 }
 
+inline void run_closure_worker_loop(ClosureWorkerState &worker) {
+    RefinementTask task;
+    while (worker.queue.pop(task)) {
+        process_closure_task(task, worker);
+        worker.queue.task_done();
+        maybe_shutdown_queue(worker);
+    }
+}
+
 }  // namespace
 
 std::pair<std::vector<OctreeCell>, std::vector<std::size_t>>
@@ -718,11 +728,21 @@ refine_with_closure(
         queue,
     };
 
-    RefinementTask task;
-    while (queue.pop(task)) {
-        process_closure_task(task, worker);
-        queue.task_done();
-        maybe_shutdown_queue(worker);
+    if (config.worker_count <= 1U) {
+        run_closure_worker_loop(worker);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(config.worker_count);
+        for (std::uint32_t worker_index = 0;
+             worker_index < config.worker_count;
+             ++worker_index) {
+            workers.emplace_back([&worker]() {
+                run_closure_worker_loop(worker);
+            });
+        }
+        for (std::thread &thread : workers) {
+            thread.join();
+        }
     }
 
     return {
