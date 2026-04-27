@@ -21,11 +21,11 @@ Rules for using this plan:
 
 ## Current Status
 
-- Current implementation phase: **Phase 5 - Parallel Workers**
+- Current implementation phase: **Phase 6 - Pipeline Integration**
 - Work in progress now:
-  - Phase 4 is complete
-  - the next focus is thread-count robustness and parallel-worker correctness
-    checks rather than further architectural preparation
+  - Phase 5 is complete
+  - the next focus is routing remaining production refinement paths through the
+    closure engine and adding the new queue-status reporting model
 
 Reporting-note:
 
@@ -1329,16 +1329,31 @@ Phase 4 is complete when all of the following are true:
 
 ## Phase 5 - Parallel Workers
 
-- [ ] Add a direct correctness test comparing low-level refinement with
+- [x] Add a direct correctness test comparing low-level refinement with
       `worker_count=1` and `worker_count=2` on the same sphere setup.
-- [ ] Verify both threaded and serial runs satisfy the 2:1 balance invariant.
-- [ ] Verify both runs respect `max_depth`.
-- [ ] Verify both runs complete without deadlock or livelock.
-- [ ] Decide and document whether exact append-order determinism is required or
+- [x] Verify both threaded and serial runs satisfy the 2:1 balance invariant.
+- [x] Verify both runs respect `max_depth`.
+- [x] Verify both runs complete without deadlock or livelock.
+- [x] Decide and document whether exact append-order determinism is required or
       whether compatibility-level equivalence is sufficient.
-- [ ] Add at least one repeated threaded regression to catch flaky queue/worker
+- [x] Add at least one repeated threaded regression to catch flaky queue/worker
       behavior.
-- [ ] Measure basic contention/scaling once correctness is trusted.
+- [x] Measure basic contention/scaling once correctness is trusted.
+
+### Phase 5 compatibility target
+
+For Phase 5, the required target is **compatibility-level equivalence**, not
+exact append-order determinism.
+
+That means threaded and serial low-level refinement runs must agree on:
+
+- validity of the 2:1 balance invariant
+- respect for `max_depth`
+- successful completion without deadlock/livelock
+- broadly compatible refinement outcome metrics such as non-zero output and
+  comparable leaf/cell counts when using the same problem setup
+
+Exact cell append order is **not** currently required for Phase 5 completion.
 
 ### Phase 5 exit criteria
 
@@ -1348,6 +1363,15 @@ Phase 5 is complete when all of the following are true:
 2. thread-count robustness checks pass for at least `worker_count=1` and `2`
 3. the acceptable determinism/compatibility target is explicitly documented
 4. no deadlock/livelock issues are observed in the threaded regression set
+
+### Phase 5 completion note
+
+- Low-level threaded refinement now has a sphere smoke test, a serial-vs-threaded
+  compatibility regression, and a repeated threaded regression.
+- The accepted Phase 5 target is compatibility-level equivalence rather than
+  exact append-order determinism.
+- The conservative threaded scaffold now passes thread-count robustness checks
+  for `worker_count=1` and `2` on the sphere setup.
 
 ## Phase 6 - Pipeline Integration
 

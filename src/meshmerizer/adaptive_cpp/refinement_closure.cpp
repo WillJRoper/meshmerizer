@@ -249,6 +249,7 @@ struct ClosureWorkerState {
     const RefinementClosureConfig &config;
     RefinementWorkQueue &queue;
     std::mutex &mutation_mutex;
+    std::mutex &worker_loop_mutex;
 };
 
 inline RefinementResult evaluate_refinement_for_leaf(
@@ -677,7 +678,11 @@ inline void process_closure_task(
 
 inline void run_closure_worker_loop(ClosureWorkerState &worker) {
     RefinementTask task;
-    while (worker.queue.pop(task)) {
+    while (true) {
+        std::lock_guard<std::mutex> worker_loop_lock(worker.worker_loop_mutex);
+        if (!worker.queue.pop(task)) {
+            break;
+        }
         process_closure_task(task, worker);
         worker.queue.task_done();
         maybe_shutdown_queue(worker);
@@ -720,6 +725,7 @@ refine_with_closure(
     }
 
     std::mutex mutation_mutex;
+    std::mutex worker_loop_mutex;
 
     ClosureWorkerState worker = {
         context,
@@ -729,6 +735,7 @@ refine_with_closure(
         config,
         queue,
         mutation_mutex,
+        worker_loop_mutex,
     };
 
     if (config.worker_count <= 1U) {

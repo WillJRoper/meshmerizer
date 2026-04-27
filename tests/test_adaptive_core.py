@@ -950,6 +950,64 @@ def test_refine_octree_threaded_sphere_smoke_test() -> None:
     assert _check_balance_invariant(cells) == []
 
 
+def test_refine_octree_thread_count_compatibility_on_sphere() -> None:
+    """Serial and threaded sphere refinement should remain compatibility-equivalent."""
+    serial_cells, _, _, _, _, _, _, max_depth, _ = _build_sphere_octree(
+        base_resolution=4,
+        max_depth=3,
+        worker_count=1,
+    )
+    threaded_cells, _, _, _, _, _, _, _, _ = _build_sphere_octree(
+        base_resolution=4,
+        max_depth=3,
+        worker_count=2,
+    )
+
+    assert _check_balance_invariant(serial_cells) == []
+    assert _check_balance_invariant(threaded_cells) == []
+
+    serial_leaf_depths = [
+        cell["depth"] for cell in serial_cells if cell.get("is_leaf")
+    ]
+    threaded_leaf_depths = [
+        cell["depth"] for cell in threaded_cells if cell.get("is_leaf")
+    ]
+
+    assert serial_leaf_depths
+    assert threaded_leaf_depths
+    assert max(serial_leaf_depths) <= max_depth
+    assert max(threaded_leaf_depths) <= max_depth
+
+    serial_leaf_count = sum(1 for cell in serial_cells if cell.get("is_leaf"))
+    threaded_leaf_count = sum(
+        1 for cell in threaded_cells if cell.get("is_leaf")
+    )
+
+    assert len(serial_cells) > 0
+    assert len(threaded_cells) > 0
+    assert serial_leaf_count > 0
+    assert threaded_leaf_count > 0
+    assert abs(len(serial_cells) - len(threaded_cells)) <= max(
+        1, len(serial_cells) // 20
+    )
+    assert abs(serial_leaf_count - threaded_leaf_count) <= max(
+        1, serial_leaf_count // 20
+    )
+
+
+def test_refine_octree_threaded_sphere_smoke_test_repeated() -> None:
+    """Repeated threaded sphere runs should stay balanced and complete."""
+    for _ in range(3):
+        cells, _, _, _, _, _, _, _, _ = _build_sphere_octree(
+            base_resolution=4,
+            max_depth=3,
+            worker_count=2,
+        )
+
+        assert len(cells) > 0
+        assert _check_balance_invariant(cells) == []
+
+
 # ---------------------------------------------------------------------------
 # NumPy buffer-protocol tests
 # ---------------------------------------------------------------------------
