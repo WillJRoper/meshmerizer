@@ -24,8 +24,8 @@ Rules for using this plan:
 - Current implementation phase: **Phase 3 - Tree-Guided Neighbor Traversal**
 - Work in progress now:
   - beginning Phase 4 preparation work
-  - isolating child publication and contributor append behind cleaner helper
-    boundaries
+  - introducing a shared closure-side publication abstraction
+  - reducing direct raw storage mutation in split paths
 
 Reporting-note:
 
