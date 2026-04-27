@@ -40,8 +40,19 @@ bool RefinementWorkQueue::pop(RefinementTask &task) {
 
     task = tasks_.front();
     tasks_.pop_front();
+    ++in_flight_tasks_;
     ++stats_.pop_count;
     return true;
+}
+
+void RefinementWorkQueue::task_done() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (in_flight_tasks_ > 0U) {
+            --in_flight_tasks_;
+        }
+    }
+    condition_.notify_all();
 }
 
 void RefinementWorkQueue::shutdown() {
@@ -60,6 +71,11 @@ bool RefinementWorkQueue::empty() const {
 bool RefinementWorkQueue::is_shutdown() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return shutdown_requested_;
+}
+
+bool RefinementWorkQueue::is_idle() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return tasks_.empty() && in_flight_tasks_ == 0U;
 }
 
 RefinementWorkQueueStats RefinementWorkQueue::stats() const {

@@ -606,7 +606,7 @@ inline void apply_surface_split(
 }
 
 inline void maybe_shutdown_queue(ClosureWorkerState &worker) {
-    if (worker.queue.empty()) {
+    if (worker.queue.is_idle()) {
         worker.queue.shutdown();
     }
 }
@@ -721,6 +721,8 @@ refine_with_closure(
     RefinementTask task;
     while (queue.pop(task)) {
         process_closure_task(task, worker);
+        queue.task_done();
+        maybe_shutdown_queue(worker);
     }
 
     return {

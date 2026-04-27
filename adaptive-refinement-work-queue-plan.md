@@ -24,10 +24,8 @@ Rules for using this plan:
 - Current implementation phase: **Phase 4 preparation - Structural mutation
   refactor before parallel workers**
 - Work in progress now:
-  - refactoring the serial closure engine toward cleaner worker/coordinator and
-    publication/storage boundaries
-  - preparing the control flow and mutation surfaces for later multi-worker
-    execution
+  - strengthening queue lifecycle and idle-detection semantics
+  - preparing the coordinator loop for later multi-worker execution
 
 Reporting-note:
 

@@ -62,6 +62,9 @@ public:
      */
     bool pop(RefinementTask &task);
 
+    /** Mark one previously popped task as completed. */
+    void task_done();
+
     /** Request queue shutdown and wake all waiters. */
     void shutdown();
 
@@ -71,6 +74,9 @@ public:
     /** Return whether shutdown has been requested. */
     bool is_shutdown() const;
 
+    /** Return true when no queued or in-flight work remains. */
+    bool is_idle() const;
+
     /** Return a snapshot of queue statistics. */
     RefinementWorkQueueStats stats() const;
 
@@ -78,6 +84,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable condition_;
     std::deque<RefinementTask> tasks_;
+    std::size_t in_flight_tasks_ = 0U;
     bool shutdown_requested_ = false;
     RefinementWorkQueueStats stats_;
 };
