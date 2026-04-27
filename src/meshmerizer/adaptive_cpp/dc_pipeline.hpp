@@ -130,7 +130,8 @@ inline DCPipelineResult run_dc_pipeline(
     double max_qef_rms_residual_ratio = 0.1,
     double min_normal_alignment_threshold = 0.97,
     double min_feature_thickness = 0.0,
-    double pre_thickening_radius = 0.0) {
+    double pre_thickening_radius = 0.0,
+    double table_cadence_seconds = 20.0) {
 
     DCPipelineResult result;
     result.isovalue = isovalue;
@@ -225,6 +226,8 @@ inline DCPipelineResult run_dc_pipeline(
         max_depth,
         domain,
         base_resolution,
+        1U,
+        table_cadence_seconds,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold);
@@ -286,7 +289,9 @@ inline DCPipelineResult run_dc_pipeline(
             if (!refine_surface_band_cells(
                     all_cells, all_contributors, positions,
                     smoothing_lengths, isovalue, max_depth,
+                    domain, base_resolution,
                     max_surface_leaf_size,
+                    table_cadence_seconds,
                     minimum_usable_hermite_samples,
                     max_qef_rms_residual_ratio,
                     min_normal_alignment_threshold)) {
@@ -304,16 +309,6 @@ inline DCPipelineResult run_dc_pipeline(
                 regularization_refine_pass,
                 elapsed_seconds_since(surface_refine_pass_start));
         }
-
-        meshmerizer_log_detail::print_debug_status(
-            "Regularization",
-            "run_dc_pipeline",
-            "targeted refinement complete; starting final balance "
-            "(total_cells=%zu)\n",
-            all_cells.size());
-        balance_octree(
-            all_cells, all_contributors, positions, smoothing_lengths,
-            isovalue, domain, base_resolution, max_depth);
 
         LeafSpatialIndex solid_spatial_index;
         solid_spatial_index.build(all_cells, domain, max_depth, base_resolution);
@@ -363,9 +358,11 @@ inline DCPipelineResult run_dc_pipeline(
                 if (!refine_thickening_band_cells(
                         all_cells, all_contributors, positions,
                         smoothing_lengths, isovalue, max_depth,
+                        domain, base_resolution,
                         thickening_leaf_size_target, solid_leaves,
                         inside_mask, thickening_distance,
                         pre_thickening_radius,
+                        table_cadence_seconds,
                         minimum_usable_hermite_samples,
                         max_qef_rms_residual_ratio,
                         min_normal_alignment_threshold,
@@ -385,23 +382,6 @@ inline DCPipelineResult run_dc_pipeline(
                     thickening_refine_pass,
                     elapsed_seconds_since(thickening_refine_start));
 
-                meshmerizer_log_detail::print_debug_status(
-                    "Regularization",
-                    "run_dc_pipeline",
-                    "pre-thickening: balancing octree after growth-band "
-                    "refinement (total_cells=%zu)\n",
-                    all_cells.size());
-                const auto balance_start = std::chrono::steady_clock::now();
-                balance_octree(
-                    all_cells, all_contributors, positions, smoothing_lengths,
-                    isovalue, domain, base_resolution, max_depth,
-                    &dirty_cells);
-                meshmerizer_log_detail::print_debug_status(
-                    "Timing",
-                    "run_dc_pipeline",
-                    "Pre-thickening balance pass %zu: %.3f s\n",
-                    thickening_refine_pass,
-                    elapsed_seconds_since(balance_start));
                 const auto reclassify_start = std::chrono::steady_clock::now();
                 solid_spatial_index.build(
                     all_cells, domain, max_depth, base_resolution);
@@ -670,7 +650,7 @@ inline DCPipelineResult run_dc_pipeline(
     while (refine_zero_sample_incident_cells(
         all_cells, all_contributors, positions, smoothing_lengths,
         spatial_index, max_depth, base_resolution, isovalue,
-        domain)) {
+        domain, table_cadence_seconds)) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(
             qef_vertices.size() + all_cells.size());
         spatial_index.build(all_cells, domain, max_depth, base_resolution);

@@ -172,6 +172,7 @@ def refine_octree(
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
+    table_cadence: float = 20.0,
 ) -> tuple[tuple[dict[str, object], ...], tuple[int, ...]]:
     """Refine the octree using breadth-first refinement.
 
@@ -186,6 +187,8 @@ def refine_octree(
         worker_count: Experimental worker count for the native closure engine.
             Defaults to ``1`` and is primarily intended for testing and
             diagnostics while the threaded path is still being hardened.
+        table_cadence: Strict time cadence in seconds for queue-status table
+            rows emitted by queue-driven refinement. Defaults to ``20.0``.
         minimum_usable_hermite_samples: Minimum usable Hermite sample count.
         max_qef_rms_residual_ratio: Maximum acceptable RMS QEF residual ratio.
         min_normal_alignment_threshold: Minimum acceptable normal alignment.
@@ -204,6 +207,7 @@ def refine_octree(
         domain,
         base_resolution,
         worker_count,
+        table_cadence,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
@@ -328,6 +332,7 @@ def run_octree_pipeline(
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
+    table_cadence: float = 20.0,
 ) -> tuple["numpy.ndarray", "numpy.ndarray"]:
     """Run the octree pipeline in C++ and return QEF vertices.
 
@@ -339,6 +344,8 @@ def run_octree_pipeline(
         base_resolution: Number of top-level cells per axis.
         isovalue: Scalar field threshold.
         max_depth: Maximum permitted refinement depth.
+        table_cadence: Strict time cadence in seconds for queue-status table
+            rows emitted by queue-driven refinement. Defaults to ``20.0``.
         minimum_usable_hermite_samples: Minimum usable Hermite sample count.
         max_qef_rms_residual_ratio: Maximum acceptable RMS QEF residual ratio.
         min_normal_alignment_threshold: Minimum acceptable normal alignment.
@@ -356,6 +363,7 @@ def run_octree_pipeline(
         base_resolution,
         isovalue,
         max_depth,
+        table_cadence,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
@@ -373,6 +381,7 @@ def build_refined_tree(
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
+    table_cadence: float = 20.0,
 ) -> tuple[tuple[dict[str, object], ...], "numpy.ndarray"]:
     """Build and refine the adaptive tree in C++ and return resumable state.
 
@@ -384,6 +393,8 @@ def build_refined_tree(
         base_resolution: Number of top-level cells per axis.
         isovalue: Scalar field threshold used for split decisions.
         max_depth: Maximum permitted refinement depth.
+        table_cadence: Strict time cadence in seconds for queue-status table
+            rows emitted by queue-driven refinement. Defaults to ``20.0``.
         minimum_usable_hermite_samples: Minimum usable Hermite sample count.
         max_qef_rms_residual_ratio: Maximum acceptable RMS QEF residual ratio.
         min_normal_alignment_threshold: Minimum acceptable normal alignment.
@@ -406,6 +417,7 @@ def build_refined_tree(
         base_resolution,
         isovalue,
         max_depth,
+        table_cadence,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,

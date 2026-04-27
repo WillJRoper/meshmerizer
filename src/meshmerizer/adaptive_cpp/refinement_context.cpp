@@ -93,6 +93,14 @@ std::vector<OctreeCell> &RefinementContext::cells() {
     return all_cells_;
 }
 
+const std::vector<OctreeCell> &RefinementContext::cells() const {
+    return all_cells_;
+}
+
 std::vector<std::size_t> &RefinementContext::contributors() {
+    return all_contributors_;
+}
+
+const std::vector<std::size_t> &RefinementContext::contributors() const {
     return all_contributors_;
 }

@@ -102,6 +102,7 @@ def test_run_adaptive_passes_pre_thickening_radius(
 
     args = Namespace(
         nthreads=None,
+        table_cadence=20.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -176,6 +177,7 @@ def test_run_adaptive_converts_pre_thickening_in_print_units(
 
     args = Namespace(
         nthreads=None,
+        table_cadence=20.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -252,6 +254,7 @@ def test_run_adaptive_converts_regularization_lengths_for_loaded_octree(
 
     args = Namespace(
         nthreads=None,
+        table_cadence=20.0,
         load_octree=tmp_path / "tree.hdf5",
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -305,6 +308,14 @@ def test_build_parser_supports_top_level_help() -> None:
     assert excinfo.value.code == 0
 
 
+def test_build_parser_accepts_table_cadence() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(["snapshot.hdf5", "--table-cadence", "7.5"])
+
+    assert args.table_cadence == pytest.approx(7.5)
+
+
 def test_main_without_arguments_prints_usage(capsys) -> None:
     with pytest.raises(SystemExit) as excinfo:
         main([])
@@ -350,6 +361,7 @@ def test_run_adaptive_allows_missing_filename_with_loaded_octree(
 
     args = Namespace(
         nthreads=None,
+        table_cadence=20.0,
         load_octree=tmp_path / "tree.hdf5",
         save_octree=None,
         filename=None,
@@ -384,6 +396,7 @@ def test_run_adaptive_allows_missing_filename_with_loaded_octree(
 def test_run_adaptive_errors_when_no_input_source_is_given() -> None:
     args = Namespace(
         nthreads=None,
+        table_cadence=20.0,
         load_octree=None,
         save_octree=None,
         filename=None,
@@ -490,6 +503,7 @@ def test_run_adaptive_removes_temporary_output_on_interrupt(
 
     args = Namespace(
         nthreads=None,
+        table_cadence=20.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -580,6 +594,7 @@ def test_run_adaptive_applies_simplify_factor(monkeypatch, tmp_path) -> None:
 
     args = Namespace(
         nthreads=None,
+        table_cadence=20.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),

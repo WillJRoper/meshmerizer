@@ -81,8 +81,14 @@ public:
     /** Expose the octree cell storage used by the closure driver. */
     std::vector<OctreeCell> &cells();
 
+    /** Expose the octree cell storage used by the closure driver. */
+    const std::vector<OctreeCell> &cells() const;
+
     /** Expose the flat contributor storage used by the closure driver. */
     std::vector<std::size_t> &contributors();
+
+    /** Expose the flat contributor storage used by the closure driver. */
+    const std::vector<std::size_t> &contributors() const;
 
 private:
     std::vector<OctreeCell> &all_cells_;

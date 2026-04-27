@@ -24,16 +24,21 @@ Rules for using this plan:
 - Current implementation phase: **Phase 6 - Pipeline Integration**
 - Work in progress now:
   - Phase 5 is complete
-  - the next focus is routing remaining production refinement paths through the
-    closure engine and adding the new queue-status reporting model
+  - initial refinement routes through the closure engine
+  - surface-band regularization refinement routes through the closure engine
+  - thickening/pre-thickening refinement routes through the closure engine
+  - zero-sample incident refinement now routes through the closure engine
+  - queue-phase reporting now uses periodic table rows with configurable cadence
+  - the next immediate target is confirming the remaining production-path audit
+    and preparing the cleanup wave
 
 Reporting-note:
 
-- periodic table reporting remains planned work, but is intentionally deferred
-  while Phase 2 serial closure correctness continues
+- queue-driven refinement now emits coordinator-side table rows on a strict
+  time cadence
+- CLI/native plumbing for `table_cadence` is now present
 - Not started yet:
-  - replacing regularization refinement paths
-  - production-ready parallel workers
+  - production-ready parallel workers beyond the current conservative scaffold
 
 ## Problem Statement
 
@@ -1375,14 +1380,31 @@ Phase 5 is complete when all of the following are true:
 
 ## Phase 6 - Pipeline Integration
 
-- [ ] Confirm all initial octree refinement entry points use the closure engine.
-- [ ] Replace surface-band regularization refinement with the closure engine.
-- [ ] Replace thickening/pre-thickening refinement with the closure engine.
+- [x] Confirm all initial octree refinement entry points use the closure engine.
+- [x] Replace surface-band regularization refinement with the closure engine.
+- [x] Replace thickening/pre-thickening refinement with the closure engine.
 - [ ] Keep debug-only invariant verification available after those replacements.
-- [ ] Replace queue-phase `ProgressCounter` output with periodic table rows.
-- [ ] Add and wire the `--table-cadence` CLI argument.
-- [ ] Verify the regularized sphere integration path still produces a watertight
+- [x] Replace queue-phase `ProgressCounter` output with periodic table rows.
+- [x] Add and wire the `--table-cadence` CLI argument.
+- [x] Verify the regularized sphere integration path still produces a watertight
       mesh after the regularization/pre-thickening routing changes.
+
+### Phase 6 progress update
+
+- Initial octree refinement, surface-band refinement, thickening-band
+  refinement, and zero-sample incident refinement now all route through the
+  closure engine.
+- The zero-sample incident repair path in `faces.hpp` no longer performs
+  split-then-balance manually; it now submits those leaves to the same closure
+  scheduler.
+- Queue-driven refinement now emits coordinator-side table rows containing
+  queue size, in-flight work, pushed/popped counts, stale tasks, processed
+  leaves, split count, total cell count, required-depth raises, and high-water
+  mark.
+- The cadence is strictly time-based, exposed through Python/native/CLI
+  plumbing as `table_cadence` / `--table-cadence`.
+- The regularized sphere watertightness guardrail remains green after the
+  reporting and zero-sample incident-path routing changes.
 
 ### Phase 6 exit criteria
 
@@ -1395,12 +1417,28 @@ Phase 6 is complete when all of the following are true:
 
 ## Phase 7 - Cleanup
 
-- [ ] Delete obsolete balance-specific scheduling code superseded by the closure
+- [x] Delete obsolete balance-specific scheduling code superseded by the closure
       engine.
-- [ ] Retain only the old balance logic still justified for validation/tests.
-- [ ] Remove dead or misleading helper paths introduced during intermediate
+- [x] Retain only the old balance logic still justified for validation/tests.
+- [x] Remove dead or misleading helper paths introduced during intermediate
       migration stages.
-- [ ] Update design docs and developer-facing architecture notes.
+- [x] Update design docs and developer-facing architecture notes.
+
+### Phase 7 progress update
+
+- `_adaptive.cpp` topology/extraction helper paths now call the closure-backed
+  refinement entry points directly and no longer stage an explicit production
+  `balance_octree(...)` step.
+- `octree_cell.hpp` no longer carries the obsolete serial balance scheduler or
+  the legacy breadth-first `refine_octree_legacy_impl(...)` path.
+- Removed cleanup targets include `needs_balance_split(...)`,
+  `enqueue_balance_neighbors(...)`, `balance_octree(...)`, and
+  `refine_octree_legacy_impl(...)`.
+- Retained helpers are limited to pieces still used by the final architecture:
+  `split_octree_leaf(...)` remains a structural split primitive and
+  `BalanceSpatialHash` remains the closure engine's leaf lookup structure.
+- Developer-facing notes in `octree_cell.hpp` now describe closure propagation
+  support rather than the old refine-then-balance architecture.
 
 ### Phase 7 exit criteria
 

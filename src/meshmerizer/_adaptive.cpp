@@ -1412,6 +1412,7 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
     unsigned int max_depth = 0U;
     unsigned int base_resolution = 0U;
     unsigned int worker_count = 1U;
+    double table_cadence = 20.0;
     unsigned int minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
@@ -1420,10 +1421,11 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
     std::vector<OctreeCell> initial_cells;
     (void)self;
 
-    if (!PyArg_ParseTuple(args, "OOOdIOI|IIdd", &initial_cells_object,
+    if (!PyArg_ParseTuple(args, "OOOdIOI|IdIdd", &initial_cells_object,
                           &positions_object, &smoothing_object, &isovalue,
                           &max_depth, &domain_object, &base_resolution,
                           &worker_count,
+                          &table_cadence,
                           &minimum_usable_hermite_samples,
                           &max_qef_rms_residual_ratio,
                           &min_normal_alignment_threshold)) {
@@ -1460,6 +1462,7 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
         domain,
         static_cast<std::uint32_t>(base_resolution),
         static_cast<std::uint32_t>(worker_count),
+        table_cadence,
         static_cast<std::uint32_t>(minimum_usable_hermite_samples),
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold);
@@ -1626,11 +1629,12 @@ static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
     unsigned int base_resolution = 0U;
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
+    double table_cadence = 0.0;
     unsigned int minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdI|Idd",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|dIdd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -1638,6 +1642,7 @@ static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
                           &base_resolution,
                           &isovalue,
                           &max_depth,
+                          &table_cadence,
                           &minimum_usable_hermite_samples,
                           &max_qef_rms_residual_ratio,
                           &min_normal_alignment_threshold)) {
@@ -1683,6 +1688,8 @@ static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
         max_depth,
         domain,
         static_cast<std::uint32_t>(base_resolution),
+        1U,
+        table_cadence,
         static_cast<std::uint32_t>(minimum_usable_hermite_samples),
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold);
@@ -1738,6 +1745,7 @@ static PyObject *extract_opened_surface_mesh_py(
     unsigned int base_resolution = 0U;
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
+    double table_cadence = 0.0;
     unsigned int minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
@@ -1746,7 +1754,7 @@ static PyObject *extract_opened_surface_mesh_py(
     BoundingBox domain{};
     std::vector<std::uint8_t> opened_inside;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdIO|Idd",
+    if (!PyArg_ParseTuple(args, "OOOOIdIO|dIdd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -1755,6 +1763,7 @@ static PyObject *extract_opened_surface_mesh_py(
                           &isovalue,
                           &max_depth,
                           &opened_inside_object,
+                          &table_cadence,
                           &minimum_usable_hermite_samples,
                           &max_qef_rms_residual_ratio,
                           &min_normal_alignment_threshold)) {
@@ -1800,6 +1809,8 @@ static PyObject *extract_opened_surface_mesh_py(
         std::move(initial_cells), std::move(initial_contributors),
         positions, smoothing_lengths, isovalue, max_depth, domain,
         static_cast<std::uint32_t>(base_resolution),
+        1U,
+        table_cadence,
         static_cast<std::uint32_t>(minimum_usable_hermite_samples),
         max_qef_rms_residual_ratio, min_normal_alignment_threshold);
 
@@ -2261,12 +2272,13 @@ static PyObject *run_octree_pipeline_py(
     unsigned int base_resolution = 0U;
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
+    double table_cadence = 20.0;
     unsigned int minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
     (void)self;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdI|Idd",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|dIdd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -2274,6 +2286,7 @@ static PyObject *run_octree_pipeline_py(
                           &base_resolution,
                           &isovalue,
                           &max_depth,
+                          &table_cadence,
                           &minimum_usable_hermite_samples,
                           &max_qef_rms_residual_ratio,
                           &min_normal_alignment_threshold)) {
@@ -2336,6 +2349,8 @@ static PyObject *run_octree_pipeline_py(
             static_cast<std::uint32_t>(max_depth),
             domain,
             static_cast<std::uint32_t>(base_resolution),
+            1U,
+            table_cadence,
             static_cast<std::uint32_t>(minimum_usable_hermite_samples),
             max_qef_rms_residual_ratio,
             min_normal_alignment_threshold);
@@ -2383,9 +2398,10 @@ static PyObject *classify_occupied_solid_py(
     double max_surface_leaf_size = 0.0;
     double erosion_radius = 0.0;
     double pre_thickening_radius = 0.0;
+    double table_cadence = 0.0;
     (void)self;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdI|Iddddd",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|Idddddd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -2398,7 +2414,8 @@ static PyObject *classify_occupied_solid_py(
                           &min_normal_alignment_threshold,
                           &max_surface_leaf_size,
                           &erosion_radius,
-                          &pre_thickening_radius)) {
+                          &pre_thickening_radius,
+                          &table_cadence)) {
         return NULL;
     }
 
@@ -2486,22 +2503,21 @@ static PyObject *classify_occupied_solid_py(
             positions, smoothing_lengths, isovalue,
             static_cast<std::uint32_t>(max_depth), domain,
             static_cast<std::uint32_t>(base_resolution),
+            1U,
+            0.0,
             static_cast<std::uint32_t>(minimum_usable_hermite_samples),
             max_qef_rms_residual_ratio, min_normal_alignment_threshold);
 
         while (refine_surface_band_cells(
             all_cells, all_contributors, positions, smoothing_lengths,
             isovalue, static_cast<std::uint32_t>(max_depth),
+            domain, static_cast<std::uint32_t>(base_resolution),
             max_surface_leaf_size,
+            0.0,
             static_cast<std::uint32_t>(minimum_usable_hermite_samples),
             max_qef_rms_residual_ratio,
             min_normal_alignment_threshold)) {
         }
-
-        balance_octree(
-            all_cells, all_contributors, positions, smoothing_lengths,
-            isovalue, domain, static_cast<std::uint32_t>(base_resolution),
-            static_cast<std::uint32_t>(max_depth));
 
         LeafSpatialIndex spatial_index;
         spatial_index.build(
@@ -2837,8 +2853,9 @@ static PyObject *run_full_pipeline_py(
     double min_normal_alignment_threshold = 0.97;
     double min_feature_thickness = 0.0;
     double pre_thickening_radius = 0.0;
+    double table_cadence = 20.0;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdI|IddIdddd",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|dIddIdddd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -2846,6 +2863,7 @@ static PyObject *run_full_pipeline_py(
                           &base_resolution,
                           &isovalue,
                           &max_depth,
+                          &table_cadence,
                           &smoothing_iterations,
                           &smoothing_strength,
                           &max_edge_ratio,
@@ -2893,6 +2911,7 @@ static PyObject *run_full_pipeline_py(
             static_cast<std::uint32_t>(base_resolution),
             isovalue,
             static_cast<std::uint32_t>(max_depth),
+            table_cadence,
             static_cast<std::uint32_t>(smoothing_iterations),
             smoothing_strength,
             max_edge_ratio,

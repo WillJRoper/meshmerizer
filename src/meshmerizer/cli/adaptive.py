@@ -254,6 +254,7 @@ def _reconstruct_mesh(
     min_normal_alignment_threshold: float = 0.97,
     min_feature_thickness: float = 0.0,
     pre_thickening_radius: float = 0.0,
+    table_cadence: float = 20.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Reconstruct and merge one or more particle groups for the CLI.
 
@@ -274,6 +275,8 @@ def _reconstruct_mesh(
         min_normal_alignment_threshold: Minimum acceptable normal alignment.
         min_feature_thickness: Minimum preserved feature thickness.
         pre_thickening_radius: Optional outward pre-thickening radius.
+        table_cadence: Strict time cadence in seconds for queue-status table
+            rows emitted by queue-driven refinement.
 
     Returns:
         Tuple of merged ``(vertices, faces)`` arrays.
@@ -318,6 +321,7 @@ def _reconstruct_mesh(
             base_resolution,
             isovalue,
             max_depth,
+            table_cadence=table_cadence,
             smoothing_iterations=smoothing_iterations,
             smoothing_strength=smoothing_strength,
             max_edge_ratio=max_edge_ratio,
@@ -419,6 +423,7 @@ def _run_full_pipeline_path(
         ),
         min_feature_thickness=min_feature_thickness,
         pre_thickening_radius=pre_thickening_radius,
+        table_cadence=getattr(args, "table_cadence", 20.0),
     )
     record_elapsed(
         "Mesh reconstruction core",
@@ -624,6 +629,7 @@ def _build_and_optionally_save_octree(
         ),
         min_feature_thickness=min_feature_thickness,
         pre_thickening_radius=pre_thickening_radius,
+        table_cadence=getattr(args, "table_cadence", 20.0),
     )
     record_elapsed("Octree construction", tree_start, operation="Building")
 

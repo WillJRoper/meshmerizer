@@ -37,6 +37,12 @@ struct RefinementWorkQueueStats {
 
     /** Maximum observed queue size. */
     std::size_t high_watermark = 0U;
+
+    /** Current queued task count. */
+    std::size_t queue_size = 0U;
+
+    /** Current in-flight task count. */
+    std::size_t in_flight_count = 0U;
 };
 
 /**

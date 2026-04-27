@@ -11,6 +11,7 @@ bool RefinementWorkQueue::push(const RefinementTask &task) {
         tasks_.push_back(task);
         ++stats_.push_count;
         stats_.high_watermark = std::max(stats_.high_watermark, tasks_.size());
+        stats_.queue_size = tasks_.size();
     }
     condition_.notify_one();
     return true;
@@ -33,6 +34,7 @@ std::size_t RefinementWorkQueue::push_batch(const std::vector<RefinementTask> &t
         stats_.push_count += tasks.size();
         pushed_count = tasks.size();
         stats_.high_watermark = std::max(stats_.high_watermark, tasks_.size());
+        stats_.queue_size = tasks_.size();
     }
     condition_.notify_all();
     return pushed_count;
@@ -52,6 +54,8 @@ bool RefinementWorkQueue::pop(RefinementTask &task) {
     tasks_.pop_front();
     ++in_flight_tasks_;
     ++stats_.pop_count;
+    stats_.queue_size = tasks_.size();
+    stats_.in_flight_count = in_flight_tasks_;
     return true;
 }
 
@@ -61,6 +65,7 @@ void RefinementWorkQueue::task_done() {
         if (in_flight_tasks_ > 0U) {
             --in_flight_tasks_;
         }
+        stats_.in_flight_count = in_flight_tasks_;
     }
     condition_.notify_all();
 }

@@ -51,6 +51,7 @@
 #include "omp_config.hpp"
 #include "progress_bar.hpp"
 #include "qef.hpp"
+#include "refinement_closure.hpp"
 #include "vector3d.hpp"
 
 /**
@@ -906,18 +907,18 @@ inline bool refine_zero_sample_incident_cells(
     std::uint32_t max_depth,
     std::uint32_t base_resolution,
     double isovalue,
-    const BoundingBox &domain) {
+    const BoundingBox &domain,
+    double table_cadence_seconds = 0.0) {
+    const std::size_t initial_cell_count = all_cells.size();
     const std::vector<std::size_t> missing_cells =
         collect_missing_incident_cells(
             all_cells, spatial_index, max_depth, base_resolution, isovalue);
 
-    ProgressCounter refine_counter(
-        "Meshing", "refine_incident_cells", "cells", 100);
-    std::size_t split_count = 0;
+    std::vector<std::size_t> zero_sample_cells;
+    zero_sample_cells.reserve(missing_cells.size());
     std::size_t zero_sample_count = 0;
     for (std::size_t cell_idx : missing_cells) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
-        refine_counter.tick();
         if (cell_idx >= all_cells.size()) {
             continue;
         }
@@ -944,13 +945,32 @@ inline bool refine_zero_sample_incident_cells(
 
         ++zero_sample_count;
         if (cell.depth < max_depth) {
-            split_octree_leaf(
-                cell_idx, all_cells, all_contributors,
-                positions, smoothing_lengths);
-            ++split_count;
+            zero_sample_cells.push_back(cell_idx);
         }
     }
-    refine_counter.finish();
+
+    const RefinementClosureConfig closure_config = {
+        isovalue,
+        max_depth,
+        domain,
+        base_resolution,
+        1U,
+        3U,
+        0.1,
+        0.97,
+        table_cadence_seconds,
+        "Meshing",
+        "refine_zero_sample_incident_cells",
+        "incident_zero_sample",
+    };
+
+    const bool split_any = refine_cells_to_next_depth_with_closure(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        closure_config,
+        zero_sample_cells);
 
     meshmerizer_log_detail::print_debug_status(
         "Meshing",
@@ -958,15 +978,11 @@ inline bool refine_zero_sample_incident_cells(
         "missing=%zu zero_sample=%zu split=%zu\n",
         missing_cells.size(),
         zero_sample_count,
-        split_count);
+        split_any ? all_cells.size() - initial_cell_count : 0U);
 
-    if (split_count == 0) {
+    if (!split_any) {
         return false;
     }
-
-    balance_octree(
-        all_cells, all_contributors, positions, smoothing_lengths,
-        isovalue, domain, base_resolution, max_depth);
     return true;
 }
 

@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <mutex>
 #include <stdexcept>
 #include <set>
@@ -10,6 +12,7 @@
 #include <thread>
 
 #include "octree_cell.hpp"
+#include "progress_bar.hpp"
 #include "refinement_context.hpp"
 #include "refinement_work_queue.hpp"
 
@@ -241,6 +244,13 @@ private:
     double isovalue_;
 };
 
+struct ClosureRunStats {
+    std::size_t stale_task_count = 0U;
+    std::size_t processed_leaf_count = 0U;
+    std::size_t split_count = 0U;
+    std::size_t required_depth_raise_count = 0U;
+};
+
 struct ClosureWorkerState {
     RefinementContext &context;
     BalanceSpatialHash &hash;
@@ -250,6 +260,96 @@ struct ClosureWorkerState {
     RefinementWorkQueue &queue;
     std::mutex &mutation_mutex;
     std::mutex &worker_loop_mutex;
+    ClosureRunStats &run_stats;
+    std::mutex &run_stats_mutex;
+};
+
+class ClosureStatusReporter {
+public:
+    ClosureStatusReporter(
+        const RefinementClosureConfig &config,
+        const RefinementContext &context,
+        const RefinementWorkQueue &queue,
+        const ClosureRunStats &run_stats,
+        std::mutex &stats_mutex)
+        : config_(config),
+          context_(context),
+          queue_(queue),
+          run_stats_(run_stats),
+          stats_mutex_(stats_mutex),
+          start_time_(std::chrono::steady_clock::now()),
+          last_emit_(start_time_),
+          header_printed_(false) {}
+
+    void maybe_emit() {
+        if (config_.table_cadence_seconds <= 0.0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed_since_last =
+            std::chrono::duration<double>(now - last_emit_).count();
+        if (elapsed_since_last < config_.table_cadence_seconds) {
+            return;
+        }
+        emit_row(now);
+    }
+
+    void finish() {
+        emit_row(std::chrono::steady_clock::now());
+    }
+
+private:
+    void emit_row(const std::chrono::steady_clock::time_point &now) {
+        const RefinementWorkQueueStats queue_stats = queue_.stats();
+        ClosureRunStats run_stats_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            run_stats_snapshot = run_stats_;
+        }
+
+        if (!header_printed_) {
+            meshmerizer_log_detail::print_status(
+                config_.status_operation,
+                config_.status_function,
+                "queue status table follows (cadence=%.1fs, phase=%s)\n",
+                config_.table_cadence_seconds,
+                config_.phase_name.c_str());
+            meshmerizer_log_detail::print_status(
+                config_.status_operation,
+                config_.status_function,
+                "elapsed_s phase queue in_flight pushed popped stale processed split total_cells required_raises high_water\n");
+            header_printed_ = true;
+        }
+
+        const double elapsed_seconds =
+            std::chrono::duration<double>(now - start_time_).count();
+        meshmerizer_log_detail::print_status(
+            config_.status_operation,
+            config_.status_function,
+            "%8.1f %s %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu\n",
+            elapsed_seconds,
+            config_.phase_name.c_str(),
+            queue_stats.queue_size,
+            queue_stats.in_flight_count,
+            queue_stats.push_count,
+            queue_stats.pop_count,
+            run_stats_snapshot.stale_task_count,
+            run_stats_snapshot.processed_leaf_count,
+            run_stats_snapshot.split_count,
+            context_.cells().size(),
+            run_stats_snapshot.required_depth_raise_count,
+            queue_stats.high_watermark);
+        last_emit_ = now;
+    }
+
+    const RefinementClosureConfig &config_;
+    const RefinementContext &context_;
+    const RefinementWorkQueue &queue_;
+    const ClosureRunStats &run_stats_;
+    std::mutex &stats_mutex_;
+    std::chrono::steady_clock::time_point start_time_;
+    std::chrono::steady_clock::time_point last_emit_;
+    bool header_printed_;
 };
 
 inline RefinementResult evaluate_refinement_for_leaf(
@@ -346,7 +446,9 @@ inline void schedule_balance_neighbors_for_cell(
     const BalanceSpatialHash &hash,
     std::uint32_t max_depth,
     RefinementContext &context,
-    RefinementWorkQueue &queue) {
+    RefinementWorkQueue &queue,
+    ClosureRunStats &run_stats,
+    std::mutex &run_stats_mutex) {
     if (cell_index >= all_cells.size()) {
         return;
     }
@@ -361,7 +463,13 @@ inline void schedule_balance_neighbors_for_cell(
         if (context.get_required_depth(candidate) >= demanded_depth) {
             return;
         }
-        context.raise_required_depth_to(candidate, demanded_depth);
+        if (!context.raise_required_depth_to(candidate, demanded_depth)) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(run_stats_mutex);
+            ++run_stats.required_depth_raise_count;
+        }
         if (context.mark_queued(candidate)) {
             queue.push({
                 candidate,
@@ -556,7 +664,9 @@ inline void apply_balance_split(
             hash,
             worker.config.max_depth,
             context,
-            worker.queue);
+            worker.queue,
+            worker.run_stats,
+            worker.run_stats_mutex);
     }
 }
 
@@ -605,7 +715,9 @@ inline void apply_surface_split(
             hash,
             worker.config.max_depth,
             context,
-            worker.queue);
+            worker.queue,
+            worker.run_stats,
+            worker.run_stats_mutex);
     }
 }
 
@@ -619,25 +731,40 @@ inline void process_closure_task(
     std::lock_guard<std::mutex> mutation_lock(worker.mutation_mutex);
     RefinementContext &context = worker.context;
     if (task.cell_index >= context.size()) {
+        std::lock_guard<std::mutex> lock(worker.run_stats_mutex);
+        ++worker.run_stats.stale_task_count;
         return;
     }
     if (!context.mark_processing(task.cell_index)) {
+        std::lock_guard<std::mutex> lock(worker.run_stats_mutex);
+        ++worker.run_stats.stale_task_count;
         return;
     }
     if (task.cell_index >= context.cells().size()) {
         context.mark_idle(task.cell_index);
+        std::lock_guard<std::mutex> lock(worker.run_stats_mutex);
+        ++worker.run_stats.stale_task_count;
         return;
     }
 
     OctreeCell &current_cell = context.cells()[task.cell_index];
     if (!current_cell.is_leaf) {
         context.mark_retired(task.cell_index);
+        std::lock_guard<std::mutex> lock(worker.run_stats_mutex);
+        ++worker.run_stats.stale_task_count;
         return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(worker.run_stats_mutex);
+        ++worker.run_stats.processed_leaf_count;
     }
 
     if (current_cell.depth < context.get_required_depth(task.cell_index)) {
         apply_balance_split(task.cell_index, worker);
         context.mark_retired(task.cell_index);
+        std::lock_guard<std::mutex> lock(worker.run_stats_mutex);
+        ++worker.run_stats.split_count;
         return;
     }
 
@@ -674,9 +801,15 @@ inline void process_closure_task(
     apply_surface_split(task.cell_index, result, worker);
 
     context.mark_retired(task.cell_index);
+    {
+        std::lock_guard<std::mutex> lock(worker.run_stats_mutex);
+        ++worker.run_stats.split_count;
+    }
 }
 
-inline void run_closure_worker_loop(ClosureWorkerState &worker) {
+inline void run_closure_worker_loop(
+    ClosureWorkerState &worker,
+    ClosureStatusReporter &reporter) {
     RefinementTask task;
     while (true) {
         std::lock_guard<std::mutex> worker_loop_lock(worker.worker_loop_mutex);
@@ -686,7 +819,63 @@ inline void run_closure_worker_loop(ClosureWorkerState &worker) {
         process_closure_task(task, worker);
         worker.queue.task_done();
         maybe_shutdown_queue(worker);
+        reporter.maybe_emit();
     }
+}
+
+inline double closure_cell_edge_length(const OctreeCell &cell) {
+    return cell.bounds.max.x - cell.bounds.min.x;
+}
+
+inline void run_closure_queue(
+    RefinementContext &context,
+    BalanceSpatialHash &hash,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const RefinementClosureConfig &config,
+    RefinementWorkQueue &queue) {
+    std::mutex mutation_mutex;
+    std::mutex worker_loop_mutex;
+    ClosureRunStats run_stats;
+    std::mutex run_stats_mutex;
+    ClosureStatusReporter reporter(
+        config,
+        context,
+        queue,
+        run_stats,
+        run_stats_mutex);
+
+    ClosureWorkerState worker = {
+        context,
+        hash,
+        positions,
+        smoothing_lengths,
+        config,
+        queue,
+        mutation_mutex,
+        worker_loop_mutex,
+        run_stats,
+        run_stats_mutex,
+    };
+
+    if (config.worker_count <= 1U) {
+        run_closure_worker_loop(worker, reporter);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(config.worker_count);
+        for (std::uint32_t worker_index = 0;
+             worker_index < config.worker_count;
+             ++worker_index) {
+            workers.emplace_back([&worker, &reporter]() {
+                run_closure_worker_loop(worker, reporter);
+            });
+        }
+        for (std::thread &thread : workers) {
+            thread.join();
+        }
+    }
+
+    reporter.finish();
 }
 
 }  // namespace
@@ -712,9 +901,10 @@ refine_with_closure(
 
     RefinementWorkQueue queue;
     for (std::size_t cell_index = 0; cell_index < context.size(); ++cell_index) {
-        context.raise_required_depth_to(
+        if (context.raise_required_depth_to(
             cell_index,
-            initial_cells[cell_index].depth);
+            initial_cells[cell_index].depth)) {
+        }
         if (context.mark_queued(cell_index)) {
             queue.push({
                 cell_index,
@@ -724,39 +914,208 @@ refine_with_closure(
         }
     }
 
-    std::mutex mutation_mutex;
-    std::mutex worker_loop_mutex;
-
-    ClosureWorkerState worker = {
+    run_closure_queue(
         context,
         hash,
         positions,
         smoothing_lengths,
         config,
-        queue,
-        mutation_mutex,
-        worker_loop_mutex,
-    };
-
-    if (config.worker_count <= 1U) {
-        run_closure_worker_loop(worker);
-    } else {
-        std::vector<std::thread> workers;
-        workers.reserve(config.worker_count);
-        for (std::uint32_t worker_index = 0;
-             worker_index < config.worker_count;
-             ++worker_index) {
-            workers.emplace_back([&worker]() {
-                run_closure_worker_loop(worker);
-            });
-        }
-        for (std::thread &thread : workers) {
-            thread.join();
-        }
-    }
+        queue);
 
     return {
         std::move(initial_cells),
         std::move(initial_contributors),
     };
+}
+
+bool refine_surface_band_with_closure(
+    std::vector<OctreeCell> &all_cells,
+    std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const RefinementClosureConfig &config,
+    double max_surface_leaf_size) {
+    if (max_surface_leaf_size <= 0.0) {
+        return false;
+    }
+
+    const std::size_t initial_cell_count = all_cells.size();
+
+    RefinementContext context(all_cells, all_contributors);
+    context.sync_cell_state_size();
+
+    BalanceSpatialHash hash;
+    hash.build(
+        context.cells(), config.domain, config.max_depth,
+        config.base_resolution);
+
+    RefinementWorkQueue queue;
+    bool queued_any = false;
+    for (std::size_t cell_index = 0; cell_index < context.size(); ++cell_index) {
+        const OctreeCell &cell = context.cells()[cell_index];
+        if (!cell.is_leaf || !cell.has_surface || cell.depth >= config.max_depth) {
+            continue;
+        }
+        if (closure_cell_edge_length(cell) <= max_surface_leaf_size) {
+            continue;
+        }
+        context.raise_required_depth_to(cell_index, cell.depth);
+        if (context.mark_queued(cell_index)) {
+            queue.push({
+                cell_index,
+                context.get_required_depth(cell_index),
+                0U,
+            });
+            queued_any = true;
+        }
+    }
+
+    if (!queued_any) {
+        return false;
+    }
+
+    run_closure_queue(
+        context,
+        hash,
+        positions,
+        smoothing_lengths,
+        config,
+        queue);
+    return all_cells.size() > initial_cell_count;
+}
+
+bool refine_thickening_band_with_closure(
+    std::vector<OctreeCell> &all_cells,
+    std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const RefinementClosureConfig &config,
+    double target_leaf_size,
+    const std::vector<std::uint32_t> &seed_target_depths,
+    std::vector<std::uint8_t> *dirty_cells) {
+    if (target_leaf_size <= 0.0) {
+        return false;
+    }
+
+    const std::size_t initial_cell_count = all_cells.size();
+
+    RefinementContext context(all_cells, all_contributors);
+    context.sync_cell_state_size();
+
+    BalanceSpatialHash hash;
+    hash.build(
+        context.cells(), config.domain, config.max_depth,
+        config.base_resolution);
+
+    auto mark_dirty = [&](std::size_t cell_index) {
+        if (dirty_cells == nullptr) {
+            return;
+        }
+        if (dirty_cells->size() <= cell_index) {
+            dirty_cells->resize(cell_index + 1U, 0U);
+        }
+        (*dirty_cells)[cell_index] = 1U;
+    };
+
+    RefinementWorkQueue queue;
+    bool queued_any = false;
+    for (std::size_t cell_index = 0; cell_index < context.size(); ++cell_index) {
+        const OctreeCell &cell = context.cells()[cell_index];
+        if (!cell.is_leaf || cell.depth >= config.max_depth) {
+            continue;
+        }
+        const std::uint32_t target_depth =
+            cell_index < seed_target_depths.size() ?
+                seed_target_depths[cell_index] :
+                cell.depth;
+        if (closure_cell_edge_length(cell) <= target_leaf_size &&
+            cell.depth >= target_depth) {
+            continue;
+        }
+        context.raise_required_depth_to(cell_index, target_depth);
+        if (context.mark_queued(cell_index)) {
+            queue.push({
+                cell_index,
+                context.get_required_depth(cell_index),
+                0U,
+            });
+            mark_dirty(cell_index);
+            queued_any = true;
+        }
+    }
+
+    if (!queued_any) {
+        return false;
+    }
+
+    run_closure_queue(
+        context,
+        hash,
+        positions,
+        smoothing_lengths,
+        config,
+        queue);
+
+    if (dirty_cells != nullptr) {
+        dirty_cells->resize(context.cells().size(), 1U);
+    }
+    return all_cells.size() > initial_cell_count;
+}
+
+bool refine_cells_to_next_depth_with_closure(
+    std::vector<OctreeCell> &all_cells,
+    std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const RefinementClosureConfig &config,
+    const std::vector<std::size_t> &seed_cell_indices) {
+    if (seed_cell_indices.empty()) {
+        return false;
+    }
+
+    const std::size_t initial_cell_count = all_cells.size();
+
+    RefinementContext context(all_cells, all_contributors);
+    context.sync_cell_state_size();
+
+    BalanceSpatialHash hash;
+    hash.build(
+        context.cells(), config.domain, config.max_depth,
+        config.base_resolution);
+
+    RefinementWorkQueue queue;
+    bool queued_any = false;
+    for (std::size_t cell_index : seed_cell_indices) {
+        if (cell_index >= context.size()) {
+            continue;
+        }
+        const OctreeCell &cell = context.cells()[cell_index];
+        if (!cell.is_leaf || cell.depth >= config.max_depth) {
+            continue;
+        }
+        if (!context.raise_required_depth_to(cell_index, cell.depth + 1U)) {
+            continue;
+        }
+        if (context.mark_queued(cell_index)) {
+            queue.push({
+                cell_index,
+                context.get_required_depth(cell_index),
+                0U,
+            });
+            queued_any = true;
+        }
+    }
+
+    if (!queued_any) {
+        return false;
+    }
+
+    run_closure_queue(
+        context,
+        hash,
+        positions,
+        smoothing_lengths,
+        config,
+        queue);
+    return all_cells.size() > initial_cell_count;
 }

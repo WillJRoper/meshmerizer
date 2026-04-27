@@ -483,6 +483,16 @@ def build_parser() -> argparse.ArgumentParser:
             "status logs on stdout."
         ),
     )
+    parser.add_argument(
+        "--table-cadence",
+        type=_positive_float,
+        default=20.0,
+        help=(
+            "Seconds between queue-driven refinement status table rows. "
+            "This cadence is always honored even under --silent. "
+            "Default: 20"
+        ),
+    )
 
     parser.add_argument(
         "--save-octree",

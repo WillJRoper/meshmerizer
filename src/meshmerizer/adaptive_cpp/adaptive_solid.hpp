@@ -32,6 +32,7 @@
 #include "cancellation.hpp"
 #include "faces.hpp"
 #include "octree_cell.hpp"
+#include "refinement_closure.hpp"
 
 /**
  * @brief Occupancy classification used by the opened-solid pipeline.
@@ -199,7 +200,10 @@ inline bool refine_surface_band_cells(
     const std::vector<double> &smoothing_lengths,
     double isovalue,
     std::uint32_t max_depth,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution,
     double max_surface_leaf_size,
+    double table_cadence_seconds,
     std::uint32_t minimum_usable_hermite_samples,
     double max_qef_rms_residual_ratio,
     double min_normal_alignment_threshold) {
@@ -207,158 +211,28 @@ inline bool refine_surface_band_cells(
         return false;
     }
 
-    std::queue<std::size_t> cells_to_visit;
-    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
-        const OctreeCell &cell = all_cells[cell_idx];
-        if (!cell.is_leaf || !cell.has_surface || cell.depth >= max_depth) {
-            continue;
-        }
-        if (cell_edge_length(cell) > max_surface_leaf_size) {
-            cells_to_visit.push(cell_idx);
-        }
-    }
-
-    if (cells_to_visit.empty()) {
-        meshmerizer_log_detail::print_debug_status(
-            "Regularization",
-            "refine_surface_band_cells",
-            "no surface-band splits needed (leaf_size_target=%.6g, total_cells=%zu)\n",
-            max_surface_leaf_size,
-            all_cells.size());
-        return false;
-    }
-
-    meshmerizer_log_detail::print_debug_status(
+    const RefinementClosureConfig closure_config = {
+        isovalue,
+        max_depth,
+        domain,
+        base_resolution,
+        1U,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+        table_cadence_seconds,
         "Regularization",
         "refine_surface_band_cells",
-        "starting from %zu surface-band cells to reach leaf_size<=%.6g (total_cells_before=%zu)\n",
-        cells_to_visit.size(),
-        max_surface_leaf_size,
-        all_cells.size());
+        "surface_band",
+    };
 
-    ProgressCounter refine_counter(
-        "Regularization", "refine_surface_band_cells", "cells", 100);
-    std::size_t split_count = 0U;
-    std::size_t processed_count = 0U;
-
-    // Process only the surface-focused work queue so the refinement cost scales
-    // with the morphology band rather than the full tree size.
-    while (!cells_to_visit.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(
-            processed_count + split_count + 1U);
-        const std::size_t cell_idx = cells_to_visit.front();
-        cells_to_visit.pop();
-        refine_counter.tick();
-        ++processed_count;
-
-        if (cell_idx >= all_cells.size()) {
-            continue;
-        }
-
-        OctreeCell &cell = all_cells[cell_idx];
-        if (!cell.is_leaf || !cell.has_surface || cell.depth >= max_depth) {
-            continue;
-        }
-        if (cell_edge_length(cell) <= max_surface_leaf_size) {
-            continue;
-        }
-
-        // Splitting appends children into the flat arrays, so we always re-read
-        // the parent from ``all_cells`` after the mutation before inspecting
-        // child offsets.
-        split_octree_leaf(
-            cell_idx, all_cells, all_contributors,
-            positions, smoothing_lengths);
-        ++split_count;
-
-        const std::int64_t child_begin = all_cells[cell_idx].child_begin;
-        if (child_begin < 0) {
-            continue;
-        }
-
-        for (std::size_t child_offset = 0; child_offset < 8U; ++child_offset) {
-            const std::size_t child_index =
-                static_cast<std::size_t>(child_begin) + child_offset;
-            if (child_index >= all_cells.size()) {
-                continue;
-            }
-
-            OctreeCell &child = all_cells[child_index];
-            const std::span<const std::size_t> contributors =
-                cell_contributor_span(child, all_contributors);
-            child.is_active = false;
-            child.is_topo_surface = false;
-            child.representative_vertex_index = -1;
-
-            if (contributors.size() < 2U) {
-                child.has_surface = false;
-                child.corner_values = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-                child.corner_sign_mask = 0U;
-                continue;
-            }
-
-            child.corner_values = sample_cell_corners(
-                child, contributors, positions, smoothing_lengths);
-            child.corner_sign_mask = compute_corner_sign_mask(
-                child.corner_values, isovalue);
-
-            const bool corner_surface = cell_may_contain_isosurface(
-                child.corner_values, isovalue);
-            const bool inherited_surface_hint =
-                all_cells[cell_idx].has_surface && !corner_surface;
-            child.has_surface = corner_surface || inherited_surface_hint;
-            if (!child.has_surface) {
-                continue;
-            }
-
-            bool should_continue_refining =
-                child.depth < max_depth &&
-                cell_edge_length(child) > max_surface_leaf_size;
-
-            if (!should_continue_refining &&
-                child.depth < max_depth && corner_surface) {
-                const std::vector<HermiteSample> samples =
-                    compute_cell_hermite_samples(
-                        child.bounds, child.corner_values,
-                        child.corner_sign_mask, contributors,
-                        positions, smoothing_lengths, isovalue);
-                const QEFLeafDiagnostics qef_diagnostics =
-                    analyze_qef_for_leaf(samples, child.bounds);
-                const double dx = child.bounds.max.x - child.bounds.min.x;
-                const double dy = child.bounds.max.y - child.bounds.min.y;
-                const double dz = child.bounds.max.z - child.bounds.min.z;
-                const double cell_radius =
-                    0.5 * std::sqrt(dx * dx + dy * dy + dz * dz);
-                const bool poor_qef_fit =
-                    qef_diagnostics.usable_sample_count <
-                        minimum_usable_hermite_samples ||
-                    qef_diagnostics.used_fallback ||
-                    minimum_hermite_normal_alignment(samples) <
-                        min_normal_alignment_threshold ||
-                    qef_diagnostics.rms_plane_residual >
-                        max_qef_rms_residual_ratio * cell_radius;
-                should_continue_refining = poor_qef_fit;
-            }
-
-            if (should_continue_refining) {
-                cells_to_visit.push(child_index);
-            } else {
-                child.is_active = true;
-            }
-        }
-    }
-
-    refine_counter.finish();
-
-    meshmerizer_log_detail::print_debug_status(
-        "Regularization",
-        "refine_surface_band_cells",
-        "processed=%zu split=%zu (total_cells_after_refine=%zu)\n",
-        processed_count,
-        split_count,
-        all_cells.size());
-    return split_count > 0U;
+    return refine_surface_band_with_closure(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        closure_config,
+        max_surface_leaf_size);
 }
 
 inline std::array<std::size_t, 6> face_neighbor_cells(
@@ -771,11 +645,14 @@ inline bool refine_thickening_band_cells(
     const std::vector<double> &smoothing_lengths,
     double isovalue,
     std::uint32_t max_depth,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution,
     double target_leaf_size,
     const std::vector<OccupiedSolidLeaf> &solid_leaves,
     const std::vector<std::uint8_t> &inside_mask,
     const std::vector<double> &distance_from_inside,
     double thickening_radius,
+    double table_cadence_seconds,
     std::uint32_t minimum_usable_hermite_samples,
     double max_qef_rms_residual_ratio,
     double min_normal_alignment_threshold,
@@ -885,139 +762,30 @@ inline bool refine_thickening_band_cells(
         refinement_halo_radius,
         all_cells.size());
 
-    ProgressCounter refine_counter(
-        "Regularization", "refine_thickening_band_cells", "cells", 100);
-    std::size_t split_count = 0U;
-    std::size_t processed_count = 0U;
-
-    auto mark_dirty = [&](std::size_t cell_index) {
-        if (dirty_cells == nullptr) {
-            return;
-        }
-        if (dirty_cells->size() <= cell_index) {
-            dirty_cells->resize(cell_index + 1U, 0U);
-        }
-        (*dirty_cells)[cell_index] = 1U;
-    };
-
-    while (!cells_to_visit.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(
-            processed_count + split_count + 1U);
-        const std::size_t cell_idx = cells_to_visit.front();
-        cells_to_visit.pop();
-        if (cell_idx < enqueued_cells.size()) {
-            enqueued_cells[cell_idx] = 0U;
-        }
-        refine_counter.tick();
-        ++processed_count;
-
-        if (cell_idx >= all_cells.size()) {
-            continue;
-        }
-
-        OctreeCell &cell = all_cells[cell_idx];
-        if (!cell.is_leaf || cell.depth >= max_depth ||
-            cell_edge_length(cell) <= target_leaf_size) {
-            continue;
-        }
-
-        const std::uint32_t target_depth =
-            cell_idx < queued_target_depths.size() ?
-                queued_target_depths[cell_idx] :
-                cell.depth;
-
-        split_octree_leaf(
-            cell_idx, all_cells, all_contributors, positions,
-            smoothing_lengths);
-        ++split_count;
-        mark_dirty(cell_idx);
-
-        const std::int64_t child_begin = all_cells[cell_idx].child_begin;
-        if (child_begin < 0) {
-            continue;
-        }
-
-        for (std::size_t child_offset = 0; child_offset < 8U; ++child_offset) {
-            const std::size_t child_index =
-                static_cast<std::size_t>(child_begin) + child_offset;
-            if (child_index >= all_cells.size()) {
-                continue;
-            }
-            mark_dirty(child_index);
-
-            OctreeCell &child = all_cells[child_index];
-            const std::span<const std::size_t> contributors =
-                cell_contributor_span(child, all_contributors);
-            child.is_active = false;
-            child.is_topo_surface = false;
-            child.representative_vertex_index = -1;
-
-            if (contributors.size() < 2U) {
-                child.has_surface = false;
-                child.corner_values = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-                child.corner_sign_mask = 0U;
-                continue;
-            }
-
-            child.corner_values = sample_cell_corners(
-                child, contributors, positions, smoothing_lengths);
-            child.corner_sign_mask = compute_corner_sign_mask(
-                child.corner_values, isovalue);
-
-            const bool corner_surface = cell_may_contain_isosurface(
-                child.corner_values, isovalue);
-            const bool inherited_surface_hint =
-                all_cells[cell_idx].has_surface && !corner_surface;
-            child.has_surface = corner_surface || inherited_surface_hint;
-
-            bool should_continue_refining =
-                child.depth < max_depth &&
-                (cell_edge_length(child) > target_leaf_size ||
-                 child.depth < target_depth);
-
-            if (!should_continue_refining && child.depth < max_depth &&
-                corner_surface) {
-                const std::vector<HermiteSample> samples =
-                    compute_cell_hermite_samples(
-                        child.bounds, child.corner_values,
-                        child.corner_sign_mask, contributors,
-                        positions, smoothing_lengths, isovalue);
-                const QEFLeafDiagnostics qef_diagnostics =
-                    analyze_qef_for_leaf(samples, child.bounds);
-                const double dx = child.bounds.max.x - child.bounds.min.x;
-                const double dy = child.bounds.max.y - child.bounds.min.y;
-                const double dz = child.bounds.max.z - child.bounds.min.z;
-                const double cell_radius =
-                    0.5 * std::sqrt(dx * dx + dy * dy + dz * dz);
-                const bool poor_qef_fit =
-                    qef_diagnostics.usable_sample_count <
-                        minimum_usable_hermite_samples ||
-                    qef_diagnostics.used_fallback ||
-                    minimum_hermite_normal_alignment(samples) <
-                        min_normal_alignment_threshold ||
-                    qef_diagnostics.rms_plane_residual >
-                        max_qef_rms_residual_ratio * cell_radius;
-                should_continue_refining = poor_qef_fit;
-            }
-
-            if (should_continue_refining) {
-                enqueue_cell(child_index, target_depth);
-            } else {
-                child.is_active = true;
-            }
-        }
-    }
-
-    refine_counter.finish();
-
-    meshmerizer_log_detail::print_debug_status(
+    const RefinementClosureConfig closure_config = {
+        isovalue,
+        max_depth,
+        domain,
+        base_resolution,
+        1U,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+        table_cadence_seconds,
         "Regularization",
         "refine_thickening_band_cells",
-        "processed=%zu split=%zu (total_cells_after_refine=%zu)\n",
-        processed_count,
-        split_count,
-        all_cells.size());
-    return split_count > 0U;
+        "thickening_band",
+    };
+
+    return refine_thickening_band_with_closure(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        closure_config,
+        target_leaf_size,
+        queued_target_depths,
+        dirty_cells);
 }
 
 inline bool thickening_band_is_fully_refined(
