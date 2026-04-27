@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <mutex>
 #include <stdexcept>
 #include <set>
 #include <span>
@@ -247,6 +248,7 @@ struct ClosureWorkerState {
     const std::vector<double> &smoothing_lengths;
     const RefinementClosureConfig &config;
     RefinementWorkQueue &queue;
+    std::mutex &mutation_mutex;
 };
 
 inline RefinementResult evaluate_refinement_for_leaf(
@@ -615,6 +617,7 @@ inline void maybe_shutdown_queue(ClosureWorkerState &worker) {
 inline void process_closure_task(
     const RefinementTask &task,
     ClosureWorkerState &worker) {
+    std::lock_guard<std::mutex> mutation_lock(worker.mutation_mutex);
     RefinementContext &context = worker.context;
     if (!context.mark_processing(task.cell_index)) {
         return;
@@ -719,6 +722,8 @@ refine_with_closure(
         }
     }
 
+    std::mutex mutation_mutex;
+
     ClosureWorkerState worker = {
         context,
         hash,
@@ -726,6 +731,7 @@ refine_with_closure(
         smoothing_lengths,
         config,
         queue,
+        mutation_mutex,
     };
 
     if (config.worker_count <= 1U) {
