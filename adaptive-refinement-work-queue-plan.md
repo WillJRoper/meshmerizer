@@ -24,8 +24,9 @@ Rules for using this plan:
 - Current implementation phase: **Phase 3 - Tree-Guided Neighbor Traversal**
 - Work in progress now:
   - beginning Phase 4 preparation work
-  - introducing reservation/publication style storage APIs
-  - reducing dependence on one-by-one append semantics
+  - strengthening reservation tokens so they carry meaningful publication
+    expectations
+  - preparing storage APIs for later worker-safe fixed-slot publication
 
 Reporting-note:
 

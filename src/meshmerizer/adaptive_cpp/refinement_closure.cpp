@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <stdexcept>
 #include <set>
 #include <span>
 
@@ -27,19 +28,43 @@ struct PublishedChildren {
     std::vector<std::size_t> affected_indices;
 };
 
+struct ContributorReservation {
+    std::int64_t begin = 0;
+    std::size_t count = 0U;
+};
+
+struct ChildSlotReservation {
+    std::size_t begin = 0U;
+    std::size_t count = 0U;
+};
+
 class ClosureStorage {
 public:
     explicit ClosureStorage(RefinementContext &context) : context_(context) {}
 
+    ContributorReservation reserve_contributors(std::size_t count) {
+        if (count > 0U) {
+            context_.contributors().reserve(context_.contributors().size() + count);
+        }
+        return {
+            static_cast<std::int64_t>(context_.contributors().size()),
+            count,
+        };
+    }
+
     std::pair<std::int64_t, std::int64_t> publish_contributors(
-        const std::vector<std::size_t> &contributors,
-        std::size_t reserve_hint = 0U) {
-        if (reserve_hint > 0U) {
-            context_.contributors().reserve(
-                context_.contributors().size() + reserve_hint);
+        const ContributorReservation &reservation,
+        const std::vector<std::size_t> &contributors) {
+        if (contributors.size() > reservation.count) {
+            throw std::runtime_error(
+                "contributor publication exceeded reserved count");
         }
         const std::int64_t contrib_begin =
             static_cast<std::int64_t>(context_.contributors().size());
+        if (contrib_begin != reservation.begin) {
+            throw std::runtime_error(
+                "contributor publication did not begin at reserved offset");
+        }
         for (std::size_t contributor_index : contributors) {
             context_.contributors().push_back(contributor_index);
         }
@@ -48,18 +73,28 @@ public:
         return {contrib_begin, contrib_end};
     }
 
-    std::size_t publish_cell(OctreeCell cell) {
+    ChildSlotReservation reserve_children(std::size_t child_count) {
+        if (child_count > 0U) {
+            context_.cells().reserve(context_.cells().size() + child_count);
+        }
+        return {context_.cells().size(), child_count};
+    }
+
+    std::size_t publish_cell(
+        const ChildSlotReservation &reservation,
+        std::size_t offset,
+        OctreeCell cell) {
+        if (offset >= reservation.count) {
+            throw std::runtime_error("child publication offset out of range");
+        }
         const std::size_t new_index = context_.cells().size();
+        if (new_index != reservation.begin + offset) {
+            throw std::runtime_error(
+                "child publication did not match reserved slot order");
+        }
         context_.cells().push_back(std::move(cell));
         context_.sync_cell_state_size();
         return new_index;
-    }
-
-    void reserve_children(std::size_t child_count) {
-        if (child_count == 0U) {
-            return;
-        }
-        context_.cells().reserve(context_.cells().size() + child_count);
     }
 
     RefinementContext &context() { return context_; }
@@ -94,16 +129,20 @@ public:
         published.affected_indices.reserve(1U + source_children.size());
         published.affected_indices.push_back(parent_index);
         published.child_indices.reserve(source_children.size());
-        storage_.reserve_children(source_children.size());
+        const ChildSlotReservation child_slots =
+            storage_.reserve_children(source_children.size());
 
         for (std::size_t child_index = 0;
              child_index < source_children.size();
              ++child_index) {
             OctreeCell child = source_children[child_index];
+            const ContributorReservation contributor_reservation =
+                storage_.reserve_contributors(
+                    source_child_contributors[child_index].size());
             const auto [contrib_begin, contrib_end] =
                 storage_.publish_contributors(
-                    source_child_contributors[child_index],
-                    source_child_contributors[child_index].size());
+                    contributor_reservation,
+                    source_child_contributors[child_index]);
 
             child.contributor_begin = contrib_begin;
             child.contributor_end = contrib_end;
@@ -126,7 +165,8 @@ public:
                     child.corner_values, isovalue_);
             }
 
-            const std::size_t new_index = storage_.publish_cell(child);
+            const std::size_t new_index = storage_.publish_cell(
+                child_slots, child_index, child);
             storage_.context().raise_required_depth_to(
                 new_index,
                 std::max(child.depth, parent_required_depth));
