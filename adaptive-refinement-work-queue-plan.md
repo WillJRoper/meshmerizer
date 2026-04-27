@@ -24,8 +24,8 @@ Rules for using this plan:
 - Current implementation phase: **Phase 3 - Tree-Guided Neighbor Traversal**
 - Work in progress now:
   - beginning Phase 4 preparation work
-  - introducing whole-batch child publication
-  - preparing storage APIs for later worker-safe fixed-range publication
+  - refactoring the serial closure loop into clearer coordinator/worker pieces
+  - preparing the control flow for later multi-worker execution
 
 Reporting-note:
 

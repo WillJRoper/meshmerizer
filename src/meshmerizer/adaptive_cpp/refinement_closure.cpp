@@ -589,6 +589,94 @@ inline void apply_surface_split(
     }
 }
 
+inline void maybe_shutdown_queue(RefinementWorkQueue &queue) {
+    if (queue.empty()) {
+        queue.shutdown();
+    }
+}
+
+inline void process_closure_task(
+    const RefinementTask &task,
+    RefinementContext &context,
+    BalanceSpatialHash &hash,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const RefinementClosureConfig &config,
+    RefinementWorkQueue &queue) {
+    if (!context.mark_processing(task.cell_index)) {
+        return;
+    }
+    if (task.cell_index >= context.cells().size()) {
+        return;
+    }
+
+    OctreeCell &current_cell = context.cells()[task.cell_index];
+    if (!current_cell.is_leaf) {
+        context.mark_retired(task.cell_index);
+        maybe_shutdown_queue(queue);
+        return;
+    }
+
+    if (current_cell.depth < context.get_required_depth(task.cell_index)) {
+        apply_balance_split(
+            task.cell_index,
+            context,
+            hash,
+            positions,
+            smoothing_lengths,
+            config,
+            queue);
+        context.mark_retired(task.cell_index);
+        maybe_shutdown_queue(queue);
+        return;
+    }
+
+    const RefinementResult result = evaluate_refinement_for_leaf(
+        current_cell,
+        context.contributors(),
+        positions,
+        smoothing_lengths,
+        config);
+
+    current_cell.corner_values = result.corner_values;
+    current_cell.corner_sign_mask = result.corner_sign_mask;
+
+    if (!result.has_surface) {
+        current_cell.is_leaf = true;
+        current_cell.is_active = false;
+        current_cell.has_surface = false;
+        current_cell.is_topo_surface = false;
+        current_cell.child_begin = -1;
+        context.mark_idle(task.cell_index);
+        maybe_shutdown_queue(queue);
+        return;
+    }
+
+    if (!result.should_split) {
+        current_cell.is_leaf = true;
+        current_cell.is_active = true;
+        current_cell.has_surface = true;
+        current_cell.is_topo_surface = false;
+        current_cell.child_begin = -1;
+        context.mark_idle(task.cell_index);
+        maybe_shutdown_queue(queue);
+        return;
+    }
+
+    apply_surface_split(
+        task.cell_index,
+        result,
+        context,
+        hash,
+        positions,
+        smoothing_lengths,
+        config,
+        queue);
+
+    context.mark_retired(task.cell_index);
+    maybe_shutdown_queue(queue);
+}
+
 }  // namespace
 
 std::pair<std::vector<OctreeCell>, std::vector<std::size_t>>
@@ -626,89 +714,14 @@ refine_with_closure(
 
     RefinementTask task;
     while (queue.pop(task)) {
-        if (!context.mark_processing(task.cell_index)) {
-            continue;
-        }
-        if (task.cell_index >= context.cells().size()) {
-            continue;
-        }
-
-        OctreeCell &current_cell = context.cells()[task.cell_index];
-        if (!current_cell.is_leaf) {
-            context.mark_retired(task.cell_index);
-            if (queue.empty()) {
-                queue.shutdown();
-            }
-            continue;
-        }
-
-        if (current_cell.depth < context.get_required_depth(task.cell_index)) {
-            apply_balance_split(
-                task.cell_index,
-                context,
-                hash,
-                positions,
-                smoothing_lengths,
-                config,
-                queue);
-            context.mark_retired(task.cell_index);
-            if (queue.empty()) {
-                queue.shutdown();
-            }
-            continue;
-        }
-
-        const RefinementResult result = evaluate_refinement_for_leaf(
-            current_cell,
-            context.contributors(),
-            positions,
-            smoothing_lengths,
-            config);
-
-        current_cell.corner_values = result.corner_values;
-        current_cell.corner_sign_mask = result.corner_sign_mask;
-
-        if (!result.has_surface) {
-            current_cell.is_leaf = true;
-            current_cell.is_active = false;
-            current_cell.has_surface = false;
-            current_cell.is_topo_surface = false;
-            current_cell.child_begin = -1;
-            context.mark_idle(task.cell_index);
-            if (queue.empty()) {
-                queue.shutdown();
-            }
-            continue;
-        }
-
-        if (!result.should_split) {
-            current_cell.is_leaf = true;
-            current_cell.is_active = true;
-            current_cell.has_surface = true;
-            current_cell.is_topo_surface = false;
-            current_cell.child_begin = -1;
-            context.mark_idle(task.cell_index);
-            if (queue.empty()) {
-                queue.shutdown();
-            }
-            continue;
-        }
-
-        apply_surface_split(
-            task.cell_index,
-            result,
+        process_closure_task(
+            task,
             context,
             hash,
             positions,
             smoothing_lengths,
             config,
             queue);
-
-        context.mark_retired(task.cell_index);
-
-        if (queue.empty()) {
-            queue.shutdown();
-        }
     }
 
     return {
