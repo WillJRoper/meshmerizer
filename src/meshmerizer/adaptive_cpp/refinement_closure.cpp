@@ -22,6 +22,11 @@ struct RefinementResult {
     std::vector<std::vector<std::size_t>> child_contributors;
 };
 
+struct PublishedChildren {
+    std::vector<std::size_t> child_indices;
+    std::vector<std::size_t> affected_indices;
+};
+
 inline RefinementResult evaluate_refinement_for_leaf(
     const OctreeCell &current_cell,
     const std::vector<std::size_t> &all_contributors,
@@ -302,60 +307,78 @@ inline void apply_balance_split(
     hash.quantize(parent_snapshot.bounds.min, pgx, pgy, pgz);
     hash.map.erase(balance_pack_coords(pgx, pgy, pgz));
 
-    std::vector<std::size_t> affected_indices;
-    affected_indices.reserve(1U + children.size());
-    affected_indices.push_back(split_index);
+    auto publish_children = [&](const std::vector<OctreeCell> &source_children,
+                                const std::vector<std::vector<std::size_t>>
+                                    &source_child_contributors,
+                                bool compute_balance_samples) {
+        PublishedChildren published;
+        published.affected_indices.reserve(1U + source_children.size());
+        published.affected_indices.push_back(split_index);
+        published.child_indices.reserve(source_children.size());
 
-    for (std::size_t child_index = 0; child_index < children.size(); ++child_index) {
-        OctreeCell child = children[child_index];
-        const std::int64_t contrib_begin =
-            static_cast<std::int64_t>(context.contributors().size());
-        for (std::size_t contributor_index : child_contributors[child_index]) {
-            context.contributors().push_back(contributor_index);
-        }
-        const std::int64_t contrib_end =
-            static_cast<std::int64_t>(context.contributors().size());
+        for (std::size_t child_index = 0;
+             child_index < source_children.size();
+             ++child_index) {
+            OctreeCell child = source_children[child_index];
+            const std::int64_t contrib_begin =
+                static_cast<std::int64_t>(context.contributors().size());
+            for (std::size_t contributor_index :
+                 source_child_contributors[child_index]) {
+                context.contributors().push_back(contributor_index);
+            }
+            const std::int64_t contrib_end =
+                static_cast<std::int64_t>(context.contributors().size());
 
-        child.contributor_begin = contrib_begin;
-        child.contributor_end = contrib_end;
-        child.is_leaf = true;
-        child.is_active = false;
-        child.has_surface = false;
-        child.is_topo_surface = false;
+            child.contributor_begin = contrib_begin;
+            child.contributor_end = contrib_end;
+            child.is_leaf = true;
+            child.is_active = false;
+            child.has_surface = false;
+            child.is_topo_surface = false;
 
-        if (!child_contributors[child_index].empty()) {
-            child.corner_values = sample_cell_corners(
-                child,
-                std::span<const std::size_t>(child_contributors[child_index]),
-                positions,
-                smoothing_lengths);
-            child.corner_sign_mask = compute_corner_sign_mask(
-                child.corner_values, config.isovalue);
-            child.has_surface = cell_may_contain_isosurface(
-                child.corner_values, config.isovalue);
-        }
+            if (compute_balance_samples &&
+                !source_child_contributors[child_index].empty()) {
+                child.corner_values = sample_cell_corners(
+                    child,
+                    std::span<const std::size_t>(
+                        source_child_contributors[child_index]),
+                    positions,
+                    smoothing_lengths);
+                child.corner_sign_mask = compute_corner_sign_mask(
+                    child.corner_values, config.isovalue);
+                child.has_surface = cell_may_contain_isosurface(
+                    child.corner_values, config.isovalue);
+            }
 
-        const std::size_t new_index = context.cells().size();
-        context.cells().push_back(child);
-        context.sync_cell_state_size();
-        context.raise_required_depth_to(
-            new_index,
-            std::max(child.depth, parent_required_depth));
-        if (context.mark_queued(new_index)) {
-            queue.push({
+            const std::size_t new_index = context.cells().size();
+            context.cells().push_back(child);
+            context.sync_cell_state_size();
+            context.raise_required_depth_to(
                 new_index,
-                context.get_required_depth(new_index),
-                0U,
-            });
+                std::max(child.depth, parent_required_depth));
+            if (context.mark_queued(new_index)) {
+                queue.push({
+                    new_index,
+                    context.get_required_depth(new_index),
+                    0U,
+                });
+            }
+
+            published.child_indices.push_back(new_index);
+            published.affected_indices.push_back(new_index);
+
+            std::uint32_t cgx, cgy, cgz;
+            hash.quantize(child.bounds.min, cgx, cgy, cgz);
+            hash.map[balance_pack_coords(cgx, cgy, cgz)] = new_index;
         }
-        affected_indices.push_back(new_index);
 
-        std::uint32_t cgx, cgy, cgz;
-        hash.quantize(child.bounds.min, cgx, cgy, cgz);
-        hash.map[balance_pack_coords(cgx, cgy, cgz)] = new_index;
-    }
+        return published;
+    };
 
-    for (std::size_t affected_index : affected_indices) {
+    const PublishedChildren published =
+        publish_children(children, child_contributors, true);
+
+    for (std::size_t affected_index : published.affected_indices) {
         schedule_balance_neighbors_for_cell(
             affected_index,
             context.cells(),
@@ -388,47 +411,59 @@ inline void apply_surface_split(
     hash.quantize(parent_snapshot.bounds.min, pgx, pgy, pgz);
     hash.map.erase(balance_pack_coords(pgx, pgy, pgz));
 
-    std::vector<std::size_t> affected_indices;
-    affected_indices.reserve(1U + result.children.size());
-    affected_indices.push_back(split_index);
+    auto publish_children = [&](const std::vector<OctreeCell> &source_children,
+                                const std::vector<std::vector<std::size_t>>
+                                    &source_child_contributors) {
+        PublishedChildren published;
+        published.affected_indices.reserve(1U + source_children.size());
+        published.affected_indices.push_back(split_index);
+        published.child_indices.reserve(source_children.size());
 
-    for (std::size_t child_index = 0;
-         child_index < result.children.size();
-         ++child_index) {
-        const std::int64_t child_contrib_begin =
-            static_cast<std::int64_t>(context.contributors().size());
-        std::copy(
-            result.child_contributors[child_index].begin(),
-            result.child_contributors[child_index].end(),
-            std::back_inserter(context.contributors()));
-        const std::int64_t child_contrib_end =
-            static_cast<std::int64_t>(context.contributors().size());
+        for (std::size_t child_index = 0;
+             child_index < source_children.size();
+             ++child_index) {
+            const std::int64_t child_contrib_begin =
+                static_cast<std::int64_t>(context.contributors().size());
+            std::copy(
+                source_child_contributors[child_index].begin(),
+                source_child_contributors[child_index].end(),
+                std::back_inserter(context.contributors()));
+            const std::int64_t child_contrib_end =
+                static_cast<std::int64_t>(context.contributors().size());
 
-        OctreeCell child = result.children[child_index];
-        child.contributor_begin = child_contrib_begin;
-        child.contributor_end = child_contrib_end;
+            OctreeCell child = source_children[child_index];
+            child.contributor_begin = child_contrib_begin;
+            child.contributor_end = child_contrib_end;
 
-        const std::size_t new_child_index = context.cells().size();
-        context.cells().push_back(child);
-        context.sync_cell_state_size();
-        context.raise_required_depth_to(
-            new_child_index,
-            std::max(child.depth, parent_required_depth));
-        if (context.mark_queued(new_child_index)) {
-            queue.push({
+            const std::size_t new_child_index = context.cells().size();
+            context.cells().push_back(child);
+            context.sync_cell_state_size();
+            context.raise_required_depth_to(
                 new_child_index,
-                context.get_required_depth(new_child_index),
-                0U,
-            });
+                std::max(child.depth, parent_required_depth));
+            if (context.mark_queued(new_child_index)) {
+                queue.push({
+                    new_child_index,
+                    context.get_required_depth(new_child_index),
+                    0U,
+                });
+            }
+
+            published.child_indices.push_back(new_child_index);
+            published.affected_indices.push_back(new_child_index);
+
+            std::uint32_t cgx, cgy, cgz;
+            hash.quantize(child.bounds.min, cgx, cgy, cgz);
+            hash.map[balance_pack_coords(cgx, cgy, cgz)] = new_child_index;
         }
-        affected_indices.push_back(new_child_index);
 
-        std::uint32_t cgx, cgy, cgz;
-        hash.quantize(child.bounds.min, cgx, cgy, cgz);
-        hash.map[balance_pack_coords(cgx, cgy, cgz)] = new_child_index;
-    }
+        return published;
+    };
 
-    for (std::size_t affected_index : affected_indices) {
+    const PublishedChildren published =
+        publish_children(result.children, result.child_contributors);
+
+    for (std::size_t affected_index : published.affected_indices) {
         schedule_balance_neighbors_for_cell(
             affected_index,
             context.cells(),

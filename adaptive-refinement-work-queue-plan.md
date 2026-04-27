@@ -23,8 +23,9 @@ Rules for using this plan:
 
 - Current implementation phase: **Phase 3 - Tree-Guided Neighbor Traversal**
 - Work in progress now:
-  - tightening recursive face-patch propagation
-  - pruning duplicate required-depth work during tree-guided balance scheduling
+  - beginning Phase 4 preparation work
+  - isolating child publication and contributor append behind cleaner helper
+    boundaries
 
 Reporting-note:
 
@@ -1238,6 +1239,9 @@ This phase is about algorithmic correctness, not speed.
   face samples.
 - Added targeted adaptive-core regressions covering tougher multi-particle face
   and corner refinement layouts while continuing to assert the 2:1 invariant.
+- Child publication and contributor append logic are now isolated behind
+  clearer helper boundaries inside the closure engine, reducing the surface area
+  that later parallel-safe storage changes must touch.
 - Targeted adaptive-core refinement tests still pass.
 - A watertight integration regression test still passes.
 
