@@ -101,7 +101,7 @@ inline void print_octree_structure_summary(
     };
 
     if (all_cells.empty()) {
-        meshmerizer_log_detail::print_status(
+        meshmerizer_log_detail::print_debug_status(
             "Tree", "print_octree_structure_summary",
             "total=0 leaf=0 internal=0 active=0 inactive=0 surface=0\n");
         return;
