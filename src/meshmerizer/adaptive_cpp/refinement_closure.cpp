@@ -158,10 +158,18 @@ public:
             }
             prepared.cell.contributor_end =
                 static_cast<std::int64_t>(next_contributor_offset);
+            const std::int64_t published_contributor_begin =
+                prepared.cell.contributor_begin;
+            const std::int64_t published_contributor_end =
+                prepared.cell.contributor_end;
             const std::size_t new_index = publish_cell(
                 reservation,
                 offset,
                 std::move(prepared.cell));
+            context_.set_contributor_range(
+                new_index,
+                published_contributor_begin,
+                published_contributor_end);
             context_.raise_required_depth_to(new_index, prepared.required_depth);
             published_indices.push_back(new_index);
         }
@@ -1299,22 +1307,8 @@ inline PublishedChildren apply_balance_split(
     const std::uint32_t parent_required_depth =
         context.get_required_depth(split_index);
 
-    // Read the parent's contributor slice directly from the contributor
-    // arena. Workers only ever append to the arena (never overwrite), so
-    // already-published slices are immutable for the rest of the run.
     std::vector<std::size_t> parent_contributors;
-    if (parent_snapshot.contributor_begin >= 0 &&
-        parent_snapshot.contributor_end > parent_snapshot.contributor_begin) {
-        const std::size_t safe_begin = static_cast<std::size_t>(
-            parent_snapshot.contributor_begin);
-        const std::size_t safe_end = static_cast<std::size_t>(std::min(
-            parent_snapshot.contributor_end,
-            static_cast<std::int64_t>(context.contributors().size())));
-        parent_contributors.reserve(safe_end - safe_begin);
-        for (std::size_t i = safe_begin; i < safe_end; ++i) {
-            parent_contributors.push_back(context.contributors()[i]);
-        }
-    }
+    context.copy_contributors_for_cell(split_index, parent_contributors);
 
     std::vector<OctreeCell> children = create_child_cells(parent_snapshot);
     closure_assign_parent_index(children, split_index);
@@ -1793,23 +1787,8 @@ inline void process_closure_task(
             claim_refinement_tasks(claimed_indices, worker, claimed_tasks);
             queued_followup_work = !claimed_tasks.empty();
         } else {
-            const std::int64_t begin = current_cell_snapshot.contributor_begin;
-            const std::int64_t end = current_cell_snapshot.contributor_end;
-            if (begin >= 0 && end > begin) {
-                // Contributor slices in the arena are immutable once
-                // published (workers only ever append). No lock needed.
-                const ChunkedArena<std::size_t> &contributors =
-                    context.contributors();
-                const std::size_t safe_begin =
-                    static_cast<std::size_t>(std::max<std::int64_t>(0, begin));
-                const std::size_t safe_end = static_cast<std::size_t>(std::min(
-                    end,
-                    static_cast<std::int64_t>(contributors.size())));
-                contributor_snapshot.reserve(safe_end - safe_begin);
-                for (std::size_t i = safe_begin; i < safe_end; ++i) {
-                    contributor_snapshot.push_back(contributors[i]);
-                }
-            }
+            context.copy_contributors_for_cell(
+                task.cell_index, contributor_snapshot);
 
             cell_snapshot.contributor_begin = 0;
             cell_snapshot.contributor_end =
@@ -2067,19 +2046,8 @@ inline void process_classify_task(
 
     const OctreeCell &cell = context.cells()[idx];
 
-    // Gather the contributor slice for this cell.
     std::vector<std::size_t> contributors;
-    const std::int64_t cb = cell.contributor_begin;
-    const std::int64_t ce = cell.contributor_end;
-    if (cb >= 0 && ce > cb) {
-        const std::size_t safe_begin = static_cast<std::size_t>(cb);
-        const std::size_t safe_end = static_cast<std::size_t>(
-            std::min(ce, static_cast<std::int64_t>(context.contributors().size())));
-        contributors.reserve(safe_end - safe_begin);
-        for (std::size_t i = safe_begin; i < safe_end; ++i) {
-            contributors.push_back(context.contributors()[i]);
-        }
-    }
+    context.copy_contributors_for_cell(idx, contributors);
 
     // Evaluate the SPH density at the cell centre.
     const Vector3d centre = cell.bounds.center();

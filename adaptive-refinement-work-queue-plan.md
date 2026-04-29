@@ -1742,6 +1742,9 @@ Status update:
     depending only on flat `child_begin` scanning
   - closure DFS continuation no longer falls back to flat `child_begin`
     scanning once a parent has published its stable child block
+  - closure contributor ownership now also lives in `RefinementContext`
+    side-car state rather than treating `OctreeCell.contributor_begin/end` as
+    the runtime source of truth inside the closure engine
   - still incomplete because actual child/cell storage is still published into
     the global flat array
 - [~] replace balance-hash-centric neighbor wake logic with positional query /
@@ -1770,6 +1773,9 @@ Status update:
     - true lock-free cell-owned storage has not yet replaced the shared append
       path used during publication; current publication is append-only and
       low-contention, but not yet ownership-local
+    - closure runtime now reads contributor ownership from context side-cars;
+      the flat contributor offsets on `OctreeCell` remain a compatibility
+      projection for downstream pipelines, Python bindings, and serialization
 
 #### Step 8 - Revalidate performance before broad regression runs
 

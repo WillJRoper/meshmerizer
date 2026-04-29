@@ -28,6 +28,12 @@ RefinementContext::RefinementContext(
     cell_arena_.adopt(all_cells);
     contrib_arena_.adopt(all_contributors);
     sync_cell_state_size();
+    for (std::size_t i = 0; i < cell_arena_.size(); ++i) {
+        contributor_ranges_[i] = {
+            cell_arena_[i].contributor_begin,
+            cell_arena_[i].contributor_end,
+        };
+    }
 }
 
 void RefinementContext::sync_cell_state_size() {
@@ -47,6 +53,7 @@ void RefinementContext::sync_cell_state_size() {
     task_state_.reserve_to(target);
     generation_.reserve_to(target);
     child_blocks_.reserve_to(target);
+    contributor_ranges_.reserve_to(target);
     cell_classification_.reserve_to(target);
     outside_distance_bits_.reserve_to(target);
     center_value_bits_.reserve_to(target);
@@ -123,6 +130,43 @@ std::size_t RefinementContext::child_index_at(
         return std::numeric_limits<std::size_t>::max();
     }
     return child_block.child_indices[child_slot];
+}
+
+void RefinementContext::set_contributor_range(
+    std::size_t cell_index,
+    std::int64_t begin,
+    std::int64_t end) {
+    if (cell_index >= cell_arena_.size()) {
+        throw std::out_of_range("refinement contributor range index out of range");
+    }
+    contributor_ranges_[cell_index] = {begin, end};
+}
+
+RefinementContributorRange RefinementContext::contributor_range(
+    std::size_t cell_index) const {
+    if (cell_index >= cell_arena_.size()) {
+        throw std::out_of_range("refinement contributor range index out of range");
+    }
+    return contributor_ranges_[cell_index];
+}
+
+void RefinementContext::copy_contributors_for_cell(
+    std::size_t cell_index,
+    std::vector<std::size_t> &out_indices) const {
+    out_indices.clear();
+    const RefinementContributorRange range = contributor_range(cell_index);
+    if (range.begin < 0 || range.end <= range.begin) {
+        return;
+    }
+    const std::size_t safe_begin =
+        static_cast<std::size_t>(std::max<std::int64_t>(0, range.begin));
+    const std::size_t safe_end = static_cast<std::size_t>(std::min(
+        range.end,
+        static_cast<std::int64_t>(contrib_arena_.size())));
+    out_indices.reserve(safe_end - safe_begin);
+    for (std::size_t i = safe_begin; i < safe_end; ++i) {
+        out_indices.push_back(contrib_arena_[i]);
+    }
 }
 
 bool RefinementContext::raise_required_depth_to(
@@ -239,6 +283,7 @@ std::size_t RefinementContext::reserve_cell_block(std::size_t count) {
     task_state_.reserve_to(target);
     generation_.reserve_to(target);
     child_blocks_.reserve_to(target);
+    contributor_ranges_.reserve_to(target);
     cell_classification_.reserve_to(target);
     outside_distance_bits_.reserve_to(target);
     center_value_bits_.reserve_to(target);
@@ -255,6 +300,7 @@ std::size_t RefinementContext::reserve_cell_block(std::size_t count) {
             std::memory_order_relaxed);
         generation_[i].store(0U, std::memory_order_relaxed);
         child_blocks_[i] = RefinementChildBlock{};
+        contributor_ranges_[i] = RefinementContributorRange{};
         cell_classification_[i].store(0U, std::memory_order_relaxed);
         outside_distance_bits_[i].store(0U, std::memory_order_relaxed);
         center_value_bits_[i].store(0U, std::memory_order_relaxed);
@@ -308,6 +354,9 @@ void RefinementContext::materialize_into(
         // plain bool, so we set it here once at run end where there is no
         // concurrency.
         cell.is_leaf = (cell.child_begin < 0);
+        const RefinementContributorRange range = contributor_ranges_[i];
+        cell.contributor_begin = range.begin;
+        cell.contributor_end = range.end;
         out_cells.push_back(std::move(cell));
     }
     const std::size_t contrib_count = contrib_arena_.size();

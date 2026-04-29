@@ -39,6 +39,11 @@ struct RefinementChildBlock {
     std::array<std::size_t, 8> child_indices = {};
 };
 
+struct RefinementContributorRange {
+    std::int64_t begin = -1;
+    std::int64_t end = -1;
+};
+
 class RefinementContext {
 public:
     /**
@@ -86,6 +91,21 @@ public:
     std::size_t child_index_at(
         std::size_t cell_index,
         std::uint8_t child_slot) const;
+
+    /** Record the contributor slice owned by one cell. */
+    void set_contributor_range(
+        std::size_t cell_index,
+        std::int64_t begin,
+        std::int64_t end);
+
+    /** Return the context-owned contributor range for one cell. */
+    RefinementContributorRange contributor_range(
+        std::size_t cell_index) const;
+
+    /** Copy a cell's contributor slice into a local vector. */
+    void copy_contributors_for_cell(
+        std::size_t cell_index,
+        std::vector<std::size_t> &out_indices) const;
 
     /**
      * @brief Raise a cell's required depth monotonically.
@@ -231,6 +251,7 @@ private:
     ChunkedArena<std::atomic<std::uint8_t>> task_state_;
     ChunkedArena<std::atomic<std::uint32_t>> generation_;
     ChunkedArena<RefinementChildBlock> child_blocks_;
+    ChunkedArena<RefinementContributorRange> contributor_ranges_;
     // Incremental thickening side-cars (grown in lockstep with cell_arena_).
     ChunkedArena<std::atomic<std::uint8_t>> cell_classification_;
     // Outside distance stored as raw bits of a float (bit_cast equivalent).
