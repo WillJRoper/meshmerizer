@@ -128,9 +128,6 @@ std::size_t RefinementContext::child_index_at(
 bool RefinementContext::raise_required_depth_to(
     std::size_t cell_index,
     std::uint32_t new_required_depth) {
-    // Single-cell CAS. The closure pipeline never reads required_depth as a
-    // subtree aggregate, so the legacy ancestor walk that propagated
-    // requirements upward to the root has been removed.
     if (cell_index >= cell_arena_.size()) {
         return false;
     }
@@ -142,6 +139,9 @@ bool RefinementContext::raise_required_depth_to(
                 new_required_depth,
                 std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
+            // Successfully raised this cell. Propagate upward so that
+            // parent required_depth matches the max of its descendants.
+            propagate_required_depth_upward(cell_index, new_required_depth);
             return true;
         }
     }
@@ -368,5 +368,49 @@ void RefinementContext::initialize_thickening_state(
             occupancy_state_bits_[i].store(
                 (*initial_occupancy_states)[i], std::memory_order_relaxed);
         }
+    }
+}
+
+void RefinementContext::propagate_required_depth_upward(
+    std::size_t cell_index,
+    std::uint32_t new_required_depth) {
+    // Walk up the ancestor chain starting from the parent of cell_index.
+    if (cell_index >= cell_arena_.size()) {
+        return;
+    }
+    std::size_t current = cell_index;
+    while (true) {
+        const OctreeCell &cell = cell_arena_[current];
+        std::int64_t parent_idx = cell.parent_index;
+        if (parent_idx < 0) {
+            // Reached the root.
+            break;
+        }
+        std::size_t parent_index = static_cast<std::size_t>(parent_idx);
+
+        // Try to raise the parent's required_depth.
+        std::atomic<std::uint32_t> &parent_required =
+            required_depth_[parent_index];
+        std::uint32_t parent_observed =
+            parent_required.load(std::memory_order_acquire);
+        bool raised = false;
+        while (parent_observed < new_required_depth) {
+            if (parent_required.compare_exchange_weak(
+                    parent_observed,
+                    new_required_depth,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                raised = true;
+                break;
+            }
+        }
+
+        if (!raised) {
+            // Parent already has required_depth >= new_required_depth.
+            break;
+        }
+
+        // Continue walking up from the parent.
+        current = parent_index;
     }
 }

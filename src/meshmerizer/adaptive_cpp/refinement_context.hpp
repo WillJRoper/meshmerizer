@@ -240,6 +240,18 @@ private:
     ChunkedArena<std::atomic<std::uint64_t>> center_value_bits_;
     // Occupancy state aligned with adaptive_solid::OccupancyState values.
     ChunkedArena<std::atomic<std::uint8_t>> occupancy_state_bits_;
+
+    /**
+     * @brief Propagate required_depth upward from a cell that was just raised.
+     *
+     * Walks up the ancestor chain starting from the parent of `cell_index`,
+     * and raises each ancestor's required_depth to max(current, new_required_depth).
+     * Stops when an ancestor already has required_depth >= new_required_depth
+     * or when the root is reached.
+     */
+    void propagate_required_depth_upward(
+        std::size_t cell_index,
+        std::uint32_t new_required_depth);
 };
 
 #endif  // MESHMERIZER_ADAPTIVE_CPP_REFINEMENT_CONTEXT_HPP_

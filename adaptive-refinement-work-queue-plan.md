@@ -21,7 +21,7 @@ Rules for using this plan:
 
 ## Current Status
 
-- Current implementation phase: **Phase 6.5 - Work-stealing Scheduler Upgrade**
+- Current implementation phase: **Phase 6.5 - Work-Stealing Scheduler Upgrade**
 - Work in progress now:
   - Phase 5 is complete
   - initial refinement routes through the closure engine
@@ -29,20 +29,20 @@ Rules for using this plan:
   - thickening/pre-thickening refinement routes through the closure engine
   - zero-sample incident refinement now routes through the closure engine
   - queue-phase reporting now uses periodic table rows with configurable cadence
-  - the next immediate target is replacing the conservative central-queue
-    worker scaffold with a genuinely parallel DFS-with-work-stealing scheduler
-    (remove effective serialization, coarsen task granularity, reduce
-    synchronization to atomic state transitions + final join)
+  - upward propagation of `required_depth` is now implemented
+  - the work-stealing scheduler uses per-worker deques
+  - all 122 tests pass
 
 Reporting-note:
 
 - queue-driven refinement now emits coordinator-side table rows on a strict
   time cadence
 - CLI/native plumbing for `table_cadence` is now present
-- Not started yet:
-  - production-ready parallel workers beyond the current conservative scaffold
-  - work-stealing / DFS locality scheduling
+- Completed:
   - required-depth upward propagation (max over descendants)
+  - `raise_required_depth_to()` now propagates to ancestors
+- Not started yet:
+  - further optimization of work-stealing (reduce per-deque mutex contention)
 
 ## Problem Statement
 
