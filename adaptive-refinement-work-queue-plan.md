@@ -21,7 +21,7 @@ Rules for using this plan:
 
 ## Current Status
 
-- Current implementation phase: **Phase 6 - Pipeline Integration**
+- Current implementation phase: **Phase 6.5 - Work-stealing Scheduler Upgrade**
 - Work in progress now:
   - Phase 5 is complete
   - initial refinement routes through the closure engine
@@ -29,8 +29,10 @@ Rules for using this plan:
   - thickening/pre-thickening refinement routes through the closure engine
   - zero-sample incident refinement now routes through the closure engine
   - queue-phase reporting now uses periodic table rows with configurable cadence
-  - the next immediate target is confirming the remaining production-path audit
-    and preparing the cleanup wave
+  - the next immediate target is replacing the conservative central-queue
+    worker scaffold with a genuinely parallel DFS-with-work-stealing scheduler
+    (remove effective serialization, coarsen task granularity, reduce
+    synchronization to atomic state transitions + final join)
 
 Reporting-note:
 
@@ -39,6 +41,8 @@ Reporting-note:
 - CLI/native plumbing for `table_cadence` is now present
 - Not started yet:
   - production-ready parallel workers beyond the current conservative scaffold
+  - work-stealing / DFS locality scheduling
+  - required-depth upward propagation (max over descendants)
 
 ## Problem Statement
 
@@ -178,8 +182,10 @@ Candidate columns:
 - the table should always be emitted for queue-driven refinement even when
   `--silent` is set
 - the reporting path should be cheap relative to refinement work
-- rows should be emitted from one coordinator/reporting path, not by every
-  worker independently
+- rows should be triggered only when a worker goes looking for more work and the
+  cadence has elapsed
+- any worker may claim responsibility for emitting the next row, but an atomic
+  gate should ensure only one worker emits a given cadence slot
 - queue and context stats should make this reporting straightforward
 - old progress-counter output in queue-driven refinement phases should be
   removed once the table output is in place
@@ -1378,6 +1384,96 @@ Phase 5 is complete when all of the following are true:
 - The conservative threaded scaffold now passes thread-count robustness checks
   for `worker_count=1` and `2` on the sphere setup.
 
+## Phase 6.5 - Work-stealing DFS Scheduler Upgrade
+
+Replace the conservative "shared worker state + central deque" transport with a
+*genuinely parallel* scheduler:
+
+- **Per-cell demand remains authoritative**: every cell has a monotone
+  `required_depth` value stored in side-car scheduling state.
+- **Demand propagation is monotone**: updates are `required_depth =
+  max(required_depth, new_requirement)`.
+- **Upward propagation**: `required_depth` is tracked for all cells (not just
+  leaves) and parent `required_depth` is maintained as the max of its
+  descendants. This supports pruning and prevents redundant re-wakes when work
+  moves between leaves and their ancestors.
+
+### New scheduling model
+
+1. **Task granularity**
+
+   A queued task represents "make this cell satisfy its current required depth
+   and surface policy".
+
+   - Each worker processes tasks *depth-first locally*.
+   - When a task splits a cell, the worker immediately continues into one child
+     (DFS), and pushes the remaining child tasks onto its own deque.
+
+2. **Work-stealing transport**
+
+   - Use **thread-local deques** (one per worker): owner pops/pushes at the back
+     (LIFO) to preserve DFS locality.
+   - Idle workers **steal from the front** of other deques (FIFO) to reduce
+     contention and improve global progress.
+   - Avoid a single central mutex-protected deque on the hot path.
+
+3. **Wakeups are requirement-driven**
+
+   - Updating `required_depth` does *not* imply queue membership; queue tasks are
+     hints.
+   - **Only enqueue a cell when its `required_depth` increases beyond its
+     current state** (or when it first needs surface evaluation).
+   - Balance neighbor propagation should therefore:
+     1. compute the demanded neighbor depth,
+     2. perform an atomic `max` raise on neighbor `required_depth`,
+     3. enqueue only if the raise succeeded and the neighbor is currently idle.
+
+4. **Synchronization discipline**
+
+   - Prefer **atomic state transitions** for per-cell scheduling state:
+     `idle -> queued -> processing -> (idle|retired)`.
+   - Structural mutation (cell splits + child publication + spatial-hash edits)
+     may still require a narrow critical section.
+   - Termination should be based on "all deques empty AND no in-flight tasks"
+     with one final join, not global barrier steps.
+
+### Storage decision: flat cell array
+
+We should avoid a single global flat `cells[]` array *if practical*, because
+contiguous `push_back` mutation forces broad locking and makes lock-free reads
+hard.
+
+However, **if integration compatibility requires stable contiguous child
+storage**, keep the current invariant:
+
+- children of an internal cell occupy **8 consecutive slots**, with
+  `child_begin` pointing at the first.
+
+Justification for keeping contiguous child storage (if we do):
+
+- downstream code assumes constant-time child indexing via
+  `child_begin + octant` without indirection,
+- Python bindings currently expose a flat list-like view of cells,
+- changing this would be a much larger integration risk than changing the
+  scheduler.
+
+If we keep the flat array, we should mitigate it by:
+
+- reserving capacity where feasible,
+- narrowing mutation critical sections to *publication only*,
+- moving expensive per-leaf evaluation outside the mutation lock.
+
+### Phase 6.5 exit criteria
+
+Phase 6.5 is complete when all of the following are true:
+
+1. the production closure engine uses a work-stealing scheduler with thread-local
+   deques
+2. `worker_count > 1` removes effective serialization in the worker loop
+3. queueing is strictly requirement-driven (enqueue only on successful
+   `required_depth` raises / first evaluation)
+4. the threaded adaptive-core regressions remain green
+
 ## Phase 6 - Pipeline Integration
 
 - [x] Confirm all initial octree refinement entry points use the closure engine.
@@ -1447,6 +1543,231 @@ Phase 7 is complete when all of the following are true:
 1. no obsolete production balance-scheduling path remains
 2. remaining old balance code has an explicit validation/test justification
 3. docs describe the final architecture rather than transitional states
+
+## Phase 8 - Depth-first work-stealing redesign
+
+This phase replaces the current queue-centric closure scheduler with the model
+we agreed on during review:
+
+- each task should refine depth-first locally rather than paying queue overhead
+  per cell
+- `required_depth` should live on every cell, not just leaves
+- a parent's `required_depth` should be the max of the requirements in its
+  descendants so any task can cheaply decide whether it must recurse further
+- queueing should only wake cells whose `required_depth` increased beyond their
+  currently satisfied depth/state
+- workers should own thread-local deques and steal work only when their local
+  deque is empty
+- scheduler termination should be based on sleeping/active worker state, not on
+  central queue polling loops
+
+### Target architecture
+
+#### Cell state model
+
+Every cell must eventually carry enough scheduling state to answer these
+questions without consulting a global scheduler lock:
+
+1. what is the deepest refinement demanded anywhere under this cell?
+2. is this cell already queued or being processed?
+3. does this cell already own children?
+
+Concretely:
+
+- `required_depth[cell]` is authoritative and monotone
+- for internal cells, `required_depth[cell] = max(required_depth[children])`
+- worker/scheduler state should be atomic and monotone where possible:
+  - `idle`
+  - `queued`
+  - `processing`
+  - `retired/satisfied`
+
+#### Task execution model
+
+A task no longer means "process exactly one cell".
+
+Instead, a task means:
+
+1. claim one cell
+2. evaluate whether it is already satisfied
+3. if it must split, split it
+4. continue locally depth-first into its children while local budget permits
+5. only spill work back to a deque when:
+   - local DFS budget is exceeded, or
+   - a neighbor/ancestor wake-up must be handed to another worker
+
+This is the main performance goal of Phase 8: the queue should distribute coarse
+work, not micromanage every leaf.
+
+#### Queue / scheduler model
+
+- one deque per worker
+- owner pops/pushes at the back (LIFO) for DFS locality
+- thieves steal from the front (FIFO) for load balancing
+- workers sleep when they have no local or stealable work
+- termination happens when:
+  - all deques are empty
+  - no worker is actively processing
+  - all workers are sleeping
+
+### Storage direction
+
+Longer term we want to avoid one globally mutated flat `cells[]` array because
+it forces broad synchronization and makes true local ownership difficult.
+
+Desired direction:
+
+- each cell owns its progeny
+- child publication should be one-way and stable
+- positional queries should descend the tree structurally rather than relying
+  on a globally rebuilt balance-era leaf map
+
+However, to reduce integration risk, we may stage this in two steps:
+
+1. **scheduler-first transition**
+   - keep current contiguous child storage invariants temporarily
+   - remove per-cell queue traffic and broad scheduler serialization first
+2. **storage transition**
+   - move toward cell-owned progeny / stable child blocks / positional descent
+
+If we keep flat storage temporarily, it must be justified as a transitional
+compatibility choice only, not as the intended final architecture.
+
+### Detailed implementation steps
+
+#### Step 1 - Record the agreed architecture in this plan
+
+- [x] Write down the DFS work-stealing design and explicit exit criteria.
+
+#### Step 2 - Stop using the queue as a per-cell executor
+
+- [~] change closure tasks so one popped task continues depth-first locally
+      through children
+  - local DFS continuation exists now for freshly split children and for waking
+    already-internal cells whose descendant `required_depth` increased
+  - still not complete because neighbor wakeups and split publication still rely
+    on broad shared mutation / queue-era assumptions
+- [x] add a strict local DFS work budget to avoid one worker monopolizing a huge
+      region forever
+- [x] spill overflow work back to the owning deque only when the local budget is
+      exceeded
+
+#### Step 3 - Make required-depth propagation the main scheduling primitive
+
+- [~] ensure `required_depth` exists meaningfully for internal cells as well as
+      leaves
+  - upward propagation now raises ancestors too, and internal cells can be
+    re-awoken to continue DFS into descendants
+  - still incomplete because the state model is not yet lock-free / atomic and
+    some publication paths still assume leaf-centric handling
+- [x] propagate required-depth raises upward so any ancestor can answer "do I
+      need to recurse further?" cheaply
+- [~] enqueue/wake a cell only when its required depth actually increased and it
+      is not already awake
+  - retired internal cells are now allowed to wake again when descendant demand
+    rises, but queue traffic still needs further coarsening
+
+#### Step 4 - Make worker state the basis of termination
+
+- [x] add sleeping-worker tracking to the scheduler
+- [ ] replace any remaining queue-centric termination assumptions with
+      `all_deques_empty && no_active_workers && all_workers_sleeping`
+- [ ] remove short-interval polling / timed wakeups from normal idle behavior
+
+#### Step 5 - Remove effective parallel serialization
+
+- [ ] remove or drastically narrow the global mutation critical section
+- [ ] move expensive evaluation work fully outside shared-state locks
+- [ ] ensure only publication / atomic state transitions require
+      synchronization
+- [~] remove or drastically narrow the global mutation critical section
+  - queue pushes are now batched outside the mutation lock and internal-cell
+    continuation can exit the lock before local DFS enqueue/spill decisions
+  - publication/storage mutation and scheduler state mutation are now separated
+    into distinct locks
+  - still incomplete because flat global storage keeps publication itself
+    serialized and balance-hash updates still ride that same storage path
+- [x] move expensive evaluation work fully outside shared-state locks
+- [~] ensure only publication / atomic state transitions require
+      synchronization
+  - much closer now, but the current transitional flat-array publication path
+    still forces coarse serialized mutation
+  - incremental appended-cell registration now avoids rebuilding the entire
+    context lookup/state map for every published child batch
+  - child-batch contributor publication is now flattened into one contiguous
+    append per batch instead of many small reserve/publish steps
+- [ ] verify `worker_count > 1` actually improves the threaded smoke path rather
+      than merely remaining correct
+
+#### Step 5b - Correct queue seeding and reporting pathologies
+
+- [ ] wire every reported table column to real counters before changing output
+- [ ] add a real `surface` processed-leaf counter to distinguish surface work
+      from total processed leaves
+- [ ] stop seeding the entire initial frontier into the queue for
+      `refine_with_closure`
+- [ ] replace full-frontier startup with coarse worker seeds that expand via
+      local DFS before further queue growth
+- [ ] verify the real example queue no longer starts with a giant stuck
+      `peak_queue` equal to the initial seed count
+
+#### Step 6 - Plumb real worker-count usage through production
+
+- [x] forward CLI `--nthreads` / pipeline worker count into initial refinement
+- [x] forward worker count into regularization / thickening closure paths
+- [~] audit all remaining adaptive entry points for hardcoded `worker_count=1`
+  - Python bindings for opened-surface extraction and occupied-solid
+    classification now accept and forward worker count into refinement
+  - remaining hardcoded internal helper paths in `_adaptive.cpp` still need
+    audit
+
+#### Step 7 - Prepare the storage transition away from flat global mutation
+
+- [~] design per-cell child ownership / stable child-block publication
+  - scheduler-side cell-local child blocks now exist in `RefinementCellState`
+    and DFS continuation can consume those stable child indices instead of
+    depending only on flat `child_begin` scanning
+  - closure DFS continuation no longer falls back to flat `child_begin`
+    scanning once a parent has published its stable child block
+  - still incomplete because actual child/cell storage is still published into
+    the global flat array
+- [~] replace balance-hash-centric neighbor wake logic with positional query /
+      structural descent where practical
+  - closure neighbor wake discovery now uses Morton/depth structural lookup via
+    `RefinementContext` instead of probing the balance hash
+  - closure publication no longer maintains its own balance-hash state either
+  - still incomplete because other adaptive subsystems still rely on spatial
+    hash lookup
+- [ ] document exactly which flat-array assumptions remain and why
+  - current remaining flat-array assumptions:
+    - published children are still appended into one global `cells` array
+    - published contributor slices are still appended into one global
+      `contributors` array
+    - parent cells still expose `child_begin` for compatibility with older
+      non-closure consumers, even though closure DFS now prefers stable child
+      blocks in context state
+    - true lock-free cell-owned storage has not yet replaced the shared append
+      path used during publication
+
+#### Step 8 - Revalidate performance before broad regression runs
+
+- [ ] do not resume the broader adaptive-core regression subset until the
+      threaded smoke path is back down to a few seconds
+- [ ] once smoke timing is acceptable again, rerun the focused adaptive-core
+      subset
+- [ ] only then rerun larger integration checks
+
+### Phase 8 exit criteria
+
+Phase 8 is complete when all of the following are true:
+
+1. one task processes a depth-first local refinement wave rather than a single
+   cell only
+2. queue traffic is requirement-driven and coarse-grained
+3. workers sleep cleanly and termination is based on worker/deque state rather
+   than repeated timed polling
+4. `worker_count > 1` provides real speedup on the threaded smoke case
+5. the threaded smoke test returns to a runtime of only a few seconds
 
 ## Validation Plan
 
