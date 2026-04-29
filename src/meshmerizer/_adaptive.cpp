@@ -2344,12 +2344,13 @@ static PyObject *run_octree_pipeline_py(
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
     double table_cadence = 10.0;
+    unsigned int worker_count = 1U;
     unsigned int minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
     (void)self;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdI|dIdd",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|dIIdd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -2358,6 +2359,7 @@ static PyObject *run_octree_pipeline_py(
                           &isovalue,
                           &max_depth,
                           &table_cadence,
+                          &worker_count,
                           &minimum_usable_hermite_samples,
                           &max_qef_rms_residual_ratio,
                           &min_normal_alignment_threshold)) {
@@ -2420,7 +2422,7 @@ static PyObject *run_octree_pipeline_py(
             static_cast<std::uint32_t>(max_depth),
             domain,
             static_cast<std::uint32_t>(base_resolution),
-            1U,
+            static_cast<std::uint32_t>(worker_count),
             table_cadence,
             static_cast<std::uint32_t>(minimum_usable_hermite_samples),
             max_qef_rms_residual_ratio,

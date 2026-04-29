@@ -141,6 +141,9 @@ public:
 
         // One arena reservation for the whole child batch's contributor
         // slice. Lock-free; chunk-aligned so the slice is contiguous.
+        // We still publish into one shared flat contributor arena because
+        // downstream code consumes contributor_begin/contributor_end as flat
+        // offsets; replacing that with cell-owned storage is a later step.
         const std::size_t contributor_begin =
             context_.reserve_contributor_slice(contributor_count);
         std::size_t next_contributor_offset = contributor_begin;

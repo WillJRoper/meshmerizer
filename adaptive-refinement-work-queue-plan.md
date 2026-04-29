@@ -1728,11 +1728,11 @@ Status update:
 
 - [x] forward CLI `--nthreads` / pipeline worker count into initial refinement
 - [x] forward worker count into regularization / thickening closure paths
-- [~] audit all remaining adaptive entry points for hardcoded `worker_count=1`
+- [x] audit all remaining adaptive entry points for hardcoded `worker_count=1`
   - Python bindings for opened-surface extraction and occupied-solid
     classification now accept and forward worker count into refinement
-  - remaining hardcoded internal helper paths in `_adaptive.cpp` still need
-    audit
+  - `extract_opened_surface_mesh_py(...)` no longer hardcodes `1U` when it
+    refines the octree before rebuilding the opened surface mesh
 
 #### Step 7 - Prepare the storage transition away from flat global mutation
 
@@ -1751,16 +1751,25 @@ Status update:
   - closure publication no longer maintains its own balance-hash state either
   - still incomplete because other adaptive subsystems still rely on spatial
     hash lookup
-- [ ] document exactly which flat-array assumptions remain and why
+- [x] document exactly which flat-array assumptions remain and why
   - current remaining flat-array assumptions:
     - published children are still appended into one global `cells` array
+      because non-closure consumers still index children through
+      `child_begin + offset` and Python bindings still materialize a flat cell
+      list
     - published contributor slices are still appended into one global
-      `contributors` array
+      `contributors` array because leaf cells still expose contributor ranges as
+      flat begin/end offsets and downstream meshing/serialization code consumes
+      that layout directly
     - parent cells still expose `child_begin` for compatibility with older
       non-closure consumers, even though closure DFS now prefers stable child
       blocks in context state
+    - final closure state is still materialized back into flat vectors because
+      the broader pipeline, bindings, and serialization paths still use
+      `std::vector<OctreeCell>` / `std::vector<std::size_t>` boundaries
     - true lock-free cell-owned storage has not yet replaced the shared append
-      path used during publication
+      path used during publication; current publication is append-only and
+      low-contention, but not yet ownership-local
 
 #### Step 8 - Revalidate performance before broad regression runs
 

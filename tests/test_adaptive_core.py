@@ -1110,6 +1110,39 @@ def test_run_octree_pipeline_empty_particles() -> None:
     assert len(vert_normals) == 0
 
 
+def test_run_octree_pipeline_accepts_worker_count() -> None:
+    """The compact C++ octree pipeline should honor worker_count."""
+    import numpy as np
+
+    positions_arr = np.array(
+        [
+            (0.45, 0.5, 0.5),
+            (0.55, 0.5, 0.5),
+            (0.5, 0.45, 0.5),
+            (0.5, 0.55, 0.5),
+            (0.5, 0.5, 0.45),
+            (0.5, 0.5, 0.55),
+        ],
+        dtype=np.float64,
+    )
+    smoothing_arr = np.full(len(positions_arr), 0.8, dtype=np.float64)
+
+    vert_positions, vert_normals = run_octree_pipeline(
+        positions_arr,
+        smoothing_arr,
+        (-1.0, -1.0, -1.0),
+        (2.0, 2.0, 2.0),
+        4,
+        0.5,
+        3,
+        worker_count=2,
+    )
+
+    assert len(vert_positions) > 0
+    assert vert_positions.shape[1] == 3
+    assert vert_normals.shape[1] == 3
+
+
 # ---------------------------------------------------------------------------
 # Density percentile isovalue tests
 # ---------------------------------------------------------------------------
