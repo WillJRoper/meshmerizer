@@ -409,6 +409,8 @@ struct ClosureWorkerState {
     const std::vector<double> &smoothing_lengths;
     const RefinementClosureConfig &config;
     RefinementWorkQueue &queue;
+    const std::vector<std::size_t> *startup_seed_cells;
+    std::atomic<std::size_t> *startup_seed_cursor;
     std::uint32_t worker_id;
     ClosureRunStats &run_stats;
     ClosureProfiler &profiler;
@@ -1533,6 +1535,28 @@ inline bool seed_queue_from_cells(
     return queued_any;
 }
 
+inline std::vector<std::size_t> build_coarse_startup_seed_order(
+    const std::vector<std::size_t> &seed_cells,
+    std::uint32_t coarse_seed_count) {
+    if (seed_cells.empty()) {
+        return {};
+    }
+    const std::size_t coarse_count = std::min<std::size_t>(
+        std::max<std::uint32_t>(1U, coarse_seed_count), seed_cells.size());
+    const std::size_t stride =
+        (seed_cells.size() + coarse_count - 1U) / coarse_count;
+
+    std::vector<std::size_t> ordered;
+    ordered.reserve(seed_cells.size());
+    for (std::size_t offset = 0; offset < stride; ++offset) {
+        for (std::size_t index = offset; index < seed_cells.size();
+             index += stride) {
+            ordered.push_back(seed_cells[index]);
+        }
+    }
+    return ordered;
+}
+
 inline std::size_t count_remaining_surface_band_eligible(
     RefinementContext &context,
     double max_surface_leaf_size,
@@ -2388,7 +2412,10 @@ inline void run_closure_worker_loop(
     ClosureWorkerState &worker,
     ClosureStatusReporter &reporter) {
     RefinementTask task;
+    RefinementTask pending_startup_task;
     std::size_t processed_count = 0U;
+    bool have_pending_startup_task = false;
+    bool task_counts_as_in_flight = false;
     while (true) {
         poll_closure_cancellation(worker, processed_count, 4096U);
         if (worker.queue.try_claim_report(
@@ -2396,9 +2423,15 @@ inline void run_closure_worker_loop(
             reporter.maybe_emit_periodic();
         }
         bool got_task = false;
-        {
+        if (have_pending_startup_task) {
+            task = pending_startup_task;
+            got_task = true;
+            have_pending_startup_task = false;
+            task_counts_as_in_flight = true;
+        } else {
             ScopedNsTimer pop_timer(worker.profiler.ns_pop_wait);
             got_task = worker.queue.pop(worker.worker_id, task);
+            task_counts_as_in_flight = got_task;
         }
         if (!got_task) {
             break;
@@ -2428,7 +2461,36 @@ inline void run_closure_worker_loop(
                 process_closure_task(task, worker);
                 break;
         }
-        worker.queue.task_done();
+        if (worker.startup_seed_cells != nullptr &&
+            worker.startup_seed_cursor != nullptr) {
+            while (true) {
+                const std::size_t ordinal = worker.startup_seed_cursor->fetch_add(
+                    1U, std::memory_order_acq_rel);
+                if (ordinal >= worker.startup_seed_cells->size()) {
+                    break;
+                }
+                const std::size_t cell_index =
+                    (*worker.startup_seed_cells)[ordinal];
+                if (cell_index >= worker.context.size()) {
+                    continue;
+                }
+                if (!worker.context.mark_queued(cell_index)) {
+                    continue;
+                }
+                worker.queue.begin_external_task();
+                pending_startup_task = {
+                    cell_index,
+                    worker.context.get_required_depth(cell_index),
+                    0U,
+                    RefinementTaskKind::kRefine,
+                };
+                have_pending_startup_task = true;
+                break;
+            }
+        }
+        if (task_counts_as_in_flight) {
+            worker.queue.task_done();
+        }
         maybe_shutdown_queue(worker);
         ++processed_count;
     }
@@ -2439,7 +2501,9 @@ inline void run_closure_queue(
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
     const RefinementClosureConfig &config,
-    RefinementWorkQueue &queue) {
+    RefinementWorkQueue &queue,
+    const std::vector<std::size_t> *startup_seed_cells = nullptr,
+    std::size_t startup_seed_cursor_begin = 0U) {
     ClosureRunStats run_stats;
     ClosureProfiler profiler;
     const auto run_wallclock_start = std::chrono::steady_clock::now();
@@ -2450,6 +2514,7 @@ inline void run_closure_queue(
         run_stats);
 
     const std::uint32_t worker_count = std::max(1U, config.worker_count);
+    std::atomic<std::size_t> startup_seed_cursor{startup_seed_cursor_begin};
     // Queue must be initialized by the caller before seeding tasks so we do
     // not discard already-enqueued work here.
 
@@ -2461,11 +2526,13 @@ inline void run_closure_queue(
                                   &context,
                                   &positions,
                                   &smoothing_lengths,
-                                   &config,
+                                  &config,
                                   &queue,
                                   &run_stats,
                                   &reporter,
                                   &profiler,
+                                  startup_seed_cells,
+                                  &startup_seed_cursor,
                                   worker_index
                               ]() {
             ClosureWorkerState worker = {
@@ -2474,6 +2541,8 @@ inline void run_closure_queue(
                 smoothing_lengths,
                 config,
                 queue,
+                startup_seed_cells,
+                startup_seed_cells != nullptr ? &startup_seed_cursor : nullptr,
                 worker_index,
                 run_stats,
                 profiler,
@@ -2636,7 +2705,19 @@ refine_with_closure(
         }
         seed_cells.push_back(cell_index);
     }
-    if (!seed_queue_from_cells(context, queue, worker_count, seed_cells)) {
+    const std::vector<std::size_t> startup_seed_cells =
+        build_coarse_startup_seed_order(seed_cells, worker_count);
+    const std::size_t initial_startup_seed_count = std::min<std::size_t>(
+        std::max<std::uint32_t>(1U, worker_count),
+        startup_seed_cells.size());
+    const std::vector<std::size_t> initial_queue_seed_cells(
+        startup_seed_cells.begin(),
+        startup_seed_cells.begin() + initial_startup_seed_count);
+    if (!seed_queue_from_cells(
+            context,
+            queue,
+            worker_count,
+            initial_queue_seed_cells)) {
         return {
             std::move(initial_cells),
             std::move(initial_contributors),
@@ -2649,7 +2730,9 @@ refine_with_closure(
         positions,
         smoothing_lengths,
         config,
-        queue);
+        queue,
+        &startup_seed_cells,
+        initial_startup_seed_count);
 
     // Materialize arena state back into the caller-visible vectors and
     // return them. Reconciles ``is_leaf`` from ``child_begin`` for any

@@ -223,6 +223,10 @@ void RefinementWorkQueue::task_done() {
     }
 }
 
+void RefinementWorkQueue::begin_external_task() {
+    in_flight_tasks_.fetch_add(1U, std::memory_order_acq_rel);
+}
+
 void RefinementWorkQueue::shutdown() {
     shutdown_requested_.store(true, std::memory_order_release);
     idle_condition_.notify_all();

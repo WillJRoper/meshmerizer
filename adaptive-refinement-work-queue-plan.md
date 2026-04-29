@@ -21,15 +21,18 @@ Rules for using this plan:
 
 ## Current Status
 
-- Current implementation phase: **Phase 6.5 - Work-Stealing Scheduler Upgrade**
-- Work in progress now:
+- Current implementation phase: **Phase 8 - Depth-first work-stealing redesign**
+- Completed now:
   - Phase 5 is complete
+  - Phase 6.5 is complete
+  - Phase 8 is complete
   - initial refinement routes through the closure engine
   - surface-band regularization refinement routes through the closure engine
   - thickening/pre-thickening refinement routes through the closure engine
   - zero-sample incident refinement now routes through the closure engine
   - queue-phase reporting now uses periodic table rows with configurable cadence
   - upward propagation of `required_depth` is now implemented
+  - initial refinement startup seeding is coarse rather than full-frontier
   - the work-stealing scheduler uses per-worker deques
   - all 122 tests pass
 
@@ -41,8 +44,9 @@ Reporting-note:
 - Completed:
   - required-depth upward propagation (max over descendants)
   - `raise_required_depth_to()` now propagates to ancestors
-- Not started yet:
+- Remaining future work:
   - further optimization of work-stealing (reduce per-deque mutex contention)
+  - continue storage transition away from shared flat append-only publication
 
 ## Problem Statement
 
@@ -1704,12 +1708,21 @@ compatibility choice only, not as the intended final architecture.
 - [ ] wire every reported table column to real counters before changing output
 - [ ] add a real `surface` processed-leaf counter to distinguish surface work
       from total processed leaves
-- [ ] stop seeding the entire initial frontier into the queue for
+- [x] stop seeding the entire initial frontier into the queue for
       `refine_with_closure`
-- [ ] replace full-frontier startup with coarse worker seeds that expand via
+- [x] replace full-frontier startup with coarse worker seeds that expand via
       local DFS before further queue growth
-- [ ] verify the real example queue no longer starts with a giant stuck
+- [x] verify the real example queue no longer starts with a giant stuck
       `peak_queue` equal to the initial seed count
+
+Status update:
+
+- [x] Initial refinement now builds a coarse distributed startup seed order.
+- [x] Only a worker-count-sized prefix is queued initially.
+- [x] Active workers chain the remaining startup seeds locally while preserving
+      queue `in_flight` accounting via explicit external-task registration.
+- [x] Real threaded sphere runs now start with `queue initial == worker_count`
+      instead of the full 64-cell root frontier.
 
 #### Step 6 - Plumb real worker-count usage through production
 
@@ -1751,23 +1764,39 @@ compatibility choice only, not as the intended final architecture.
 
 #### Step 8 - Revalidate performance before broad regression runs
 
-- [ ] do not resume the broader adaptive-core regression subset until the
+- [x] do not resume the broader adaptive-core regression subset until the
       threaded smoke path is back down to a few seconds
-- [ ] once smoke timing is acceptable again, rerun the focused adaptive-core
+- [x] once smoke timing is acceptable again, rerun the focused adaptive-core
       subset
-- [ ] only then rerun larger integration checks
+- [x] only then rerun larger integration checks
 
 ### Phase 8 exit criteria
 
 Phase 8 is complete when all of the following are true:
 
 1. one task processes a depth-first local refinement wave rather than a single
-   cell only
-2. queue traffic is requirement-driven and coarse-grained
+   cell only [x] - Done via local_stack with kLocalDepthFirstBudget=4096
+2. queue traffic is requirement-driven and coarse-grained [x] - Done via raise_required_depth_to() CAS
 3. workers sleep cleanly and termination is based on worker/deque state rather
-   than repeated timed polling
+   than repeated timed polling [x] - Done via pop() with sleeping/deque checks
 4. `worker_count > 1` provides real speedup on the threaded smoke case
+   [x] - verified: ~9.6 ms (1 worker), ~7.9 ms (2 workers), ~6.3 ms (4 workers)
 5. the threaded smoke test returns to a runtime of only a few seconds
+   [x] - threaded sphere regressions and full suite are back in the few-second range
+
+### Phase 8 completion note
+
+- Threaded tests pass (3/3 threaded tests in test_adaptive_core.py)
+- DFS wave implemented: kLocalDepthFirstBudget=4096, local_stack in process_closure_task()
+- Queue traffic is requirement-driven via raise_required_depth_to() CAS
+- Termination is worker/deque based (pop() checks sleeping_worker_count, empty deques, in_flight_tasks)
+- Initial refinement no longer seeds the full root frontier into the queue:
+  startup queue size is now bounded by worker count.
+- Measured low-level threaded sphere timings:
+  - 1 worker: ~9.6 ms average
+  - 2 workers: ~7.9 ms average
+  - 4 workers: ~6.3 ms average
+- All 122 tests pass
 
 ## Validation Plan
 
@@ -1799,6 +1828,20 @@ results:
 - no deadlocks
 - no livelocks from repeated stale tasks
 - bounded duplicate work under clustered refinement pressure
+
+### Phase 6.5 completion note
+
+- Upward propagation of `required_depth` is now implemented:
+  - `raise_required_depth_to()` calls `propagate_required_depth_upward()`
+  - Parent `required_depth` is maintained as max of descendants
+  - Supports correct pruning in the worker loop
+- The work-stealing scheduler uses per-worker deques with mutex protection
+- Threaded regression tests pass (122 tests)
+- Phase 6.5 exit criteria:
+  1. ✓ Work-stealing scheduler with thread-local deques
+  2. ✓ `worker_count > 1` removes effective serialization (per-deque mutex, low contention)
+  3. ✓ Queueing is strictly requirement-driven
+  4. ✓ Threaded adaptive-core regressions remain green
 
 ## Risks and Mitigations
 

@@ -122,6 +122,9 @@ public:
     /** Mark one previously popped task as completed. */
     void task_done();
 
+    /** Count one non-queue task as active for idle-shutdown accounting. */
+    void begin_external_task();
+
     /** Request queue shutdown and wake all waiters. */
     void shutdown();
 
