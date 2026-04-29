@@ -245,6 +245,7 @@ def _reconstruct_mesh(
     isovalue: float,
     max_depth: int,
     *,
+    worker_count: int = 1,
     group_labels: np.ndarray | None = None,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
@@ -321,6 +322,7 @@ def _reconstruct_mesh(
             base_resolution,
             isovalue,
             max_depth,
+            worker_count=worker_count,
             table_cadence=table_cadence,
             smoothing_iterations=smoothing_iterations,
             smoothing_strength=smoothing_strength,
@@ -408,6 +410,7 @@ def _run_full_pipeline_path(
         base_resolution,
         isovalue,
         max_depth,
+        worker_count=max(1, int(getattr(args, "nthreads", 1) or 1)),
         group_labels=group_labels,
         smoothing_iterations=getattr(args, "smoothing_iterations", 0),
         smoothing_strength=getattr(args, "smoothing_strength", 0.5),
@@ -618,6 +621,7 @@ def _build_and_optionally_save_octree(
         max_depth,
         domain=(domain_min, domain_max),
         base_resolution=base_resolution,
+        worker_count=max(1, int(getattr(args, "nthreads", 1) or 1)),
         minimum_usable_hermite_samples=getattr(
             args, "min_usable_hermite_samples", 3
         ),

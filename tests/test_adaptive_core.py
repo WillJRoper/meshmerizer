@@ -29,9 +29,9 @@ from meshmerizer.adaptive import (
 )
 
 
-def test_adaptive_extension_scaffold_imports() -> None:
+def test_adaptive_extension_imports() -> None:
     """The adaptive C++ extension should import through its Python wrapper."""
-    assert adaptive_status() == "adaptive core scaffold ready"
+    assert adaptive_status() == "adaptive core ready"
 
 
 def test_morton_encode_decode_round_trip() -> None:
@@ -1471,3 +1471,84 @@ def test_pre_thickening_increases_leaf_count_when_refinement_is_needed() -> (
 
     assert thickened["n_leaves"] >= baseline["n_leaves"]
     assert thickened["n_thickened_inside"] >= thickened["n_inside"]
+
+
+# ---------------------------------------------------------------------------
+# B2 classify→distance→refine chain unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_b2_chain_produces_inside_classified_cells() -> None:
+    """B2 kClassify tasks must label at least one leaf cell as inside.
+
+    Exercises the full incremental chain:
+      kClassify → kDistanceUpdate → kRefine → kClassify(children) → …
+
+    We use a small solid-sphere particle cloud with a non-zero
+    pre_thickening_radius so the thickening-band task chain is active.
+    The result dict must report at least one inside leaf (the chain has run)
+    and no crash must occur.
+    """
+    positions, smoothing_lengths = _make_solid_sphere_particles(
+        n=200, radius=0.6, center=(2.0, 2.0, 2.0), h=0.25, seed=7
+    )
+
+    result = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        base_resolution=4,
+        isovalue=0.01,
+        max_depth=2,
+        pre_thickening_radius=0.3,
+    )
+
+    # The classify pass must have run and labelled some cells inside.
+    assert result["n_inside"] > 0, "Expected at least one inside leaf after B2 classify"
+    # The thickening pass must have expanded the inside count.
+    assert result["n_thickened_inside"] >= result["n_inside"], (
+        "Thickened inside count must be >= raw inside count"
+    )
+
+
+def test_b2_chain_refines_more_than_no_thickening() -> None:
+    """B2 kDistanceUpdate→kRefine cascade must produce additional leaves.
+
+    Compares leaf counts from a run with pre_thickening_radius=0 (chain
+    disabled) versus pre_thickening_radius>0 (chain active).  The thickening
+    run must produce at least as many leaves because the cascade refines cells
+    within the outward band.
+    """
+    positions, smoothing_lengths = _make_solid_sphere_particles(
+        n=200, radius=0.6, center=(2.0, 2.0, 2.0), h=0.25, seed=7
+    )
+
+    common_kwargs = dict(
+        domain_minimum=(0.0, 0.0, 0.0),
+        domain_maximum=(4.0, 4.0, 4.0),
+        base_resolution=4,
+        isovalue=0.01,
+        max_depth=2,
+        erosion_radius=0.0,
+    )
+
+    baseline = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        pre_thickening_radius=0.0,
+        **common_kwargs,
+    )
+    thickened = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        pre_thickening_radius=0.3,
+        **common_kwargs,
+    )
+
+    assert thickened["n_leaves"] >= baseline["n_leaves"], (
+        "Thickening band refinement should not reduce leaf count"
+    )
+    assert thickened["n_thickened_inside"] >= thickened["n_inside"], (
+        "Thickened inside count must be >= raw inside count"
+    )

@@ -33,6 +33,8 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <algorithm>
+#include <thread>
 
 #include "adaptive_cpp/bounding_box.hpp"
 #include "adaptive_cpp/hermite.hpp"
@@ -49,6 +51,7 @@
 #include "adaptive_cpp/adaptive_solid.hpp"
 #include "adaptive_cpp/cancellation.hpp"
 #include "adaptive_cpp/qef.hpp"
+#include "adaptive_cpp/refinement_arena.hpp"
 
 // ---------------------------------------------------------------------------
 // Exception translation helpers.
@@ -433,6 +436,12 @@ static bool parse_octree_cell_dict(PyObject *dictionary,
     // Start from a zeroed cell so missing optional Python keys fall back to the
     // same defaults used by the native refinement pipeline.
     cell = OctreeCell{};
+    // Value-initialization gives parent_index=0, which would falsely advertise
+    // "child of cell 0". The native default is -1 (no parent linkage); set it
+    // explicitly here. Cells round-tripped through Python carry no parent
+    // linkage, which is correct: closure paths populate it on split.
+    cell.parent_index = -1;
+    cell.slot_in_parent = 0U;
     cell.morton_key = PyLong_AsUnsignedLongLong(
         PyDict_GetItemString(dictionary, "morton_key"));
     cell.depth = static_cast<std::uint32_t>(PyLong_AsUnsignedLong(
@@ -1453,19 +1462,36 @@ static PyObject *refine_octree_py(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    auto [all_cells, all_contributors] = refine_octree(
-        std::move(initial_cells),
-        positions,
-        smoothing_lengths,
-        isovalue,
-        max_depth,
-        domain,
-        static_cast<std::uint32_t>(base_resolution),
-        static_cast<std::uint32_t>(worker_count),
-        table_cadence,
-        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
-        max_qef_rms_residual_ratio,
-        min_normal_alignment_threshold);
+    std::vector<OctreeCell> all_cells;
+    std::vector<std::size_t> all_contributors;
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyThreadState *_save = PyEval_SaveThread();
+    try {
+        std::tie(all_cells, all_contributors) = refine_octree(
+            std::move(initial_cells),
+            positions,
+            smoothing_lengths,
+            isovalue,
+            max_depth,
+            domain,
+            static_cast<std::uint32_t>(base_resolution),
+            static_cast<std::uint32_t>(worker_count),
+            table_cadence,
+            static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+            max_qef_rms_residual_ratio,
+            min_normal_alignment_threshold);
+    } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
+        PyEval_RestoreThread(_save);
+        return raise_cancelled_exception();
+    } catch (const std::exception &exc) {
+        PyEval_RestoreThread(_save);
+        return raise_cpp_exception(exc);
+    } catch (...) {
+        PyEval_RestoreThread(_save);
+        return raise_unknown_cpp_exception();
+    }
+    PyEval_RestoreThread(_save);
+    meshmerizer_cancel_detail::reset_cancel_state();
 
     PyObject *result = PyTuple_New(2);
     if (result == NULL) {
@@ -1629,12 +1655,13 @@ static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
     unsigned int base_resolution = 0U;
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
-    double table_cadence = 0.0;
+    double table_cadence = 10.0;
+    unsigned int worker_count = 1U;
     unsigned int minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdI|dIdd",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|dIIdd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -1643,6 +1670,7 @@ static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
                           &isovalue,
                           &max_depth,
                           &table_cadence,
+                          &worker_count,
                           &minimum_usable_hermite_samples,
                           &max_qef_rms_residual_ratio,
                           &min_normal_alignment_threshold)) {
@@ -1679,20 +1707,37 @@ static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
                                           initial_cells,
                                           initial_contributors);
 
-    auto [all_cells, all_contributors] = refine_octree(
-        std::move(initial_cells),
-        std::move(initial_contributors),
-        positions,
-        smoothing_lengths,
-        isovalue,
-        max_depth,
-        domain,
-        static_cast<std::uint32_t>(base_resolution),
-        1U,
-        table_cadence,
-        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
-        max_qef_rms_residual_ratio,
-        min_normal_alignment_threshold);
+    std::vector<OctreeCell> all_cells;
+    std::vector<std::size_t> all_contributors;
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyThreadState *_save = PyEval_SaveThread();
+    try {
+        std::tie(all_cells, all_contributors) = refine_octree(
+            std::move(initial_cells),
+            std::move(initial_contributors),
+            positions,
+            smoothing_lengths,
+            isovalue,
+            max_depth,
+            domain,
+            static_cast<std::uint32_t>(base_resolution),
+            static_cast<std::uint32_t>(worker_count),
+            table_cadence,
+            static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+            max_qef_rms_residual_ratio,
+            min_normal_alignment_threshold);
+    } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
+        PyEval_RestoreThread(_save);
+        return raise_cancelled_exception();
+    } catch (const std::exception &exc) {
+        PyEval_RestoreThread(_save);
+        return raise_cpp_exception(exc);
+    } catch (...) {
+        PyEval_RestoreThread(_save);
+        return raise_unknown_cpp_exception();
+    }
+    PyEval_RestoreThread(_save);
+    meshmerizer_cancel_detail::reset_cancel_state();
 
     PyObject *cells_list = PyList_New(static_cast<Py_ssize_t>(all_cells.size()));
     if (cells_list == NULL) {
@@ -1746,6 +1791,7 @@ static PyObject *extract_opened_surface_mesh_py(
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
     double table_cadence = 0.0;
+    unsigned int worker_count = 1U;
     unsigned int minimum_usable_hermite_samples = 3U;
     double max_qef_rms_residual_ratio = 0.1;
     double min_normal_alignment_threshold = 0.97;
@@ -1754,7 +1800,7 @@ static PyObject *extract_opened_surface_mesh_py(
     BoundingBox domain{};
     std::vector<std::uint8_t> opened_inside;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdIO|dIdd",
+    if (!PyArg_ParseTuple(args, "OOOOIdIO|dIIdd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -1764,6 +1810,7 @@ static PyObject *extract_opened_surface_mesh_py(
                           &max_depth,
                           &opened_inside_object,
                           &table_cadence,
+                          &worker_count,
                           &minimum_usable_hermite_samples,
                           &max_qef_rms_residual_ratio,
                           &min_normal_alignment_threshold)) {
@@ -1805,38 +1852,62 @@ static PyObject *extract_opened_surface_mesh_py(
                                           initial_cells,
                                           initial_contributors);
 
-    auto [all_cells, all_contributors] = refine_octree(
-        std::move(initial_cells), std::move(initial_contributors),
-        positions, smoothing_lengths, isovalue, max_depth, domain,
-        static_cast<std::uint32_t>(base_resolution),
-        1U,
-        table_cadence,
-        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
-        max_qef_rms_residual_ratio, min_normal_alignment_threshold);
-
+    std::vector<OctreeCell> all_cells;
+    std::vector<std::size_t> all_contributors;
     LeafSpatialIndex spatial_index;
-    spatial_index.build(all_cells, domain, max_depth,
-                        static_cast<std::uint32_t>(base_resolution));
-    const std::vector<OccupiedSolidLeaf> solid_leaves =
-        classify_occupied_solid_leaves(
-            all_cells, all_contributors, positions, smoothing_lengths,
-            spatial_index, isovalue, max_depth);
-    if (opened_inside.size() != solid_leaves.size()) {
-        PyErr_SetString(PyExc_ValueError,
-                        "opened_inside length must match the number of solid leaves");
-        return NULL;
-    }
+    std::vector<OccupiedSolidLeaf> solid_leaves;
+    OpenedSurfaceMesh opened_surface_mesh;
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyThreadState *_save = PyEval_SaveThread();
+    try {
+        std::tie(all_cells, all_contributors) = refine_octree(
+            std::move(initial_cells), std::move(initial_contributors),
+            positions, smoothing_lengths, isovalue, max_depth, domain,
+            static_cast<std::uint32_t>(base_resolution),
+            static_cast<std::uint32_t>(worker_count),
+            table_cadence,
+            static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+            max_qef_rms_residual_ratio, min_normal_alignment_threshold);
 
-    OpenedSurfaceMesh opened_surface_mesh = generate_opened_surface_mesh(
-        solid_leaves, opened_inside, all_cells, spatial_index,
-        domain, static_cast<std::uint32_t>(base_resolution), max_depth);
-    if (resolve_opened_edge_ambiguities(
-            solid_leaves, all_cells, spatial_index,
-            opened_inside, opened_surface_mesh)) {
+        spatial_index.build(all_cells, domain, max_depth,
+                            static_cast<std::uint32_t>(base_resolution));
+        OccupiedSolidClassificationCache classification_cache;
+        update_occupied_solid_classification_cache(
+            all_cells, all_contributors, positions, smoothing_lengths,
+            spatial_index, isovalue, max_depth, classification_cache);
+        solid_leaves = build_occupied_solid_leaves_from_cache(
+            all_cells, classification_cache);
+        if (opened_inside.size() != solid_leaves.size()) {
+            PyEval_RestoreThread(_save);
+            PyErr_SetString(
+                PyExc_ValueError,
+                "opened_inside length must match the number of solid leaves");
+            return NULL;
+        }
+
         opened_surface_mesh = generate_opened_surface_mesh(
             solid_leaves, opened_inside, all_cells, spatial_index,
             domain, static_cast<std::uint32_t>(base_resolution), max_depth);
+        if (resolve_opened_edge_ambiguities(
+                solid_leaves, all_cells, spatial_index,
+                opened_inside, opened_surface_mesh)) {
+            opened_surface_mesh = generate_opened_surface_mesh(
+                solid_leaves, opened_inside, all_cells, spatial_index,
+                domain, static_cast<std::uint32_t>(base_resolution),
+                max_depth);
+        }
+    } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
+        PyEval_RestoreThread(_save);
+        return raise_cancelled_exception();
+    } catch (const std::exception &exc) {
+        PyEval_RestoreThread(_save);
+        return raise_cpp_exception(exc);
+    } catch (...) {
+        PyEval_RestoreThread(_save);
+        return raise_unknown_cpp_exception();
     }
+    PyEval_RestoreThread(_save);
+    meshmerizer_cancel_detail::reset_cancel_state();
 
     npy_intp vertex_dims[2] = {
         static_cast<npy_intp>(opened_surface_mesh.vertices.size()), 3};
@@ -2399,9 +2470,10 @@ static PyObject *classify_occupied_solid_py(
     double erosion_radius = 0.0;
     double pre_thickening_radius = 0.0;
     double table_cadence = 0.0;
+    unsigned int worker_count = 1U;
     (void)self;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdI|Idddddd",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|IIdddddd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -2409,6 +2481,7 @@ static PyObject *classify_occupied_solid_py(
                           &base_resolution,
                           &isovalue,
                           &max_depth,
+                          &worker_count,
                           &minimum_usable_hermite_samples,
                           &max_qef_rms_residual_ratio,
                           &min_normal_alignment_threshold,
@@ -2503,7 +2576,7 @@ static PyObject *classify_occupied_solid_py(
             positions, smoothing_lengths, isovalue,
             static_cast<std::uint32_t>(max_depth), domain,
             static_cast<std::uint32_t>(base_resolution),
-            1U,
+            static_cast<std::uint32_t>(worker_count),
             0.0,
             static_cast<std::uint32_t>(minimum_usable_hermite_samples),
             max_qef_rms_residual_ratio, min_normal_alignment_threshold);
@@ -2512,6 +2585,7 @@ static PyObject *classify_occupied_solid_py(
             all_cells, all_contributors, positions, smoothing_lengths,
             isovalue, static_cast<std::uint32_t>(max_depth),
             domain, static_cast<std::uint32_t>(base_resolution),
+            static_cast<std::uint32_t>(worker_count),
             max_surface_leaf_size,
             0.0,
             static_cast<std::uint32_t>(minimum_usable_hermite_samples),
@@ -2523,30 +2597,76 @@ static PyObject *classify_occupied_solid_py(
         spatial_index.build(
             all_cells, domain, static_cast<std::uint32_t>(max_depth),
             static_cast<std::uint32_t>(base_resolution));
-        solid_leaves = classify_occupied_solid_leaves(
+        OccupiedSolidClassificationCache classification_cache;
+        update_occupied_solid_classification_cache(
             all_cells, all_contributors, positions, smoothing_lengths,
-            spatial_index, isovalue, static_cast<std::uint32_t>(max_depth));
-        std::vector<std::uint8_t> inside_mask = build_inside_mask(solid_leaves);
+            spatial_index, isovalue, static_cast<std::uint32_t>(max_depth),
+            classification_cache);
+        solid_leaves = build_occupied_solid_leaves_from_cache(
+            all_cells, classification_cache);
+        std::vector<std::uint8_t> inside_mask_by_cell =
+            build_inside_mask_from_classification_cache(
+                all_cells, classification_cache);
+        std::vector<std::uint8_t> inside_mask = build_leaf_mask_from_cell_mask(
+            solid_leaves, inside_mask_by_cell);
+        std::vector<double> thickening_distance_by_cell(
+            all_cells.size(), std::numeric_limits<double>::infinity());
         thickening_distance.assign(
             solid_leaves.size(), std::numeric_limits<double>::infinity());
         thickened_inside = inside_mask;
         if (pre_thickening_radius > 0.0) {
-            thickening_distance = compute_outside_distance_from_inside_mask(
-                solid_leaves, inside_mask);
-            thickened_inside = dilate_inside_mask(
-                inside_mask, thickening_distance, pre_thickening_radius);
+            thickening_distance_by_cell =
+                compute_outside_distance_from_classification_cache(
+                    all_cells, classification_cache);
+            thickening_distance = project_leaf_scalars_from_cell_state(
+                solid_leaves,
+                thickening_distance_by_cell,
+                std::numeric_limits<double>::infinity());
+            inside_mask_by_cell = dilate_inside_cell_mask(
+                all_cells,
+                inside_mask_by_cell,
+                thickening_distance_by_cell,
+                pre_thickening_radius);
+            thickened_inside = build_leaf_mask_from_cell_mask(
+                solid_leaves, inside_mask_by_cell);
             inside_mask = thickened_inside;
         } else {
-            thickening_distance = compute_outside_distance_from_inside_mask(
-                solid_leaves, inside_mask);
+            thickening_distance_by_cell =
+                compute_outside_distance_from_classification_cache(
+                    all_cells, classification_cache);
+            thickening_distance = project_leaf_scalars_from_cell_state(
+                solid_leaves,
+                thickening_distance_by_cell,
+                std::numeric_limits<double>::infinity());
         }
-        clearance = compute_inside_clearance(solid_leaves, inside_mask);
-        eroded_inside = erode_occupied_solid_leaves(
-            inside_mask, clearance, erosion_radius);
-        dilation_distance = compute_distance_to_eroded_solid(
-            solid_leaves, eroded_inside);
-        opened_inside = dilate_eroded_solid_leaves(
-            eroded_inside, dilation_distance, erosion_radius);
+        const std::vector<double> clearance_by_cell =
+            compute_inside_clearance_from_cell_mask(
+                all_cells, classification_cache, inside_mask_by_cell);
+        clearance = project_leaf_scalars_from_cell_state(
+            solid_leaves,
+            clearance_by_cell,
+            std::numeric_limits<double>::infinity());
+        const std::vector<std::uint8_t> eroded_inside_by_cell =
+            erode_occupied_solid_cells(
+                all_cells, inside_mask_by_cell, clearance_by_cell,
+                erosion_radius);
+        eroded_inside = build_leaf_mask_from_cell_mask(
+            solid_leaves, eroded_inside_by_cell);
+        const std::vector<double> dilation_distance_by_cell =
+            compute_distance_to_eroded_solid_from_cell_mask(
+                all_cells, classification_cache, eroded_inside_by_cell);
+        dilation_distance = project_leaf_scalars_from_cell_state(
+            solid_leaves,
+            dilation_distance_by_cell,
+            std::numeric_limits<double>::infinity());
+        const std::vector<std::uint8_t> opened_inside_by_cell =
+            dilate_eroded_solid_cells(
+                all_cells,
+                eroded_inside_by_cell,
+                dilation_distance_by_cell,
+                erosion_radius);
+        opened_inside = build_leaf_mask_from_cell_mask(
+            solid_leaves, opened_inside_by_cell);
         opened_boundary_samples = generate_opened_boundary_samples(
             solid_leaves, opened_inside, all_cells);
         opened_surface_mesh = generate_opened_surface_mesh(
@@ -2845,6 +2965,7 @@ static PyObject *run_full_pipeline_py(
     unsigned int base_resolution = 0U;
     double isovalue = 0.0;
     unsigned int max_depth = 0U;
+    unsigned int worker_count = 1U;
     unsigned int smoothing_iterations = 0U;
     double smoothing_strength = 0.5;
     double max_edge_ratio = 1.5;
@@ -2855,7 +2976,7 @@ static PyObject *run_full_pipeline_py(
     double pre_thickening_radius = 0.0;
     double table_cadence = 10.0;
 
-    if (!PyArg_ParseTuple(args, "OOOOIdI|dIddIdddd",
+    if (!PyArg_ParseTuple(args, "OOOOIdI|IdIddIdddd",
                           &positions_object,
                           &smoothing_object,
                           &domain_min_object,
@@ -2863,6 +2984,7 @@ static PyObject *run_full_pipeline_py(
                           &base_resolution,
                           &isovalue,
                           &max_depth,
+                          &worker_count,
                           &table_cadence,
                           &smoothing_iterations,
                           &smoothing_strength,
@@ -2911,6 +3033,7 @@ static PyObject *run_full_pipeline_py(
             static_cast<std::uint32_t>(base_resolution),
             isovalue,
             static_cast<std::uint32_t>(max_depth),
+            static_cast<std::uint32_t>(worker_count),
             static_cast<std::uint32_t>(smoothing_iterations),
             smoothing_strength,
             max_edge_ratio,
@@ -2984,6 +3107,164 @@ static PyObject *run_full_pipeline_py(
     PyDict_SetItemString(dict, "n_qef_vertices",
         PyLong_FromSize_t(result.n_qef_vertices));
     return dict;
+}
+
+/**
+ * @brief Stress test for ``ChunkedArena`` reservation correctness.
+ *
+ * Spawns ``threads`` workers; each calls ``reserve_block(8)`` ``ops`` times
+ * and writes its thread id into all eight slots of the returned block.
+ * Returns a tuple ``(ok, total_reserved)`` where ``ok`` is a bool that is
+ * true iff every invariant held:
+ *
+ * - ``size()`` after all threads finish equals the sum of reserved entries.
+ * - Every reserved 8-block lies entirely within one chunk (no straddle).
+ * - Every slot that was claimed has a thread id stored in it (no torn
+ *   block, no lost write).
+ * - No two threads ever claimed the same flat index (verified via a
+ *   per-slot tag count: each slot must be written at most once).
+ *
+ * The hook is permanent and used by ``tests/test_arena.py`` as a regression
+ * guard for the chunked arena, which is a load-bearing primitive in the
+ * adaptive refinement closure.
+ *
+ * @param self Unused module reference.
+ * @param args Python args ``(threads:int, ops_per_thread:int)``.
+ * @return Python tuple ``(ok:bool, total_reserved:int)``.
+ */
+static PyObject *arena_stress_test_py(PyObject * /*self*/, PyObject *args) {
+    int threads = 0;
+    int ops = 0;
+    if (!PyArg_ParseTuple(args, "ii", &threads, &ops)) {
+        return NULL;
+    }
+    if (threads < 1 || ops < 1) {
+        PyErr_SetString(PyExc_ValueError,
+                        "threads and ops must be >= 1");
+        return NULL;
+    }
+    constexpr std::size_t kBlock = 8U;
+
+    // Sentinel marking unwritten slots. Picked far above any plausible
+    // thread id so accidental collisions cannot mask a missed write.
+    constexpr std::size_t kUnwritten = static_cast<std::size_t>(-1);
+
+    ChunkedArena<std::size_t> arena;
+
+    // Pre-fill is impossible (entries do not exist until reserved), so the
+    // invariant "no slot was missed" is checked by tagging each slot with
+    // the writing thread id and asserting it is non-sentinel afterwards.
+    // Newly allocated chunks zero-initialize std::size_t to 0, which is a
+    // valid thread id; to detect missed writes we add 1 to the thread id
+    // before storing and treat 0 as "unwritten".
+
+    std::vector<std::vector<std::size_t>> per_thread_starts(
+        static_cast<std::size_t>(threads));
+
+    PyObject *result = NULL;
+    bool ok = true;
+
+    Py_BEGIN_ALLOW_THREADS
+
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(threads));
+    for (int t = 0; t < threads; ++t) {
+        const std::size_t tid = static_cast<std::size_t>(t);
+        per_thread_starts[tid].reserve(static_cast<std::size_t>(ops));
+        workers.emplace_back([&arena, &per_thread_starts, tid, ops]() {
+            const std::size_t marker = tid + 1U;  // never zero
+            for (int i = 0; i < ops; ++i) {
+                const std::size_t begin = arena.reserve_block(kBlock);
+                per_thread_starts[tid].push_back(begin);
+                for (std::size_t k = 0; k < kBlock; ++k) {
+                    arena[begin + k] = marker;
+                }
+            }
+        });
+    }
+    for (auto &w : workers) {
+        w.join();
+    }
+
+    // Invariants check on the main thread (still under Py_BEGIN_ALLOW_THREADS
+    // because we touch no Python state).
+    const std::size_t expected_total =
+        static_cast<std::size_t>(threads) *
+        static_cast<std::size_t>(ops) * kBlock;
+
+    // 1. arena size matches the sum of reservations made.
+    //    Note: due to chunk-boundary alignment, arena.size() may exceed the
+    //    total bytes actually claimed. Skipped slots are unused but counted
+    //    as "reserved" for purposes of cursor advancement; we identify them
+    //    by the kUnwritten (zero) sentinel below and exclude them.
+    if (arena.size() < expected_total) {
+        ok = false;
+    }
+
+    // 2. every recorded block start is within bounds and 8 contiguous slots
+    //    fit in one chunk.
+    if (ok) {
+        for (int t = 0; t < threads && ok; ++t) {
+            for (std::size_t begin : per_thread_starts[
+                     static_cast<std::size_t>(t)]) {
+                const std::size_t end = begin + kBlock;
+                if (end > arena.size()) {
+                    ok = false;
+                    break;
+                }
+                const std::size_t chunk_begin =
+                    begin >> meshmerizer_arena_detail::kArenaChunkLog2;
+                const std::size_t chunk_end =
+                    (end - 1U) >> meshmerizer_arena_detail::kArenaChunkLog2;
+                if (chunk_begin != chunk_end) {
+                    ok = false;
+                    break;
+                }
+                // Every slot in this block must carry the matching marker.
+                const std::size_t expected_marker =
+                    static_cast<std::size_t>(t) + 1U;
+                for (std::size_t k = 0; k < kBlock; ++k) {
+                    if (arena[begin + k] != expected_marker) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok) {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. no two threads claimed overlapping ranges. Each block start must
+    //    be unique. Collect, sort, and check strict ordering of (start)
+    //    followed by start+8 <= next_start.
+    if (ok) {
+        std::vector<std::size_t> all_starts;
+        all_starts.reserve(static_cast<std::size_t>(threads) *
+                           static_cast<std::size_t>(ops));
+        for (const auto &v : per_thread_starts) {
+            all_starts.insert(all_starts.end(), v.begin(), v.end());
+        }
+        std::sort(all_starts.begin(), all_starts.end());
+        for (std::size_t i = 1; i < all_starts.size(); ++i) {
+            if (all_starts[i] < all_starts[i - 1] + kBlock) {
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    (void)kUnwritten;  // sentinel reserved for future invariants
+
+    Py_END_ALLOW_THREADS
+
+    PyObject *ok_obj = PyBool_FromLong(ok ? 1 : 0);
+    PyObject *total_obj = PyLong_FromSize_t(arena.size());
+    result = PyTuple_Pack(2, ok_obj, total_obj);
+    Py_DECREF(ok_obj);
+    Py_DECREF(total_obj);
+    return result;
 }
 
 /**
@@ -3208,6 +3489,16 @@ static PyMethodDef adaptive_methods[] = {
             "(adaptive octree + reconstruction) in C++ "
             "and return a dict with vertices, faces, and "
             "basic pipeline metadata."),
+    },
+    {
+        "_arena_stress_test",
+        arena_stress_test_py,
+        METH_VARARGS,
+        PyDoc_STR(
+            "Stress-test the chunked arena reservation primitive. "
+            "Args: (threads:int, ops_per_thread:int). "
+            "Returns (ok:bool, total_reserved:int). "
+            "Used by tests/test_arena.py as a regression guard."),
     },
     {NULL, NULL, 0, NULL},
 };

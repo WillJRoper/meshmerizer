@@ -84,6 +84,34 @@ struct OccupiedSolidClassificationCache {
 };
 
 /**
+ * @brief Compact extraction views derived from the full-tree classification cache.
+ *
+ * Phase 5 groundwork: keep cell-local material state authoritative on the full
+ * octree, and build compact leaf-only views explicitly at the
+ * morphology/extraction boundary.
+ */
+struct OccupiedSolidExtractionView {
+    /** Compact occupied-solid leaf records used by morphology/extraction. */
+    std::vector<OccupiedSolidLeaf> solid_leaves;
+    /** Full-tree inside mask aligned with ``all_cells``. */
+    std::vector<std::uint8_t> inside_mask_by_cell;
+    /** Leaf-compact inside mask aligned with ``solid_leaves``. */
+    std::vector<std::uint8_t> inside_mask;
+};
+
+/**
+ * @brief Return whether one cached cell classification is part of the solid.
+ *
+ * @param occupancy Cached occupancy state stored in the full-tree side-car.
+ * @return ``true`` when the cell is inside or boundary-inside.
+ */
+inline bool occupied_solid_cache_is_inside(std::uint8_t occupancy) {
+    const auto state = static_cast<OccupancyState>(occupancy);
+    return state == OccupancyState::kInside ||
+           state == OccupancyState::kBoundaryInside;
+}
+
+/**
  * @brief Boundary sample emitted from the opened solid.
  *
  * These samples act as the reopened analogue of classic Hermite samples: they
@@ -202,6 +230,7 @@ inline bool refine_surface_band_cells(
     std::uint32_t max_depth,
     const BoundingBox &domain,
     std::uint32_t base_resolution,
+    std::uint32_t worker_count,
     double max_surface_leaf_size,
     double table_cadence_seconds,
     std::uint32_t minimum_usable_hermite_samples,
@@ -216,7 +245,7 @@ inline bool refine_surface_band_cells(
         max_depth,
         domain,
         base_resolution,
-        1U,
+        worker_count,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
@@ -279,7 +308,7 @@ inline std::array<std::size_t, 6> face_neighbor_cells(
     return neighbors;
 }
 
-inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
+inline void update_occupied_solid_classification_cache(
     const std::vector<OctreeCell> &all_cells,
     const std::vector<std::size_t> &all_contributors,
     const std::vector<Vector3d> &positions,
@@ -287,45 +316,21 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
     const LeafSpatialIndex &spatial_index,
     double isovalue,
     std::uint32_t max_depth,
-    OccupiedSolidClassificationCache *cache = nullptr,
+    OccupiedSolidClassificationCache &cache,
     const std::vector<std::uint8_t> *dirty_cells = nullptr,
-    std::vector<std::uint8_t> *inside_mask = nullptr) {
-    std::vector<OccupiedSolidLeaf> solid_leaves;
-    solid_leaves.reserve(all_cells.size());
-    std::vector<std::uint8_t> local_inside_flags;
-    std::vector<double> local_center_values;
-    if (cache == nullptr) {
-        local_inside_flags.assign(all_cells.size(), 0U);
-        local_center_values.assign(all_cells.size(), 0.0);
-    } else {
-        cache->inside_flags.resize(all_cells.size(), 0U);
-        cache->center_values.resize(all_cells.size(), 0.0);
-        cache->occupancy_states.resize(
-            all_cells.size(),
-            static_cast<std::uint8_t>(OccupancyState::kOutside));
-        cache->face_neighbor_cell_indices.resize(
-            all_cells.size(),
-            {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
-    }
-    std::vector<std::uint8_t> &inside_flags =
-        cache == nullptr ? local_inside_flags : cache->inside_flags;
-    std::vector<double> &center_values =
-        cache == nullptr ? local_center_values : cache->center_values;
-    std::vector<std::int64_t> cell_to_leaf_index(all_cells.size(), -1);
-    std::vector<std::uint8_t> leaf_is_included(all_cells.size(), 0U);
-    std::vector<OccupiedSolidLeaf> leaf_buffer(all_cells.size());
-    std::vector<std::uint8_t> local_occupancy_states(
+    const std::vector<std::uint8_t> *precomputed_inside_flags = nullptr,
+    const std::vector<double> *precomputed_center_values = nullptr) {
+    cache.inside_flags.resize(all_cells.size(), 0U);
+    cache.center_values.resize(all_cells.size(), 0.0);
+    cache.occupancy_states.resize(
         all_cells.size(),
         static_cast<std::uint8_t>(OccupancyState::kOutside));
-    std::vector<std::array<std::size_t, 6>> local_face_neighbor_cell_indices(
+    cache.face_neighbor_cell_indices.resize(
         all_cells.size(),
         {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
-    std::vector<std::uint8_t> &occupancy_states = cache == nullptr ?
-        local_occupancy_states : cache->occupancy_states;
-    std::vector<std::array<std::size_t, 6>> &face_neighbor_cell_indices =
-        cache == nullptr ? local_face_neighbor_cell_indices :
-                           cache->face_neighbor_cell_indices;
     std::vector<std::uint8_t> occupancy_dirty;
+    std::vector<std::size_t> classify_cell_indices;
+    std::vector<std::size_t> occupancy_cell_indices;
 
     if (dirty_cells != nullptr) {
         occupancy_dirty = *dirty_cells;
@@ -334,11 +339,18 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
         }
         for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
             meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            const OctreeCell &cell = all_cells[cell_idx];
+            if (!cell.is_leaf) {
+                continue;
+            }
+            if (cell_idx < dirty_cells->size() && (*dirty_cells)[cell_idx] != 0U) {
+                classify_cell_indices.push_back(cell_idx);
+            }
             if (cell_idx >= occupancy_dirty.size() || occupancy_dirty[cell_idx] == 0U) {
                 continue;
             }
             const auto neighbors = face_neighbor_cells(
-                all_cells[cell_idx], spatial_index, max_depth);
+                cell, spatial_index, max_depth);
             for (std::size_t neighbor_idx : neighbors) {
                 if (neighbor_idx == SIZE_MAX || neighbor_idx >= occupancy_dirty.size()) {
                     continue;
@@ -346,18 +358,38 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
                 occupancy_dirty[neighbor_idx] = 1U;
             }
         }
-    }
-
-    if (inside_mask != nullptr) {
-        inside_mask->clear();
-        inside_mask->reserve(all_cells.size());
+        occupancy_cell_indices.reserve(classify_cell_indices.size());
+        for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            if (!all_cells[cell_idx].is_leaf) {
+                continue;
+            }
+            if (occupancy_dirty[cell_idx] != 0U) {
+                occupancy_cell_indices.push_back(cell_idx);
+            }
+        }
+    } else {
+        classify_cell_indices.reserve(all_cells.size());
+        occupancy_cell_indices.reserve(all_cells.size());
+        for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            if (!all_cells[cell_idx].is_leaf) {
+                continue;
+            }
+            classify_cell_indices.push_back(cell_idx);
+            occupancy_cell_indices.push_back(cell_idx);
+        }
     }
 
     ProgressCounter classify_counter(
         "Regularization", "classify_occupied_solid_leaves", "cells", 1000);
 
 #pragma omp parallel for schedule(dynamic)
-    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+    for (std::int64_t active_idx = 0;
+         active_idx < static_cast<std::int64_t>(classify_cell_indices.size());
+         ++active_idx) {
+        const std::size_t cell_idx =
+            classify_cell_indices[static_cast<std::size_t>(active_idx)];
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 cell_idx)) {
             classify_counter.tick();
@@ -365,14 +397,15 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
         }
         classify_counter.tick();
         const OctreeCell &cell = all_cells[cell_idx];
-        if (!cell.is_leaf) {
-            continue;
-        }
 
-        const bool reuse_cached_value =
-            dirty_cells != nullptr && cell_idx < dirty_cells->size() &&
-            (*dirty_cells)[cell_idx] == 0U;
-        if (reuse_cached_value) {
+        const bool has_precomputed_value =
+            precomputed_inside_flags != nullptr &&
+            precomputed_center_values != nullptr &&
+            cell_idx < precomputed_inside_flags->size() &&
+            cell_idx < precomputed_center_values->size();
+        if (has_precomputed_value) {
+            cache.center_values[cell_idx] = (*precomputed_center_values)[cell_idx];
+            cache.inside_flags[cell_idx] = (*precomputed_inside_flags)[cell_idx];
             continue;
         }
 
@@ -380,7 +413,7 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
             cell_contributor_span(cell, all_contributors);
         const double center_value = evaluate_field_at_point(
             cell.bounds.center(), contributors, positions, smoothing_lengths);
-        center_values[cell_idx] = center_value;
+        cache.center_values[cell_idx] = center_value;
 
         std::size_t inside_corner_count = 0;
         for (double corner_value : cell.corner_values) {
@@ -391,7 +424,7 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
 
         const bool inside =
             center_value >= isovalue || inside_corner_count >= 4U;
-        inside_flags[cell_idx] = inside ? 1U : 0U;
+        cache.inside_flags[cell_idx] = inside ? 1U : 0U;
     }
 
     classify_counter.finish();
@@ -400,7 +433,11 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
         "Regularization", "classify_occupied_solid_leaves", "cells", 1000);
 
 #pragma omp parallel for schedule(dynamic)
-    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+    for (std::int64_t active_idx = 0;
+         active_idx < static_cast<std::int64_t>(occupancy_cell_indices.size());
+         ++active_idx) {
+        const std::size_t cell_idx =
+            occupancy_cell_indices[static_cast<std::size_t>(active_idx)];
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 cell_idx)) {
             occupancy_counter.tick();
@@ -408,63 +445,71 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
         }
         occupancy_counter.tick();
         const OctreeCell &cell = all_cells[cell_idx];
-        if (!cell.is_leaf) {
-            continue;
-        }
 
-        const bool inside = inside_flags[cell_idx] != 0U;
+        const bool inside = cache.inside_flags[cell_idx] != 0U;
         OccupancyState occupancy = OccupancyState::kOutside;
-        if (dirty_cells != nullptr && cell_idx < occupancy_dirty.size() &&
-            occupancy_dirty[cell_idx] == 0U) {
-            occupancy = static_cast<OccupancyState>(occupancy_states[cell_idx]);
-        } else {
-            bool touches_opposite = false;
-            const auto neighbors = face_neighbor_cells(
-                cell, spatial_index, max_depth);
-            face_neighbor_cell_indices[cell_idx] = neighbors;
-            for (std::size_t neighbor_idx : neighbors) {
-                if (neighbor_idx == SIZE_MAX || neighbor_idx >= all_cells.size()) {
-                    continue;
-                }
-                if (inside_flags[neighbor_idx] != inside_flags[cell_idx]) {
-                    touches_opposite = true;
-                    break;
-                }
+        bool touches_opposite = false;
+        const auto neighbors = face_neighbor_cells(
+            cell, spatial_index, max_depth);
+        cache.face_neighbor_cell_indices[cell_idx] = neighbors;
+        for (std::size_t neighbor_idx : neighbors) {
+            if (neighbor_idx == SIZE_MAX || neighbor_idx >= all_cells.size()) {
+                continue;
             }
-
-            occupancy = inside ? OccupancyState::kInside
-                               : OccupancyState::kOutside;
-            if (touches_opposite) {
-                occupancy = inside ? OccupancyState::kBoundaryInside
-                                   : OccupancyState::kBoundaryOutside;
+            if (cache.inside_flags[neighbor_idx] !=
+                cache.inside_flags[cell_idx]) {
+                touches_opposite = true;
+                break;
             }
-            occupancy_states[cell_idx] =
-                static_cast<std::uint8_t>(occupancy);
         }
 
-        leaf_is_included[cell_idx] = 1U;
-        leaf_buffer[cell_idx] = {
-            cell_idx,
-            center_values[cell_idx],
-            cell_edge_length(cell),
-            cell.depth,
-            occupancy,
-            {-1, -1, -1, -1, -1, -1},
-        };
+        occupancy = inside ? OccupancyState::kInside
+                           : OccupancyState::kOutside;
+        if (touches_opposite) {
+            occupancy = inside ? OccupancyState::kBoundaryInside
+                               : OccupancyState::kBoundaryOutside;
+        }
+        cache.occupancy_states[cell_idx] =
+            static_cast<std::uint8_t>(occupancy);
     }
     occupancy_counter.finish();
 
     for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
-        if (leaf_is_included[cell_idx] == 0U) {
+        if (all_cells[cell_idx].is_leaf) {
             continue;
         }
-        solid_leaves.push_back(leaf_buffer[cell_idx]);
+        cache.inside_flags[cell_idx] = 0U;
+        cache.center_values[cell_idx] = 0.0;
+        cache.occupancy_states[cell_idx] =
+            static_cast<std::uint8_t>(OccupancyState::kOutside);
+        cache.face_neighbor_cell_indices[cell_idx] = {
+            SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
+    }
+}
+
+inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &cache) {
+    std::vector<OccupiedSolidLeaf> solid_leaves;
+    solid_leaves.reserve(all_cells.size());
+    std::vector<std::int64_t> cell_to_leaf_index(all_cells.size(), -1);
+
+    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+        const OctreeCell &cell = all_cells[cell_idx];
+        if (!cell.is_leaf) {
+            continue;
+        }
+        solid_leaves.push_back({
+            cell_idx,
+            cache.center_values[cell_idx],
+            cell_edge_length(cell),
+            cell.depth,
+            static_cast<OccupancyState>(cache.occupancy_states[cell_idx]),
+            {-1, -1, -1, -1, -1, -1},
+        });
         cell_to_leaf_index[cell_idx] =
             static_cast<std::int64_t>(solid_leaves.size() - 1U);
-        if (inside_mask != nullptr) {
-            inside_mask->push_back(inside_flags[cell_idx] != 0U ? 1U : 0U);
-        }
     }
 
     ProgressCounter neighbor_counter(
@@ -482,7 +527,7 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
         OccupiedSolidLeaf &leaf =
             solid_leaves[static_cast<std::size_t>(leaf_index)];
         neighbor_counter.tick();
-        const auto &neighbors = face_neighbor_cell_indices[leaf.cell_index];
+        const auto &neighbors = cache.face_neighbor_cell_indices[leaf.cell_index];
         for (std::size_t face = 0; face < neighbors.size(); ++face) {
             const std::size_t neighbor_cell_index = neighbors[face];
             if (neighbor_cell_index == SIZE_MAX ||
@@ -498,30 +543,218 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
     return solid_leaves;
 }
 
-inline std::vector<std::uint8_t> build_inside_mask(
-    const std::vector<OccupiedSolidLeaf> &solid_leaves) {
-    std::vector<std::uint8_t> inside_mask(solid_leaves.size(), 0U);
+inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const LeafSpatialIndex &spatial_index,
+    double isovalue,
+    std::uint32_t max_depth,
+    OccupiedSolidClassificationCache *cache = nullptr,
+    const std::vector<std::uint8_t> *dirty_cells = nullptr) {
+    OccupiedSolidClassificationCache local_cache;
+    OccupiedSolidClassificationCache &cache_ref =
+        cache == nullptr ? local_cache : *cache;
+    update_occupied_solid_classification_cache(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        spatial_index,
+        isovalue,
+        max_depth,
+        cache_ref,
+        dirty_cells);
+    return build_occupied_solid_leaves_from_cache(all_cells, cache_ref);
+}
+
+inline void merge_occupied_solid_cache_from_closure_state(
+    const std::vector<OctreeCell> &all_cells,
+    const LeafSpatialIndex &spatial_index,
+    std::uint32_t max_depth,
+    OccupiedSolidClassificationCache &cache,
+    std::vector<std::uint8_t> inside_flags,
+    std::vector<double> center_values,
+    std::vector<std::uint8_t> occupancy_states,
+    const std::vector<std::uint8_t> &dirty_cells) {
+    cache.inside_flags = std::move(inside_flags);
+    cache.center_values = std::move(center_values);
+    cache.occupancy_states = std::move(occupancy_states);
+    if (cache.inside_flags.size() < all_cells.size()) {
+        cache.inside_flags.resize(all_cells.size(), 0U);
+    }
+    if (cache.center_values.size() < all_cells.size()) {
+        cache.center_values.resize(all_cells.size(), 0.0);
+    }
+    if (cache.occupancy_states.size() < all_cells.size()) {
+        cache.occupancy_states.resize(
+            all_cells.size(),
+            static_cast<std::uint8_t>(OccupancyState::kOutside));
+    }
+    cache.face_neighbor_cell_indices.resize(
+        all_cells.size(),
+        {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
+
+    std::vector<std::uint8_t> active_mask(all_cells.size(), 0U);
+    std::vector<std::size_t> active_leaf_indices;
+    active_leaf_indices.reserve(dirty_cells.size() * 2U);
+
+    auto activate_leaf = [&](std::size_t cell_idx) {
+        if (cell_idx >= all_cells.size() || !all_cells[cell_idx].is_leaf ||
+            active_mask[cell_idx] != 0U) {
+            return;
+        }
+        active_mask[cell_idx] = 1U;
+        active_leaf_indices.push_back(cell_idx);
+    };
+
+    for (std::size_t dirty_idx = 0; dirty_idx < dirty_cells.size(); ++dirty_idx) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(dirty_idx);
+        if (dirty_cells[dirty_idx] == 0U || dirty_idx >= all_cells.size()) {
+            continue;
+        }
+        if (!all_cells[dirty_idx].is_leaf) {
+            cache.face_neighbor_cell_indices[dirty_idx] = {
+                SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
+            cache.inside_flags[dirty_idx] = 0U;
+            cache.center_values[dirty_idx] = 0.0;
+            cache.occupancy_states[dirty_idx] =
+                static_cast<std::uint8_t>(OccupancyState::kOutside);
+            continue;
+        }
+        activate_leaf(dirty_idx);
+        const auto neighbors = face_neighbor_cells(
+            all_cells[dirty_idx], spatial_index, max_depth);
+        cache.face_neighbor_cell_indices[dirty_idx] = neighbors;
+        for (std::size_t neighbor_idx : neighbors) {
+            if (neighbor_idx == SIZE_MAX || neighbor_idx >= all_cells.size()) {
+                continue;
+            }
+            activate_leaf(neighbor_idx);
+        }
+    }
+
+    ProgressCounter neighbor_counter(
+        "Regularization",
+        "merge_occupied_solid_cache_from_closure_state",
+        "cells",
+        1000);
+#pragma omp parallel for schedule(dynamic)
+    for (std::int64_t active_idx = 0;
+         active_idx < static_cast<std::int64_t>(active_leaf_indices.size());
+         ++active_idx) {
+        const std::size_t idx =
+            active_leaf_indices[static_cast<std::size_t>(active_idx)];
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(idx)) {
+            neighbor_counter.tick();
+            continue;
+        }
+        neighbor_counter.tick();
+        cache.face_neighbor_cell_indices[idx] = face_neighbor_cells(
+            all_cells[idx], spatial_index, max_depth);
+    }
+    neighbor_counter.finish();
+}
+
+inline std::vector<std::uint8_t> build_inside_mask_from_classification_cache(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache) {
+    std::vector<std::uint8_t> inside_mask(all_cells.size(), 0U);
     ProgressCounter mask_counter(
-        "Regularization", "build_inside_mask", "leaves", 1000);
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
+        "Regularization",
+        "build_inside_mask_from_classification_cache",
+        "cells",
+        1000);
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
         mask_counter.tick();
-        inside_mask[leaf_index] =
-            (solid_leaves[leaf_index].occupancy == OccupancyState::kInside ||
-             solid_leaves[leaf_index].occupancy == OccupancyState::kBoundaryInside)
-                ? 1U
-                : 0U;
+        if (!all_cells[cell_index].is_leaf) {
+            continue;
+        }
+        inside_mask[cell_index] = occupied_solid_cache_is_inside(
+                                      classification_cache.occupancy_states[
+                                          cell_index])
+                                      ? 1U
+                                      : 0U;
     }
     mask_counter.finish();
     return inside_mask;
 }
 
-inline std::vector<double> compute_outside_distance_from_inside_mask(
+inline std::vector<std::uint8_t> build_leaf_mask_from_cell_mask(
     const std::vector<OccupiedSolidLeaf> &solid_leaves,
-    const std::vector<std::uint8_t> &inside_mask,
+    const std::vector<std::uint8_t> &cell_mask);
+
+/**
+ * @brief Build compact morphology/extraction views from the classification cache.
+ *
+ * This is the current queue boundary between full-tree side-cars and legacy
+ * compact leaf views. Later phases should shrink the amount of work done here,
+ * but for now this helper makes that boundary explicit and single-shot.
+ */
+inline OccupiedSolidExtractionView build_occupied_solid_extraction_view(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache) {
+    OccupiedSolidExtractionView view;
+    view.solid_leaves =
+        build_occupied_solid_leaves_from_cache(all_cells, classification_cache);
+    view.inside_mask_by_cell =
+        build_inside_mask_from_classification_cache(all_cells, classification_cache);
+    view.inside_mask = build_leaf_mask_from_cell_mask(
+        view.solid_leaves, view.inside_mask_by_cell);
+    return view;
+}
+
+inline std::vector<std::uint8_t> build_leaf_mask_from_cell_mask(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<std::uint8_t> &cell_mask) {
+    std::vector<std::uint8_t> inside_mask(solid_leaves.size(), 0U);
+    ProgressCounter mask_counter(
+        "Regularization",
+        "build_leaf_mask_from_cell_mask",
+        "leaves",
+        1000);
+    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
+        mask_counter.tick();
+        const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
+        if (cell_index < cell_mask.size()) {
+            inside_mask[leaf_index] = cell_mask[cell_index];
+        }
+    }
+    mask_counter.finish();
+    return inside_mask;
+}
+
+inline std::vector<double> project_leaf_scalars_from_cell_state(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<double> &cell_values,
+    double default_value) {
+    std::vector<double> leaf_values(solid_leaves.size(), default_value);
+    ProgressCounter value_counter(
+        "Regularization",
+        "project_leaf_scalars_from_cell_state",
+        "leaves",
+        1000);
+    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
+        value_counter.tick();
+        const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
+        if (cell_index < cell_values.size()) {
+            leaf_values[leaf_index] = cell_values[cell_index];
+        }
+    }
+    value_counter.finish();
+    return leaf_values;
+}
+
+inline std::vector<double> compute_outside_distance_from_classification_cache(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache,
     double max_distance = std::numeric_limits<double>::infinity()) {
     const double inf = std::numeric_limits<double>::infinity();
-    std::vector<double> distance_from_inside(solid_leaves.size(), inf);
+    std::vector<double> distance_from_inside(all_cells.size(), inf);
     using QueueEntry = std::pair<double, std::size_t>;
     std::priority_queue<
         QueueEntry,
@@ -529,80 +762,87 @@ inline std::vector<double> compute_outside_distance_from_inside_mask(
         std::greater<QueueEntry>> queue;
 
     ProgressCounter seed_counter(
-        "Regularization", "compute_outside_distance_from_inside_mask",
-        "leaves", 1000);
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
+        "Regularization",
+        "compute_outside_distance_from_classification_cache",
+        "cells",
+        1000);
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
         seed_counter.tick();
-        if (inside_mask[leaf_index] == 0U) {
+        if (!all_cells[cell_index].is_leaf ||
+            !occupied_solid_cache_is_inside(
+                classification_cache.occupancy_states[cell_index])) {
             continue;
         }
 
         bool is_boundary_seed = false;
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
+        for (std::size_t neighbor_cell_index :
+             classification_cache.face_neighbor_cell_indices[cell_index]) {
+            if (neighbor_cell_index == SIZE_MAX ||
+                neighbor_cell_index >= all_cells.size()) {
                 is_boundary_seed = true;
                 break;
             }
-
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (inside_mask[neighbor] == 0U) {
+            if (!all_cells[neighbor_cell_index].is_leaf ||
+                !occupied_solid_cache_is_inside(
+                    classification_cache.occupancy_states[neighbor_cell_index])) {
                 is_boundary_seed = true;
                 break;
             }
         }
 
         if (is_boundary_seed) {
-            distance_from_inside[leaf_index] = 0.0;
-            queue.push({0.0, leaf_index});
+            distance_from_inside[cell_index] = 0.0;
+            queue.push({0.0, cell_index});
         }
     }
     seed_counter.finish();
 
     ProgressCounter wavefront_counter(
-        "Regularization", "compute_outside_distance_from_inside_mask",
-        "queue pops", 10000);
+        "Regularization",
+        "compute_outside_distance_from_classification_cache",
+        "queue pops",
+        10000);
     while (!queue.empty()) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
         wavefront_counter.tick();
-        const auto [distance, leaf_index] = queue.top();
+        const auto [distance, cell_index] = queue.top();
         queue.pop();
-        if (distance > distance_from_inside[leaf_index]) {
+        if (distance > distance_from_inside[cell_index]) {
             continue;
         }
         if (distance > max_distance) {
             continue;
         }
 
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
+        for (std::size_t neighbor_cell_index :
+             classification_cache.face_neighbor_cell_indices[cell_index]) {
+            if (neighbor_cell_index == SIZE_MAX ||
+                neighbor_cell_index >= all_cells.size()) {
                 continue;
             }
-
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (inside_mask[neighbor] != 0U) {
+            if (!all_cells[neighbor_cell_index].is_leaf ||
+                occupied_solid_cache_is_inside(
+                    classification_cache.occupancy_states[neighbor_cell_index])) {
                 continue;
             }
 
             const double source_size = std::max(
-                std::min(solid_leaves[leaf_index].cell_size, max_distance),
+                std::min(cell_edge_length(all_cells[cell_index]), max_distance),
                 0.0);
             const double neighbor_size = std::max(
-                std::min(solid_leaves[neighbor].cell_size, max_distance),
+                std::min(
+                    cell_edge_length(all_cells[neighbor_cell_index]),
+                    max_distance),
                 0.0);
-            const double edge_cost = 0.5 * (
-                source_size + neighbor_size);
+            const double edge_cost = 0.5 * (source_size + neighbor_size);
             const double candidate = distance + edge_cost;
             if (candidate > max_distance) {
                 continue;
             }
-            if (candidate < distance_from_inside[neighbor]) {
-                distance_from_inside[neighbor] = candidate;
-                queue.push({candidate, neighbor});
+            if (candidate < distance_from_inside[neighbor_cell_index]) {
+                distance_from_inside[neighbor_cell_index] = candidate;
+                queue.push({candidate, neighbor_cell_index});
             }
         }
     }
@@ -611,25 +851,32 @@ inline std::vector<double> compute_outside_distance_from_inside_mask(
     return distance_from_inside;
 }
 
-inline std::vector<std::uint8_t> dilate_inside_mask(
-    const std::vector<std::uint8_t> &inside_mask,
-    const std::vector<double> &distance_from_inside,
+inline std::vector<std::uint8_t> dilate_inside_cell_mask(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::uint8_t> &inside_mask_by_cell,
+    const std::vector<double> &distance_from_inside_by_cell,
     double dilation_radius) {
-    std::vector<std::uint8_t> dilated_inside(inside_mask.size(), 0U);
+    std::vector<std::uint8_t> dilated_inside(all_cells.size(), 0U);
 
     ProgressCounter dilate_counter(
-        "Regularization", "dilate_inside_mask", "leaves", 1000);
+        "Regularization",
+        "dilate_inside_cell_mask",
+        "cells",
+        1000);
 #pragma omp parallel for schedule(static)
-    for (std::size_t leaf_index = 0; leaf_index < inside_mask.size(); ++leaf_index) {
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
-                leaf_index)) {
+                cell_index)) {
             dilate_counter.tick();
             continue;
         }
         dilate_counter.tick();
-        dilated_inside[leaf_index] =
-            (inside_mask[leaf_index] != 0U ||
-             distance_from_inside[leaf_index] <= dilation_radius)
+        if (!all_cells[cell_index].is_leaf) {
+            continue;
+        }
+        dilated_inside[cell_index] =
+            (inside_mask_by_cell[cell_index] != 0U ||
+             distance_from_inside_by_cell[cell_index] <= dilation_radius)
                 ? 1U
                 : 0U;
     }
@@ -647,16 +894,19 @@ inline bool refine_thickening_band_cells(
     std::uint32_t max_depth,
     const BoundingBox &domain,
     std::uint32_t base_resolution,
+    std::uint32_t worker_count,
     double target_leaf_size,
-    const std::vector<OccupiedSolidLeaf> &solid_leaves,
-    const std::vector<std::uint8_t> &inside_mask,
-    const std::vector<double> &distance_from_inside,
+    const OccupiedSolidClassificationCache &classification_cache,
+    const std::vector<double> &distance_from_inside_by_cell,
     double thickening_radius,
     double table_cadence_seconds,
     std::uint32_t minimum_usable_hermite_samples,
     double max_qef_rms_residual_ratio,
     double min_normal_alignment_threshold,
-    std::vector<std::uint8_t> *dirty_cells = nullptr) {
+    std::vector<std::uint8_t> *dirty_cells = nullptr,
+    std::vector<std::uint8_t> *classified_inside_flags = nullptr,
+    std::vector<double> *classified_center_values = nullptr,
+    std::vector<std::uint8_t> *classified_occupancy_states = nullptr) {
     if (target_leaf_size <= 0.0 || thickening_radius <= 0.0) {
         return false;
     }
@@ -665,9 +915,9 @@ inline bool refine_thickening_band_cells(
         thickening_radius + 2.0 * target_leaf_size;
 
     const auto target_depth_for_cell =
-        [&](const OccupiedSolidLeaf &leaf) -> std::uint32_t {
-            std::uint32_t target_depth = leaf.depth;
-            double size = leaf.cell_size;
+        [&](const OctreeCell &cell) -> std::uint32_t {
+            std::uint32_t target_depth = cell.depth;
+            double size = cell_edge_length(cell);
             while (target_depth < max_depth && size > target_leaf_size) {
                 size *= 0.5;
                 ++target_depth;
@@ -676,23 +926,31 @@ inline bool refine_thickening_band_cells(
         };
 
     std::queue<std::size_t> cells_to_visit;
-    std::vector<std::uint32_t> queued_target_depths(all_cells.size(), 0U);
+    std::vector<std::size_t> queued_cell_indices;
+    const std::uint32_t kNoTargetDepth =
+        std::numeric_limits<std::uint32_t>::max();
+    std::vector<std::uint32_t> queued_target_depths(
+        all_cells.size(), kNoTargetDepth);
     std::vector<std::uint8_t> enqueued_cells(all_cells.size(), 0U);
-    std::vector<std::size_t> band_seed_leaf_indices;
 
     auto enqueue_cell = [&](std::size_t cell_index, std::uint32_t target_depth) {
         if (cell_index >= all_cells.size()) {
             return;
         }
         if (cell_index >= queued_target_depths.size()) {
-            queued_target_depths.resize(all_cells.size(), 0U);
+            queued_target_depths.resize(all_cells.size(), kNoTargetDepth);
         }
         if (cell_index >= enqueued_cells.size()) {
             enqueued_cells.resize(all_cells.size(), 0U);
         }
         if (enqueued_cells[cell_index] == 0U) {
             cells_to_visit.push(cell_index);
+            queued_cell_indices.push_back(cell_index);
             enqueued_cells[cell_index] = 1U;
+            queued_target_depths[cell_index] = target_depth;
+            return;
+        }
+        if (queued_target_depths[cell_index] == kNoTargetDepth) {
             queued_target_depths[cell_index] = target_depth;
             return;
         }
@@ -700,44 +958,42 @@ inline bool refine_thickening_band_cells(
             queued_target_depths[cell_index], target_depth);
     };
 
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        if (inside_mask[leaf_index] != 0U) {
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
+        const OctreeCell &cell = all_cells[cell_index];
+        if (!cell.is_leaf) {
             continue;
         }
-        if (distance_from_inside[leaf_index] > refinement_halo_radius) {
+        if (!std::isfinite(distance_from_inside_by_cell[cell_index]) ||
+            distance_from_inside_by_cell[cell_index] > refinement_halo_radius) {
             continue;
         }
-        if (solid_leaves[leaf_index].depth >= max_depth ||
-            solid_leaves[leaf_index].cell_size <= target_leaf_size) {
+        const OccupancyState occupancy = static_cast<OccupancyState>(
+            classification_cache.occupancy_states[cell_index]);
+        if (occupancy != OccupancyState::kBoundaryInside) {
             continue;
         }
-        const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
-        enqueue_cell(
-            cell_index, target_depth_for_cell(solid_leaves[leaf_index]));
-        band_seed_leaf_indices.push_back(leaf_index);
+        if (cell.depth >= max_depth || cell_edge_length(cell) <= target_leaf_size) {
+            continue;
+        }
+        enqueue_cell(cell_index, target_depth_for_cell(cell));
     }
 
-    for (std::size_t leaf_index : band_seed_leaf_indices) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
-                continue;
-            }
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (inside_mask[neighbor] != 0U) {
-                continue;
-            }
-            if (solid_leaves[neighbor].depth >= max_depth ||
-                solid_leaves[neighbor].cell_size <= target_leaf_size) {
-                continue;
-            }
-            enqueue_cell(
-                solid_leaves[neighbor].cell_index,
-                target_depth_for_cell(solid_leaves[neighbor]));
+    // Build seed vectors with correct ordinal mapping for the closure.
+    std::vector<std::size_t> closure_seed_indices;
+    std::vector<std::uint32_t> closure_seed_depths;
+    closure_seed_indices.reserve(queued_cell_indices.size());
+    closure_seed_depths.reserve(queued_cell_indices.size());
+    for (std::size_t idx : queued_cell_indices) {
+        if (idx >= queued_target_depths.size()) {
+            continue;
         }
+        const std::uint32_t td = queued_target_depths[idx];
+        if (td == kNoTargetDepth) {
+            continue;
+        }
+        closure_seed_indices.push_back(idx);
+        closure_seed_depths.push_back(td);
     }
 
     if (cells_to_visit.empty()) {
@@ -767,7 +1023,7 @@ inline bool refine_thickening_band_cells(
         max_depth,
         domain,
         base_resolution,
-        1U,
+        worker_count,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
@@ -775,6 +1031,9 @@ inline bool refine_thickening_band_cells(
         "Regularization",
         "refine_thickening_band_cells",
         "thickening_band",
+        /*surface_band_target_leaf_size=*/0.0,
+        /*thickening_band_target_leaf_size=*/target_leaf_size,
+        /*thickening_radius=*/thickening_radius,
     };
 
     return refine_thickening_band_with_closure(
@@ -784,8 +1043,15 @@ inline bool refine_thickening_band_cells(
         smoothing_lengths,
         closure_config,
         target_leaf_size,
-        queued_target_depths,
-        dirty_cells);
+        closure_seed_indices,
+        closure_seed_depths,
+        &classification_cache.inside_flags,
+        &classification_cache.center_values,
+        &classification_cache.occupancy_states,
+        dirty_cells,
+        classified_inside_flags,
+        classified_center_values,
+        classified_occupancy_states);
 }
 
 inline bool thickening_band_is_fully_refined(
@@ -828,12 +1094,96 @@ inline bool thickening_band_is_fully_refined(
     return unresolved_count == 0U;
 }
 
-inline std::vector<double> compute_inside_clearance(
-    const std::vector<OccupiedSolidLeaf> &solid_leaves,
-    const std::vector<std::uint8_t> &inside_mask,
+/**
+ * @brief B2 incremental single-pass thickening-band refinement.
+ *
+ * Replaces the outer classify→distance→refine→reclassify loop with a single
+ * closure run seeded by kClassify tasks for all current leaf cells.  The
+ * incremental chain
+ *   kClassify → kDistanceUpdate → kRefine → kClassify(children) → ...
+ * converges without any outer iteration.
+ *
+ * @param all_cells    Flat cell array updated in place.
+ * @param all_contributors Flat contributor array updated in place.
+ * @param positions    Particle positions.
+ * @param smoothing_lengths Per-particle support radii.
+ * @param isovalue     Field isovalue for classification.
+ * @param max_depth    Maximum octree depth.
+ * @param domain       Domain bounding box.
+ * @param base_resolution Top-level cell count per axis.
+ * @param worker_count Number of worker threads.
+ * @param target_leaf_size Target leaf size for the thickening band.
+ * @param thickening_radius Outward thickening radius.
+ * @param table_cadence_seconds Status table cadence.
+ * @param minimum_usable_hermite_samples Min Hermite samples for QEF.
+ * @param max_qef_rms_residual_ratio Max QEF residual ratio.
+ * @param min_normal_alignment_threshold Min Hermite normal alignment.
+ * @param dirty_cells Optional output dirty-cell mask.
+ * @return ``true`` when at least one new cell was created.
+ */
+inline bool refine_thickening_band_incremental(
+    std::vector<OctreeCell> &all_cells,
+    std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    double isovalue,
+    std::uint32_t max_depth,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution,
+    std::uint32_t worker_count,
+    double target_leaf_size,
+    double thickening_radius,
+    double table_cadence_seconds,
+    std::uint32_t minimum_usable_hermite_samples,
+    double max_qef_rms_residual_ratio,
+    double min_normal_alignment_threshold,
+    std::vector<std::uint8_t> *dirty_cells = nullptr) {
+    if (target_leaf_size <= 0.0 || thickening_radius <= 0.0) {
+        return false;
+    }
+
+    // Thread both thickening parameters into the config so the closure
+    // workers can drive the kClassify → kDistanceUpdate → kRefine chain.
+    const RefinementClosureConfig closure_config = {
+        isovalue,
+        max_depth,
+        domain,
+        base_resolution,
+        worker_count,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+        table_cadence_seconds,
+        "Regularization",
+        "refine_thickening_band_incremental",
+        "thickening_incremental",
+        /*surface_band_target_leaf_size=*/0.0,
+        /*thickening_band_target_leaf_size=*/target_leaf_size,
+        /*thickening_radius=*/thickening_radius,
+    };
+
+    return refine_thickening_band_with_closure(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        closure_config,
+        target_leaf_size,
+        /*seed_cell_indices=*/{},
+        /*seed_target_depths=*/{},
+        /*initial_inside_flags=*/nullptr,
+        /*initial_center_values=*/nullptr,
+        /*initial_occupancy_states=*/nullptr,
+        dirty_cells);
+}
+
+inline std::vector<double> compute_inside_clearance_from_cell_mask(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache,
+    const std::vector<std::uint8_t> &inside_mask_by_cell,
     double max_distance = std::numeric_limits<double>::infinity()) {
     const double inf = std::numeric_limits<double>::infinity();
-    std::vector<double> clearance(solid_leaves.size(), inf);
+    std::vector<double> clearance(all_cells.size(), inf);
     using QueueEntry = std::pair<double, std::size_t>;
     std::priority_queue<
         QueueEntry,
@@ -841,113 +1191,119 @@ inline std::vector<double> compute_inside_clearance(
         std::greater<QueueEntry>> queue;
 
     ProgressCounter seed_counter(
-        "Regularization", "compute_inside_clearance", "leaves", 1000);
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
+        "Regularization",
+        "compute_inside_clearance_from_cell_mask",
+        "cells",
+        1000);
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
         seed_counter.tick();
-        if (inside_mask[leaf_index] == 0U) {
+        if (!all_cells[cell_index].is_leaf || inside_mask_by_cell[cell_index] == 0U) {
             continue;
         }
 
         bool is_boundary_seed = false;
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
+        for (std::size_t neighbor_cell_index :
+             classification_cache.face_neighbor_cell_indices[cell_index]) {
+            if (neighbor_cell_index == SIZE_MAX ||
+                neighbor_cell_index >= all_cells.size()) {
                 is_boundary_seed = true;
                 break;
             }
-
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (inside_mask[neighbor] == 0U) {
+            if (!all_cells[neighbor_cell_index].is_leaf ||
+                inside_mask_by_cell[neighbor_cell_index] == 0U) {
                 is_boundary_seed = true;
                 break;
             }
         }
 
         if (is_boundary_seed) {
-            clearance[leaf_index] = 0.0;
-            queue.push({0.0, leaf_index});
+            clearance[cell_index] = 0.0;
+            queue.push({0.0, cell_index});
         }
     }
     seed_counter.finish();
 
     ProgressCounter wavefront_counter(
-        "Regularization", "compute_inside_clearance", "queue pops", 10000);
-
+        "Regularization",
+        "compute_inside_clearance_from_cell_mask",
+        "queue pops",
+        10000);
     while (!queue.empty()) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
         wavefront_counter.tick();
-        const auto [distance, leaf_index] = queue.top();
+        const auto [distance, cell_index] = queue.top();
         queue.pop();
-        if (distance > clearance[leaf_index]) {
+        if (distance > clearance[cell_index]) {
             continue;
         }
         if (distance > max_distance) {
             continue;
         }
 
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
+        for (std::size_t neighbor_cell_index :
+             classification_cache.face_neighbor_cell_indices[cell_index]) {
+            if (neighbor_cell_index == SIZE_MAX ||
+                neighbor_cell_index >= all_cells.size()) {
                 continue;
             }
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (inside_mask[neighbor] == 0U) {
+            if (!all_cells[neighbor_cell_index].is_leaf ||
+                inside_mask_by_cell[neighbor_cell_index] == 0U) {
                 continue;
             }
 
             const double edge_cost = 0.5 * (
-                solid_leaves[leaf_index].cell_size +
-                solid_leaves[neighbor].cell_size);
+                cell_edge_length(all_cells[cell_index]) +
+                cell_edge_length(all_cells[neighbor_cell_index]));
             const double candidate = distance + edge_cost;
             if (candidate > max_distance) {
                 continue;
             }
-            if (candidate < clearance[neighbor]) {
-                clearance[neighbor] = candidate;
-                queue.push({candidate, neighbor});
+            if (candidate < clearance[neighbor_cell_index]) {
+                clearance[neighbor_cell_index] = candidate;
+                queue.push({candidate, neighbor_cell_index});
             }
         }
     }
-
     wavefront_counter.finish();
 
     return clearance;
 }
 
-inline std::vector<std::uint8_t> erode_occupied_solid_leaves(
-    const std::vector<std::uint8_t> &inside_mask,
-    const std::vector<double> &clearance,
+inline std::vector<std::uint8_t> erode_occupied_solid_cells(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::uint8_t> &inside_mask_by_cell,
+    const std::vector<double> &clearance_by_cell,
     double erosion_radius) {
-    std::vector<std::uint8_t> kept_inside(inside_mask.size(), 0U);
+    std::vector<std::uint8_t> kept_inside(all_cells.size(), 0U);
 
     ProgressCounter erode_counter(
-        "Regularization", "erode_occupied_solid_leaves", "leaves", 1000);
+        "Regularization", "erode_occupied_solid_cells", "cells", 1000);
 #pragma omp parallel for schedule(static)
-    for (std::size_t leaf_index = 0; leaf_index < inside_mask.size(); ++leaf_index) {
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
-                leaf_index)) {
+                cell_index)) {
             erode_counter.tick();
             continue;
         }
         erode_counter.tick();
-        if (inside_mask[leaf_index] == 0U) {
+        if (!all_cells[cell_index].is_leaf || inside_mask_by_cell[cell_index] == 0U) {
             continue;
         }
-        kept_inside[leaf_index] = clearance[leaf_index] >= erosion_radius ? 1U : 0U;
+        kept_inside[cell_index] =
+            clearance_by_cell[cell_index] >= erosion_radius ? 1U : 0U;
     }
     erode_counter.finish();
     return kept_inside;
 }
 
-inline std::vector<double> compute_distance_to_eroded_solid(
-    const std::vector<OccupiedSolidLeaf> &solid_leaves,
-    const std::vector<std::uint8_t> &eroded_inside,
+inline std::vector<double> compute_distance_to_eroded_solid_from_cell_mask(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache,
+    const std::vector<std::uint8_t> &eroded_inside_by_cell,
     double max_distance = std::numeric_limits<double>::infinity()) {
     const double inf = std::numeric_limits<double>::infinity();
-    std::vector<double> distance_to_eroded(solid_leaves.size(), inf);
+    std::vector<double> distance_to_eroded(all_cells.size(), inf);
     using QueueEntry = std::pair<double, std::size_t>;
     std::priority_queue<
         QueueEntry,
@@ -955,98 +1311,108 @@ inline std::vector<double> compute_distance_to_eroded_solid(
         std::greater<QueueEntry>> queue;
 
     ProgressCounter seed_counter(
-        "Regularization", "compute_distance_to_eroded_solid", "leaves", 1000);
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
+        "Regularization",
+        "compute_distance_to_eroded_solid_from_cell_mask",
+        "cells",
+        1000);
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
         seed_counter.tick();
-        if (eroded_inside[leaf_index] == 0U) {
+        if (!all_cells[cell_index].is_leaf || eroded_inside_by_cell[cell_index] == 0U) {
             continue;
         }
 
         bool is_boundary_seed = false;
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
+        for (std::size_t neighbor_cell_index :
+             classification_cache.face_neighbor_cell_indices[cell_index]) {
+            if (neighbor_cell_index == SIZE_MAX ||
+                neighbor_cell_index >= all_cells.size()) {
                 is_boundary_seed = true;
                 break;
             }
-            if (eroded_inside[static_cast<std::size_t>(neighbor_leaf_index)] == 0U) {
+            if (!all_cells[neighbor_cell_index].is_leaf ||
+                eroded_inside_by_cell[neighbor_cell_index] == 0U) {
                 is_boundary_seed = true;
                 break;
             }
         }
 
         if (is_boundary_seed) {
-            distance_to_eroded[leaf_index] = 0.0;
-            queue.push({0.0, leaf_index});
+            distance_to_eroded[cell_index] = 0.0;
+            queue.push({0.0, cell_index});
         }
     }
     seed_counter.finish();
 
     ProgressCounter wavefront_counter(
-        "Regularization", "compute_distance_to_eroded_solid", "queue pops", 10000);
-
+        "Regularization",
+        "compute_distance_to_eroded_solid_from_cell_mask",
+        "queue pops",
+        10000);
     while (!queue.empty()) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
         wavefront_counter.tick();
-        const auto [distance, leaf_index] = queue.top();
+        const auto [distance, cell_index] = queue.top();
         queue.pop();
-        if (distance > distance_to_eroded[leaf_index]) {
+        if (distance > distance_to_eroded[cell_index]) {
             continue;
         }
         if (distance > max_distance) {
             continue;
         }
 
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
+        for (std::size_t neighbor_cell_index :
+             classification_cache.face_neighbor_cell_indices[cell_index]) {
+            if (neighbor_cell_index == SIZE_MAX ||
+                neighbor_cell_index >= all_cells.size()) {
                 continue;
             }
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (eroded_inside[neighbor] != 0U) {
+            if (!all_cells[neighbor_cell_index].is_leaf ||
+                eroded_inside_by_cell[neighbor_cell_index] != 0U) {
                 continue;
             }
 
             const double edge_cost = 0.5 * (
-                solid_leaves[leaf_index].cell_size +
-                solid_leaves[neighbor].cell_size);
+                cell_edge_length(all_cells[cell_index]) +
+                cell_edge_length(all_cells[neighbor_cell_index]));
             const double candidate = distance + edge_cost;
             if (candidate > max_distance) {
                 continue;
             }
-            if (candidate < distance_to_eroded[neighbor]) {
-                distance_to_eroded[neighbor] = candidate;
-                queue.push({candidate, neighbor});
+            if (candidate < distance_to_eroded[neighbor_cell_index]) {
+                distance_to_eroded[neighbor_cell_index] = candidate;
+                queue.push({candidate, neighbor_cell_index});
             }
         }
     }
-
     wavefront_counter.finish();
 
     return distance_to_eroded;
 }
 
-inline std::vector<std::uint8_t> dilate_eroded_solid_leaves(
-    const std::vector<std::uint8_t> &eroded_inside,
-    const std::vector<double> &distance_to_eroded,
+inline std::vector<std::uint8_t> dilate_eroded_solid_cells(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::uint8_t> &eroded_inside_by_cell,
+    const std::vector<double> &distance_to_eroded_by_cell,
     double dilation_radius) {
-    std::vector<std::uint8_t> opened_inside(eroded_inside.size(), 0U);
+    std::vector<std::uint8_t> opened_inside(all_cells.size(), 0U);
 
     ProgressCounter dilate_counter(
-        "Regularization", "dilate_eroded_solid_leaves", "leaves", 1000);
+        "Regularization", "dilate_eroded_solid_cells", "cells", 1000);
 #pragma omp parallel for schedule(static)
-    for (std::size_t leaf_index = 0; leaf_index < eroded_inside.size(); ++leaf_index) {
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
-                leaf_index)) {
+                cell_index)) {
             dilate_counter.tick();
             continue;
         }
         dilate_counter.tick();
-        opened_inside[leaf_index] =
-            (eroded_inside[leaf_index] != 0U ||
-             distance_to_eroded[leaf_index] <= dilation_radius)
+        if (!all_cells[cell_index].is_leaf) {
+            continue;
+        }
+        opened_inside[cell_index] =
+            (eroded_inside_by_cell[cell_index] != 0U ||
+             distance_to_eroded_by_cell[cell_index] <= dilation_radius)
                 ? 1U
                 : 0U;
     }

@@ -158,6 +158,22 @@ inline void print_status(
     va_end(args);
 }
 
+inline void vprint_indented_status(
+    const char* format,
+    std::va_list args) {
+    std::lock_guard<std::mutex> lock(status_log_mutex());
+    std::fprintf(stdout, "    ");
+    std::vfprintf(stdout, format, args);
+    std::fflush(stdout);
+}
+
+inline void print_indented_status(const char* format, ...) {
+    std::va_list args;
+    va_start(args, format);
+    vprint_indented_status(format, args);
+    va_end(args);
+}
+
 #ifdef DEBUG_LOG
 
 inline void print_debug_status(

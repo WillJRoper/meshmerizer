@@ -187,12 +187,18 @@ struct LeafSpatialIndex {
         }
         lookup.reserve(n_leaves);
 
+        ProgressCounter build_counter(
+            "Regularization",
+            "LeafSpatialIndex::build",
+            "leaves",
+            10000);
         for (std::size_t cell_idx = 0; cell_idx < all_cells.size();
              ++cell_idx) {
             const OctreeCell &cell = all_cells[cell_idx];
             if (!cell.is_leaf) {
                 continue;
             }
+            build_counter.tick();
 
             // Quantize the cell's min corner to fine-grid coordinates.
             // This gives the unique key for this leaf.
@@ -210,6 +216,7 @@ struct LeafSpatialIndex {
                 ix_min, iy_min, iz_min)};
             lookup[key] = cell_idx;
         }
+        build_counter.finish();
     }
 
     /**

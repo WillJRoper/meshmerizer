@@ -123,6 +123,7 @@ inline DCPipelineResult run_dc_pipeline(
     std::uint32_t base_resolution,
     double isovalue,
     std::uint32_t max_depth,
+    std::uint32_t worker_count,
     std::uint32_t smoothing_iterations,
     double smoothing_strength,
     double max_edge_ratio,
@@ -216,38 +217,18 @@ inline DCPipelineResult run_dc_pipeline(
     // crosses the isovalue, producing an adaptive leaf set that
     // concentrates resolution where the surface is.
 
-    const auto refine_start = std::chrono::steady_clock::now();
-    auto [all_cells, all_contributors] = refine_octree(
-        std::move(initial_cells),
-        std::move(initial_contributors),
-        positions,
-        smoothing_lengths,
-        isovalue,
-        max_depth,
-        domain,
-        base_resolution,
-        1U,
-        table_cadence_seconds,
-        minimum_usable_hermite_samples,
-        max_qef_rms_residual_ratio,
-        min_normal_alignment_threshold);
-    meshmerizer_log_detail::print_debug_status(
-        "Timing",
-        "run_dc_pipeline",
-        "Initial octree refinement: %.3f s\n",
-        elapsed_seconds_since(refine_start));
-
+    const Vector3d domain_extent = domain.extent();
+    const double min_domain_extent = std::min(
+        domain_extent.x,
+        std::min(domain_extent.y, domain_extent.z));
+    const double finest_leaf_size =
+        min_domain_extent /
+        static_cast<double>(base_resolution * (1U << max_depth));
+    double effective_min_feature_thickness = min_feature_thickness;
+    double opening_radius = 0.0;
+    double max_surface_leaf_size = 0.0;
     if (min_feature_thickness > 0.0) {
-        const Vector3d domain_extent = domain.extent();
-        const double min_domain_extent = std::min(
-            domain_extent.x,
-            std::min(domain_extent.y, domain_extent.z));
-        const double finest_leaf_size =
-            min_domain_extent /
-            static_cast<double>(base_resolution * (1U << max_depth));
         const double minimum_resolvable_thickness = 2.0 * finest_leaf_size;
-
-        double effective_min_feature_thickness = min_feature_thickness;
         if (effective_min_feature_thickness < minimum_resolvable_thickness) {
             meshmerizer_log_detail::print_status(
                 "Regularization",
@@ -262,8 +243,33 @@ inline DCPipelineResult run_dc_pipeline(
                 minimum_resolvable_thickness);
             effective_min_feature_thickness = minimum_resolvable_thickness;
         }
+        opening_radius = 0.5 * effective_min_feature_thickness;
+        max_surface_leaf_size = opening_radius;
+    }
 
-        const double opening_radius = 0.5 * effective_min_feature_thickness;
+    const auto refine_start = std::chrono::steady_clock::now();
+    auto [all_cells, all_contributors] = refine_octree(
+        std::move(initial_cells),
+        std::move(initial_contributors),
+        positions,
+        smoothing_lengths,
+        isovalue,
+        max_depth,
+        domain,
+        base_resolution,
+        worker_count,
+        table_cadence_seconds,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+        max_surface_leaf_size);
+    meshmerizer_log_detail::print_debug_status(
+        "Timing",
+        "run_dc_pipeline",
+        "Initial octree refinement (+surface band): %.3f s\n",
+        elapsed_seconds_since(refine_start));
+
+    if (min_feature_thickness > 0.0) {
         meshmerizer_log_detail::print_debug_status(
             "Regularization",
             "run_dc_pipeline",
@@ -271,172 +277,183 @@ inline DCPipelineResult run_dc_pipeline(
             effective_min_feature_thickness,
             opening_radius);
 
-        const double max_surface_leaf_size = opening_radius;
-        std::size_t regularization_refine_pass = 0U;
-        while (true) {
-            meshmerizer_cancel_detail::poll_for_cancellation_serial(
-                regularization_refine_pass + 1U);
-            ++regularization_refine_pass;
-            const auto surface_refine_pass_start =
-                std::chrono::steady_clock::now();
-            meshmerizer_log_detail::print_debug_status(
-                "Regularization",
-                "run_dc_pipeline",
-                "pass %zu: target_leaf_size<=%.6g (total_cells=%zu)\n",
-                regularization_refine_pass,
-                max_surface_leaf_size,
-                all_cells.size());
-            if (!refine_surface_band_cells(
-                    all_cells, all_contributors, positions,
-                    smoothing_lengths, isovalue, max_depth,
-                    domain, base_resolution,
-                    max_surface_leaf_size,
-                    table_cadence_seconds,
-                    minimum_usable_hermite_samples,
-                    max_qef_rms_residual_ratio,
-                    min_normal_alignment_threshold)) {
-                    meshmerizer_log_detail::print_debug_status(
-                        "Regularization",
-                        "run_dc_pipeline",
-                        "pass %zu: no further surface-band refinement required\n",
-                    regularization_refine_pass);
-                break;
-            }
-            meshmerizer_log_detail::print_debug_status(
-                "Timing",
-                "run_dc_pipeline",
-                "Regularization surface refine pass %zu: %.3f s\n",
-                regularization_refine_pass,
-                elapsed_seconds_since(surface_refine_pass_start));
-        }
-
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "run_dc_pipeline",
+            "building solid leaf index (%zu cells)\n",
+            all_cells.size());
         LeafSpatialIndex solid_spatial_index;
         solid_spatial_index.build(all_cells, domain, max_depth, base_resolution);
         OccupiedSolidClassificationCache classification_cache;
         std::vector<std::uint8_t> dirty_cells(all_cells.size(), 1U);
-        std::vector<std::uint8_t> inside_mask;
-        std::vector<OccupiedSolidLeaf> solid_leaves =
-            classify_occupied_solid_leaves(
-                all_cells, all_contributors, positions,
-                smoothing_lengths, solid_spatial_index,
-                isovalue, max_depth, &classification_cache, &dirty_cells,
-                &inside_mask);
+        meshmerizer_log_detail::print_status(
+            "Regularization",
+            "run_dc_pipeline",
+            "updating occupied solid classification cache\n");
+        const auto initial_solid_classify_start =
+            std::chrono::steady_clock::now();
+        update_occupied_solid_classification_cache(
+            all_cells, all_contributors, positions,
+            smoothing_lengths, solid_spatial_index,
+            isovalue, max_depth, classification_cache, &dirty_cells);
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "initial solid classification took %.3f s\n",
+            elapsed_seconds_since(initial_solid_classify_start));
 
         if (pre_thickening_radius > 0.0) {
             const double thickening_leaf_size_target =
                 std::max(pre_thickening_radius * 0.5, finest_leaf_size);
-            std::size_t thickening_refine_pass = 0U;
 
-            while (true) {
-                meshmerizer_cancel_detail::poll_for_cancellation_serial(
-                    thickening_refine_pass + 1U);
-                const auto thickening_distance_start =
+            // Frontier-seeded thickening closure.
+            //
+            // The old B2 path seeded kClassify for every eligible leaf and
+            // allowed classify/distance/refine tasks to grow from there. On
+            // large trees this created millions of classify tasks before the
+            // queue had a useful frontier. Until the distance-front task graph
+            // is fully cell-side-car driven, seed the closure from the bounded
+            // outside growth band computed from the current solid mask. This
+            // keeps task work proportional to the pre-thickening band rather
+            // than the whole leaf set, while still using the task queue for
+            // the structural refinement work.
+            {
+                const auto thickening_frontier_start =
                     std::chrono::steady_clock::now();
-                const std::vector<double> thickening_distance =
-                    compute_outside_distance_from_inside_mask(
-                        solid_leaves, inside_mask,
-                        pre_thickening_radius + thickening_leaf_size_target);
-                ++thickening_refine_pass;
                 meshmerizer_log_detail::print_debug_status(
                     "Regularization",
                     "run_dc_pipeline",
-                    "pre-thickening pass %zu: target_leaf_size<=%.6g "
+                    "frontier thickening closure: target_leaf_size<=%.6g "
                     "(radius=%.6g, total_cells=%zu)\n",
-                    thickening_refine_pass,
                     thickening_leaf_size_target,
                     pre_thickening_radius,
                     all_cells.size());
-                meshmerizer_log_detail::print_debug_status(
+                const auto seed_distance_start = std::chrono::steady_clock::now();
+                const std::vector<double> seed_distance =
+                    compute_outside_distance_from_classification_cache(
+                        all_cells, classification_cache,
+                        pre_thickening_radius + 2.0 * thickening_leaf_size_target);
+                meshmerizer_log_detail::print_status(
                     "Timing",
                     "run_dc_pipeline",
-                    "Pre-thickening distance pass %zu: %.3f s\n",
-                    thickening_refine_pass,
-                    elapsed_seconds_since(thickening_distance_start));
-                const auto thickening_refine_start =
-                    std::chrono::steady_clock::now();
+                    "frontier seed distance took %.3f s\n",
+                    elapsed_seconds_since(seed_distance_start));
                 dirty_cells.assign(all_cells.size(), 0U);
-                if (!refine_thickening_band_cells(
-                        all_cells, all_contributors, positions,
-                        smoothing_lengths, isovalue, max_depth,
-                        domain, base_resolution,
-                        thickening_leaf_size_target, solid_leaves,
-                        inside_mask, thickening_distance,
-                        pre_thickening_radius,
-                        table_cadence_seconds,
-                        minimum_usable_hermite_samples,
-                        max_qef_rms_residual_ratio,
-                        min_normal_alignment_threshold,
-                        &dirty_cells)) {
-                    meshmerizer_log_detail::print_debug_status(
+                std::vector<std::uint8_t> closure_inside_flags;
+                std::vector<double> closure_center_values;
+                std::vector<std::uint8_t> closure_occupancy_states;
+                const bool thickening_refined = refine_thickening_band_cells(
+                    all_cells, all_contributors, positions,
+                    smoothing_lengths, isovalue, max_depth,
+                    domain, base_resolution, worker_count,
+                    thickening_leaf_size_target,
+                    classification_cache, seed_distance,
+                    pre_thickening_radius,
+                    table_cadence_seconds,
+                    minimum_usable_hermite_samples,
+                    max_qef_rms_residual_ratio,
+                    min_normal_alignment_threshold,
+                    &dirty_cells,
+                    &closure_inside_flags,
+                    &closure_center_values,
+                    &closure_occupancy_states);
+                if (!thickening_refined) {
+                    meshmerizer_log_detail::print_status(
                         "Regularization",
                         "run_dc_pipeline",
-                        "pre-thickening pass %zu: no further growth-band "
-                        "refinement required\n",
-                        thickening_refine_pass);
-                    break;
+                        "frontier thickening skipped: no eligible leaf cells "
+                        "inside the growth band\n");
                 }
                 meshmerizer_log_detail::print_debug_status(
                     "Timing",
                     "run_dc_pipeline",
-                    "Pre-thickening refine pass %zu: %.3f s\n",
-                    thickening_refine_pass,
-                    elapsed_seconds_since(thickening_refine_start));
-
-                const auto reclassify_start = std::chrono::steady_clock::now();
+                    "Frontier thickening closure: %.3f s (total_cells=%zu)\n",
+                    elapsed_seconds_since(thickening_frontier_start),
+                    all_cells.size());
+                meshmerizer_log_detail::print_status(
+                    "Regularization",
+                    "run_dc_pipeline",
+                    "materializing occupied solid classification cache after pre-thickening\n");
+                const auto rebuild_solid_classify_start =
+                    std::chrono::steady_clock::now();
                 solid_spatial_index.build(
                     all_cells, domain, max_depth, base_resolution);
-                solid_leaves = classify_occupied_solid_leaves(
-                    all_cells, all_contributors, positions,
-                    smoothing_lengths, solid_spatial_index,
-                    isovalue, max_depth, &classification_cache,
-                    &dirty_cells, &inside_mask);
-                meshmerizer_log_detail::print_debug_status(
-                    "Timing",
-                    "run_dc_pipeline",
-                    "Pre-thickening reclassify pass %zu: %.3f s\n",
-                    thickening_refine_pass,
-                    elapsed_seconds_since(reclassify_start));
-
-                const auto strict_check_start =
-                    std::chrono::steady_clock::now();
-                const std::vector<double> strict_band_distance =
-                    compute_outside_distance_from_inside_mask(
-                        solid_leaves, inside_mask,
-                        pre_thickening_radius);
-                meshmerizer_log_detail::print_debug_status(
-                    "Timing",
-                    "run_dc_pipeline",
-                    "Pre-thickening strict-band distance pass %zu: %.3f s\n",
-                    thickening_refine_pass,
-                    elapsed_seconds_since(strict_check_start));
-
-                if (thickening_band_is_fully_refined(
-                        solid_leaves, inside_mask,
-                        strict_band_distance,
-                        thickening_leaf_size_target,
-                        pre_thickening_radius)) {
-                    meshmerizer_log_detail::print_debug_status(
-                        "Regularization",
-                        "run_dc_pipeline",
-                        "pre-thickening pass %zu: strict growth band fully refined; stopping iterations early\n",
-                        thickening_refine_pass);
-                    break;
+                if (thickening_refined) {
+                    const bool exported_state_matches_tree =
+                        closure_inside_flags.size() == all_cells.size() &&
+                        closure_center_values.size() == all_cells.size() &&
+                        closure_occupancy_states.size() == all_cells.size();
+                    if (!exported_state_matches_tree) {
+                        meshmerizer_log_detail::print_status(
+                            "Regularization",
+                            "run_dc_pipeline",
+                            "closure solid-state export size mismatch after pre-thickening "
+                            "(cells=%zu, inside=%zu, center=%zu, occupancy=%zu); "
+                            "falling back to full cache rebuild\n",
+                            all_cells.size(),
+                            closure_inside_flags.size(),
+                            closure_center_values.size(),
+                            closure_occupancy_states.size());
+                        dirty_cells.assign(all_cells.size(), 1U);
+                        update_occupied_solid_classification_cache(
+                            all_cells, all_contributors, positions,
+                            smoothing_lengths, solid_spatial_index,
+                            isovalue, max_depth, classification_cache,
+                            &dirty_cells);
+                    } else {
+                        merge_occupied_solid_cache_from_closure_state(
+                            all_cells,
+                            solid_spatial_index,
+                            max_depth,
+                            classification_cache,
+                            std::move(closure_inside_flags),
+                            std::move(closure_center_values),
+                            std::move(closure_occupancy_states),
+                            dirty_cells);
+                    }
                 }
+                if (classification_cache.inside_flags.size() != all_cells.size() ||
+                    classification_cache.center_values.size() != all_cells.size() ||
+                    classification_cache.occupancy_states.size() != all_cells.size() ||
+                    classification_cache.face_neighbor_cell_indices.size() !=
+                        all_cells.size()) {
+                    throw std::runtime_error(
+                        "post-thickening solid-state cache size mismatch");
+                }
+                meshmerizer_log_detail::print_status(
+                    "Timing",
+                    "run_dc_pipeline",
+                    "post-thickening solid-state materialization took %.3f s\n",
+                    elapsed_seconds_since(rebuild_solid_classify_start));
             }
 
             const auto final_thickening_distance_start =
                 std::chrono::steady_clock::now();
             const std::vector<double> thickening_distance =
-                compute_outside_distance_from_inside_mask(
-                    solid_leaves, inside_mask,
+                compute_outside_distance_from_classification_cache(
+                    all_cells, classification_cache,
                     pre_thickening_radius);
-            meshmerizer_log_detail::print_debug_status(
+            meshmerizer_log_detail::print_status(
                 "Timing",
                 "run_dc_pipeline",
                 "Final pre-thickening distance: %.3f s\n",
                 elapsed_seconds_since(final_thickening_distance_start));
-            inside_mask = dilate_inside_mask(
-                inside_mask, thickening_distance, pre_thickening_radius);
+            const auto pre_thickening_dilate_start =
+                std::chrono::steady_clock::now();
+            const std::vector<std::uint8_t> inside_mask_by_cell =
+                build_inside_mask_from_classification_cache(
+                    all_cells, classification_cache);
+            const std::vector<std::uint8_t> dilated_inside_mask_by_cell =
+                dilate_inside_cell_mask(
+                    all_cells,
+                    inside_mask_by_cell,
+                    thickening_distance,
+                    pre_thickening_radius);
+            meshmerizer_log_detail::print_status(
+                "Timing",
+                "run_dc_pipeline",
+                "pre-thickening dilation took %.3f s\n",
+                elapsed_seconds_since(pre_thickening_dilate_start));
             meshmerizer_log_detail::print_debug_status(
                 "Regularization",
                 "run_dc_pipeline",
@@ -444,24 +461,83 @@ inline DCPipelineResult run_dc_pipeline(
                 pre_thickening_radius);
         }
 
+        OccupiedSolidExtractionView extraction_view =
+            build_occupied_solid_extraction_view(
+                all_cells, classification_cache);
+        std::vector<OccupiedSolidLeaf> &solid_leaves =
+            extraction_view.solid_leaves;
+        std::vector<std::uint8_t> &inside_mask =
+            extraction_view.inside_mask;
+
         const auto morphology_start = std::chrono::steady_clock::now();
+        const std::vector<std::uint8_t> &inside_mask_by_cell =
+            extraction_view.inside_mask_by_cell;
+        const auto clearance_start = std::chrono::steady_clock::now();
+        const std::vector<double> clearance_by_cell =
+            compute_inside_clearance_from_cell_mask(
+                all_cells, classification_cache, inside_mask_by_cell,
+                opening_radius);
         const std::vector<double> clearance =
-            compute_inside_clearance(
-                solid_leaves, inside_mask, opening_radius);
+            project_leaf_scalars_from_cell_state(
+                solid_leaves, clearance_by_cell,
+                std::numeric_limits<double>::infinity());
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "inside clearance took %.3f s\n",
+            elapsed_seconds_since(clearance_start));
+        const auto erosion_start = std::chrono::steady_clock::now();
+        const std::vector<std::uint8_t> eroded_inside_by_cell =
+            erode_occupied_solid_cells(
+                all_cells, inside_mask_by_cell, clearance_by_cell,
+                opening_radius);
         const std::vector<std::uint8_t> eroded_inside =
-            erode_occupied_solid_leaves(
-                inside_mask, clearance, opening_radius);
+            build_leaf_mask_from_cell_mask(
+                solid_leaves, eroded_inside_by_cell);
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "erosion took %.3f s\n",
+            elapsed_seconds_since(erosion_start));
+        const auto dilation_distance_start =
+            std::chrono::steady_clock::now();
+        const std::vector<double> dilation_distance_by_cell =
+            compute_distance_to_eroded_solid_from_cell_mask(
+                all_cells, classification_cache, eroded_inside_by_cell,
+                opening_radius);
         const std::vector<double> dilation_distance =
-            compute_distance_to_eroded_solid(
-                solid_leaves, eroded_inside, opening_radius);
+            project_leaf_scalars_from_cell_state(
+                solid_leaves, dilation_distance_by_cell,
+                std::numeric_limits<double>::infinity());
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "eroded-solid distance took %.3f s\n",
+            elapsed_seconds_since(dilation_distance_start));
+        const auto dilation_start = std::chrono::steady_clock::now();
+        const std::vector<std::uint8_t> opened_inside_by_cell =
+            dilate_eroded_solid_cells(
+                all_cells, eroded_inside_by_cell, dilation_distance_by_cell,
+                opening_radius);
         std::vector<std::uint8_t> opened_inside =
-            dilate_eroded_solid_leaves(
-                eroded_inside, dilation_distance, opening_radius);
+            build_leaf_mask_from_cell_mask(
+                solid_leaves, opened_inside_by_cell);
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "eroded-solid dilation took %.3f s\n",
+            elapsed_seconds_since(dilation_start));
+        const auto cleanup_start = std::chrono::steady_clock::now();
         fill_small_opened_cavities(solid_leaves, opened_inside);
         prune_small_opened_components(solid_leaves, opened_inside);
         suppress_opened_edge_contacts(
             solid_leaves, all_cells, solid_spatial_index, opened_inside);
-        meshmerizer_log_detail::print_debug_status(
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "opened-solid cleanup took %.3f s\n",
+            elapsed_seconds_since(cleanup_start));
+        meshmerizer_log_detail::print_status(
             "Timing",
             "run_dc_pipeline",
             "Regularization morphology: %.3f s\n",
@@ -483,6 +559,11 @@ inline DCPipelineResult run_dc_pipeline(
         OpenedSurfaceMesh opened_surface = generate_opened_surface_mesh(
             solid_leaves, opened_inside, all_cells, solid_spatial_index,
             domain, base_resolution, max_depth);
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "opened surface extraction pass 1 took %.3f s\n",
+            elapsed_seconds_since(opened_surface_start));
         if (resolve_opened_edge_ambiguities(
                 solid_leaves, all_cells, solid_spatial_index,
                 opened_inside, opened_surface)) {
@@ -492,11 +573,18 @@ inline DCPipelineResult run_dc_pipeline(
                 "re-extracting opened blocky surface after ambiguity cleanup "
                 "(opened_inside=%zu)\n",
                 log_opened_count());
+            const auto opened_surface_reextract_start =
+                std::chrono::steady_clock::now();
             opened_surface = generate_opened_surface_mesh(
                 solid_leaves, opened_inside, all_cells, solid_spatial_index,
                 domain, base_resolution, max_depth);
+            meshmerizer_log_detail::print_status(
+                "Timing",
+                "run_dc_pipeline",
+                "opened surface extraction pass 2 took %.3f s\n",
+                elapsed_seconds_since(opened_surface_reextract_start));
         }
-        meshmerizer_log_detail::print_debug_status(
+        meshmerizer_log_detail::print_status(
             "Timing",
             "run_dc_pipeline",
             "Opened surface extraction: %.3f s\n",

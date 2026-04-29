@@ -79,6 +79,23 @@ struct OctreeCell {
     std::array<double, 8> corner_values;
     /** Bit mask encoding ``corner_values >= isovalue``. */
     std::uint8_t corner_sign_mask;
+    /**
+     * @brief Index of the parent cell in ``all_cells``, or ``-1`` for roots.
+     *
+     * Populated by the closure pipeline when it splits a parent and appends
+     * the child block to the flat array. Cells constructed outside that path
+     * (e.g. Python ``create_child_cells`` binding, top-level cells) carry
+     * ``-1`` and rely on the morton-ascend fallback rather than this field.
+     */
+    std::int64_t parent_index;
+    /**
+     * @brief Local child index within the parent's eight-child block.
+     *
+     * Bit 0 = x half, bit 1 = y half, bit 2 = z half (matches
+     * ``create_child_cells`` and ``child_bounds_from_index``). Meaningful only
+     * when ``parent_index >= 0``; otherwise stored as 0.
+     */
+    std::uint8_t slot_in_parent;
 };
 
 /**
@@ -249,6 +266,8 @@ inline std::vector<OctreeCell> create_top_level_cells(
                     -1,
                     {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
                     0U,
+                    -1,
+                    0U,
                 });
             }
         }
@@ -323,6 +342,8 @@ inline std::vector<OctreeCell> create_child_cells(const OctreeCell &parent) {
             -1,
             {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
             0U,
+            -1,
+            child_index,
         });
     }
     return children;
@@ -409,6 +430,8 @@ inline void split_octree_leaf(
     parent.representative_vertex_index = -1;
     parent.child_begin = static_cast<std::int64_t>(all_cells.size());
 
+    const std::int64_t parent_storage_index =
+        static_cast<std::int64_t>(split_index);
     for (std::size_t i = 0; i < children.size(); ++i) {
         const std::int64_t child_contrib_begin =
             static_cast<std::int64_t>(all_contributors.size());
@@ -420,6 +443,8 @@ inline void split_octree_leaf(
 
         children[i].contributor_begin = child_contrib_begin;
         children[i].contributor_end = child_contrib_end;
+        children[i].parent_index = parent_storage_index;
+        // slot_in_parent already set by create_child_cells.
         all_cells.push_back(children[i]);
     }
 }
@@ -853,6 +878,127 @@ struct BalanceSpatialHash {
     }
 };
 
+inline std::vector<std::size_t> collect_balance_violation_seed_cells(
+    const std::vector<OctreeCell> &all_cells,
+    const BoundingBox &domain,
+    std::uint32_t max_depth,
+    std::uint32_t base_resolution) {
+    BalanceSpatialHash spatial_hash;
+    spatial_hash.build(all_cells, domain, max_depth, base_resolution);
+    std::vector<std::size_t> violating_cells;
+    violating_cells.reserve(all_cells.size() / 16U);
+    const std::uint32_t fine_max = base_resolution << max_depth;
+
+    auto check_neighbor = [&](std::size_t cell_index,
+                              std::uint32_t ix,
+                              std::uint32_t iy,
+                              std::uint32_t iz) {
+        const std::size_t neighbor_index = spatial_hash.find_leaf_at(ix, iy, iz);
+        if (neighbor_index == SIZE_MAX || neighbor_index >= all_cells.size() ||
+            neighbor_index == cell_index) {
+            return;
+        }
+        const OctreeCell &cell = all_cells[cell_index];
+        const OctreeCell &neighbor = all_cells[neighbor_index];
+        const std::uint32_t depth_diff =
+            cell.depth > neighbor.depth ? cell.depth - neighbor.depth
+                                        : neighbor.depth - cell.depth;
+        if (depth_diff <= 1U) {
+            return;
+        }
+        violating_cells.push_back(
+            cell.depth < neighbor.depth ? cell_index : neighbor_index);
+    };
+
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
+        const OctreeCell &cell = all_cells[cell_index];
+        if (!cell.is_leaf) {
+            continue;
+        }
+
+        std::uint32_t min_x = 0U;
+        std::uint32_t min_y = 0U;
+        std::uint32_t min_z = 0U;
+        std::uint32_t max_x = 0U;
+        std::uint32_t max_y = 0U;
+        std::uint32_t max_z = 0U;
+        spatial_hash.quantize(cell.bounds.min, min_x, min_y, min_z);
+        spatial_hash.quantize(cell.bounds.max, max_x, max_y, max_z);
+        const std::uint32_t mid_x = min_x + (max_x - min_x) / 2U;
+        const std::uint32_t mid_y = min_y + (max_y - min_y) / 2U;
+        const std::uint32_t mid_z = min_z + (max_z - min_z) / 2U;
+
+        if (min_x > 0U) {
+            check_neighbor(cell_index, min_x - 1U, mid_y, mid_z);
+        }
+        if (max_x < fine_max) {
+            check_neighbor(cell_index, max_x, mid_y, mid_z);
+        }
+        if (min_y > 0U) {
+            check_neighbor(cell_index, mid_x, min_y - 1U, mid_z);
+        }
+        if (max_y < fine_max) {
+            check_neighbor(cell_index, mid_x, max_y, mid_z);
+        }
+        if (min_z > 0U) {
+            check_neighbor(cell_index, mid_x, mid_y, min_z - 1U);
+        }
+        if (max_z < fine_max) {
+            check_neighbor(cell_index, mid_x, mid_y, max_z);
+        }
+    }
+
+    std::sort(violating_cells.begin(), violating_cells.end());
+    violating_cells.erase(
+        std::unique(violating_cells.begin(), violating_cells.end()),
+        violating_cells.end());
+    return violating_cells;
+}
+
+inline void repair_balance_invariant_with_closure(
+    std::vector<OctreeCell> &all_cells,
+    std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const RefinementClosureConfig &config) {
+    const std::size_t max_passes =
+        static_cast<std::size_t>(std::max(1U, config.max_depth)) + 2U;
+    for (std::size_t pass = 0; pass < max_passes; ++pass) {
+        meshmerizer_log_detail::print_status(
+            "Building",
+            "repair_balance_invariant_with_closure",
+            "checking 2:1 balance pass %zu (%zu cells)\n",
+            pass + 1U,
+            all_cells.size());
+        const std::vector<std::size_t> violating_cells =
+            collect_balance_violation_seed_cells(
+                all_cells, config.domain, config.max_depth,
+                config.base_resolution);
+        if (violating_cells.empty()) {
+            meshmerizer_log_detail::print_status(
+                "Building",
+                "repair_balance_invariant_with_closure",
+                "2:1 balance check passed\n");
+            return;
+        }
+        meshmerizer_log_detail::print_status(
+            "Building",
+            "repair_balance_invariant_with_closure",
+            "repairing %zu balance seed cells\n",
+            violating_cells.size());
+        if (!refine_cells_to_next_depth_with_closure(
+                all_cells,
+                all_contributors,
+                positions,
+                smoothing_lengths,
+                config,
+                violating_cells)) {
+            return;
+        }
+    }
+}
+
 inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>>
 refine_octree(
     std::vector<OctreeCell> initial_cells,
@@ -867,7 +1013,8 @@ refine_octree(
     double table_cadence_seconds = 10.0,
     std::uint32_t minimum_usable_hermite_samples = 3U,
     double max_qef_rms_residual_ratio = 0.1,
-    double min_normal_alignment_threshold = 0.97) {
+    double min_normal_alignment_threshold = 0.97,
+    double surface_band_target_leaf_size = 0.0) {
     const RefinementClosureConfig closure_config = {
         isovalue,
         max_depth,
@@ -881,14 +1028,28 @@ refine_octree(
         "Building",
         "refine_octree",
         "refine_octree",
+        surface_band_target_leaf_size,
     };
 
-    return refine_with_closure(
+    auto refined = refine_with_closure(
         std::move(initial_cells),
         std::move(initial_contributors),
         positions,
         smoothing_lengths,
         closure_config);
+#ifdef DEBUG_LOG
+    // Debug-only safety net: the closure queue is expected to enforce 2:1
+    // balance before it drains. If this does work, the scheduler missed a
+    // balance wake and the debug logs will expose it without reintroducing
+    // hidden production iteration.
+    repair_balance_invariant_with_closure(
+        refined.first,
+        refined.second,
+        positions,
+        smoothing_lengths,
+        closure_config);
+#endif
+    return refined;
 }
 
 inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octree(
@@ -903,7 +1064,8 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
     double table_cadence_seconds = 10.0,
     std::uint32_t minimum_usable_hermite_samples = 3U,
     double max_qef_rms_residual_ratio = 0.1,
-    double min_normal_alignment_threshold = 0.97) {
+    double min_normal_alignment_threshold = 0.97,
+    double surface_band_target_leaf_size = 0.0) {
     if (initial_cells.empty()) {
         return {{}, {}};
     }
@@ -938,7 +1100,8 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
         domain, base_resolution, worker_count, table_cadence_seconds,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
-        min_normal_alignment_threshold);
+        min_normal_alignment_threshold,
+        surface_band_target_leaf_size);
 }
 
 #endif  // MESHMERIZER_ADAPTIVE_CPP_OCTREE_CELL_HPP_

@@ -378,6 +378,7 @@ def build_refined_tree(
     base_resolution: int,
     isovalue: float,
     max_depth: int,
+    worker_count: int = 1,
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
@@ -393,6 +394,7 @@ def build_refined_tree(
         base_resolution: Number of top-level cells per axis.
         isovalue: Scalar field threshold used for split decisions.
         max_depth: Maximum permitted refinement depth.
+        worker_count: Number of worker threads for parallel refinement.
         table_cadence: Strict time cadence in seconds for queue-status table
             rows emitted by queue-driven refinement. Defaults to ``10.0``.
         minimum_usable_hermite_samples: Minimum usable Hermite sample count.
@@ -418,6 +420,7 @@ def build_refined_tree(
         isovalue,
         max_depth,
         table_cadence,
+        worker_count,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
