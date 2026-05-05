@@ -50,6 +50,7 @@ def test_build_tree_returns_tree_state() -> None:
     assert isinstance(tree, TreeState)
     assert tree.positions.shape == positions.shape
     assert tree.smoothing_lengths.shape == smoothing_lengths.shape
+    assert isinstance(tree.contributors, np.ndarray)
 
 
 def test_regularize_returns_topology_state() -> None:
@@ -156,6 +157,32 @@ def test_extract_mesh_from_topology_returns_mesh_result() -> None:
     result = extract_mesh(topology)
     assert isinstance(result, MeshResult)
     assert result.mesh.faces.shape[1] == 3
+
+
+def test_extract_mesh_from_topology_reuses_cached_mesh() -> None:
+    positions, smoothing_lengths = _simple_particles()
+    tree = build_tree(
+        positions,
+        smoothing_lengths,
+        domain_min=(0.0, 0.0, 0.0),
+        domain_max=(2.0, 2.0, 2.0),
+        base_resolution=2,
+        isovalue=0.01,
+        max_depth=2,
+    )
+    topology = regularize(tree, min_feature_thickness=0.2)
+    cached_vertices = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float64,
+    )
+    cached_faces = np.array([[0, 1, 2]], dtype=np.uint32)
+    topology.mesh_vertices = cached_vertices
+    topology.mesh_faces = cached_faces
+
+    result = extract_mesh(topology)
+
+    assert np.array_equal(result.mesh.vertices, cached_vertices)
+    assert np.array_equal(result.mesh.faces, cached_faces)
 
 
 def test_cluster_particles_returns_labels() -> None:

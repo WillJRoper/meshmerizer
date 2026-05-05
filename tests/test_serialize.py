@@ -111,12 +111,14 @@ def test_round_trip_without_mesh():
         # Particles
         assert len(result["positions"]) == len(positions)
         for orig, loaded in zip(positions, result["positions"]):
-            assert orig == loaded
+            np.testing.assert_allclose(loaded, orig)
 
-        assert result["smoothing_lengths"] == list(smoothing_lengths)
+        np.testing.assert_allclose(
+            result["smoothing_lengths"], smoothing_lengths
+        )
 
         # Contributors
-        assert result["contributors"] == list(contributors)
+        np.testing.assert_array_equal(result["contributors"], contributors)
 
         # Cells
         assert len(result["cells"]) == len(cells)

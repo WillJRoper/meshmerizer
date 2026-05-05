@@ -23,10 +23,10 @@ from pathlib import Path
 import numpy as np
 
 from meshmerizer.adaptive import (
+    build_refined_tree,
     compute_isovalue_from_percentile,
-    create_top_level_cells_with_contributors,
     fof_cluster,
-    refine_octree,
+    generate_mesh,
     run_full_pipeline,
     solve_vertices,
 )
@@ -267,6 +267,7 @@ def _reconstruct_mesh(
         base_resolution: Number of top-level cells per axis.
         isovalue: Scalar field threshold for extraction.
         max_depth: Maximum octree refinement depth.
+        worker_count: Number of native refinement workers to use.
         group_labels: Optional per-particle group labels.
         smoothing_iterations: Number of smoothing iterations.
         smoothing_strength: Laplacian smoothing strength in ``(0, 1]``.
@@ -570,8 +571,6 @@ def _build_and_optionally_save_octree(
     base_resolution: int,
     max_depth: int,
     isovalue: float,
-    min_feature_thickness: float,
-    pre_thickening_radius: float,
 ):
     """Build and optionally persist an octree from particle inputs.
 
@@ -584,8 +583,6 @@ def _build_and_optionally_save_octree(
         base_resolution: Number of top-level cells per axis.
         max_depth: Maximum octree refinement depth.
         isovalue: Scalar field threshold used during refinement.
-        min_feature_thickness: Regularization control in native units.
-        pre_thickening_radius: Optional pre-thickening control in native units.
 
     Returns:
         Tuple ``(cells, contributors)`` describing the refined octree.
@@ -597,30 +594,14 @@ def _build_and_optionally_save_octree(
     )
     tree_start = time.perf_counter()
 
-    top_cells = create_top_level_cells_with_contributors(
+    cells, contributors = build_refined_tree(
         positions,
         smoothing_lengths,
         domain_min,
         domain_max,
         base_resolution,
-    )
-    initial_cells = []
-    for cell in top_cells:
-        cell_dict = dict(cell)
-        contributors = cell_dict.pop("contributors")
-        cell_dict["contributor_begin"] = 0
-        cell_dict["contributor_end"] = len(contributors)
-        cell_dict["contributors"] = contributors
-        initial_cells.append(cell_dict)
-
-    cells, contributors = refine_octree(
-        initial_cells,
-        positions,
-        smoothing_lengths,
         isovalue,
         max_depth,
-        domain=(domain_min, domain_max),
-        base_resolution=base_resolution,
         worker_count=max(1, int(getattr(args, "nthreads", 1) or 1)),
         minimum_usable_hermite_samples=getattr(
             args, "min_usable_hermite_samples", 3
@@ -631,8 +612,6 @@ def _build_and_optionally_save_octree(
         min_normal_alignment_threshold=getattr(
             args, "min_normal_alignment_threshold", 0.97
         ),
-        min_feature_thickness=min_feature_thickness,
-        pre_thickening_radius=pre_thickening_radius,
         table_cadence=getattr(args, "table_cadence", 10.0),
     )
     record_elapsed("Octree construction", tree_start, operation="Building")
@@ -729,6 +708,13 @@ def _run_octree_backed_pipeline(
     else:
         group_labels = np.zeros(len(positions), dtype=np.int64)
 
+    can_reuse_loaded_tree = (
+        not getattr(args, "fof", False)
+        and min_feature_thickness <= 0.0
+        and pre_thickening_radius <= 0.0
+        and getattr(args, "smoothing_iterations", 0) == 0
+        and getattr(args, "max_edge_ratio", 1.5) <= 0.0
+    )
     reconstruction_depth = max_depth
     log_status(
         "Meshing",
@@ -736,30 +722,45 @@ def _run_octree_backed_pipeline(
         f"(depth={reconstruction_depth})...",
     )
     reconstruction_start = time.perf_counter()
-    mesh_verts, mesh_faces = _reconstruct_mesh(
-        positions,
-        smoothing_lengths,
-        domain_min,
-        domain_max,
-        base_resolution,
-        isovalue,
-        reconstruction_depth,
-        group_labels=group_labels,
-        smoothing_iterations=getattr(args, "smoothing_iterations", 0),
-        smoothing_strength=getattr(args, "smoothing_strength", 0.5),
-        max_edge_ratio=getattr(args, "max_edge_ratio", 1.5),
-        minimum_usable_hermite_samples=getattr(
-            args, "min_usable_hermite_samples", 3
-        ),
-        max_qef_rms_residual_ratio=getattr(
-            args, "max_qef_rms_residual_ratio", 0.1
-        ),
-        min_normal_alignment_threshold=getattr(
-            args, "min_normal_alignment_threshold", 0.97
-        ),
-        min_feature_thickness=min_feature_thickness,
-        pre_thickening_radius=pre_thickening_radius,
-    )
+    if can_reuse_loaded_tree:
+        mesh_verts, _, mesh_faces = generate_mesh(
+            cells,
+            contributors,
+            positions,
+            smoothing_lengths,
+            isovalue,
+            domain_min,
+            domain_max,
+            reconstruction_depth,
+            base_resolution,
+        )
+    else:
+        mesh_verts, mesh_faces = _reconstruct_mesh(
+            positions,
+            smoothing_lengths,
+            domain_min,
+            domain_max,
+            base_resolution,
+            isovalue,
+            reconstruction_depth,
+            worker_count=max(1, int(getattr(args, "nthreads", 1) or 1)),
+            group_labels=group_labels,
+            smoothing_iterations=getattr(args, "smoothing_iterations", 0),
+            smoothing_strength=getattr(args, "smoothing_strength", 0.5),
+            max_edge_ratio=getattr(args, "max_edge_ratio", 1.5),
+            minimum_usable_hermite_samples=getattr(
+                args, "min_usable_hermite_samples", 3
+            ),
+            max_qef_rms_residual_ratio=getattr(
+                args, "max_qef_rms_residual_ratio", 0.1
+            ),
+            min_normal_alignment_threshold=getattr(
+                args, "min_normal_alignment_threshold", 0.97
+            ),
+            min_feature_thickness=min_feature_thickness,
+            pre_thickening_radius=pre_thickening_radius,
+            table_cadence=getattr(args, "table_cadence", 10.0),
+        )
     record_elapsed(
         "Mesh reconstruction core",
         reconstruction_start,
@@ -855,8 +856,6 @@ def run_adaptive(args) -> None:
             base_resolution=state["base_resolution"],
             max_depth=state["max_depth"],
             isovalue=state["isovalue"],
-            min_feature_thickness=effective_min_feature_thickness,
-            pre_thickening_radius=effective_pre_thickening_radius,
         )
     elif args.save_octree is not None:
         log_status("Saving", f"Saving octree to {args.save_octree}")

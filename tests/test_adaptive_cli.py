@@ -393,6 +393,87 @@ def test_run_adaptive_allows_missing_filename_with_loaded_octree(
     run_adaptive(args)
 
 
+def test_run_adaptive_loaded_octree_reuses_tree_for_direct_meshing(
+    monkeypatch, tmp_path
+) -> None:
+    captured = {}
+
+    monkeypatch.setattr(
+        "meshmerizer.cli.adaptive.import_octree",
+        lambda path: {
+            "positions": np.array(
+                [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]],
+                dtype=np.float64,
+            ),
+            "smoothing_lengths": np.full(3, 0.1, dtype=np.float64),
+            "domain_minimum": (0.0, 0.0, 0.0),
+            "domain_maximum": (2.0, 1.0, 1.0),
+            "cells": [{"is_leaf": True}],
+            "contributors": np.array([0, 1, 2], dtype=np.int64),
+            "isovalue": 0.01,
+            "max_depth": 2,
+            "base_resolution": 2,
+        },
+    )
+    monkeypatch.setattr(
+        "meshmerizer.cli.adaptive.generate_mesh",
+        lambda *args, **kwargs: (
+            captured.setdefault("generate_mesh_called", True),
+            np.array(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=np.float64,
+            ),
+            np.zeros((3, 3), dtype=np.float64),
+            np.array([[0, 1, 2]], dtype=np.uint32),
+        )[1:],
+    )
+    monkeypatch.setattr(
+        "meshmerizer.cli.adaptive._reconstruct_mesh",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("_reconstruct_mesh should not be called")
+        ),
+    )
+    monkeypatch.setattr(
+        "meshmerizer.mesh.core.trimesh.Trimesh.export",
+        lambda self, *args, **kwargs: None,
+    )
+
+    args = Namespace(
+        nthreads=None,
+        table_cadence=10.0,
+        load_octree=tmp_path / "tree.hdf5",
+        save_octree=None,
+        filename=None,
+        output=tmp_path / "out.stl",
+        min_feature_thickness=0.0,
+        pre_thickening_radius=0.0,
+        simplify_factor=1.0,
+        target_size=None,
+        max_depth=2,
+        base_resolution=2,
+        isovalue=None,
+        surface_percentile=5.0,
+        fof=False,
+        linking_factor=0.2,
+        smoothing_iterations=0,
+        smoothing_strength=0.5,
+        max_edge_ratio=0.0,
+        min_usable_hermite_samples=3,
+        max_qef_rms_residual_ratio=0.1,
+        min_normal_alignment_threshold=0.97,
+        remove_islands_fraction=None,
+        visualise_verts=None,
+        min_fof_cluster_size=None,
+        center=None,
+        extent=None,
+        silent=False,
+    )
+
+    run_adaptive(args)
+
+    assert captured["generate_mesh_called"] is True
+
+
 def test_run_adaptive_errors_when_no_input_source_is_given() -> None:
     args = Namespace(
         nthreads=None,

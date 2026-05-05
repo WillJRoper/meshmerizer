@@ -8,7 +8,6 @@
 #include <cstdio>
 #include <functional>
 #include <mutex>
-#include <set>
 #include <stdexcept>
 #include <span>
 #include <thread>
@@ -990,9 +989,6 @@ inline void schedule_balance_neighbors_for_cell(
         }
     };
 
-    std::set<std::tuple<int, bool, std::uint32_t, std::uint32_t,
-                        std::uint32_t, std::uint32_t>> visited_patches;
-
     auto recurse_face_patch = [&](auto &&self,
                                   int axis,
                                   bool positive_direction,
@@ -1001,16 +997,6 @@ inline void schedule_balance_neighbors_for_cell(
                                   std::uint32_t patch_u_size,
                                   std::uint32_t patch_v_size) -> void {
         if (patch_u_size == 0U || patch_v_size == 0U) {
-            return;
-        }
-        const auto patch_key = std::make_tuple(
-            axis,
-            positive_direction,
-            patch_u_min,
-            patch_v_min,
-            patch_u_size,
-            patch_v_size);
-        if (!visited_patches.insert(patch_key).second) {
             return;
         }
 

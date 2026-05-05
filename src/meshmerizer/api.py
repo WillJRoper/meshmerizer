@@ -19,7 +19,6 @@ from meshmerizer.adaptive import (
     build_refined_tree,
     classify_occupied_solid,
     compute_isovalue_from_percentile,
-    extract_opened_surface_mesh,
     fof_cluster,
     run_full_pipeline,
 )
@@ -157,7 +156,7 @@ def build_tree(
     )
     return TreeState(
         cells=cells,
-        contributors=tuple(int(v) for v in contributors.tolist()),
+        contributors=contributors,
         positions=pos,
         smoothing_lengths=sml,
         domain_min=tuple(domain_min),
@@ -255,7 +254,7 @@ def _extract_mesh_from_tree(
     # refined tree and does not request regularization.
     if (
         tree.cells
-        and tree.contributors
+        and tree.contributors.size > 0
         and min_feature_thickness <= 0.0
         and pre_thickening_radius <= 0.0
     ):
@@ -326,22 +325,8 @@ def _extract_mesh_from_topology(
     """
     # Topology extraction always uses the opened-solid mesh path because the
     # caller has already committed to the regularized occupancy state.
-    vertices, faces = extract_opened_surface_mesh(
-        topology.tree.positions,
-        topology.tree.smoothing_lengths,
-        topology.tree.domain_min,
-        topology.tree.domain_max,
-        topology.tree.base_resolution,
-        topology.tree.isovalue,
-        topology.tree.max_depth,
-        topology.opened_inside,
-        0.0,
-        topology.tree.minimum_usable_hermite_samples,
-        topology.tree.max_qef_rms_residual_ratio,
-        topology.tree.min_normal_alignment_threshold,
-    )
-    # The opened-surface extractor does not solve a fresh QEF vertex cloud in
-    # the same sense as the full tree pipeline, so report zero here.
+    vertices = np.asarray(topology.mesh_vertices, dtype=np.float64)
+    faces = np.asarray(topology.mesh_faces, dtype=np.uint32)
     mesh_result = MeshResult(
         mesh=Mesh(vertices=vertices, faces=faces),
         isovalue=topology.tree.isovalue,

@@ -40,7 +40,7 @@ class TreeState:
     """
 
     cells: tuple[dict[str, object], ...]
-    contributors: tuple[int, ...]
+    contributors: np.ndarray
     positions: np.ndarray
     smoothing_lengths: np.ndarray
     domain_min: Vec3
