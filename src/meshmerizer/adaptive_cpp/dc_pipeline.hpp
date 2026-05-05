@@ -286,6 +286,7 @@ inline DCPipelineResult run_dc_pipeline(
         solid_spatial_index.build(all_cells, domain, max_depth, base_resolution);
         OccupiedSolidClassificationCache classification_cache;
         std::vector<std::uint8_t> dirty_cells(all_cells.size(), 1U);
+        std::vector<std::uint8_t> regularization_inside_mask_by_cell;
         meshmerizer_log_detail::print_status(
             "Regularization",
             "run_dc_pipeline",
@@ -440,13 +441,13 @@ inline DCPipelineResult run_dc_pipeline(
                 elapsed_seconds_since(final_thickening_distance_start));
             const auto pre_thickening_dilate_start =
                 std::chrono::steady_clock::now();
-            const std::vector<std::uint8_t> inside_mask_by_cell =
+            regularization_inside_mask_by_cell =
                 build_inside_mask_from_classification_cache(
                     all_cells, classification_cache);
             const std::vector<std::uint8_t> dilated_inside_mask_by_cell =
                 dilate_inside_cell_mask(
                     all_cells,
-                    inside_mask_by_cell,
+                    regularization_inside_mask_by_cell,
                     thickening_distance,
                     pre_thickening_radius);
             meshmerizer_log_detail::print_status(
@@ -463,7 +464,9 @@ inline DCPipelineResult run_dc_pipeline(
 
         OccupiedSolidExtractionView extraction_view =
             build_occupied_solid_extraction_view(
-                all_cells, classification_cache);
+                all_cells,
+                classification_cache,
+                std::move(regularization_inside_mask_by_cell));
         std::vector<OccupiedSolidLeaf> &solid_leaves =
             extraction_view.solid_leaves;
         std::vector<std::uint8_t> &inside_mask =

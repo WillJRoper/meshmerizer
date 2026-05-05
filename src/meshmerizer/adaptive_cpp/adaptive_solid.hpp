@@ -695,12 +695,16 @@ inline std::vector<std::uint8_t> build_leaf_mask_from_cell_mask(
  */
 inline OccupiedSolidExtractionView build_occupied_solid_extraction_view(
     const std::vector<OctreeCell> &all_cells,
-    const OccupiedSolidClassificationCache &classification_cache) {
+    const OccupiedSolidClassificationCache &classification_cache,
+    std::vector<std::uint8_t> inside_mask_by_cell = {}) {
     OccupiedSolidExtractionView view;
     view.solid_leaves =
         build_occupied_solid_leaves_from_cache(all_cells, classification_cache);
-    view.inside_mask_by_cell =
-        build_inside_mask_from_classification_cache(all_cells, classification_cache);
+    if (inside_mask_by_cell.size() != all_cells.size()) {
+        inside_mask_by_cell = build_inside_mask_from_classification_cache(
+            all_cells, classification_cache);
+    }
+    view.inside_mask_by_cell = std::move(inside_mask_by_cell);
     view.inside_mask = build_leaf_mask_from_cell_mask(
         view.solid_leaves, view.inside_mask_by_cell);
     return view;
