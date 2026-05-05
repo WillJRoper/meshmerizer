@@ -41,6 +41,17 @@ enum class RefinementTaskKind : std::uint8_t {
     kOccupancyUpdate = 3U,
     kRegionExtractSurface = 4U,
     kMergeSurfaceBuffers = 5U,
+    kBuildExtractionView = 6U,
+    kComputeInsideClearance = 7U,
+    kErodeOccupiedSolid = 8U,
+    kComputeDistanceToEroded = 9U,
+    kDilateErodedSolid = 10U,
+    kProjectOpenedMaskToLeaves = 11U,
+    kFillOpenedCavities = 12U,
+    kPruneOpenedComponents = 13U,
+    kSuppressOpenedEdgeContacts = 14U,
+    kResolveOpenedSurfaceAmbiguities = 15U,
+    kReextractOpenedSurface = 16U,
 };
 
 struct RefinementTask {

@@ -548,125 +548,36 @@ inline DCPipelineResult run_dc_pipeline(
                 pre_thickening_radius);
         }
 
-        OccupiedSolidExtractionView extraction_view =
-            build_occupied_solid_extraction_view(
+        const auto morphology_start = std::chrono::steady_clock::now();
+        PostRefineRegularizationResult post_refine_result =
+            run_post_refine_regularization_task_graph(
                 all_cells,
                 classification_cache,
+                solid_spatial_index,
+                domain,
+                base_resolution,
+                max_depth,
+                worker_count,
+                opening_radius,
+                table_cadence_seconds,
                 std::move(regularization_inside_mask_by_cell));
         std::vector<OccupiedSolidLeaf> &solid_leaves =
-            extraction_view.solid_leaves;
-
-        const auto morphology_start = std::chrono::steady_clock::now();
-        const std::vector<std::uint8_t> &inside_mask_by_cell =
-            extraction_view.inside_mask_by_cell;
-        const auto clearance_start = std::chrono::steady_clock::now();
-        const std::vector<double> clearance_by_cell =
-            compute_inside_clearance_from_cell_mask(
-                all_cells, classification_cache, inside_mask_by_cell,
-                opening_radius);
-        meshmerizer_log_detail::print_status(
-            "Timing",
-            "run_dc_pipeline",
-            "inside clearance took %.3f s\n",
-            elapsed_seconds_since(clearance_start));
-        const auto erosion_start = std::chrono::steady_clock::now();
-        const std::vector<std::uint8_t> eroded_inside_by_cell =
-            erode_occupied_solid_cells(
-                all_cells, inside_mask_by_cell, clearance_by_cell,
-                opening_radius);
-        meshmerizer_log_detail::print_status(
-            "Timing",
-            "run_dc_pipeline",
-            "erosion took %.3f s\n",
-            elapsed_seconds_since(erosion_start));
-        const auto dilation_distance_start =
-            std::chrono::steady_clock::now();
-        const std::vector<double> dilation_distance_by_cell =
-            compute_distance_to_eroded_solid_from_cell_mask(
-                all_cells, classification_cache, eroded_inside_by_cell,
-                opening_radius);
-        meshmerizer_log_detail::print_status(
-            "Timing",
-            "run_dc_pipeline",
-            "eroded-solid distance took %.3f s\n",
-            elapsed_seconds_since(dilation_distance_start));
-        const auto dilation_start = std::chrono::steady_clock::now();
-        const std::vector<std::uint8_t> opened_inside_by_cell =
-            dilate_eroded_solid_cells(
-                all_cells, eroded_inside_by_cell, dilation_distance_by_cell,
-                opening_radius);
-        std::vector<std::uint8_t> opened_inside =
-            build_leaf_mask_from_cell_mask(
-                solid_leaves, opened_inside_by_cell);
-        meshmerizer_log_detail::print_status(
-            "Timing",
-            "run_dc_pipeline",
-            "eroded-solid dilation took %.3f s\n",
-            elapsed_seconds_since(dilation_start));
-        const auto cleanup_start = std::chrono::steady_clock::now();
-        fill_small_opened_cavities(solid_leaves, opened_inside);
-        prune_small_opened_components(solid_leaves, opened_inside);
-        suppress_opened_edge_contacts(
-            solid_leaves, all_cells, solid_spatial_index, opened_inside);
-        meshmerizer_log_detail::print_status(
-            "Timing",
-            "run_dc_pipeline",
-            "opened-solid cleanup took %.3f s\n",
-            elapsed_seconds_since(cleanup_start));
+            post_refine_result.extraction_view.solid_leaves;
+        std::vector<std::uint8_t> &opened_inside =
+            post_refine_result.opened_inside;
+        OpenedSurfaceMesh &opened_surface =
+            post_refine_result.opened_surface;
         meshmerizer_log_detail::print_status(
             "Timing",
             "run_dc_pipeline",
             "Regularization morphology: %.3f s\n",
             elapsed_seconds_since(morphology_start));
 
-        auto log_opened_count = [&]() {
-            return static_cast<std::size_t>(std::count(
-                opened_inside.begin(), opened_inside.end(),
-                static_cast<std::uint8_t>(1U)));
-        };
-
-        meshmerizer_log_detail::print_debug_status(
-            "Regularization",
-            "run_dc_pipeline",
-            "extracting opened blocky surface (opened_inside=%zu)\n",
-            log_opened_count());
-
-        const auto opened_surface_start = std::chrono::steady_clock::now();
-        OpenedSurfaceMesh opened_surface = generate_opened_surface_mesh(
-            solid_leaves, opened_inside, all_cells, solid_spatial_index,
-            domain, base_resolution, max_depth, worker_count,
-            table_cadence_seconds);
-        meshmerizer_log_detail::print_status(
-            "Timing",
-            "run_dc_pipeline",
-            "opened surface extraction pass 1 took %.3f s\n",
-            elapsed_seconds_since(opened_surface_start));
-        if (resolve_opened_edge_ambiguities(
-                solid_leaves, all_cells, solid_spatial_index,
-                opened_inside, opened_surface)) {
-            meshmerizer_log_detail::print_debug_status(
-                "Regularization",
-                "run_dc_pipeline",
-                "re-extracting opened blocky surface after ambiguity cleanup "
-                "(opened_inside=%zu)\n",
-                log_opened_count());
-            const auto opened_surface_reextract_start =
-                std::chrono::steady_clock::now();
-            opened_surface = generate_opened_surface_mesh(
-                solid_leaves, opened_inside, all_cells, solid_spatial_index,
-                domain, base_resolution, max_depth, worker_count,
-                table_cadence_seconds);
-            meshmerizer_log_detail::print_status(
-                "Timing",
-                "run_dc_pipeline",
-                "opened surface extraction pass 2 took %.3f s\n",
-                elapsed_seconds_since(opened_surface_reextract_start));
-        }
         meshmerizer_log_detail::print_status(
             "Timing",
             "run_dc_pipeline",
             "Opened surface extraction: %.3f s\n",
-            elapsed_seconds_since(opened_surface_start));
+            elapsed_seconds_since(morphology_start));
 
         meshmerizer_log_detail::print_status(
             "Regularization",

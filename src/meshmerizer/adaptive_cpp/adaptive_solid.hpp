@@ -2080,6 +2080,10 @@ struct OpenedSurfaceMesh {
     std::vector<std::uint64_t> vertex_keys;
 };
 
+struct SurfaceRegion;
+struct SurfaceExtractionRuntime;
+struct RegionSurfaceBuffers;
+
 inline void unpack_surface_corner_coords(
     std::uint64_t key,
     std::uint32_t &ix,
@@ -2090,6 +2094,25 @@ inline std::uint64_t pack_surface_corner_coords(
     std::uint32_t ix,
     std::uint32_t iy,
     std::uint32_t iz);
+
+inline std::vector<SurfaceRegion> build_surface_regions(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<OctreeCell> &all_cells);
+
+inline void run_region_extract_surface_task(
+    std::size_t region_id,
+    const SurfaceExtractionRuntime &runtime,
+    RegionSurfaceBuffers &out_buffers);
+
+inline OpenedSurfaceMesh merge_region_surface_buffers(
+    const std::vector<RegionSurfaceBuffers> &region_buffers);
+
+inline bool resolve_opened_edge_ambiguities(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<OctreeCell> &all_cells,
+    const LeafSpatialIndex &spatial_index,
+    std::vector<std::uint8_t> &opened_inside,
+    const OpenedSurfaceMesh &mesh);
 
 struct SurfaceRegion {
     std::size_t region_id = 0U;
@@ -2144,6 +2167,521 @@ struct SurfaceTaskGraphRuntime {
     OpenedSurfaceMesh merged_mesh;
     std::mutex merged_mesh_mutex;
 };
+
+struct PostRefineRegularizationResult {
+    OccupiedSolidExtractionView extraction_view;
+    std::vector<double> clearance_by_cell;
+    std::vector<std::uint8_t> eroded_inside_by_cell;
+    std::vector<double> dilation_distance_by_cell;
+    std::vector<std::uint8_t> opened_inside_by_cell;
+    std::vector<std::uint8_t> opened_inside;
+    OpenedSurfaceMesh opened_surface;
+};
+
+struct PostRefineTaskGraphRuntime {
+    const std::vector<OctreeCell> *all_cells = nullptr;
+    const OccupiedSolidClassificationCache *classification_cache = nullptr;
+    const LeafSpatialIndex *solid_spatial_index = nullptr;
+    const BoundingBox *domain = nullptr;
+    std::uint32_t base_resolution = 0U;
+    std::uint32_t max_depth = 0U;
+    std::uint32_t worker_count = 1U;
+    double opening_radius = 0.0;
+    double table_cadence_seconds = 10.0;
+    std::vector<std::uint8_t> initial_inside_mask_by_cell;
+    PostRefineRegularizationResult result;
+    std::array<std::atomic<std::uint32_t>, 13U> dependency_counts;
+    std::vector<std::uint8_t> enqueued;
+    SurfaceExtractionRuntime surface_extraction;
+    std::vector<std::int64_t> surface_cell_to_leaf_index;
+    std::vector<SurfaceRegion> surface_regions;
+    std::vector<RegionSurfaceBuffers> region_buffers;
+    std::atomic<std::size_t> pending_region_tasks{0U};
+    std::atomic<bool> reextract_pass{false};
+    std::mutex result_mutex;
+};
+
+enum class PostRefineTaskNode : std::uint8_t {
+    kBuildExtractionView = 0U,
+    kComputeInsideClearance = 1U,
+    kErodeOccupiedSolid = 2U,
+    kComputeDistanceToEroded = 3U,
+    kDilateErodedSolid = 4U,
+    kProjectOpenedMaskToLeaves = 5U,
+    kFillOpenedCavities = 6U,
+    kPruneOpenedComponents = 7U,
+    kSuppressOpenedEdgeContacts = 8U,
+    kRegionExtractSurface = 9U,
+    kResolveOpenedSurfaceAmbiguities = 10U,
+    kReextractOpenedSurface = 11U,
+    kMergeSurfaceBuffers = 12U,
+    kCount = 13U,
+};
+
+inline constexpr std::size_t post_refine_task_node_count() {
+    return static_cast<std::size_t>(PostRefineTaskNode::kCount);
+}
+
+inline std::size_t post_refine_task_index(PostRefineTaskNode node) {
+    return static_cast<std::size_t>(node);
+}
+
+inline RefinementTaskKind post_refine_task_kind(PostRefineTaskNode node) {
+    switch (node) {
+        case PostRefineTaskNode::kBuildExtractionView:
+            return RefinementTaskKind::kBuildExtractionView;
+        case PostRefineTaskNode::kComputeInsideClearance:
+            return RefinementTaskKind::kComputeInsideClearance;
+        case PostRefineTaskNode::kErodeOccupiedSolid:
+            return RefinementTaskKind::kErodeOccupiedSolid;
+        case PostRefineTaskNode::kComputeDistanceToEroded:
+            return RefinementTaskKind::kComputeDistanceToEroded;
+        case PostRefineTaskNode::kDilateErodedSolid:
+            return RefinementTaskKind::kDilateErodedSolid;
+        case PostRefineTaskNode::kProjectOpenedMaskToLeaves:
+            return RefinementTaskKind::kProjectOpenedMaskToLeaves;
+        case PostRefineTaskNode::kFillOpenedCavities:
+            return RefinementTaskKind::kFillOpenedCavities;
+        case PostRefineTaskNode::kPruneOpenedComponents:
+            return RefinementTaskKind::kPruneOpenedComponents;
+        case PostRefineTaskNode::kSuppressOpenedEdgeContacts:
+            return RefinementTaskKind::kSuppressOpenedEdgeContacts;
+        case PostRefineTaskNode::kResolveOpenedSurfaceAmbiguities:
+            return RefinementTaskKind::kResolveOpenedSurfaceAmbiguities;
+        case PostRefineTaskNode::kReextractOpenedSurface:
+            return RefinementTaskKind::kReextractOpenedSurface;
+        case PostRefineTaskNode::kMergeSurfaceBuffers:
+            return RefinementTaskKind::kMergeSurfaceBuffers;
+        case PostRefineTaskNode::kRegionExtractSurface:
+            return RefinementTaskKind::kRegionExtractSurface;
+        case PostRefineTaskNode::kCount:
+            break;
+    }
+    return RefinementTaskKind::kBuildExtractionView;
+}
+
+inline void enqueue_post_refine_task(
+    RefinementWorkQueue &queue,
+    PostRefineTaskGraphRuntime &runtime,
+    PostRefineTaskNode node,
+    std::size_t cell_index,
+    std::uint32_t preferred_worker) {
+    const std::size_t node_index = post_refine_task_index(node);
+    if (node_index >= runtime.enqueued.size()) {
+        return;
+    }
+    if (runtime.enqueued[node_index] != 0U) {
+        return;
+    }
+    runtime.enqueued[node_index] = 1U;
+    queue.push(
+        {cell_index, 0U, 0U, post_refine_task_kind(node)},
+        preferred_worker);
+}
+
+inline void unlock_post_refine_task(
+    RefinementWorkQueue &queue,
+    PostRefineTaskGraphRuntime &runtime,
+    PostRefineTaskNode node,
+    std::size_t cell_index,
+    std::uint32_t preferred_worker) {
+    const std::size_t node_index = post_refine_task_index(node);
+    const std::uint32_t remaining = runtime.dependency_counts[node_index].fetch_sub(
+        1U, std::memory_order_acq_rel);
+    if (remaining == 1U) {
+        enqueue_post_refine_task(
+            queue, runtime, node, cell_index, preferred_worker);
+    }
+}
+
+inline void run_build_extraction_view_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.result.extraction_view = build_occupied_solid_extraction_view(
+        *runtime.all_cells,
+        *runtime.classification_cache,
+        std::move(runtime.initial_inside_mask_by_cell));
+}
+
+inline void run_compute_inside_clearance_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.result.clearance_by_cell = compute_inside_clearance_from_cell_mask(
+        *runtime.all_cells,
+        *runtime.classification_cache,
+        runtime.result.extraction_view.inside_mask_by_cell,
+        runtime.opening_radius);
+}
+
+inline void run_erode_occupied_solid_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.result.eroded_inside_by_cell = erode_occupied_solid_cells(
+        *runtime.all_cells,
+        runtime.result.extraction_view.inside_mask_by_cell,
+        runtime.result.clearance_by_cell,
+        runtime.opening_radius);
+}
+
+inline void run_compute_distance_to_eroded_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.result.dilation_distance_by_cell =
+        compute_distance_to_eroded_solid_from_cell_mask(
+            *runtime.all_cells,
+            *runtime.classification_cache,
+            runtime.result.eroded_inside_by_cell,
+            runtime.opening_radius);
+}
+
+inline void run_dilate_eroded_solid_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.result.opened_inside_by_cell = dilate_eroded_solid_cells(
+        *runtime.all_cells,
+        runtime.result.eroded_inside_by_cell,
+        runtime.result.dilation_distance_by_cell,
+        runtime.opening_radius);
+}
+
+inline void run_project_opened_mask_to_leaves_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.result.opened_inside = build_leaf_mask_from_cell_mask(
+        runtime.result.extraction_view.solid_leaves,
+        runtime.result.opened_inside_by_cell);
+}
+
+inline void run_fill_opened_cavities_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    fill_small_opened_cavities(
+        runtime.result.extraction_view.solid_leaves,
+        runtime.result.opened_inside);
+}
+
+inline void run_prune_opened_components_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    prune_small_opened_components(
+        runtime.result.extraction_view.solid_leaves,
+        runtime.result.opened_inside);
+}
+
+inline void run_suppress_opened_edge_contacts_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    suppress_opened_edge_contacts(
+        runtime.result.extraction_view.solid_leaves,
+        *runtime.all_cells,
+        *runtime.solid_spatial_index,
+        runtime.result.opened_inside);
+}
+
+inline void initialize_post_refine_task_graph(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.enqueued.assign(post_refine_task_node_count(), 0U);
+
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kBuildExtractionView)].store(0U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kComputeInsideClearance)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kErodeOccupiedSolid)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kComputeDistanceToEroded)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kDilateErodedSolid)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kProjectOpenedMaskToLeaves)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kFillOpenedCavities)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kPruneOpenedComponents)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kSuppressOpenedEdgeContacts)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kResolveOpenedSurfaceAmbiguities)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kReextractOpenedSurface)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kMergeSurfaceBuffers)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kRegionExtractSurface)].store(1U);
+}
+
+inline void prepare_post_refine_surface_extraction_runtime(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.surface_extraction.solid_leaves =
+        &runtime.result.extraction_view.solid_leaves;
+    runtime.surface_extraction.opened_inside = &runtime.result.opened_inside;
+    runtime.surface_extraction.all_cells = runtime.all_cells;
+    runtime.surface_extraction.spatial_index = runtime.solid_spatial_index;
+    runtime.surface_extraction.domain = runtime.domain;
+    runtime.surface_extraction.base_resolution = runtime.base_resolution;
+    runtime.surface_extraction.max_depth = runtime.max_depth;
+    runtime.surface_extraction.fine_resolution =
+        runtime.base_resolution * (1U << runtime.max_depth);
+    runtime.surface_extraction.fine_dx =
+        (runtime.domain->max.x - runtime.domain->min.x) /
+        static_cast<double>(runtime.surface_extraction.fine_resolution);
+    runtime.surface_extraction.fine_dy =
+        (runtime.domain->max.y - runtime.domain->min.y) /
+        static_cast<double>(runtime.surface_extraction.fine_resolution);
+    runtime.surface_extraction.fine_dz =
+        (runtime.domain->max.z - runtime.domain->min.z) /
+        static_cast<double>(runtime.surface_extraction.fine_resolution);
+    runtime.surface_cell_to_leaf_index = build_opened_cell_to_leaf_index(
+        *runtime.all_cells,
+        runtime.result.extraction_view.solid_leaves);
+    runtime.surface_extraction.cell_to_leaf_index =
+        &runtime.surface_cell_to_leaf_index;
+    runtime.surface_regions = build_surface_regions(
+        runtime.result.extraction_view.solid_leaves,
+        *runtime.all_cells);
+    runtime.surface_extraction.regions = &runtime.surface_regions;
+    runtime.region_buffers.clear();
+    runtime.region_buffers.resize(runtime.surface_regions.size());
+    runtime.pending_region_tasks.store(
+        runtime.surface_regions.size(), std::memory_order_release);
+}
+
+inline PostRefineRegularizationResult run_post_refine_regularization_task_graph(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache,
+    const LeafSpatialIndex &solid_spatial_index,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution,
+    std::uint32_t max_depth,
+    std::uint32_t worker_count,
+    double opening_radius,
+    double table_cadence_seconds,
+    std::vector<std::uint8_t> initial_inside_mask_by_cell) {
+    if (worker_count == 0U) {
+        worker_count = 1U;
+    }
+
+    PostRefineTaskGraphRuntime runtime;
+    runtime.all_cells = &all_cells;
+    runtime.classification_cache = &classification_cache;
+    runtime.solid_spatial_index = &solid_spatial_index;
+    runtime.domain = &domain;
+    runtime.base_resolution = base_resolution;
+    runtime.max_depth = max_depth;
+    runtime.worker_count = worker_count;
+    runtime.opening_radius = opening_radius;
+    runtime.table_cadence_seconds = table_cadence_seconds;
+    runtime.initial_inside_mask_by_cell = std::move(initial_inside_mask_by_cell);
+    initialize_post_refine_task_graph(runtime);
+
+    RefinementWorkQueue queue;
+    queue.initialize(worker_count);
+    enqueue_post_refine_task(
+        queue,
+        runtime,
+        PostRefineTaskNode::kBuildExtractionView,
+        0U,
+        0U);
+    queue.capture_initial_queue_size();
+
+    std::exception_ptr worker_error;
+    std::mutex error_mutex;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::uint32_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                try {
+                    switch (task.kind) {
+                        case RefinementTaskKind::kBuildExtractionView:
+                            run_build_extraction_view_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kComputeInsideClearance,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kComputeInsideClearance:
+                            run_compute_inside_clearance_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kErodeOccupiedSolid,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kErodeOccupiedSolid:
+                            run_erode_occupied_solid_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kComputeDistanceToEroded,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kComputeDistanceToEroded:
+                            run_compute_distance_to_eroded_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kDilateErodedSolid,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kDilateErodedSolid:
+                            run_dilate_eroded_solid_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kProjectOpenedMaskToLeaves,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kProjectOpenedMaskToLeaves:
+                            run_project_opened_mask_to_leaves_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kFillOpenedCavities,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kFillOpenedCavities:
+                            run_fill_opened_cavities_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kPruneOpenedComponents,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kPruneOpenedComponents:
+                            run_prune_opened_components_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kSuppressOpenedEdgeContacts,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kSuppressOpenedEdgeContacts:
+                            run_suppress_opened_edge_contacts_task(runtime);
+                            prepare_post_refine_surface_extraction_runtime(runtime);
+                            if (runtime.surface_regions.empty()) {
+                                runtime.result.opened_surface = {};
+                                unlock_post_refine_task(
+                                    queue,
+                                    runtime,
+                                    PostRefineTaskNode::kResolveOpenedSurfaceAmbiguities,
+                                    0U,
+                                    worker_id);
+                                break;
+                            }
+                            for (std::size_t region_id = 0;
+                                 region_id < runtime.surface_regions.size();
+                                 ++region_id) {
+                                queue.push(
+                                    {
+                                        region_id,
+                                        0U,
+                                        0U,
+                                        RefinementTaskKind::kRegionExtractSurface,
+                                    },
+                                    static_cast<std::uint32_t>(region_id %
+                                                               runtime.worker_count));
+                            }
+                            runtime.enqueued[post_refine_task_index(
+                                PostRefineTaskNode::kRegionExtractSurface)] = 1U;
+                            break;
+                        case RefinementTaskKind::kRegionExtractSurface: {
+                            const std::size_t region_id = task.cell_index;
+                            run_region_extract_surface_task(
+                                region_id,
+                                runtime.surface_extraction,
+                                runtime.region_buffers[region_id]);
+                            if (runtime.pending_region_tasks.fetch_sub(
+                                    1U,
+                                    std::memory_order_acq_rel) == 1U) {
+                                enqueue_post_refine_task(
+                                    queue,
+                                    runtime,
+                                    PostRefineTaskNode::kMergeSurfaceBuffers,
+                                    0U,
+                                    0U);
+                            }
+                            break;
+                        }
+                        case RefinementTaskKind::kMergeSurfaceBuffers:
+                            runtime.result.opened_surface =
+                                merge_region_surface_buffers(runtime.region_buffers);
+                            if (runtime.reextract_pass.load(
+                                    std::memory_order_acquire)) {
+                                runtime.reextract_pass.store(
+                                    false, std::memory_order_release);
+                            } else {
+                                unlock_post_refine_task(
+                                    queue,
+                                    runtime,
+                                    PostRefineTaskNode::kResolveOpenedSurfaceAmbiguities,
+                                    0U,
+                                    worker_id);
+                            }
+                            break;
+                        case RefinementTaskKind::kResolveOpenedSurfaceAmbiguities:
+                            if (resolve_opened_edge_ambiguities(
+                                    runtime.result.extraction_view.solid_leaves,
+                                    *runtime.all_cells,
+                                    *runtime.solid_spatial_index,
+                                    runtime.result.opened_inside,
+                                    runtime.result.opened_surface)) {
+                                enqueue_post_refine_task(
+                                    queue,
+                                    runtime,
+                                    PostRefineTaskNode::kReextractOpenedSurface,
+                                    0U,
+                                    worker_id);
+                            }
+                            break;
+                        case RefinementTaskKind::kReextractOpenedSurface:
+                            runtime.reextract_pass.store(
+                                true,
+                                std::memory_order_release);
+                            prepare_post_refine_surface_extraction_runtime(runtime);
+                            runtime.enqueued[post_refine_task_index(
+                                PostRefineTaskNode::kMergeSurfaceBuffers)] = 0U;
+                            for (std::size_t region_id = 0;
+                                 region_id < runtime.surface_regions.size();
+                                 ++region_id) {
+                                queue.push(
+                                    {
+                                        region_id,
+                                        0U,
+                                        0U,
+                                        RefinementTaskKind::kRegionExtractSurface,
+                                    },
+                                    static_cast<std::uint32_t>(region_id %
+                                                               runtime.worker_count));
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (worker_error == nullptr) {
+                        worker_error = std::current_exception();
+                    }
+                    queue.task_done();
+                    queue.shutdown();
+                    return;
+                }
+                queue.task_done();
+                queue.try_shutdown_if_idle();
+            }
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    if (worker_error != nullptr) {
+        std::rethrow_exception(worker_error);
+    }
+
+    return std::move(runtime.result);
+}
 
 inline bool surface_region_contains_cell(
     const std::vector<OctreeCell> &all_cells,
