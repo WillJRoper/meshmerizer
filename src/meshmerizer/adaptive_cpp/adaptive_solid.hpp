@@ -93,6 +93,8 @@ struct OccupiedSolidClassificationCache {
 struct OccupiedSolidExtractionView {
     /** Compact occupied-solid leaf records used by morphology/extraction. */
     std::vector<OccupiedSolidLeaf> solid_leaves;
+    /** Reverse lookup from global cell index to ``solid_leaves`` index. */
+    std::vector<std::int64_t> cell_to_leaf_index;
     /** Full-tree inside mask aligned with ``all_cells``. */
     std::vector<std::uint8_t> inside_mask_by_cell;
     /** Leaf-compact inside mask aligned with ``solid_leaves``. */
@@ -489,7 +491,8 @@ inline void update_occupied_solid_classification_cache(
 
 inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
     const std::vector<OctreeCell> &all_cells,
-    const OccupiedSolidClassificationCache &cache) {
+    const OccupiedSolidClassificationCache &cache,
+    std::vector<std::int64_t> *out_cell_to_leaf_index = nullptr) {
     std::vector<OccupiedSolidLeaf> solid_leaves;
     solid_leaves.reserve(all_cells.size());
     std::vector<std::int64_t> cell_to_leaf_index(all_cells.size(), -1);
@@ -539,6 +542,10 @@ inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
         }
     }
     neighbor_counter.finish();
+
+    if (out_cell_to_leaf_index != nullptr) {
+        *out_cell_to_leaf_index = std::move(cell_to_leaf_index);
+    }
 
     return solid_leaves;
 }
@@ -710,7 +717,10 @@ inline OccupiedSolidExtractionView build_occupied_solid_extraction_view(
     std::vector<std::uint8_t> inside_mask_by_cell = {}) {
     OccupiedSolidExtractionView view;
     view.solid_leaves =
-        build_occupied_solid_leaves_from_cache(all_cells, classification_cache);
+        build_occupied_solid_leaves_from_cache(
+            all_cells,
+            classification_cache,
+            &view.cell_to_leaf_index);
     if (inside_mask_by_cell.size() != all_cells.size()) {
         inside_mask_by_cell = build_inside_mask_from_classification_cache(
             all_cells, classification_cache);

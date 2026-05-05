@@ -1473,6 +1473,37 @@ def test_opened_solid_generates_surface_mesh() -> None:
     assert faces.shape[1] == 3
 
 
+def test_regularization_fixed_sphere_topology_fingerprint() -> None:
+    """Fixed regularization case should preserve opened-solid topology counts."""
+    positions, smoothing_lengths = _make_solid_sphere_particles(
+        n=300,
+        radius=0.9,
+        center=(2.0, 2.0, 2.0),
+        h=0.20,
+        seed=404,
+    )
+
+    opened = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        3,
+        erosion_radius=0.225,
+        pre_thickening_radius=0.0,
+    )
+
+    assert opened["n_leaves"] == 3914
+    assert opened["n_inside"] == 1348
+    assert opened["n_eroded_inside"] == 276
+    assert opened["n_opened_inside"] == 579
+    assert opened["n_opened_boundary_samples"] == 774
+    assert opened["n_opened_surface_vertices"] == 1024
+    assert 2040 <= opened["n_opened_surface_faces"] <= 2060
+
+
 def test_pre_thickening_increases_leaf_count_when_refinement_is_needed() -> (
     None
 ):

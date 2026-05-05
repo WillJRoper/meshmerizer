@@ -63,6 +63,38 @@ inline double elapsed_seconds_since(
         .count();
 }
 
+enum class OccupiedSolidCacheRebuildMode : std::uint8_t {
+    kLegacyPass = 0U,
+};
+
+inline void rebuild_occupied_solid_classification_cache(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const LeafSpatialIndex &solid_spatial_index,
+    double isovalue,
+    std::uint32_t max_depth,
+    OccupiedSolidClassificationCache &classification_cache,
+    const std::vector<std::uint8_t> &dirty_cells,
+    OccupiedSolidCacheRebuildMode rebuild_mode) {
+    switch (rebuild_mode) {
+        case OccupiedSolidCacheRebuildMode::kLegacyPass:
+        default:
+            update_occupied_solid_classification_cache(
+                all_cells,
+                all_contributors,
+                positions,
+                smoothing_lengths,
+                solid_spatial_index,
+                isovalue,
+                max_depth,
+                classification_cache,
+                &dirty_cells);
+            break;
+    }
+}
+
 /**
  * @brief Result of the Dual Contouring pipeline.
  *
@@ -306,6 +338,8 @@ inline DCPipelineResult run_dc_pipeline(
         LeafSpatialIndex solid_spatial_index;
         solid_spatial_index.build(all_cells, domain, max_depth, base_resolution);
         OccupiedSolidClassificationCache classification_cache;
+        constexpr OccupiedSolidCacheRebuildMode occupied_solid_rebuild_mode =
+            OccupiedSolidCacheRebuildMode::kLegacyPass;
         std::vector<std::uint8_t> dirty_cells(all_cells.size(), 1U);
         std::vector<std::uint8_t> regularization_inside_mask_by_cell;
         meshmerizer_log_detail::print_status(
@@ -314,10 +348,17 @@ inline DCPipelineResult run_dc_pipeline(
             "updating occupied solid classification cache\n");
         const auto initial_solid_classify_start =
             std::chrono::steady_clock::now();
-        update_occupied_solid_classification_cache(
-            all_cells, all_contributors, positions,
-            smoothing_lengths, solid_spatial_index,
-            isovalue, max_depth, classification_cache, &dirty_cells);
+        rebuild_occupied_solid_classification_cache(
+            all_cells,
+            all_contributors,
+            positions,
+            smoothing_lengths,
+            solid_spatial_index,
+            isovalue,
+            max_depth,
+            classification_cache,
+            dirty_cells,
+            occupied_solid_rebuild_mode);
         meshmerizer_log_detail::print_status(
             "Timing",
             "run_dc_pipeline",
@@ -421,11 +462,17 @@ inline DCPipelineResult run_dc_pipeline(
                             closure_occupancy_states.size(),
                             closure_face_neighbors.size());
                         dirty_cells.assign(all_cells.size(), 1U);
-                        update_occupied_solid_classification_cache(
-                            all_cells, all_contributors, positions,
-                            smoothing_lengths, solid_spatial_index,
-                            isovalue, max_depth, classification_cache,
-                            &dirty_cells);
+                        rebuild_occupied_solid_classification_cache(
+                            all_cells,
+                            all_contributors,
+                            positions,
+                            smoothing_lengths,
+                            solid_spatial_index,
+                            isovalue,
+                            max_depth,
+                            classification_cache,
+                            dirty_cells,
+                            occupied_solid_rebuild_mode);
                     } else {
                         merge_occupied_solid_cache_from_closure_state(
                             all_cells,
@@ -506,10 +553,6 @@ inline DCPipelineResult run_dc_pipeline(
             compute_inside_clearance_from_cell_mask(
                 all_cells, classification_cache, inside_mask_by_cell,
                 opening_radius);
-        const std::vector<double> clearance =
-            project_leaf_scalars_from_cell_state(
-                solid_leaves, clearance_by_cell,
-                std::numeric_limits<double>::infinity());
         meshmerizer_log_detail::print_status(
             "Timing",
             "run_dc_pipeline",
@@ -520,9 +563,6 @@ inline DCPipelineResult run_dc_pipeline(
             erode_occupied_solid_cells(
                 all_cells, inside_mask_by_cell, clearance_by_cell,
                 opening_radius);
-        const std::vector<std::uint8_t> eroded_inside =
-            build_leaf_mask_from_cell_mask(
-                solid_leaves, eroded_inside_by_cell);
         meshmerizer_log_detail::print_status(
             "Timing",
             "run_dc_pipeline",
@@ -534,10 +574,6 @@ inline DCPipelineResult run_dc_pipeline(
             compute_distance_to_eroded_solid_from_cell_mask(
                 all_cells, classification_cache, eroded_inside_by_cell,
                 opening_radius);
-        const std::vector<double> dilation_distance =
-            project_leaf_scalars_from_cell_state(
-                solid_leaves, dilation_distance_by_cell,
-                std::numeric_limits<double>::infinity());
         meshmerizer_log_detail::print_status(
             "Timing",
             "run_dc_pipeline",
