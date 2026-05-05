@@ -934,10 +934,7 @@ inline void schedule_balance_neighbors_for_cell(
     const std::uint32_t fine_min_z = cell_z << shift;
     const std::uint32_t span = 1U << shift;
 
-    auto sample_face = [&](int axis,
-                           bool positive,
-                           std::uint32_t u_step,
-                           std::uint32_t v_step) {
+    auto sample_face_interior = [&](int axis, bool positive) {
         // Face coord just outside the cell along ``axis``.
         const std::int64_t base[3] = {
             static_cast<std::int64_t>(fine_min_x),
@@ -957,78 +954,20 @@ inline void schedule_balance_neighbors_for_cell(
         }
         const int u_axis = (axis == 0) ? 1 : 0;
         const int v_axis = (axis == 2) ? 1 : 2;
-        for (std::uint32_t u = 0U; u < span; u += u_step) {
-            for (std::uint32_t v = 0U; v < span; v += v_step) {
-                std::int64_t target[3] = {base[0], base[1], base[2]};
-                target[axis] = face_coord;
-                target[u_axis] += static_cast<std::int64_t>(u);
-                target[v_axis] += static_cast<std::int64_t>(v);
-                if (target[u_axis] < 0 || target[v_axis] < 0) {
-                    continue;
-                }
-                if (target[u_axis] >= fine_max ||
-                    target[v_axis] >= fine_max) {
-                    continue;
-                }
-                const std::uint64_t target_morton = morton_encode_3d(
-                    static_cast<std::uint32_t>(target[0]),
-                    static_cast<std::uint32_t>(target[1]),
-                    static_cast<std::uint32_t>(target[2]));
-                const std::size_t neighbor_idx =
-                    closure_locate_cell_for_target(
-                        cell_index, all_cells, target_morton, max_depth,
-                        base_resolution);
-                if (neighbor_idx ==
-                    std::numeric_limits<std::size_t>::max()) {
-                    continue;
-                }
-                if (all_cells[neighbor_idx].depth < demanded_depth) {
-                    raise_and_enqueue(neighbor_idx, demanded_depth);
-                }
-            }
-        }
-    };
-
-    auto recurse_face_patch = [&](auto &&self,
-                                  int axis,
-                                  bool positive_direction,
-                                  std::uint32_t patch_u_min,
-                                  std::uint32_t patch_v_min,
-                                  std::uint32_t patch_u_size,
-                                  std::uint32_t patch_v_size) -> void {
-        if (patch_u_size == 0U || patch_v_size == 0U) {
-            return;
-        }
-
-        const int u_axis = axis == 0 ? 1 : 0;
-        const int v_axis = axis == 2 ? 1 : 2;
-        const std::int64_t base[3] = {
-            static_cast<std::int64_t>(fine_min_x),
-            static_cast<std::int64_t>(fine_min_y),
-            static_cast<std::int64_t>(fine_min_z),
-        };
-        const std::int64_t face_coord =
-            positive_direction ?
-                base[axis] + static_cast<std::int64_t>(span) :
-                base[axis] - 1;
-        if (face_coord < 0) {
-            return;
-        }
-        const std::int64_t fine_max = static_cast<std::int64_t>(
-            base_resolution << max_depth);
-        if (face_coord >= fine_max) {
-            return;
-        }
-
+        // For face-only 2:1 balance, any violating coarser neighbor spans the
+        // entire open interior of the face in an aligned dyadic octree. One
+        // strict interior sample is therefore sufficient to identify the
+        // unique neighbor leaf covering that face.
         std::int64_t target[3] = {base[0], base[1], base[2]};
         target[axis] = face_coord;
-        target[u_axis] += static_cast<std::int64_t>(patch_u_min);
-        target[v_axis] += static_cast<std::int64_t>(patch_v_min);
-        if (target[u_axis] < 0 || target[v_axis] < 0 ||
-            target[u_axis] >= fine_max || target[v_axis] >= fine_max) {
+        target[u_axis] += static_cast<std::int64_t>(span / 2U);
+        target[v_axis] += static_cast<std::int64_t>(span / 2U);
+        if (target[u_axis] < 0 || target[v_axis] < 0) {
             return;
         }
-
+        if (target[u_axis] >= fine_max || target[v_axis] >= fine_max) {
+            return;
+        }
         const std::uint64_t target_morton = morton_encode_3d(
             static_cast<std::uint32_t>(target[0]),
             static_cast<std::uint32_t>(target[1]),
@@ -1041,78 +980,14 @@ inline void schedule_balance_neighbors_for_cell(
         if (all_cells[neighbor_idx].depth < demanded_depth) {
             raise_and_enqueue(neighbor_idx, demanded_depth);
         }
-
-        const OctreeCell &neighbor = all_cells[neighbor_idx];
-        std::uint32_t ngx = 0U;
-        std::uint32_t ngy = 0U;
-        std::uint32_t ngz = 0U;
-        morton_decode_3d(neighbor.morton_key, ngx, ngy, ngz);
-        const std::uint32_t neighbor_span =
-            1U << (max_depth - neighbor.depth);
-        const std::array<std::uint32_t, 3> neighbor_min = {ngx, ngy, ngz};
-        const std::array<std::uint32_t, 3> neighbor_max = {
-            ngx + neighbor_span,
-            ngy + neighbor_span,
-            ngz + neighbor_span,
-        };
-        const std::uint32_t patch_u_max = patch_u_min + patch_u_size;
-        const std::uint32_t patch_v_max = patch_v_min + patch_v_size;
-        const std::uint32_t abs_patch_u_min =
-            (u_axis == 0 ? fine_min_x : u_axis == 1 ? fine_min_y : fine_min_z) +
-            patch_u_min;
-        const std::uint32_t abs_patch_u_max =
-            (u_axis == 0 ? fine_min_x : u_axis == 1 ? fine_min_y : fine_min_z) +
-            patch_u_max;
-        const std::uint32_t abs_patch_v_min =
-            (v_axis == 0 ? fine_min_x : v_axis == 1 ? fine_min_y : fine_min_z) +
-            patch_v_min;
-        const std::uint32_t abs_patch_v_max =
-            (v_axis == 0 ? fine_min_x : v_axis == 1 ? fine_min_y : fine_min_z) +
-            patch_v_max;
-        const bool leaf_covers_patch =
-            neighbor_min[u_axis] <= abs_patch_u_min &&
-            abs_patch_u_max <= neighbor_max[u_axis] &&
-            neighbor_min[v_axis] <= abs_patch_v_min &&
-            abs_patch_v_max <= neighbor_max[v_axis];
-
-        if (leaf_covers_patch || (patch_u_size == 1U && patch_v_size == 1U)) {
-            return;
-        }
-
-        const std::uint32_t u_half = patch_u_size > 1U ? patch_u_size / 2U : 0U;
-        const std::uint32_t v_half = patch_v_size > 1U ? patch_v_size / 2U : 0U;
-        const std::uint32_t u_sizes[2] = {u_half, patch_u_size - u_half};
-        const std::uint32_t v_sizes[2] = {v_half, patch_v_size - v_half};
-        const std::uint32_t u_offsets[2] = {patch_u_min, patch_u_min + u_half};
-        const std::uint32_t v_offsets[2] = {patch_v_min, patch_v_min + v_half};
-
-        for (int ui = 0; ui < 2; ++ui) {
-            for (int vi = 0; vi < 2; ++vi) {
-                if (u_sizes[ui] == 0U || v_sizes[vi] == 0U) {
-                    continue;
-                }
-                if (u_sizes[ui] == patch_u_size &&
-                    v_sizes[vi] == patch_v_size) {
-                    continue;
-                }
-                self(
-                    self,
-                    axis,
-                    positive_direction,
-                    u_offsets[ui],
-                    v_offsets[vi],
-                    u_sizes[ui],
-                    v_sizes[vi]);
-            }
-        }
     };
 
-    recurse_face_patch(recurse_face_patch, 0, true, 0U, 0U, span, span);
-    recurse_face_patch(recurse_face_patch, 0, false, 0U, 0U, span, span);
-    recurse_face_patch(recurse_face_patch, 1, true, 0U, 0U, span, span);
-    recurse_face_patch(recurse_face_patch, 1, false, 0U, 0U, span, span);
-    recurse_face_patch(recurse_face_patch, 2, true, 0U, 0U, span, span);
-    recurse_face_patch(recurse_face_patch, 2, false, 0U, 0U, span, span);
+    sample_face_interior(0, true);
+    sample_face_interior(0, false);
+    sample_face_interior(1, true);
+    sample_face_interior(1, false);
+    sample_face_interior(2, true);
+    sample_face_interior(2, false);
 }
 
 inline void enqueue_local_children(
