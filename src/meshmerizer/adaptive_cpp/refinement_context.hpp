@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <array>
 #include <atomic>
+#include <span>
 #include <vector>
 
 #include "refinement_arena.hpp"
@@ -100,6 +101,10 @@ public:
 
     /** Return the context-owned contributor range for one cell. */
     RefinementContributorRange contributor_range(
+        std::size_t cell_index) const;
+
+    /** Return a cell's contributor slice as a span over arena storage. */
+    std::span<const std::size_t> contributor_span(
         std::size_t cell_index) const;
 
     /** Copy a cell's contributor slice into a local vector. */

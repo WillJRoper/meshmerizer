@@ -150,23 +150,33 @@ RefinementContributorRange RefinementContext::contributor_range(
     return contributor_ranges_[cell_index];
 }
 
-void RefinementContext::copy_contributors_for_cell(
-    std::size_t cell_index,
-    std::vector<std::size_t> &out_indices) const {
-    out_indices.clear();
+std::span<const std::size_t> RefinementContext::contributor_span(
+    std::size_t cell_index) const {
     const RefinementContributorRange range = contributor_range(cell_index);
     if (range.begin < 0 || range.end <= range.begin) {
-        return;
+        return {};
     }
     const std::size_t safe_begin =
         static_cast<std::size_t>(std::max<std::int64_t>(0, range.begin));
     const std::size_t safe_end = static_cast<std::size_t>(std::min(
         range.end,
         static_cast<std::int64_t>(contrib_arena_.size())));
-    out_indices.reserve(safe_end - safe_begin);
-    for (std::size_t i = safe_begin; i < safe_end; ++i) {
-        out_indices.push_back(contrib_arena_[i]);
+    if (safe_end <= safe_begin) {
+        return {};
     }
+    // Contributor slices are reserved through reserve_contributor_slice(),
+    // which uses the arena's contiguous block reservation and therefore keeps
+    // each slice within a single chunk.
+    return std::span<const std::size_t>(
+        &contrib_arena_[safe_begin],
+        safe_end - safe_begin);
+}
+
+void RefinementContext::copy_contributors_for_cell(
+    std::size_t cell_index,
+    std::vector<std::size_t> &out_indices) const {
+    const std::span<const std::size_t> contributors = contributor_span(cell_index);
+    out_indices.assign(contributors.begin(), contributors.end());
 }
 
 bool RefinementContext::raise_required_depth_to(

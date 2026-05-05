@@ -1168,15 +1168,14 @@ inline PublishedChildren apply_balance_split(
     const std::uint32_t parent_required_depth =
         context.get_required_depth(split_index);
 
-    std::vector<std::size_t> parent_contributors;
-    context.copy_contributors_for_cell(split_index, parent_contributors);
+    const std::span<const std::size_t> parent_contributors =
+        context.contributor_span(split_index);
 
     std::vector<OctreeCell> children = create_child_cells(parent_snapshot);
     closure_assign_parent_index(children, split_index);
     const std::vector<std::vector<std::size_t>> child_contributors =
         filter_child_contributors(
-            std::span<const std::size_t>(
-                parent_contributors.data(), parent_contributors.size()),
+            parent_contributors,
             worker.positions,
             worker.smoothing_lengths,
             children);
@@ -1648,8 +1647,10 @@ inline void process_closure_task(
             claim_refinement_tasks(claimed_indices, worker, claimed_tasks);
             queued_followup_work = !claimed_tasks.empty();
         } else {
-            context.copy_contributors_for_cell(
-                task.cell_index, contributor_snapshot);
+            const std::span<const std::size_t> contributor_span =
+                context.contributor_span(task.cell_index);
+            contributor_snapshot.assign(
+                contributor_span.begin(), contributor_span.end());
 
             cell_snapshot.contributor_begin = 0;
             cell_snapshot.contributor_end =
@@ -1907,8 +1908,8 @@ inline void process_classify_task(
 
     const OctreeCell &cell = context.cells()[idx];
 
-    std::vector<std::size_t> contributors;
-    context.copy_contributors_for_cell(idx, contributors);
+    const std::span<const std::size_t> contributors =
+        context.contributor_span(idx);
 
     // Evaluate the SPH density at the cell centre.
     const Vector3d centre = cell.bounds.center();
