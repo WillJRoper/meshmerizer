@@ -183,7 +183,6 @@ private:
         std::size_t queue_size = 0U;
         std::size_t push_count = 0U;
         std::size_t pop_count = 0U;
-        std::size_t stale_task_count = 0U;
         std::size_t processed_leaf_count = 0U;
         std::size_t surface_leaf_count = 0U;
         std::size_t split_count = 0U;
@@ -196,7 +195,6 @@ private:
             return queue_size == other.queue_size &&
                    push_count == other.push_count &&
                    pop_count == other.pop_count &&
-                   stale_task_count == other.stale_task_count &&
                    processed_leaf_count == other.processed_leaf_count &&
                    surface_leaf_count == other.surface_leaf_count &&
                    split_count == other.split_count &&
@@ -211,7 +209,7 @@ private:
             return push_count > 0U || pop_count > 0U ||
                    processed_leaf_count > 0U || split_count > 0U ||
                    required_depth_raise_count > 0U ||
-                   internal_wake_count > 0U || stale_task_count > 0U;
+                   internal_wake_count > 0U;
         }
     };
 
@@ -465,7 +463,6 @@ private:
         std::size_t queue_size = 0U;
         std::size_t push_count = 0U;
         std::size_t pop_count = 0U;
-        std::size_t stale_task_count = 0U;
         std::size_t processed_leaf_count = 0U;
         std::size_t surface_leaf_count = 0U;
         std::size_t split_count = 0U;
@@ -483,7 +480,6 @@ private:
             return queue_size == other.queue_size &&
                    push_count == other.push_count &&
                    pop_count == other.pop_count &&
-                   stale_task_count == other.stale_task_count &&
                    processed_leaf_count == other.processed_leaf_count &&
                    surface_leaf_count == other.surface_leaf_count &&
                    split_count == other.split_count &&
@@ -504,7 +500,7 @@ private:
             return push_count > 0U || pop_count > 0U ||
                    processed_leaf_count > 0U || split_count > 0U ||
                    required_depth_raise_count > 0U ||
-                   internal_wake_count > 0U || stale_task_count > 0U;
+                   internal_wake_count > 0U;
         }
     };
 
@@ -549,19 +545,15 @@ public:
             config_.phase_name.c_str());
         meshmerizer_log_detail::print_indented_status(
             "%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s"
-            " %*s %*s %*s %*s\n",
+            " %*s %*s\n",
             kTableElapsedWidth,
             "elapsed_s",
             kTableCountWidth,
             "queue",
             kTableCountWidth,
-            "inflight",
-            kTableCountWidth,
             "pushed",
             kTableCountWidth,
             "popped",
-            kTableCountWidth,
-            "stale",
             kTableCountWidth,
             "refine",
             kTableCountWidth,
@@ -591,7 +583,6 @@ public:
             queue_stats.queue_size,
             queue_stats.push_count,
             queue_stats.pop_count,
-            run_stats_snapshot.stale_task_count,
             run_stats_snapshot.processed_leaf_count,
             run_stats_snapshot.surface_leaf_count,
             run_stats_snapshot.split_count,
@@ -623,19 +614,15 @@ public:
             std::chrono::duration<double>(now - start_time_).count();
         meshmerizer_log_detail::print_indented_status(
             "%*.1f %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu"
-            " %*zu %*zu %*zu %*zu\n",
+            " %*zu %*zu\n",
             kTableElapsedWidth,
             elapsed_seconds,
             kTableCountWidth,
             snapshot.queue_size,
             kTableCountWidth,
-            queue_.stats().in_flight_count,
-            kTableCountWidth,
             snapshot.push_count,
             kTableCountWidth,
             snapshot.pop_count,
-            kTableCountWidth,
-            snapshot.stale_task_count,
             kTableCountWidth,
             snapshot.refine_pop_count,
             kTableCountWidth,
@@ -2053,11 +2040,9 @@ inline void process_occupancy_update_task(
             worker.config.base_resolution);
         if (neighbor_idx == std::numeric_limits<std::size_t>::max() ||
             neighbor_idx >= context.size()) {
-            context.face_neighbor_indices()[idx][&face - faces] = SIZE_MAX;
             touches_opposite = true;
             continue;
         }
-        context.face_neighbor_indices()[idx][&face - faces] = neighbor_idx;
         const bool neighbor_inside =
             context.cell_classification()[neighbor_idx].load(
                 std::memory_order_acquire) != 0U;
@@ -2696,8 +2681,7 @@ bool refine_thickening_band_with_closure(
     std::vector<std::uint8_t> *dirty_cells,
     std::vector<std::uint8_t> *classified_inside_flags,
     std::vector<double> *classified_center_values,
-    std::vector<std::uint8_t> *classified_occupancy_states,
-    std::vector<std::array<std::size_t, 6>> *classified_face_neighbors) {
+    std::vector<std::uint8_t> *classified_occupancy_states) {
     if (target_leaf_size <= 0.0) {
         return false;
     }
@@ -2792,23 +2776,52 @@ bool refine_thickening_band_with_closure(
             config,
             queue);
 
+        meshmerizer_log_detail::print_status(
+            config.status_operation,
+            config.status_function,
+            "thickening-band queue drained; finalizing closure state\n");
+
+        const auto count_remaining_start = std::chrono::steady_clock::now();
         const std::size_t remaining_thickening_eligible =
             count_remaining_thickening_band_eligible(
                 context,
                 target_leaf_size,
                 config.max_depth);
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            config.status_function,
+            "thickening-band remaining-eligible scan took %.3f s\n",
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - count_remaining_start)
+                .count());
 
         if (classified_inside_flags != nullptr ||
             classified_center_values != nullptr ||
-            classified_occupancy_states != nullptr ||
-            classified_face_neighbors != nullptr) {
+            classified_occupancy_states != nullptr) {
+            const auto materialize_state_start =
+                std::chrono::steady_clock::now();
             context.materialize_thickening_state(
                 classified_inside_flags,
                 classified_center_values,
-                classified_occupancy_states,
-                classified_face_neighbors);
+                classified_occupancy_states);
+            meshmerizer_log_detail::print_status(
+                "Timing",
+                config.status_function,
+                "thickening-band state materialization took %.3f s\n",
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - materialize_state_start)
+                    .count());
         }
+
+        const auto materialize_tree_start = std::chrono::steady_clock::now();
         context.materialize_into(all_cells, all_contributors);
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            config.status_function,
+            "thickening-band tree materialization took %.3f s\n",
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - materialize_tree_start)
+                .count());
         meshmerizer_log_detail::print_debug_status(
             config.status_operation,
             config.status_function,

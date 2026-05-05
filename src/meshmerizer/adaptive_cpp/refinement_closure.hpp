@@ -86,9 +86,7 @@ bool refine_thickening_band_with_closure(
     std::vector<std::uint8_t> *dirty_cells = nullptr,
     std::vector<std::uint8_t> *classified_inside_flags = nullptr,
     std::vector<double> *classified_center_values = nullptr,
-    std::vector<std::uint8_t> *classified_occupancy_states = nullptr,
-    std::vector<std::array<std::size_t, 6>> *classified_face_neighbors =
-        nullptr);
+    std::vector<std::uint8_t> *classified_occupancy_states = nullptr);
 
 bool refine_cells_to_next_depth_with_closure(
     std::vector<OctreeCell> &all_cells,

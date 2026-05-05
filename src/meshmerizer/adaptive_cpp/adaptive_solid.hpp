@@ -18,12 +18,17 @@
 #ifndef MESHMERIZER_ADAPTIVE_CPP_ADAPTIVE_SOLID_HPP_
 #define MESHMERIZER_ADAPTIVE_CPP_ADAPTIVE_SOLID_HPP_
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <span>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -33,6 +38,7 @@
 #include "faces.hpp"
 #include "octree_cell.hpp"
 #include "refinement_closure.hpp"
+#include "refinement_work_queue.hpp"
 
 /**
  * @brief Occupancy classification used by the opened-solid pipeline.
@@ -489,6 +495,223 @@ inline void update_occupied_solid_classification_cache(
     }
 }
 
+template <typename ProcessCell>
+inline void run_static_leaf_queue_epoch(
+    const std::vector<std::size_t> &cell_indices,
+    std::uint32_t worker_count,
+    ProcessCell process_cell) {
+    if (cell_indices.empty()) {
+        return;
+    }
+
+    RefinementWorkQueue queue;
+    const std::uint32_t active_workers = std::max(1U, worker_count);
+    queue.initialize(active_workers);
+    for (std::size_t ordinal = 0; ordinal < cell_indices.size(); ++ordinal) {
+        queue.push(
+            {cell_indices[ordinal], 0U, 0U, RefinementTaskKind::kRefine},
+            static_cast<std::uint32_t>(ordinal % active_workers));
+    }
+    queue.capture_initial_queue_size();
+
+    std::exception_ptr worker_error;
+    std::mutex error_mutex;
+    std::vector<std::thread> workers;
+    workers.reserve(active_workers);
+    for (std::uint32_t worker_id = 0; worker_id < active_workers; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                try {
+                    process_cell(task.cell_index);
+                } catch (...) {
+                    {
+                        std::lock_guard<std::mutex> lock(error_mutex);
+                        if (worker_error == nullptr) {
+                            worker_error = std::current_exception();
+                        }
+                    }
+                    queue.task_done();
+                    queue.shutdown();
+                    return;
+                }
+                queue.task_done();
+                queue.try_shutdown_if_idle();
+            }
+        });
+    }
+
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    if (worker_error != nullptr) {
+        std::rethrow_exception(worker_error);
+    }
+}
+
+inline void update_occupied_solid_classification_cache_with_queue(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const LeafSpatialIndex &spatial_index,
+    double isovalue,
+    std::uint32_t max_depth,
+    std::uint32_t worker_count,
+    OccupiedSolidClassificationCache &cache,
+    const std::vector<std::uint8_t> *dirty_cells = nullptr,
+    const std::vector<std::uint8_t> *precomputed_inside_flags = nullptr,
+    const std::vector<double> *precomputed_center_values = nullptr) {
+    cache.inside_flags.resize(all_cells.size(), 0U);
+    cache.center_values.resize(all_cells.size(), 0.0);
+    cache.occupancy_states.resize(
+        all_cells.size(),
+        static_cast<std::uint8_t>(OccupancyState::kOutside));
+    cache.face_neighbor_cell_indices.resize(
+        all_cells.size(),
+        {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
+    std::vector<std::uint8_t> occupancy_dirty;
+    std::vector<std::size_t> classify_cell_indices;
+    std::vector<std::size_t> occupancy_cell_indices;
+
+    if (dirty_cells != nullptr) {
+        occupancy_dirty = *dirty_cells;
+        if (occupancy_dirty.size() < all_cells.size()) {
+            occupancy_dirty.resize(all_cells.size(), 0U);
+        }
+        for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            const OctreeCell &cell = all_cells[cell_idx];
+            if (!cell.is_leaf) {
+                continue;
+            }
+            if (cell_idx < dirty_cells->size() && (*dirty_cells)[cell_idx] != 0U) {
+                classify_cell_indices.push_back(cell_idx);
+            }
+            if (cell_idx >= occupancy_dirty.size() || occupancy_dirty[cell_idx] == 0U) {
+                continue;
+            }
+            const auto neighbors = face_neighbor_cells(
+                cell, spatial_index, max_depth);
+            for (std::size_t neighbor_idx : neighbors) {
+                if (neighbor_idx == SIZE_MAX || neighbor_idx >= occupancy_dirty.size()) {
+                    continue;
+                }
+                occupancy_dirty[neighbor_idx] = 1U;
+            }
+        }
+        occupancy_cell_indices.reserve(classify_cell_indices.size());
+        for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            if (!all_cells[cell_idx].is_leaf) {
+                continue;
+            }
+            if (occupancy_dirty[cell_idx] != 0U) {
+                occupancy_cell_indices.push_back(cell_idx);
+            }
+        }
+    } else {
+        classify_cell_indices.reserve(all_cells.size());
+        occupancy_cell_indices.reserve(all_cells.size());
+        for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            if (!all_cells[cell_idx].is_leaf) {
+                continue;
+            }
+            classify_cell_indices.push_back(cell_idx);
+            occupancy_cell_indices.push_back(cell_idx);
+        }
+    }
+
+    run_static_leaf_queue_epoch(
+        classify_cell_indices,
+        worker_count,
+        [&](std::size_t cell_idx) {
+            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                    cell_idx)) {
+                return;
+            }
+            const OctreeCell &cell = all_cells[cell_idx];
+
+            const bool has_precomputed_value =
+                precomputed_inside_flags != nullptr &&
+                precomputed_center_values != nullptr &&
+                cell_idx < precomputed_inside_flags->size() &&
+                cell_idx < precomputed_center_values->size();
+            if (has_precomputed_value) {
+                cache.center_values[cell_idx] = (*precomputed_center_values)[cell_idx];
+                cache.inside_flags[cell_idx] = (*precomputed_inside_flags)[cell_idx];
+                return;
+            }
+
+            const std::span<const std::size_t> contributors =
+                cell_contributor_span(cell, all_contributors);
+            const double center_value = evaluate_field_at_point(
+                cell.bounds.center(), contributors, positions, smoothing_lengths);
+            cache.center_values[cell_idx] = center_value;
+
+            std::size_t inside_corner_count = 0;
+            for (double corner_value : cell.corner_values) {
+                if (corner_value >= isovalue) {
+                    ++inside_corner_count;
+                }
+            }
+
+            const bool inside =
+                center_value >= isovalue || inside_corner_count >= 4U;
+            cache.inside_flags[cell_idx] = inside ? 1U : 0U;
+        });
+
+    run_static_leaf_queue_epoch(
+        occupancy_cell_indices,
+        worker_count,
+        [&](std::size_t cell_idx) {
+            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                    cell_idx)) {
+                return;
+            }
+            const OctreeCell &cell = all_cells[cell_idx];
+
+            const bool inside = cache.inside_flags[cell_idx] != 0U;
+            OccupancyState occupancy = OccupancyState::kOutside;
+            bool touches_opposite = false;
+            const auto neighbors = face_neighbor_cells(
+                cell, spatial_index, max_depth);
+            cache.face_neighbor_cell_indices[cell_idx] = neighbors;
+            for (std::size_t neighbor_idx : neighbors) {
+                if (neighbor_idx == SIZE_MAX || neighbor_idx >= all_cells.size()) {
+                    continue;
+                }
+                if (cache.inside_flags[neighbor_idx] !=
+                    cache.inside_flags[cell_idx]) {
+                    touches_opposite = true;
+                    break;
+                }
+            }
+
+            occupancy = inside ? OccupancyState::kInside
+                               : OccupancyState::kOutside;
+            if (touches_opposite) {
+                occupancy = inside ? OccupancyState::kBoundaryInside
+                                   : OccupancyState::kBoundaryOutside;
+            }
+            cache.occupancy_states[cell_idx] =
+                static_cast<std::uint8_t>(occupancy);
+        });
+
+    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+        if (all_cells[cell_idx].is_leaf) {
+            continue;
+        }
+        cache.inside_flags[cell_idx] = 0U;
+        cache.center_values[cell_idx] = 0.0;
+        cache.occupancy_states[cell_idx] =
+            static_cast<std::uint8_t>(OccupancyState::kOutside);
+        cache.face_neighbor_cell_indices[cell_idx] = {
+            SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
+    }
+}
+
 inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
     const std::vector<OctreeCell> &all_cells,
     const OccupiedSolidClassificationCache &cache,
@@ -584,12 +807,10 @@ inline void merge_occupied_solid_cache_from_closure_state(
     std::vector<std::uint8_t> inside_flags,
     std::vector<double> center_values,
     std::vector<std::uint8_t> occupancy_states,
-    std::vector<std::array<std::size_t, 6>> face_neighbor_cell_indices,
     const std::vector<std::uint8_t> &dirty_cells) {
     cache.inside_flags = std::move(inside_flags);
     cache.center_values = std::move(center_values);
     cache.occupancy_states = std::move(occupancy_states);
-    cache.face_neighbor_cell_indices = std::move(face_neighbor_cell_indices);
     if (cache.inside_flags.size() < all_cells.size()) {
         cache.inside_flags.resize(all_cells.size(), 0U);
     }
@@ -601,11 +822,9 @@ inline void merge_occupied_solid_cache_from_closure_state(
             all_cells.size(),
             static_cast<std::uint8_t>(OccupancyState::kOutside));
     }
-    if (cache.face_neighbor_cell_indices.size() < all_cells.size()) {
-        cache.face_neighbor_cell_indices.resize(
-            all_cells.size(),
-            {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
-    }
+    cache.face_neighbor_cell_indices.resize(
+        all_cells.size(),
+        {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
 
     std::vector<std::uint8_t> active_mask(all_cells.size(), 0U);
     std::vector<std::size_t> active_leaf_indices;
@@ -635,7 +854,9 @@ inline void merge_occupied_solid_cache_from_closure_state(
             continue;
         }
         activate_leaf(dirty_idx);
-        const auto &neighbors = cache.face_neighbor_cell_indices[dirty_idx];
+        const auto neighbors = face_neighbor_cells(
+            all_cells[dirty_idx], spatial_index, max_depth);
+        cache.face_neighbor_cell_indices[dirty_idx] = neighbors;
         for (std::size_t neighbor_idx : neighbors) {
             if (neighbor_idx == SIZE_MAX || neighbor_idx >= all_cells.size()) {
                 continue;
@@ -660,17 +881,8 @@ inline void merge_occupied_solid_cache_from_closure_state(
             continue;
         }
         neighbor_counter.tick();
-        bool has_exported_neighbors = false;
-        for (std::size_t neighbor_idx : cache.face_neighbor_cell_indices[idx]) {
-            if (neighbor_idx != SIZE_MAX) {
-                has_exported_neighbors = true;
-                break;
-            }
-        }
-        if (!has_exported_neighbors) {
-            cache.face_neighbor_cell_indices[idx] = face_neighbor_cells(
-                all_cells[idx], spatial_index, max_depth);
-        }
+        cache.face_neighbor_cell_indices[idx] = face_neighbor_cells(
+            all_cells[idx], spatial_index, max_depth);
     }
     neighbor_counter.finish();
 }
@@ -931,9 +1143,7 @@ inline bool refine_thickening_band_cells(
     std::vector<std::uint8_t> *dirty_cells = nullptr,
     std::vector<std::uint8_t> *classified_inside_flags = nullptr,
     std::vector<double> *classified_center_values = nullptr,
-    std::vector<std::uint8_t> *classified_occupancy_states = nullptr,
-    std::vector<std::array<std::size_t, 6>> *classified_face_neighbors =
-        nullptr) {
+    std::vector<std::uint8_t> *classified_occupancy_states = nullptr) {
     if (target_leaf_size <= 0.0 || thickening_radius <= 0.0) {
         return false;
     }
@@ -1078,8 +1288,7 @@ inline bool refine_thickening_band_cells(
         dirty_cells,
         classified_inside_flags,
         classified_center_values,
-        classified_occupancy_states,
-        classified_face_neighbors);
+        classified_occupancy_states);
 }
 
 inline bool thickening_band_is_fully_refined(
@@ -1871,6 +2080,566 @@ struct OpenedSurfaceMesh {
     std::vector<std::uint64_t> vertex_keys;
 };
 
+inline void unpack_surface_corner_coords(
+    std::uint64_t key,
+    std::uint32_t &ix,
+    std::uint32_t &iy,
+    std::uint32_t &iz);
+
+inline std::uint64_t pack_surface_corner_coords(
+    std::uint32_t ix,
+    std::uint32_t iy,
+    std::uint32_t iz);
+
+struct SurfaceRegion {
+    std::size_t region_id = 0U;
+    std::size_t root_cell_index = 0U;
+    std::uint32_t root_depth = 0U;
+    std::vector<std::size_t> leaf_indices;
+};
+
+struct RegionSurfaceVertex {
+    std::uint64_t key = 0U;
+    Vector3d position = {0.0, 0.0, 0.0};
+    Vector3d normal_sum = {0.0, 0.0, 0.0};
+};
+
+struct RegionSurfaceTriangle {
+    std::size_t local_vertex_index[3] = {0U, 0U, 0U};
+};
+
+struct RegionSurfaceBuffers {
+    std::size_t region_id = 0U;
+    std::vector<RegionSurfaceVertex> local_vertices;
+    std::vector<RegionSurfaceTriangle> local_triangles;
+    std::unordered_map<std::uint64_t, std::size_t> local_vertex_lookup;
+};
+
+struct SurfaceExtractionRuntime {
+    const std::vector<OccupiedSolidLeaf> *solid_leaves = nullptr;
+    const std::vector<std::uint8_t> *opened_inside = nullptr;
+    const std::vector<OctreeCell> *all_cells = nullptr;
+    const LeafSpatialIndex *spatial_index = nullptr;
+    const BoundingBox *domain = nullptr;
+    const std::vector<std::int64_t> *cell_to_leaf_index = nullptr;
+    const std::vector<SurfaceRegion> *regions = nullptr;
+    std::uint32_t base_resolution = 0U;
+    std::uint32_t max_depth = 0U;
+    std::uint32_t fine_resolution = 0U;
+    double fine_dx = 0.0;
+    double fine_dy = 0.0;
+    double fine_dz = 0.0;
+};
+
+struct SurfaceTaskGraphState {
+    std::atomic<std::size_t> pending_region_tasks{0U};
+    std::atomic<bool> merge_enqueued{false};
+    std::atomic<bool> merge_completed{false};
+};
+
+struct SurfaceTaskGraphRuntime {
+    SurfaceExtractionRuntime extraction;
+    std::vector<RegionSurfaceBuffers> region_buffers;
+    SurfaceTaskGraphState graph;
+    OpenedSurfaceMesh merged_mesh;
+    std::mutex merged_mesh_mutex;
+};
+
+inline bool surface_region_contains_cell(
+    const std::vector<OctreeCell> &all_cells,
+    std::size_t root_cell_index,
+    std::size_t cell_index) {
+    if (root_cell_index >= all_cells.size() || cell_index >= all_cells.size()) {
+        return false;
+    }
+    std::size_t current = cell_index;
+    while (true) {
+        if (current == root_cell_index) {
+            return true;
+        }
+        const std::int64_t parent = all_cells[current].parent_index;
+        if (parent < 0) {
+            return false;
+        }
+        current = static_cast<std::size_t>(parent);
+    }
+}
+
+inline std::vector<SurfaceRegion> build_surface_regions(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<OctreeCell> &all_cells) {
+    std::unordered_map<std::size_t, std::size_t> region_lookup;
+    std::vector<SurfaceRegion> regions;
+    region_lookup.reserve(solid_leaves.size());
+
+    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        std::size_t root_cell_index = solid_leaves[leaf_index].cell_index;
+        while (root_cell_index < all_cells.size() &&
+               all_cells[root_cell_index].parent_index >= 0) {
+            root_cell_index = static_cast<std::size_t>(
+                all_cells[root_cell_index].parent_index);
+        }
+
+        auto it = region_lookup.find(root_cell_index);
+        if (it == region_lookup.end()) {
+            const std::size_t region_id = regions.size();
+            region_lookup[root_cell_index] = region_id;
+            regions.push_back({
+                region_id,
+                root_cell_index,
+                all_cells[root_cell_index].depth,
+                {leaf_index},
+            });
+            continue;
+        }
+
+        SurfaceRegion &region = regions[it->second];
+        region.leaf_indices.push_back(leaf_index);
+    }
+
+    return regions;
+}
+
+inline std::size_t region_vertex_index_for(
+    const SurfaceExtractionRuntime &runtime,
+    RegionSurfaceBuffers &buffers,
+    std::uint32_t ix,
+    std::uint32_t iy,
+    std::uint32_t iz) {
+    const std::uint64_t key = pack_surface_corner_coords(ix, iy, iz);
+    auto existing = buffers.local_vertex_lookup.find(key);
+    if (existing != buffers.local_vertex_lookup.end()) {
+        return existing->second;
+    }
+
+    const Vector3d position = {
+        runtime.domain->min.x + static_cast<double>(ix) * runtime.fine_dx,
+        runtime.domain->min.y + static_cast<double>(iy) * runtime.fine_dy,
+        runtime.domain->min.z + static_cast<double>(iz) * runtime.fine_dz,
+    };
+    const std::size_t vertex_index = buffers.local_vertices.size();
+    buffers.local_vertices.push_back({key, position, {0.0, 0.0, 0.0}});
+    buffers.local_vertex_lookup.emplace(key, vertex_index);
+    return vertex_index;
+}
+
+inline void append_region_oriented_quad(
+    RegionSurfaceBuffers &buffers,
+    const std::array<Vector3d, 4> &positions,
+    const std::array<std::size_t, 4> &indices,
+    const Vector3d &outward) {
+    const Vector3d e1 = {
+        positions[1].x - positions[0].x,
+        positions[1].y - positions[0].y,
+        positions[1].z - positions[0].z,
+    };
+    const Vector3d e2 = {
+        positions[2].x - positions[0].x,
+        positions[2].y - positions[0].y,
+        positions[2].z - positions[0].z,
+    };
+    const Vector3d cross = {
+        e1.y * e2.z - e1.z * e2.y,
+        e1.z * e2.x - e1.x * e2.z,
+        e1.x * e2.y - e1.y * e2.x,
+    };
+    const double alignment =
+        cross.x * outward.x + cross.y * outward.y + cross.z * outward.z;
+
+    std::array<std::size_t, 4> oriented = indices;
+    if (alignment < 0.0) {
+        oriented = {indices[0], indices[3], indices[2], indices[1]};
+    }
+
+    buffers.local_triangles.push_back(
+        {{oriented[0], oriented[1], oriented[2]}});
+    buffers.local_triangles.push_back(
+        {{oriented[0], oriented[2], oriented[3]}});
+
+    for (std::size_t vertex_index : oriented) {
+        buffers.local_vertices[vertex_index].normal_sum.x += outward.x;
+        buffers.local_vertices[vertex_index].normal_sum.y += outward.y;
+        buffers.local_vertices[vertex_index].normal_sum.z += outward.z;
+    }
+}
+
+inline void emit_region_opened_surface(
+    const SurfaceRegion &region,
+    const SurfaceExtractionRuntime &runtime,
+    RegionSurfaceBuffers &buffers) {
+    const std::vector<OccupiedSolidLeaf> &solid_leaves = *runtime.solid_leaves;
+    const std::vector<std::uint8_t> &opened_inside = *runtime.opened_inside;
+    const std::vector<OctreeCell> &all_cells = *runtime.all_cells;
+    const LeafSpatialIndex &spatial_index = *runtime.spatial_index;
+    const std::vector<std::int64_t> &cell_to_leaf_index =
+        *runtime.cell_to_leaf_index;
+
+    for (std::size_t leaf_index : region.leaf_indices) {
+        if (opened_inside[leaf_index] == 0U) {
+            continue;
+        }
+
+        const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
+        if (!surface_region_contains_cell(all_cells, region.root_cell_index, cell_index)) {
+            continue;
+        }
+
+        std::uint32_t cell_x = 0U;
+        std::uint32_t cell_y = 0U;
+        std::uint32_t cell_z = 0U;
+        const OctreeCell &cell = all_cells[cell_index];
+        morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
+        const std::uint32_t span = 1U << (runtime.max_depth - cell.depth);
+        const std::uint32_t ix0 = cell_x << (runtime.max_depth - cell.depth);
+        const std::uint32_t iy0 = cell_y << (runtime.max_depth - cell.depth);
+        const std::uint32_t iz0 = cell_z << (runtime.max_depth - cell.depth);
+
+        for (std::uint32_t u = 0; u < span; ++u) {
+            for (std::uint32_t v = 0; v < span; ++v) {
+                const auto neighbor_opened = [&](std::int64_t neighbor_cell_index) {
+                    if (neighbor_cell_index < 0) {
+                        return false;
+                    }
+                    return opened_inside[static_cast<std::size_t>(neighbor_cell_index)] != 0U;
+                };
+                auto lookup_neighbor = [&](std::uint32_t qx,
+                                           std::uint32_t qy,
+                                           std::uint32_t qz) {
+                    if (qx >= runtime.fine_resolution ||
+                        qy >= runtime.fine_resolution ||
+                        qz >= runtime.fine_resolution) {
+                        return false;
+                    }
+                    const std::size_t neighbor_cell_index =
+                        spatial_index.find_leaf_at(qx, qy, qz);
+                    if (neighbor_cell_index == SIZE_MAX ||
+                        neighbor_cell_index >= cell_to_leaf_index.size()) {
+                        return false;
+                    }
+                    return neighbor_opened(cell_to_leaf_index[neighbor_cell_index]);
+                };
+
+                if (ix0 == 0U || !lookup_neighbor(ix0 - 1U, iy0 + u, iz0 + v)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0, iy0 + u, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0, iy0 + u + 1U, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0, iy0 + u + 1U, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0, iy0 + u, iz0 + v + 1U),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {-1.0, 0.0, 0.0});
+                }
+                if (ix0 + span >= runtime.fine_resolution ||
+                    !lookup_neighbor(ix0 + span, iy0 + u, iz0 + v)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0 + span, iy0 + u, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0 + span, iy0 + u, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0 + span, iy0 + u + 1U, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0 + span, iy0 + u + 1U, iz0 + v),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {1.0, 0.0, 0.0});
+                }
+                if (iy0 == 0U || !lookup_neighbor(ix0 + u, iy0 - 1U, iz0 + v)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0, iz0 + v),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {0.0, -1.0, 0.0});
+                }
+                if (iy0 + span >= runtime.fine_resolution ||
+                    !lookup_neighbor(ix0 + u, iy0 + span, iz0 + v)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + span, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + span, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + span, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + span, iz0 + v + 1U),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {0.0, 1.0, 0.0});
+                }
+                if (iz0 == 0U || !lookup_neighbor(ix0 + u, iy0 + v, iz0 - 1U)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + v, iz0),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + v, iz0),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + v + 1U, iz0),
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + v + 1U, iz0),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {0.0, 0.0, -1.0});
+                }
+                if (iz0 + span >= runtime.fine_resolution ||
+                    !lookup_neighbor(ix0 + u, iy0 + v, iz0 + span)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + v, iz0 + span),
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + v + 1U, iz0 + span),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + v + 1U, iz0 + span),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + v, iz0 + span),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {0.0, 0.0, 1.0});
+                }
+            }
+        }
+    }
+}
+
+inline void run_region_extract_surface_task(
+    std::size_t region_id,
+    const SurfaceExtractionRuntime &runtime,
+    RegionSurfaceBuffers &out_buffers) {
+    out_buffers.region_id = region_id;
+    out_buffers.local_vertices.clear();
+    out_buffers.local_triangles.clear();
+    out_buffers.local_vertex_lookup.clear();
+    emit_region_opened_surface(runtime.regions->at(region_id), runtime, out_buffers);
+}
+
+inline OpenedSurfaceMesh merge_region_surface_buffers(
+    const std::vector<RegionSurfaceBuffers> &region_buffers) {
+    OpenedSurfaceMesh mesh;
+    std::unordered_map<std::uint64_t, std::size_t> vertex_lookup;
+    std::vector<Vector3d> normal_accum;
+
+    std::size_t vertex_capacity = 0U;
+    std::size_t triangle_capacity = 0U;
+    for (const RegionSurfaceBuffers &buffer : region_buffers) {
+        vertex_capacity += buffer.local_vertices.size();
+        triangle_capacity += buffer.local_triangles.size();
+    }
+    vertex_lookup.reserve(vertex_capacity);
+    mesh.triangles.reserve(triangle_capacity);
+
+    for (const RegionSurfaceBuffers &buffer : region_buffers) {
+        std::vector<std::size_t> local_to_global(buffer.local_vertices.size(), 0U);
+        for (std::size_t i = 0; i < buffer.local_vertices.size(); ++i) {
+            const RegionSurfaceVertex &vertex = buffer.local_vertices[i];
+            auto existing = vertex_lookup.find(vertex.key);
+            if (existing == vertex_lookup.end()) {
+                const std::size_t global_index = mesh.vertices.size();
+                mesh.vertices.push_back({vertex.position, {0.0, 0.0, 0.0}});
+                mesh.vertex_keys.push_back(vertex.key);
+                normal_accum.push_back(vertex.normal_sum);
+                vertex_lookup.emplace(vertex.key, global_index);
+                local_to_global[i] = global_index;
+            } else {
+                local_to_global[i] = existing->second;
+                normal_accum[existing->second].x += vertex.normal_sum.x;
+                normal_accum[existing->second].y += vertex.normal_sum.y;
+                normal_accum[existing->second].z += vertex.normal_sum.z;
+            }
+        }
+
+        for (const RegionSurfaceTriangle &triangle : buffer.local_triangles) {
+            mesh.triangles.push_back({
+                local_to_global[triangle.local_vertex_index[0]],
+                local_to_global[triangle.local_vertex_index[1]],
+                local_to_global[triangle.local_vertex_index[2]],
+            });
+        }
+    }
+
+    std::vector<std::size_t> order(mesh.vertices.size(), 0U);
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return mesh.vertex_keys[a] < mesh.vertex_keys[b];
+    });
+
+    OpenedSurfaceMesh sorted_mesh;
+    sorted_mesh.vertices.resize(mesh.vertices.size());
+    sorted_mesh.vertex_keys.resize(mesh.vertex_keys.size());
+    sorted_mesh.triangles = mesh.triangles;
+    std::vector<Vector3d> sorted_normals(normal_accum.size(), {0.0, 0.0, 0.0});
+    std::vector<std::size_t> old_to_new(order.size(), 0U);
+    for (std::size_t new_index = 0; new_index < order.size(); ++new_index) {
+        const std::size_t old_index = order[new_index];
+        old_to_new[old_index] = new_index;
+        sorted_mesh.vertices[new_index] = mesh.vertices[old_index];
+        sorted_mesh.vertex_keys[new_index] = mesh.vertex_keys[old_index];
+        sorted_normals[new_index] = normal_accum[old_index];
+    }
+    for (MeshTriangle &triangle : sorted_mesh.triangles) {
+        triangle.vertex_indices[0] = old_to_new[triangle.vertex_indices[0]];
+        triangle.vertex_indices[1] = old_to_new[triangle.vertex_indices[1]];
+        triangle.vertex_indices[2] = old_to_new[triangle.vertex_indices[2]];
+    }
+    for (std::size_t i = 0; i < sorted_mesh.vertices.size(); ++i) {
+        const double mag = std::sqrt(
+            sorted_normals[i].x * sorted_normals[i].x +
+            sorted_normals[i].y * sorted_normals[i].y +
+            sorted_normals[i].z * sorted_normals[i].z);
+        if (mag > 0.0) {
+            sorted_mesh.vertices[i].normal = {
+                sorted_normals[i].x / mag,
+                sorted_normals[i].y / mag,
+                sorted_normals[i].z / mag,
+            };
+        }
+    }
+    return sorted_mesh;
+}
+
+inline void run_merge_surface_buffers_task(
+    const SurfaceTaskGraphRuntime &runtime,
+    OpenedSurfaceMesh &out_mesh) {
+    out_mesh = merge_region_surface_buffers(runtime.region_buffers);
+}
+
+inline OpenedSurfaceMesh run_opened_surface_task_graph(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<std::uint8_t> &opened_inside,
+    const std::vector<OctreeCell> &all_cells,
+    const LeafSpatialIndex &spatial_index,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution,
+    std::uint32_t max_depth,
+    std::uint32_t worker_count,
+    double table_cadence_seconds) {
+    if (worker_count == 0U) {
+        worker_count = 1U;
+    }
+
+    SurfaceTaskGraphRuntime runtime;
+    runtime.extraction.solid_leaves = &solid_leaves;
+    runtime.extraction.opened_inside = &opened_inside;
+    runtime.extraction.all_cells = &all_cells;
+    runtime.extraction.spatial_index = &spatial_index;
+    runtime.extraction.domain = &domain;
+    runtime.extraction.cell_to_leaf_index = nullptr;
+    runtime.extraction.base_resolution = base_resolution;
+    runtime.extraction.max_depth = max_depth;
+    runtime.extraction.fine_resolution = base_resolution * (1U << max_depth);
+    runtime.extraction.fine_dx =
+        (domain.max.x - domain.min.x) /
+        static_cast<double>(runtime.extraction.fine_resolution);
+    runtime.extraction.fine_dy =
+        (domain.max.y - domain.min.y) /
+        static_cast<double>(runtime.extraction.fine_resolution);
+    runtime.extraction.fine_dz =
+        (domain.max.z - domain.min.z) /
+        static_cast<double>(runtime.extraction.fine_resolution);
+
+    const std::vector<std::int64_t> cell_to_leaf_index =
+        build_opened_cell_to_leaf_index(all_cells, solid_leaves);
+    runtime.extraction.cell_to_leaf_index = &cell_to_leaf_index;
+
+    const std::vector<SurfaceRegion> regions =
+        build_surface_regions(solid_leaves, all_cells);
+    runtime.extraction.regions = &regions;
+    runtime.region_buffers.resize(regions.size());
+    runtime.graph.pending_region_tasks.store(regions.size(), std::memory_order_relaxed);
+
+    if (regions.empty()) {
+        return {};
+    }
+
+    RefinementWorkQueue queue;
+    queue.initialize(worker_count);
+    for (std::size_t region_id = 0; region_id < regions.size(); ++region_id) {
+        queue.push(
+            {region_id, 0U, 0U, RefinementTaskKind::kRegionExtractSurface},
+            static_cast<std::uint32_t>(region_id % worker_count));
+    }
+    queue.capture_initial_queue_size();
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::uint32_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                switch (task.kind) {
+                    case RefinementTaskKind::kRegionExtractSurface: {
+                        const std::size_t region_id = task.cell_index;
+                        run_region_extract_surface_task(
+                            region_id,
+                            runtime.extraction,
+                            runtime.region_buffers[region_id]);
+                        if (runtime.graph.pending_region_tasks.fetch_sub(
+                                1U, std::memory_order_acq_rel) == 1U) {
+                            bool expected = false;
+                            if (runtime.graph.merge_enqueued.compare_exchange_strong(
+                                    expected,
+                                    true,
+                                    std::memory_order_acq_rel)) {
+                                queue.push(
+                                    {0U, 0U, 0U, RefinementTaskKind::kMergeSurfaceBuffers},
+                                    0U);
+                            }
+                        }
+                        break;
+                    }
+                    case RefinementTaskKind::kMergeSurfaceBuffers: {
+                        OpenedSurfaceMesh merged;
+                        run_merge_surface_buffers_task(runtime, merged);
+                        {
+                            std::lock_guard<std::mutex> lock(runtime.merged_mesh_mutex);
+                            runtime.merged_mesh = std::move(merged);
+                        }
+                        runtime.graph.merge_completed.store(true, std::memory_order_release);
+                        break;
+                    }
+                    default:
+                        break;
+                }
+                queue.task_done();
+                if (queue.try_claim_report(table_cadence_seconds)) {
+                    const RefinementWorkQueueStats stats = queue.stats();
+                    meshmerizer_log_detail::print_debug_status(
+                        "Meshing",
+                        "run_opened_surface_task_graph",
+                        "scheduler: queue=%zu inflight=%zu pushed=%zu popped=%zu\n",
+                        stats.queue_size,
+                        stats.in_flight_count,
+                        stats.push_count,
+                        stats.pop_count);
+                }
+                queue.try_shutdown_if_idle();
+            }
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+
+    return runtime.merged_mesh;
+}
+
 struct CornerVote {
     std::uint32_t inside = 0U;
     std::uint32_t outside = 0U;
@@ -2109,253 +2878,19 @@ inline OpenedSurfaceMesh generate_opened_surface_mesh(
     const LeafSpatialIndex &spatial_index,
     const BoundingBox &domain,
     std::uint32_t base_resolution,
-    std::uint32_t max_depth) {
-    OpenedSurfaceMesh mesh;
-    std::unordered_map<std::uint64_t, std::size_t> vertex_lookup;
-    std::vector<Vector3d> normal_accum;
-    vertex_lookup.reserve(solid_leaves.size() * 8U);
-    ProgressCounter surface_counter(
-        "Meshing", "generate_opened_surface_mesh", "leaves", 1000);
-
-    const std::uint32_t fine_resolution =
-        base_resolution * (1U << max_depth);
-    const double fine_dx =
-        (domain.max.x - domain.min.x) / static_cast<double>(fine_resolution);
-    const double fine_dy =
-        (domain.max.y - domain.min.y) / static_cast<double>(fine_resolution);
-    const double fine_dz =
-        (domain.max.z - domain.min.z) / static_cast<double>(fine_resolution);
-
-    std::vector<std::int64_t> cell_to_leaf_index(all_cells.size(), -1);
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        cell_to_leaf_index[solid_leaves[leaf_index].cell_index] =
-            static_cast<std::int64_t>(leaf_index);
-    }
-
-    const auto vertex_index_for = [&](std::uint32_t ix, std::uint32_t iy,
-                                      std::uint32_t iz) {
-        const std::uint64_t key = pack_surface_corner_coords(ix, iy, iz);
-        auto it = vertex_lookup.find(key);
-        if (it != vertex_lookup.end()) {
-            return it->second;
-        }
-        const Vector3d position = {
-            domain.min.x + static_cast<double>(ix) * fine_dx,
-            domain.min.y + static_cast<double>(iy) * fine_dy,
-            domain.min.z + static_cast<double>(iz) * fine_dz,
-        };
-        const std::size_t index = mesh.vertices.size();
-        mesh.vertices.push_back({position, {0.0, 0.0, 0.0}});
-        mesh.vertex_keys.push_back(key);
-        normal_accum.push_back({0.0, 0.0, 0.0});
-        vertex_lookup[key] = index;
-        return index;
-    };
-
-    const auto emit_oriented_quad = [&](const std::array<Vector3d, 4> &positions,
-                                        const std::array<std::size_t, 4> &indices,
-                                        const Vector3d &outward) {
-        const Vector3d e1 = {
-            positions[1].x - positions[0].x,
-            positions[1].y - positions[0].y,
-            positions[1].z - positions[0].z,
-        };
-        const Vector3d e2 = {
-            positions[2].x - positions[0].x,
-            positions[2].y - positions[0].y,
-            positions[2].z - positions[0].z,
-        };
-        const Vector3d cross = {
-            e1.y * e2.z - e1.z * e2.y,
-            e1.z * e2.x - e1.x * e2.z,
-            e1.x * e2.y - e1.y * e2.x,
-        };
-        const double alignment =
-            cross.x * outward.x + cross.y * outward.y + cross.z * outward.z;
-
-        std::array<std::size_t, 4> oriented = indices;
-        if (alignment < 0.0) {
-            oriented = {indices[0], indices[3], indices[2], indices[1]};
-        }
-
-        mesh.triangles.push_back({
-            static_cast<std::uint32_t>(oriented[0]),
-            static_cast<std::uint32_t>(oriented[1]),
-            static_cast<std::uint32_t>(oriented[2]),
-        });
-        mesh.triangles.push_back({
-            static_cast<std::uint32_t>(oriented[0]),
-            static_cast<std::uint32_t>(oriented[2]),
-            static_cast<std::uint32_t>(oriented[3]),
-        });
-
-        for (std::size_t vertex_index : oriented) {
-            normal_accum[vertex_index].x += outward.x;
-            normal_accum[vertex_index].y += outward.y;
-            normal_accum[vertex_index].z += outward.z;
-        }
-    };
-
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        surface_counter.tick();
-        if (opened_inside[leaf_index] == 0U) {
-            continue;
-        }
-
-        std::uint32_t cell_x = 0U;
-        std::uint32_t cell_y = 0U;
-        std::uint32_t cell_z = 0U;
-        const OctreeCell &cell = all_cells[solid_leaves[leaf_index].cell_index];
-        morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
-        const std::uint32_t span = 1U << (max_depth - cell.depth);
-        const std::uint32_t ix0 = cell_x << (max_depth - cell.depth);
-        const std::uint32_t iy0 = cell_y << (max_depth - cell.depth);
-        const std::uint32_t iz0 = cell_z << (max_depth - cell.depth);
-
-        for (std::uint32_t u = 0; u < span; ++u) {
-            for (std::uint32_t v = 0; v < span; ++v) {
-                const auto neighbor_opened = [&](std::int64_t neighbor_cell_index) {
-                    if (neighbor_cell_index < 0) {
-                        return false;
-                    }
-                    const std::size_t neighbor_leaf = static_cast<std::size_t>(neighbor_cell_index);
-                    return opened_inside[neighbor_leaf] != 0U;
-                };
-                auto lookup_neighbor = [&](std::uint32_t qx, std::uint32_t qy,
-                                           std::uint32_t qz) {
-                    if (qx >= fine_resolution || qy >= fine_resolution || qz >= fine_resolution) {
-                        return false;
-                    }
-                    const std::size_t neighbor_cell_index =
-                        spatial_index.find_leaf_at(qx, qy, qz);
-                    if (neighbor_cell_index == SIZE_MAX ||
-                        neighbor_cell_index >= cell_to_leaf_index.size()) {
-                        return false;
-                    }
-                    const std::int64_t neighbor_leaf_index =
-                        cell_to_leaf_index[neighbor_cell_index];
-                    return neighbor_opened(neighbor_leaf_index);
-                };
-
-                if (ix0 == 0U || !lookup_neighbor(ix0 - 1U, iy0 + u, iz0 + v)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0, iy0 + u, iz0 + v),
-                        vertex_index_for(ix0, iy0 + u + 1U, iz0 + v),
-                        vertex_index_for(ix0, iy0 + u + 1U, iz0 + v + 1U),
-                        vertex_index_for(ix0, iy0 + u, iz0 + v + 1U),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {-1.0, 0.0, 0.0});
-                }
-                if (ix0 + span >= fine_resolution ||
-                    !lookup_neighbor(ix0 + span, iy0 + u, iz0 + v)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0 + span, iy0 + u, iz0 + v),
-                        vertex_index_for(ix0 + span, iy0 + u, iz0 + v + 1U),
-                        vertex_index_for(ix0 + span, iy0 + u + 1U, iz0 + v + 1U),
-                        vertex_index_for(ix0 + span, iy0 + u + 1U, iz0 + v),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {1.0, 0.0, 0.0});
-                }
-                if (iy0 == 0U || !lookup_neighbor(ix0 + u, iy0 - 1U, iz0 + v)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0 + u, iy0, iz0 + v),
-                        vertex_index_for(ix0 + u, iy0, iz0 + v + 1U),
-                        vertex_index_for(ix0 + u + 1U, iy0, iz0 + v + 1U),
-                        vertex_index_for(ix0 + u + 1U, iy0, iz0 + v),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {0.0, -1.0, 0.0});
-                }
-                if (iy0 + span >= fine_resolution ||
-                    !lookup_neighbor(ix0 + u, iy0 + span, iz0 + v)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0 + u, iy0 + span, iz0 + v),
-                        vertex_index_for(ix0 + u + 1U, iy0 + span, iz0 + v),
-                        vertex_index_for(ix0 + u + 1U, iy0 + span, iz0 + v + 1U),
-                        vertex_index_for(ix0 + u, iy0 + span, iz0 + v + 1U),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {0.0, 1.0, 0.0});
-                }
-                if (iz0 == 0U || !lookup_neighbor(ix0 + u, iy0 + v, iz0 - 1U)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0 + u, iy0 + v, iz0),
-                        vertex_index_for(ix0 + u + 1U, iy0 + v, iz0),
-                        vertex_index_for(ix0 + u + 1U, iy0 + v + 1U, iz0),
-                        vertex_index_for(ix0 + u, iy0 + v + 1U, iz0),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {0.0, 0.0, -1.0});
-                }
-                if (iz0 + span >= fine_resolution ||
-                    !lookup_neighbor(ix0 + u, iy0 + v, iz0 + span)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0 + u, iy0 + v, iz0 + span),
-                        vertex_index_for(ix0 + u, iy0 + v + 1U, iz0 + span),
-                        vertex_index_for(ix0 + u + 1U, iy0 + v + 1U, iz0 + span),
-                        vertex_index_for(ix0 + u + 1U, iy0 + v, iz0 + span),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {0.0, 0.0, 1.0});
-                }
-            }
-        }
-    }
-
-    surface_counter.finish();
-
-    ProgressCounter normal_counter(
-        "Meshing", "generate_opened_surface_mesh", "vertices", 1000);
-    for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
-        normal_counter.tick();
-        const double mag = std::sqrt(
-            normal_accum[i].x * normal_accum[i].x +
-            normal_accum[i].y * normal_accum[i].y +
-            normal_accum[i].z * normal_accum[i].z);
-        if (mag > 0.0) {
-            mesh.vertices[i].normal = {
-                normal_accum[i].x / mag,
-                normal_accum[i].y / mag,
-                normal_accum[i].z / mag,
-            };
-        }
-    }
-
-    normal_counter.finish();
-
-    return mesh;
+    std::uint32_t max_depth,
+    std::uint32_t worker_count = 1U,
+    double table_cadence_seconds = 10.0) {
+    return run_opened_surface_task_graph(
+        solid_leaves,
+        opened_inside,
+        all_cells,
+        spatial_index,
+        domain,
+        base_resolution,
+        max_depth,
+        worker_count,
+        table_cadence_seconds);
 }
 
 inline void apply_qef_positions_to_opened_surface_mesh(

@@ -39,6 +39,8 @@ enum class RefinementTaskKind : std::uint8_t {
     kClassify = 1U,
     kDistanceUpdate = 2U,
     kOccupancyUpdate = 3U,
+    kRegionExtractSurface = 4U,
+    kMergeSurfaceBuffers = 5U,
 };
 
 struct RefinementTask {

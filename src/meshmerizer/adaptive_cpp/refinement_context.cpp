@@ -71,7 +71,6 @@ void RefinementContext::sync_cell_state_size() {
     outside_distance_bits_.reserve_to(target);
     center_value_bits_.reserve_to(target);
     occupancy_state_bits_.reserve_to(target);
-    face_neighbor_indices_.reserve_to(target);
 }
 
 std::size_t RefinementContext::size() const {
@@ -333,7 +332,6 @@ std::size_t RefinementContext::reserve_cell_block(std::size_t count) {
     outside_distance_bits_.reserve_to(target);
     center_value_bits_.reserve_to(target);
     occupancy_state_bits_.reserve_to(target);
-    face_neighbor_indices_.reserve_to(target);
     // Explicitly initialize the scheduler side-cars for the newly reserved
     // slots. Do not rely on default construction semantics of
     // ``std::atomic<T>`` arrays here: newly appended children must always
@@ -351,8 +349,6 @@ std::size_t RefinementContext::reserve_cell_block(std::size_t count) {
         outside_distance_bits_[i].store(0U, std::memory_order_relaxed);
         center_value_bits_[i].store(0U, std::memory_order_relaxed);
         occupancy_state_bits_[i].store(0U, std::memory_order_relaxed);
-        face_neighbor_indices_[i] = {
-            SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
     }
     return begin;
 }
@@ -384,10 +380,6 @@ ChunkedArena<std::atomic<std::uint64_t>> &RefinementContext::center_value_bits()
 
 ChunkedArena<std::atomic<std::uint8_t>> &RefinementContext::occupancy_state_bits() {
     return occupancy_state_bits_;
-}
-
-ChunkedArena<std::array<std::size_t, 6>> &RefinementContext::face_neighbor_indices() {
-    return face_neighbor_indices_;
 }
 
 void RefinementContext::materialize_into(
@@ -422,8 +414,7 @@ void RefinementContext::materialize_into(
 void RefinementContext::materialize_thickening_state(
     std::vector<std::uint8_t> *out_cell_classification,
     std::vector<double> *out_center_values,
-    std::vector<std::uint8_t> *out_occupancy_states,
-    std::vector<std::array<std::size_t, 6>> *out_face_neighbors) const {
+    std::vector<std::uint8_t> *out_occupancy_states) const {
     const std::size_t cell_count = cell_arena_.size();
     if (out_cell_classification != nullptr) {
         out_cell_classification->assign(cell_count, 0U);
@@ -444,14 +435,6 @@ void RefinementContext::materialize_thickening_state(
         for (std::size_t i = 0; i < cell_count; ++i) {
             (*out_occupancy_states)[i] =
                 occupancy_state_bits_[i].load(std::memory_order_acquire);
-        }
-    }
-    if (out_face_neighbors != nullptr) {
-        out_face_neighbors->assign(
-            cell_count,
-            {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
-        for (std::size_t i = 0; i < cell_count; ++i) {
-            (*out_face_neighbors)[i] = face_neighbor_indices_[i];
         }
     }
 }
@@ -478,8 +461,6 @@ void RefinementContext::initialize_thickening_state(
             occupancy_state_bits_[i].store(
                 (*initial_occupancy_states)[i], std::memory_order_relaxed);
         }
-        face_neighbor_indices_[i] = {
-            SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
     }
 }
 

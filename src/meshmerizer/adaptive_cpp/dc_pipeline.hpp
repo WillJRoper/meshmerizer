@@ -65,6 +65,7 @@ inline double elapsed_seconds_since(
 
 enum class OccupiedSolidCacheRebuildMode : std::uint8_t {
     kLegacyPass = 0U,
+    kQueuedLeafEpoch = 1U,
 };
 
 inline void rebuild_occupied_solid_classification_cache(
@@ -80,7 +81,6 @@ inline void rebuild_occupied_solid_classification_cache(
     OccupiedSolidCacheRebuildMode rebuild_mode) {
     switch (rebuild_mode) {
         case OccupiedSolidCacheRebuildMode::kLegacyPass:
-        default:
             update_occupied_solid_classification_cache(
                 all_cells,
                 all_contributors,
@@ -92,6 +92,22 @@ inline void rebuild_occupied_solid_classification_cache(
                 classification_cache,
                 &dirty_cells);
             break;
+        case OccupiedSolidCacheRebuildMode::kQueuedLeafEpoch:
+            update_occupied_solid_classification_cache_with_queue(
+                all_cells,
+                all_contributors,
+                positions,
+                smoothing_lengths,
+                solid_spatial_index,
+                isovalue,
+                max_depth,
+                1U,
+                classification_cache,
+                &dirty_cells);
+            break;
+        default:
+            throw std::runtime_error(
+                "unsupported occupied-solid cache rebuild mode");
     }
 }
 
@@ -338,7 +354,9 @@ inline DCPipelineResult run_dc_pipeline(
         LeafSpatialIndex solid_spatial_index;
         solid_spatial_index.build(all_cells, domain, max_depth, base_resolution);
         OccupiedSolidClassificationCache classification_cache;
-        constexpr OccupiedSolidCacheRebuildMode occupied_solid_rebuild_mode =
+        constexpr OccupiedSolidCacheRebuildMode initial_occupied_solid_rebuild_mode =
+            OccupiedSolidCacheRebuildMode::kLegacyPass;
+        constexpr OccupiedSolidCacheRebuildMode post_thickening_rebuild_mode =
             OccupiedSolidCacheRebuildMode::kLegacyPass;
         std::vector<std::uint8_t> dirty_cells(all_cells.size(), 1U);
         std::vector<std::uint8_t> regularization_inside_mask_by_cell;
@@ -358,7 +376,7 @@ inline DCPipelineResult run_dc_pipeline(
             max_depth,
             classification_cache,
             dirty_cells,
-            occupied_solid_rebuild_mode);
+            initial_occupied_solid_rebuild_mode);
         meshmerizer_log_detail::print_status(
             "Timing",
             "run_dc_pipeline",
@@ -405,7 +423,6 @@ inline DCPipelineResult run_dc_pipeline(
                 std::vector<std::uint8_t> closure_inside_flags;
                 std::vector<double> closure_center_values;
                 std::vector<std::uint8_t> closure_occupancy_states;
-                std::vector<std::array<std::size_t, 6>> closure_face_neighbors;
                 const bool thickening_refined = refine_thickening_band_cells(
                     all_cells, all_contributors, positions,
                     smoothing_lengths, isovalue, max_depth,
@@ -420,8 +437,7 @@ inline DCPipelineResult run_dc_pipeline(
                     &dirty_cells,
                     &closure_inside_flags,
                     &closure_center_values,
-                    &closure_occupancy_states,
-                    &closure_face_neighbors);
+                    &closure_occupancy_states);
                 if (!thickening_refined) {
                     meshmerizer_log_detail::print_status(
                         "Regularization",
@@ -447,20 +463,18 @@ inline DCPipelineResult run_dc_pipeline(
                     const bool exported_state_matches_tree =
                         closure_inside_flags.size() == all_cells.size() &&
                         closure_center_values.size() == all_cells.size() &&
-                        closure_occupancy_states.size() == all_cells.size() &&
-                        closure_face_neighbors.size() == all_cells.size();
+                        closure_occupancy_states.size() == all_cells.size();
                     if (!exported_state_matches_tree) {
                         meshmerizer_log_detail::print_status(
                             "Regularization",
                             "run_dc_pipeline",
                             "closure solid-state export size mismatch after pre-thickening "
-                            "(cells=%zu, inside=%zu, center=%zu, occupancy=%zu, neighbors=%zu); "
+                            "(cells=%zu, inside=%zu, center=%zu, occupancy=%zu); "
                             "falling back to full cache rebuild\n",
                             all_cells.size(),
                             closure_inside_flags.size(),
                             closure_center_values.size(),
-                            closure_occupancy_states.size(),
-                            closure_face_neighbors.size());
+                            closure_occupancy_states.size());
                         dirty_cells.assign(all_cells.size(), 1U);
                         rebuild_occupied_solid_classification_cache(
                             all_cells,
@@ -472,7 +486,7 @@ inline DCPipelineResult run_dc_pipeline(
                             max_depth,
                             classification_cache,
                             dirty_cells,
-                            occupied_solid_rebuild_mode);
+                            post_thickening_rebuild_mode);
                     } else {
                         merge_occupied_solid_cache_from_closure_state(
                             all_cells,
@@ -482,7 +496,6 @@ inline DCPipelineResult run_dc_pipeline(
                             std::move(closure_inside_flags),
                             std::move(closure_center_values),
                             std::move(closure_occupancy_states),
-                            std::move(closure_face_neighbors),
                             dirty_cells);
                     }
                 }
@@ -542,8 +555,6 @@ inline DCPipelineResult run_dc_pipeline(
                 std::move(regularization_inside_mask_by_cell));
         std::vector<OccupiedSolidLeaf> &solid_leaves =
             extraction_view.solid_leaves;
-        std::vector<std::uint8_t> &inside_mask =
-            extraction_view.inside_mask;
 
         const auto morphology_start = std::chrono::steady_clock::now();
         const std::vector<std::uint8_t> &inside_mask_by_cell =
@@ -623,7 +634,8 @@ inline DCPipelineResult run_dc_pipeline(
         const auto opened_surface_start = std::chrono::steady_clock::now();
         OpenedSurfaceMesh opened_surface = generate_opened_surface_mesh(
             solid_leaves, opened_inside, all_cells, solid_spatial_index,
-            domain, base_resolution, max_depth);
+            domain, base_resolution, max_depth, worker_count,
+            table_cadence_seconds);
         meshmerizer_log_detail::print_status(
             "Timing",
             "run_dc_pipeline",
@@ -642,7 +654,8 @@ inline DCPipelineResult run_dc_pipeline(
                 std::chrono::steady_clock::now();
             opened_surface = generate_opened_surface_mesh(
                 solid_leaves, opened_inside, all_cells, solid_spatial_index,
-                domain, base_resolution, max_depth);
+                domain, base_resolution, max_depth, worker_count,
+                table_cadence_seconds);
             meshmerizer_log_detail::print_status(
                 "Timing",
                 "run_dc_pipeline",
