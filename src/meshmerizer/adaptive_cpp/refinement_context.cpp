@@ -18,6 +18,19 @@ inline double bits_to_double(std::uint64_t bits) {
     return value;
 }
 
+inline bool range_fits_single_chunk(
+    std::size_t begin,
+    std::size_t end) {
+    if (end <= begin) {
+        return true;
+    }
+    const std::size_t begin_chunk =
+        begin >> meshmerizer_arena_detail::kArenaChunkLog2;
+    const std::size_t end_chunk =
+        (end - 1U) >> meshmerizer_arena_detail::kArenaChunkLog2;
+    return begin_chunk == end_chunk;
+}
+
 }  // namespace
 
 RefinementContext::RefinementContext(
@@ -164,9 +177,12 @@ std::span<const std::size_t> RefinementContext::contributor_span(
     if (safe_end <= safe_begin) {
         return {};
     }
-    // Contributor slices are reserved through reserve_contributor_slice(),
-    // which uses the arena's contiguous block reservation and therefore keeps
-    // each slice within a single chunk.
+    if (!range_fits_single_chunk(safe_begin, safe_end)) {
+        throw std::runtime_error(
+            "refinement contributor slice crosses arena chunks; "
+            "copy_contributors_for_cell() is required"
+        );
+    }
     return std::span<const std::size_t>(
         &contrib_arena_[safe_begin],
         safe_end - safe_begin);
@@ -175,8 +191,26 @@ std::span<const std::size_t> RefinementContext::contributor_span(
 void RefinementContext::copy_contributors_for_cell(
     std::size_t cell_index,
     std::vector<std::size_t> &out_indices) const {
-    const std::span<const std::size_t> contributors = contributor_span(cell_index);
-    out_indices.assign(contributors.begin(), contributors.end());
+    const RefinementContributorRange range = contributor_range(cell_index);
+    if (range.begin < 0 || range.end <= range.begin) {
+        out_indices.clear();
+        return;
+    }
+    const std::size_t safe_begin =
+        static_cast<std::size_t>(std::max<std::int64_t>(0, range.begin));
+    const std::size_t safe_end = static_cast<std::size_t>(std::min(
+        range.end,
+        static_cast<std::int64_t>(contrib_arena_.size())));
+    if (safe_end <= safe_begin) {
+        out_indices.clear();
+        return;
+    }
+
+    out_indices.clear();
+    out_indices.reserve(safe_end - safe_begin);
+    for (std::size_t index = safe_begin; index < safe_end; ++index) {
+        out_indices.push_back(contrib_arena_[index]);
+    }
 }
 
 bool RefinementContext::raise_required_depth_to(
