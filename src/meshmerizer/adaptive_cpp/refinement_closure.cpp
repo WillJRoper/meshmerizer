@@ -2676,19 +2676,11 @@ refine_with_closure(
         }
         seed_cells.push_back(cell_index);
     }
-    const std::vector<std::size_t> startup_seed_cells =
-        build_coarse_startup_seed_order(seed_cells, worker_count);
-    const std::size_t initial_startup_seed_count = std::min<std::size_t>(
-        std::max<std::uint32_t>(1U, worker_count),
-        startup_seed_cells.size());
-    const std::vector<std::size_t> initial_queue_seed_cells(
-        startup_seed_cells.begin(),
-        startup_seed_cells.begin() + initial_startup_seed_count);
     if (!seed_queue_from_cells(
             context,
             queue,
             worker_count,
-            initial_queue_seed_cells)) {
+            seed_cells)) {
         return {
             std::move(initial_cells),
             std::move(initial_contributors),
@@ -2701,9 +2693,7 @@ refine_with_closure(
         positions,
         smoothing_lengths,
         config,
-        queue,
-        &startup_seed_cells,
-        initial_startup_seed_count);
+        queue);
 
     // Materialize arena state back into the caller-visible vectors and
     // return them. Reconciles ``is_leaf`` from ``child_begin`` for any
