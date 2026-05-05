@@ -52,6 +52,14 @@ enum class RefinementTaskKind : std::uint8_t {
     kSuppressOpenedEdgeContacts = 14U,
     kResolveOpenedSurfaceAmbiguities = 15U,
     kReextractOpenedSurface = 16U,
+    kBuildSolidSpatialIndex = 17U,
+    kInitialSolidClassification = 18U,
+    kComputeThickeningSeedDistance = 19U,
+    kRunThickeningClosure = 20U,
+    kMaterializePostThickeningCache = 21U,
+    kComputeFinalThickeningDistance = 22U,
+    kBuildRegularizationInsideMask = 23U,
+    kDilatePreThickeningMask = 24U,
 };
 
 struct RefinementTask {
