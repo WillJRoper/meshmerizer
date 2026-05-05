@@ -577,10 +577,12 @@ inline void merge_occupied_solid_cache_from_closure_state(
     std::vector<std::uint8_t> inside_flags,
     std::vector<double> center_values,
     std::vector<std::uint8_t> occupancy_states,
+    std::vector<std::array<std::size_t, 6>> face_neighbor_cell_indices,
     const std::vector<std::uint8_t> &dirty_cells) {
     cache.inside_flags = std::move(inside_flags);
     cache.center_values = std::move(center_values);
     cache.occupancy_states = std::move(occupancy_states);
+    cache.face_neighbor_cell_indices = std::move(face_neighbor_cell_indices);
     if (cache.inside_flags.size() < all_cells.size()) {
         cache.inside_flags.resize(all_cells.size(), 0U);
     }
@@ -592,9 +594,11 @@ inline void merge_occupied_solid_cache_from_closure_state(
             all_cells.size(),
             static_cast<std::uint8_t>(OccupancyState::kOutside));
     }
-    cache.face_neighbor_cell_indices.resize(
-        all_cells.size(),
-        {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
+    if (cache.face_neighbor_cell_indices.size() < all_cells.size()) {
+        cache.face_neighbor_cell_indices.resize(
+            all_cells.size(),
+            {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
+    }
 
     std::vector<std::uint8_t> active_mask(all_cells.size(), 0U);
     std::vector<std::size_t> active_leaf_indices;
@@ -624,9 +628,7 @@ inline void merge_occupied_solid_cache_from_closure_state(
             continue;
         }
         activate_leaf(dirty_idx);
-        const auto neighbors = face_neighbor_cells(
-            all_cells[dirty_idx], spatial_index, max_depth);
-        cache.face_neighbor_cell_indices[dirty_idx] = neighbors;
+        const auto &neighbors = cache.face_neighbor_cell_indices[dirty_idx];
         for (std::size_t neighbor_idx : neighbors) {
             if (neighbor_idx == SIZE_MAX || neighbor_idx >= all_cells.size()) {
                 continue;
@@ -651,8 +653,17 @@ inline void merge_occupied_solid_cache_from_closure_state(
             continue;
         }
         neighbor_counter.tick();
-        cache.face_neighbor_cell_indices[idx] = face_neighbor_cells(
-            all_cells[idx], spatial_index, max_depth);
+        bool has_exported_neighbors = false;
+        for (std::size_t neighbor_idx : cache.face_neighbor_cell_indices[idx]) {
+            if (neighbor_idx != SIZE_MAX) {
+                has_exported_neighbors = true;
+                break;
+            }
+        }
+        if (!has_exported_neighbors) {
+            cache.face_neighbor_cell_indices[idx] = face_neighbor_cells(
+                all_cells[idx], spatial_index, max_depth);
+        }
     }
     neighbor_counter.finish();
 }
@@ -910,7 +921,9 @@ inline bool refine_thickening_band_cells(
     std::vector<std::uint8_t> *dirty_cells = nullptr,
     std::vector<std::uint8_t> *classified_inside_flags = nullptr,
     std::vector<double> *classified_center_values = nullptr,
-    std::vector<std::uint8_t> *classified_occupancy_states = nullptr) {
+    std::vector<std::uint8_t> *classified_occupancy_states = nullptr,
+    std::vector<std::array<std::size_t, 6>> *classified_face_neighbors =
+        nullptr) {
     if (target_leaf_size <= 0.0 || thickening_radius <= 0.0) {
         return false;
     }
@@ -1055,7 +1068,8 @@ inline bool refine_thickening_band_cells(
         dirty_cells,
         classified_inside_flags,
         classified_center_values,
-        classified_occupancy_states);
+        classified_occupancy_states,
+        classified_face_neighbors);
 }
 
 inline bool thickening_band_is_fully_refined(

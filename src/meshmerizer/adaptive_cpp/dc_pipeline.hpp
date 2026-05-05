@@ -364,6 +364,7 @@ inline DCPipelineResult run_dc_pipeline(
                 std::vector<std::uint8_t> closure_inside_flags;
                 std::vector<double> closure_center_values;
                 std::vector<std::uint8_t> closure_occupancy_states;
+                std::vector<std::array<std::size_t, 6>> closure_face_neighbors;
                 const bool thickening_refined = refine_thickening_band_cells(
                     all_cells, all_contributors, positions,
                     smoothing_lengths, isovalue, max_depth,
@@ -378,7 +379,8 @@ inline DCPipelineResult run_dc_pipeline(
                     &dirty_cells,
                     &closure_inside_flags,
                     &closure_center_values,
-                    &closure_occupancy_states);
+                    &closure_occupancy_states,
+                    &closure_face_neighbors);
                 if (!thickening_refined) {
                     meshmerizer_log_detail::print_status(
                         "Regularization",
@@ -404,18 +406,20 @@ inline DCPipelineResult run_dc_pipeline(
                     const bool exported_state_matches_tree =
                         closure_inside_flags.size() == all_cells.size() &&
                         closure_center_values.size() == all_cells.size() &&
-                        closure_occupancy_states.size() == all_cells.size();
+                        closure_occupancy_states.size() == all_cells.size() &&
+                        closure_face_neighbors.size() == all_cells.size();
                     if (!exported_state_matches_tree) {
                         meshmerizer_log_detail::print_status(
                             "Regularization",
                             "run_dc_pipeline",
                             "closure solid-state export size mismatch after pre-thickening "
-                            "(cells=%zu, inside=%zu, center=%zu, occupancy=%zu); "
+                            "(cells=%zu, inside=%zu, center=%zu, occupancy=%zu, neighbors=%zu); "
                             "falling back to full cache rebuild\n",
                             all_cells.size(),
                             closure_inside_flags.size(),
                             closure_center_values.size(),
-                            closure_occupancy_states.size());
+                            closure_occupancy_states.size(),
+                            closure_face_neighbors.size());
                         dirty_cells.assign(all_cells.size(), 1U);
                         update_occupied_solid_classification_cache(
                             all_cells, all_contributors, positions,
@@ -431,6 +435,7 @@ inline DCPipelineResult run_dc_pipeline(
                             std::move(closure_inside_flags),
                             std::move(closure_center_values),
                             std::move(closure_occupancy_states),
+                            std::move(closure_face_neighbors),
                             dirty_cells);
                     }
                 }

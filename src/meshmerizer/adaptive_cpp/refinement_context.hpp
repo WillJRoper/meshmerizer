@@ -204,7 +204,8 @@ public:
     void materialize_thickening_state(
         std::vector<std::uint8_t> *out_cell_classification,
         std::vector<double> *out_center_values,
-        std::vector<std::uint8_t> *out_occupancy_states) const;
+        std::vector<std::uint8_t> *out_occupancy_states,
+        std::vector<std::array<std::size_t, 6>> *out_face_neighbors) const;
 
     void initialize_thickening_state(
         const std::vector<std::uint8_t> *initial_cell_classification,
@@ -234,6 +235,9 @@ public:
 
     /** Expose the per-cell occupancy-state side-car. */
     ChunkedArena<std::atomic<std::uint8_t>> &occupancy_state_bits();
+
+    /** Expose the per-cell face-neighbor indices side-car. */
+    ChunkedArena<std::array<std::size_t, 6>> &face_neighbor_indices();
 
 private:
     /** External vectors retained only so that materialize_into can target them. */
@@ -266,6 +270,8 @@ private:
     ChunkedArena<std::atomic<std::uint64_t>> center_value_bits_;
     // Occupancy state aligned with adaptive_solid::OccupancyState values.
     ChunkedArena<std::atomic<std::uint8_t>> occupancy_state_bits_;
+    // Face-neighbor cell indices aligned with OccupiedSolidClassificationCache.
+    ChunkedArena<std::array<std::size_t, 6>> face_neighbor_indices_;
 
     /**
      * @brief Propagate required_depth upward from a cell that was just raised.

@@ -2053,9 +2053,11 @@ inline void process_occupancy_update_task(
             worker.config.base_resolution);
         if (neighbor_idx == std::numeric_limits<std::size_t>::max() ||
             neighbor_idx >= context.size()) {
+            context.face_neighbor_indices()[idx][&face - faces] = SIZE_MAX;
             touches_opposite = true;
             continue;
         }
+        context.face_neighbor_indices()[idx][&face - faces] = neighbor_idx;
         const bool neighbor_inside =
             context.cell_classification()[neighbor_idx].load(
                 std::memory_order_acquire) != 0U;
@@ -2694,7 +2696,8 @@ bool refine_thickening_band_with_closure(
     std::vector<std::uint8_t> *dirty_cells,
     std::vector<std::uint8_t> *classified_inside_flags,
     std::vector<double> *classified_center_values,
-    std::vector<std::uint8_t> *classified_occupancy_states) {
+    std::vector<std::uint8_t> *classified_occupancy_states,
+    std::vector<std::array<std::size_t, 6>> *classified_face_neighbors) {
     if (target_leaf_size <= 0.0) {
         return false;
     }
@@ -2797,11 +2800,13 @@ bool refine_thickening_band_with_closure(
 
         if (classified_inside_flags != nullptr ||
             classified_center_values != nullptr ||
-            classified_occupancy_states != nullptr) {
+            classified_occupancy_states != nullptr ||
+            classified_face_neighbors != nullptr) {
             context.materialize_thickening_state(
                 classified_inside_flags,
                 classified_center_values,
-                classified_occupancy_states);
+                classified_occupancy_states,
+                classified_face_neighbors);
         }
         context.materialize_into(all_cells, all_contributors);
         meshmerizer_log_detail::print_debug_status(
