@@ -54,13 +54,15 @@ Dataset layout
     ``normals``: float64[V, 3]
     ``group_labels``: int64[V]
 
-The imported Python representation mirrors the historical dictionary-based API
-so existing reconstruction and diagnostic code can continue to consume it.
+The imported Python representation preserves the historical dictionary-based API
+through a lazy sequence wrapper so existing reconstruction and diagnostic code
+can continue to consume it without paying the full materialization cost up
+front.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -78,6 +80,63 @@ SCHEMA_VERSION = "1.0"
 CellDict = Dict[str, object]
 Vec3 = Tuple[float, float, float]
 MeshVertex = Tuple[Vec3, Vec3]
+
+
+class ColumnarCells:
+    """Lazy sequence view over imported octree cell columns."""
+
+    def __init__(
+        self,
+        columns: dict[str, np.ndarray],
+        contributor_indices: np.ndarray,
+    ) -> None:
+        """Store the imported octree columns for lazy cell reconstruction.
+
+        Args:
+            columns: Columnar octree arrays loaded from HDF5.
+            contributor_indices: Flat contributor index array.
+        """
+        self._columns = columns
+        self._contributor_indices = contributor_indices
+        self._cache: list[Optional[CellDict]] = [None] * len(
+            columns["morton_keys"]
+        )
+
+    def __len__(self) -> int:
+        """Return the number of octree cells."""
+        return len(self._cache)
+
+    def __getitem__(
+        self, index: Union[int, slice]
+    ) -> Union[CellDict, list[CellDict]]:
+        """Materialize one cell or a slice of cells on demand."""
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[position] for position in range(start, stop, step)]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError("cell index out of range")
+
+        cached = self._cache[index]
+        if cached is None:
+            cached = _decode_cell(
+                index,
+                self._columns,
+                self._contributor_indices,
+            )
+            self._cache[index] = cached
+        return cached
+
+    def __iter__(self):
+        """Iterate over cells, materializing entries lazily."""
+        for index in range(len(self)):
+            yield self[index]
+
+    @property
+    def columns(self) -> dict[str, np.ndarray]:
+        """Expose the underlying columnar arrays for fast re-export."""
+        return self._columns
 
 
 def _as_position_array(positions: Sequence[Vec3]) -> np.ndarray:
@@ -138,6 +197,12 @@ def _encode_cells(
         ValueError: If a cell's contributor slice cannot be matched back to the
             flat contributor array.
     """
+    if isinstance(cells, ColumnarCells):
+        return {
+            name: values.copy()
+            for name, values in cells.columns.items()
+        }
+
     n_cells = len(cells)
     morton_keys = np.empty(n_cells, dtype=np.uint64)
     depths = np.empty(n_cells, dtype=np.uint32)
@@ -209,54 +274,65 @@ def _encode_cells(
     }
 
 
-def _decode_cells(tree, contributor_indices: np.ndarray) -> list[CellDict]:
-    """Reconstruct historical cell dictionaries from the columnar layout.
+def _load_cell_columns(tree) -> dict[str, np.ndarray]:
+    """Load columnar octree arrays from the HDF5 group.
 
     Args:
         tree: HDF5 octree group.
+
+    Returns:
+        Mapping of dataset names to loaded NumPy arrays.
+    """
+    return {
+        "morton_keys": tree["morton_keys"][:],
+        "depths": tree["depths"][:],
+        "bounds_min": tree["bounds_min"][:],
+        "bounds_max": tree["bounds_max"][:],
+        "is_leaf": tree["is_leaf"][:],
+        "is_active": tree["is_active"][:],
+        "has_surface": tree["has_surface"][:],
+        "child_begin": tree["child_begin"][:],
+        "corner_sign_mask": tree["corner_sign_mask"][:],
+        "corner_values": tree["corner_values"][:],
+        "contributor_begin": tree["contributor_begin"][:],
+        "contributor_end": tree["contributor_end"][:],
+    }
+
+
+def _decode_cell(
+    index: int,
+    columns: dict[str, np.ndarray],
+    contributor_indices: np.ndarray,
+) -> CellDict:
+    """Reconstruct one historical cell dictionary from columnar arrays.
+
+    Args:
+        index: Cell index to decode.
+        columns: Loaded octree columns.
         contributor_indices: Flat contributor array loaded from disk.
 
     Returns:
-        Cell dictionaries matching the historical Python/native bridge format.
+        Cell dictionary matching the historical Python/native bridge format.
     """
-    morton_keys = tree["morton_keys"][:]
-    depths = tree["depths"][:]
-    bounds_min = tree["bounds_min"][:]
-    bounds_max = tree["bounds_max"][:]
-    is_leaf = tree["is_leaf"][:]
-    is_active = tree["is_active"][:]
-    has_surface = tree["has_surface"][:]
-    child_begin = tree["child_begin"][:]
-    sign_masks = tree["corner_sign_mask"][:]
-    corner_values = tree["corner_values"][:]
-    contributor_begin = tree["contributor_begin"][:]
-    contributor_end = tree["contributor_end"][:]
-
-    cells: list[CellDict] = []
-    for index in range(len(morton_keys)):
-        begin = int(contributor_begin[index])
-        end = int(contributor_end[index])
-        cells.append(
-            {
-                "morton_key": int(morton_keys[index]),
-                "depth": int(depths[index]),
-                "bounds": (
-                    tuple(bounds_min[index].tolist()),
-                    tuple(bounds_max[index].tolist()),
-                ),
-                "is_leaf": int(bool(is_leaf[index])),
-                "is_active": int(bool(is_active[index])),
-                "has_surface": int(bool(has_surface[index])),
-                "child_begin": int(child_begin[index]),
-                "corner_sign_mask": int(sign_masks[index]),
-                "corner_values": tuple(corner_values[index].tolist()),
-                "contributors": tuple(
-                    int(value)
-                    for value in contributor_indices[begin:end].tolist()
-                ),
-            }
-        )
-    return cells
+    begin = int(columns["contributor_begin"][index])
+    end = int(columns["contributor_end"][index])
+    return {
+        "morton_key": int(columns["morton_keys"][index]),
+        "depth": int(columns["depths"][index]),
+        "bounds": (
+            tuple(columns["bounds_min"][index].tolist()),
+            tuple(columns["bounds_max"][index].tolist()),
+        ),
+        "is_leaf": int(bool(columns["is_leaf"][index])),
+        "is_active": int(bool(columns["is_active"][index])),
+        "has_surface": int(bool(columns["has_surface"][index])),
+        "child_begin": int(columns["child_begin"][index]),
+        "corner_sign_mask": int(columns["corner_sign_mask"][index]),
+        "corner_values": tuple(columns["corner_values"][index].tolist()),
+        "contributors": tuple(
+            int(value) for value in contributor_indices[begin:end].tolist()
+        ),
+    }
 
 
 def export_octree(
@@ -368,7 +444,8 @@ def import_octree(path: str) -> dict:
         smoothing_array = particles["smoothing_lengths"][:]
 
         contributor_indices = handle["contributors"]["indices"][:]
-        cells = _decode_cells(handle["octree"], contributor_indices)
+        cell_columns = _load_cell_columns(handle["octree"])
+        cells = ColumnarCells(cell_columns, contributor_indices)
 
         vertices = None
         normals = None
