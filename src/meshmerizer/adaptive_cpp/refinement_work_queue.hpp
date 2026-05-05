@@ -31,11 +31,14 @@
  * kDistanceUpdate – compute or update the outside distance for the cell and,
  *                 if within the thickening band and above target leaf size,
  *                 enqueue a kRefine task.
+ * kOccupancyUpdate – refresh inside/boundary occupancy for one leaf from the
+ *                 current cell-classification state of its face neighbours.
  */
 enum class RefinementTaskKind : std::uint8_t {
     kRefine = 0U,
     kClassify = 1U,
     kDistanceUpdate = 2U,
+    kOccupancyUpdate = 3U,
 };
 
 struct RefinementTask {

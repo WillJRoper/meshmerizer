@@ -376,9 +376,9 @@ inline DCPipelineResult run_dc_pipeline(
                     "materializing occupied solid classification cache after pre-thickening\n");
                 const auto rebuild_solid_classify_start =
                     std::chrono::steady_clock::now();
-                solid_spatial_index.build(
-                    all_cells, domain, max_depth, base_resolution);
                 if (thickening_refined) {
+                    solid_spatial_index.build(
+                        all_cells, domain, max_depth, base_resolution);
                     const bool exported_state_matches_tree =
                         closure_inside_flags.size() == all_cells.size() &&
                         closure_center_values.size() == all_cells.size() &&

@@ -313,6 +313,7 @@ struct ClosureRunStats {
     // the status table can show classify / dist_upd / refine breakdown.
     std::atomic<std::size_t> classify_pop_count{0U};
     std::atomic<std::size_t> distance_update_pop_count{0U};
+    std::atomic<std::size_t> occupancy_update_pop_count{0U};
     std::atomic<std::size_t> refine_pop_count{0U};
 };
 
@@ -328,6 +329,7 @@ struct ClosureRunStatsSnapshot {
     // Per-kind breakdown.
     std::size_t classify_pop_count = 0U;
     std::size_t distance_update_pop_count = 0U;
+    std::size_t occupancy_update_pop_count = 0U;
     std::size_t refine_pop_count = 0U;
 };
 
@@ -348,6 +350,8 @@ inline ClosureRunStatsSnapshot snapshot_run_stats(
     out.classify_pop_count = stats.classify_pop_count.load(
         std::memory_order_relaxed);
     out.distance_update_pop_count = stats.distance_update_pop_count.load(
+        std::memory_order_relaxed);
+    out.occupancy_update_pop_count = stats.occupancy_update_pop_count.load(
         std::memory_order_relaxed);
     out.refine_pop_count = stats.refine_pop_count.load(
         std::memory_order_relaxed);
@@ -472,6 +476,7 @@ private:
         // Per-task-kind pop counters for table breakdown.
         std::size_t classify_pop_count = 0U;
         std::size_t distance_update_pop_count = 0U;
+        std::size_t occupancy_update_pop_count = 0U;
         std::size_t refine_pop_count = 0U;
 
         bool operator==(const EmittedSnapshot &other) const {
@@ -490,6 +495,8 @@ private:
                    classify_pop_count == other.classify_pop_count &&
                    distance_update_pop_count ==
                        other.distance_update_pop_count &&
+                   occupancy_update_pop_count ==
+                       other.occupancy_update_pop_count &&
                    refine_pop_count == other.refine_pop_count;
         }
 
@@ -562,6 +569,8 @@ public:
             kTableCountWidth,
             "dist_upd",
             kTableCountWidth,
+            "occup_upd",
+            kTableCountWidth,
             "split",
             kTableCountWidth,
             "balance",
@@ -592,6 +601,7 @@ public:
             queue_stats.high_watermark,
             run_stats_snapshot.classify_pop_count,
             run_stats_snapshot.distance_update_pop_count,
+            run_stats_snapshot.occupancy_update_pop_count,
             run_stats_snapshot.refine_pop_count,
         };
     }
@@ -612,7 +622,7 @@ public:
         const double elapsed_seconds =
             std::chrono::duration<double>(now - start_time_).count();
         meshmerizer_log_detail::print_indented_status(
-            "%*.1f %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu"
+            "%*.1f %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu"
             " %*zu %*zu %*zu %*zu\n",
             kTableElapsedWidth,
             elapsed_seconds,
@@ -632,6 +642,8 @@ public:
             snapshot.classify_pop_count,
             kTableCountWidth,
             snapshot.distance_update_pop_count,
+            kTableCountWidth,
+            snapshot.occupancy_update_pop_count,
             kTableCountWidth,
             snapshot.split_count,
             kTableCountWidth,
@@ -1841,178 +1853,15 @@ inline std::uint64_t double_to_bits(double value) {
     return bits;
 }
 
-inline void refresh_occupancy_state_for_cell(
-    std::size_t idx,
+inline void enqueue_occupancy_update(
+    std::size_t cell_index,
     ClosureWorkerState &worker) {
-
-    RefinementContext &context = worker.context;
-    if (idx >= context.size()) {
+    if (cell_index >= worker.context.size()) {
         return;
     }
-    if (!closure_is_leaf(context.cells()[idx])) {
-        return;
-    }
-
-    const OctreeCell &cell = context.cells()[idx];
-    constexpr std::uint8_t kInsideOccupancy = 1U;
-    constexpr std::uint8_t kBoundaryInsideOccupancy = 2U;
-    constexpr std::uint8_t kBoundaryOutsideOccupancy = 3U;
-    const std::uint8_t cls =
-        context.cell_classification()[idx].load(std::memory_order_acquire);
-    const bool inside = cls != 0U;
-    std::uint8_t occupancy = inside ? kInsideOccupancy : 0U;
-
-    std::uint32_t cell_x = 0U;
-    std::uint32_t cell_y = 0U;
-    std::uint32_t cell_z = 0U;
-    morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
-    const std::uint32_t cell_shift = worker.config.max_depth - cell.depth;
-    const std::uint32_t fine_min_x = cell_x << cell_shift;
-    const std::uint32_t fine_min_y = cell_y << cell_shift;
-    const std::uint32_t fine_min_z = cell_z << cell_shift;
-    const std::uint32_t span = 1U << cell_shift;
-    const std::uint32_t half_span = span / 2U > 0U ? span / 2U : 1U;
-    const std::int64_t fine_max = static_cast<std::int64_t>(
-        worker.config.base_resolution << worker.config.max_depth);
-
-    struct FaceInfo { int axis; bool positive; };
-    const FaceInfo faces[6] = {
-        {0, false}, {0, true}, {1, false},
-        {1, true},  {2, false}, {2, true},
-    };
-    bool touches_opposite = false;
-    for (const FaceInfo &face : faces) {
-        const std::int64_t base_x = static_cast<std::int64_t>(fine_min_x);
-        const std::int64_t base_y = static_cast<std::int64_t>(fine_min_y);
-        const std::int64_t base_z = static_cast<std::int64_t>(fine_min_z);
-        std::int64_t probe[3] = {
-            base_x + static_cast<std::int64_t>(half_span),
-            base_y + static_cast<std::int64_t>(half_span),
-            base_z + static_cast<std::int64_t>(half_span),
-        };
-        if (face.positive) {
-            probe[face.axis] = face.axis == 0 ?
-                base_x + static_cast<std::int64_t>(span) :
-                face.axis == 1 ?
-                    base_y + static_cast<std::int64_t>(span) :
-                    base_z + static_cast<std::int64_t>(span);
-        } else {
-            probe[face.axis] = face.axis == 0 ? base_x - 1
-                             : face.axis == 1 ? base_y - 1
-                                              : base_z - 1;
-        }
-        if (probe[0] < 0 || probe[0] >= fine_max ||
-            probe[1] < 0 || probe[1] >= fine_max ||
-            probe[2] < 0 || probe[2] >= fine_max) {
-            touches_opposite = true;
-            continue;
-        }
-        const std::uint64_t target_morton = morton_encode_3d(
-            static_cast<std::uint32_t>(probe[0]),
-            static_cast<std::uint32_t>(probe[1]),
-            static_cast<std::uint32_t>(probe[2]));
-        const std::size_t neighbor_idx = closure_locate_cell_for_target(
-            idx,
-            context.cells(),
-            target_morton,
-            worker.config.max_depth,
-            worker.config.base_resolution);
-        if (neighbor_idx == std::numeric_limits<std::size_t>::max() ||
-            neighbor_idx >= context.size()) {
-            touches_opposite = true;
-            continue;
-        }
-        const bool neighbor_inside =
-            context.cell_classification()[neighbor_idx].load(
-                std::memory_order_acquire) != 0U;
-        if (neighbor_inside != inside) {
-            touches_opposite = true;
-        }
-    }
-
-    if (touches_opposite) {
-        occupancy = inside ? kBoundaryInsideOccupancy
-                           : kBoundaryOutsideOccupancy;
-    }
-    context.occupancy_state_bits()[idx].store(
-        occupancy,
-        std::memory_order_release);
-}
-
-inline void refresh_occupancy_state_for_cell_and_neighbors(
-    std::size_t idx,
-    ClosureWorkerState &worker) {
-
-    RefinementContext &context = worker.context;
-    if (idx >= context.size()) {
-        return;
-    }
-    refresh_occupancy_state_for_cell(idx, worker);
-    if (!closure_is_leaf(context.cells()[idx])) {
-        return;
-    }
-
-    const OctreeCell &cell = context.cells()[idx];
-    std::uint32_t cell_x = 0U;
-    std::uint32_t cell_y = 0U;
-    std::uint32_t cell_z = 0U;
-    morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
-    const std::uint32_t cell_shift = worker.config.max_depth - cell.depth;
-    const std::uint32_t fine_min_x = cell_x << cell_shift;
-    const std::uint32_t fine_min_y = cell_y << cell_shift;
-    const std::uint32_t fine_min_z = cell_z << cell_shift;
-    const std::uint32_t span = 1U << cell_shift;
-    const std::uint32_t half_span = span / 2U > 0U ? span / 2U : 1U;
-    const std::int64_t fine_max = static_cast<std::int64_t>(
-        worker.config.base_resolution << worker.config.max_depth);
-
-    struct FaceInfo { int axis; bool positive; };
-    const FaceInfo faces[6] = {
-        {0, false}, {0, true}, {1, false},
-        {1, true},  {2, false}, {2, true},
-    };
-    for (const FaceInfo &face : faces) {
-        const std::int64_t base_x = static_cast<std::int64_t>(fine_min_x);
-        const std::int64_t base_y = static_cast<std::int64_t>(fine_min_y);
-        const std::int64_t base_z = static_cast<std::int64_t>(fine_min_z);
-        std::int64_t probe[3] = {
-            base_x + static_cast<std::int64_t>(half_span),
-            base_y + static_cast<std::int64_t>(half_span),
-            base_z + static_cast<std::int64_t>(half_span),
-        };
-        if (face.positive) {
-            probe[face.axis] = face.axis == 0 ?
-                base_x + static_cast<std::int64_t>(span) :
-                face.axis == 1 ?
-                    base_y + static_cast<std::int64_t>(span) :
-                    base_z + static_cast<std::int64_t>(span);
-        } else {
-            probe[face.axis] = face.axis == 0 ? base_x - 1
-                             : face.axis == 1 ? base_y - 1
-                                              : base_z - 1;
-        }
-        if (probe[0] < 0 || probe[0] >= fine_max ||
-            probe[1] < 0 || probe[1] >= fine_max ||
-            probe[2] < 0 || probe[2] >= fine_max) {
-            continue;
-        }
-        const std::uint64_t target_morton = morton_encode_3d(
-            static_cast<std::uint32_t>(probe[0]),
-            static_cast<std::uint32_t>(probe[1]),
-            static_cast<std::uint32_t>(probe[2]));
-        const std::size_t neighbor_idx = closure_locate_cell_for_target(
-            idx,
-            context.cells(),
-            target_morton,
-            worker.config.max_depth,
-            worker.config.base_resolution);
-        if (neighbor_idx == std::numeric_limits<std::size_t>::max() ||
-            neighbor_idx >= context.size() ||
-            neighbor_idx == idx) {
-            continue;
-        }
-        refresh_occupancy_state_for_cell(neighbor_idx, worker);
-    }
+    worker.queue.push(
+        {cell_index, 0U, 0U, RefinementTaskKind::kOccupancyUpdate},
+        worker.worker_id);
 }
 
 // Atomically store a float distance into the outside_distance_bits side-car
@@ -2083,7 +1932,7 @@ inline void process_classify_task(
     context.cell_classification()[idx].store(
         inside ? std::uint8_t{1U} : std::uint8_t{0U},
         std::memory_order_release);
-    refresh_occupancy_state_for_cell_and_neighbors(idx, worker);
+    enqueue_occupancy_update(idx, worker);
 
     if (!inside) {
         // Outside cells: distance is trivially 0 (they ARE the outside);
@@ -2111,6 +1960,112 @@ inline void process_classify_task(
     worker.queue.push(
         {idx, 0U, 0U, RefinementTaskKind::kDistanceUpdate},
         worker.worker_id);
+}
+
+inline void process_occupancy_update_task(
+    const RefinementTask &task,
+    ClosureWorkerState &worker) {
+
+    const std::size_t idx = task.cell_index;
+    RefinementContext &context = worker.context;
+    if (idx >= context.size()) {
+        return;
+    }
+    if (!closure_is_leaf(context.cells()[idx])) {
+        return;
+    }
+
+    const OctreeCell &cell = context.cells()[idx];
+    constexpr std::uint8_t kInsideOccupancy = 1U;
+    constexpr std::uint8_t kBoundaryInsideOccupancy = 2U;
+    constexpr std::uint8_t kBoundaryOutsideOccupancy = 3U;
+    const std::uint8_t cls =
+        context.cell_classification()[idx].load(std::memory_order_acquire);
+    const bool inside = cls != 0U;
+    std::uint8_t occupancy = inside ? kInsideOccupancy : 0U;
+
+    std::uint32_t cell_x = 0U;
+    std::uint32_t cell_y = 0U;
+    std::uint32_t cell_z = 0U;
+    morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
+    const std::uint32_t cell_shift = worker.config.max_depth - cell.depth;
+    const std::uint32_t fine_min_x = cell_x << cell_shift;
+    const std::uint32_t fine_min_y = cell_y << cell_shift;
+    const std::uint32_t fine_min_z = cell_z << cell_shift;
+    const std::uint32_t span = 1U << cell_shift;
+    const std::uint32_t half_span = span / 2U > 0U ? span / 2U : 1U;
+    const std::int64_t fine_max = static_cast<std::int64_t>(
+        worker.config.base_resolution << worker.config.max_depth);
+
+    struct FaceInfo {
+        int axis;
+        bool positive;
+    };
+    const FaceInfo faces[6] = {
+        {0, false}, {0, true},
+        {1, false}, {1, true},
+        {2, false}, {2, true},
+    };
+    bool touches_opposite = false;
+    for (const FaceInfo &face : faces) {
+        const std::int64_t base_x =
+            static_cast<std::int64_t>(fine_min_x);
+        const std::int64_t base_y =
+            static_cast<std::int64_t>(fine_min_y);
+        const std::int64_t base_z =
+            static_cast<std::int64_t>(fine_min_z);
+        std::int64_t probe[3] = {
+            base_x + static_cast<std::int64_t>(half_span),
+            base_y + static_cast<std::int64_t>(half_span),
+            base_z + static_cast<std::int64_t>(half_span),
+        };
+        if (face.positive) {
+            probe[face.axis] = face.axis == 0 ?
+                base_x + static_cast<std::int64_t>(span) :
+                face.axis == 1 ?
+                    base_y + static_cast<std::int64_t>(span) :
+                    base_z + static_cast<std::int64_t>(span);
+        } else {
+            probe[face.axis] = face.axis == 0 ? base_x - 1
+                             : face.axis == 1 ? base_y - 1
+                                              : base_z - 1;
+        }
+        if (probe[0] < 0 || probe[0] >= fine_max ||
+            probe[1] < 0 || probe[1] >= fine_max ||
+            probe[2] < 0 || probe[2] >= fine_max) {
+            touches_opposite = true;
+            continue;
+        }
+        const std::uint64_t target_morton = morton_encode_3d(
+            static_cast<std::uint32_t>(probe[0]),
+            static_cast<std::uint32_t>(probe[1]),
+            static_cast<std::uint32_t>(probe[2]));
+        const std::size_t neighbor_idx = closure_locate_cell_for_target(
+            idx,
+            context.cells(),
+            target_morton,
+            worker.config.max_depth,
+            worker.config.base_resolution);
+        if (neighbor_idx == std::numeric_limits<std::size_t>::max() ||
+            neighbor_idx >= context.size()) {
+            touches_opposite = true;
+            continue;
+        }
+        const bool neighbor_inside =
+            context.cell_classification()[neighbor_idx].load(
+                std::memory_order_acquire) != 0U;
+        if (neighbor_inside != inside) {
+            touches_opposite = true;
+        }
+    }
+
+    if (touches_opposite) {
+        occupancy = inside ? kBoundaryInsideOccupancy
+                           : kBoundaryOutsideOccupancy;
+    }
+    context.occupancy_state_bits()[idx].store(
+        occupancy,
+        std::memory_order_release);
 }
 
 // ---------------------------------------------------------------------------
@@ -2332,6 +2287,11 @@ inline void run_closure_worker_loop(
                 worker.run_stats.distance_update_pop_count.fetch_add(
                     1U, std::memory_order_relaxed);
                 process_distance_update_task(task, worker);
+                break;
+            case RefinementTaskKind::kOccupancyUpdate:
+                worker.run_stats.occupancy_update_pop_count.fetch_add(
+                    1U, std::memory_order_relaxed);
+                process_occupancy_update_task(task, worker);
                 break;
             case RefinementTaskKind::kRefine:
             default:
