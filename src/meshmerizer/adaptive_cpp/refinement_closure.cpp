@@ -313,7 +313,6 @@ struct ClosureRunStats {
     // the status table can show classify / dist_upd / refine breakdown.
     std::atomic<std::size_t> classify_pop_count{0U};
     std::atomic<std::size_t> distance_update_pop_count{0U};
-    std::atomic<std::size_t> occupancy_update_pop_count{0U};
     std::atomic<std::size_t> refine_pop_count{0U};
 };
 
@@ -329,7 +328,6 @@ struct ClosureRunStatsSnapshot {
     // Per-kind breakdown.
     std::size_t classify_pop_count = 0U;
     std::size_t distance_update_pop_count = 0U;
-    std::size_t occupancy_update_pop_count = 0U;
     std::size_t refine_pop_count = 0U;
 };
 
@@ -350,8 +348,6 @@ inline ClosureRunStatsSnapshot snapshot_run_stats(
     out.classify_pop_count = stats.classify_pop_count.load(
         std::memory_order_relaxed);
     out.distance_update_pop_count = stats.distance_update_pop_count.load(
-        std::memory_order_relaxed);
-    out.occupancy_update_pop_count = stats.occupancy_update_pop_count.load(
         std::memory_order_relaxed);
     out.refine_pop_count = stats.refine_pop_count.load(
         std::memory_order_relaxed);
@@ -476,7 +472,6 @@ private:
         // Per-task-kind pop counters for table breakdown.
         std::size_t classify_pop_count = 0U;
         std::size_t distance_update_pop_count = 0U;
-        std::size_t occupancy_update_pop_count = 0U;
         std::size_t refine_pop_count = 0U;
 
         bool operator==(const EmittedSnapshot &other) const {
@@ -495,8 +490,6 @@ private:
                    classify_pop_count == other.classify_pop_count &&
                    distance_update_pop_count ==
                        other.distance_update_pop_count &&
-                   occupancy_update_pop_count ==
-                       other.occupancy_update_pop_count &&
                    refine_pop_count == other.refine_pop_count;
         }
 
@@ -569,8 +562,6 @@ public:
             kTableCountWidth,
             "dist_upd",
             kTableCountWidth,
-            "occup_upd",
-            kTableCountWidth,
             "split",
             kTableCountWidth,
             "balance",
@@ -601,7 +592,6 @@ public:
             queue_stats.high_watermark,
             run_stats_snapshot.classify_pop_count,
             run_stats_snapshot.distance_update_pop_count,
-            run_stats_snapshot.occupancy_update_pop_count,
             run_stats_snapshot.refine_pop_count,
         };
     }
@@ -622,7 +612,7 @@ public:
         const double elapsed_seconds =
             std::chrono::duration<double>(now - start_time_).count();
         meshmerizer_log_detail::print_indented_status(
-            "%*.1f %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu"
+            "%*.1f %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu"
             " %*zu %*zu %*zu %*zu\n",
             kTableElapsedWidth,
             elapsed_seconds,
@@ -642,8 +632,6 @@ public:
             snapshot.classify_pop_count,
             kTableCountWidth,
             snapshot.distance_update_pop_count,
-            kTableCountWidth,
-            snapshot.occupancy_update_pop_count,
             kTableCountWidth,
             snapshot.split_count,
             kTableCountWidth,
@@ -1853,120 +1841,10 @@ inline std::uint64_t double_to_bits(double value) {
     return bits;
 }
 
-inline void enqueue_occupancy_update(
-    std::size_t cell_index,
-    ClosureWorkerState &worker) {
-    if (cell_index >= worker.context.size()) {
-        return;
-    }
-    worker.queue.push(
-        {cell_index, 0U, 0U, RefinementTaskKind::kOccupancyUpdate},
-        worker.worker_id);
-}
-
-// Atomically store a float distance into the outside_distance_bits side-car
-// only if the new value is strictly smaller (i.e., maintain a min-register).
-inline void atomic_update_distance_min(
-    std::atomic<std::uint32_t> &slot,
-    float new_distance) {
-    std::uint32_t new_bits = float_to_bits(new_distance);
-    std::uint32_t observed = slot.load(std::memory_order_acquire);
-    while (bits_to_float(observed) > new_distance) {
-        if (slot.compare_exchange_weak(
-                observed, new_bits,
-                std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            break;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Step 4: kClassify task handler.
-//
-// Evaluates whether the cell centre is inside the particle field and records
-// the result in the cell_classification_ side-car.  If inside, initialises
-// outside_distance_bits_ to +inf and enqueues a kDistanceUpdate task.
-// ---------------------------------------------------------------------------
-
-inline void process_classify_task(
-    const RefinementTask &task,
+inline void refresh_occupancy_state_for_cell(
+    std::size_t idx,
     ClosureWorkerState &worker) {
 
-    const std::size_t idx = task.cell_index;
-    RefinementContext &context = worker.context;
-
-    if (idx >= context.size()) {
-        return;
-    }
-
-    // Only classify leaf cells; internal cells are not relevant.
-    if (!closure_is_leaf(context.cells()[idx])) {
-        return;
-    }
-
-    const OctreeCell &cell = context.cells()[idx];
-
-    std::vector<std::size_t> contributors;
-    context.copy_contributors_for_cell(idx, contributors);
-
-    // Evaluate the SPH density at the cell centre.
-    const Vector3d centre = cell.bounds.center();
-    double field_value = 0.0;
-    for (std::size_t pi : contributors) {
-        const Vector3d d = {
-            centre.x - worker.positions[pi].x,
-            centre.y - worker.positions[pi].y,
-            centre.z - worker.positions[pi].z,
-        };
-        const double r = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-        field_value += evaluate_wendland_c2(
-            r, worker.smoothing_lengths[pi], true);
-    }
-
-    // Classification: inside when field_value >= isovalue (matches the
-    // classification logic used by classify_occupied_solid_leaves).
-    const bool inside = (field_value >= worker.config.isovalue);
-    context.center_value_bits()[idx].store(
-        double_to_bits(field_value), std::memory_order_release);
-    context.cell_classification()[idx].store(
-        inside ? std::uint8_t{1U} : std::uint8_t{0U},
-        std::memory_order_release);
-    enqueue_occupancy_update(idx, worker);
-
-    if (!inside) {
-        // Outside cells: distance is trivially 0 (they ARE the outside);
-        // leave outside_distance_bits_ unchanged (it will be read as-is
-        // by any kDistanceUpdate that reaches a neighbour).
-        return;
-    }
-
-    // Inside cell: initialise outside distance to +inf so a kDistanceUpdate
-    // can overwrite it with a finite estimate.
-    context.outside_distance_bits()[idx].store(
-        kPlusInfBits, std::memory_order_release);
-
-    // Only enqueue a distance update for cells that could still be refined.
-    const double target = worker.config.thickening_band_target_leaf_size;
-    if (target <= 0.0) {
-        return;
-    }
-    const double edge = closure_cell_edge_length(cell);
-    if (cell.depth >= worker.config.max_depth || edge <= target) {
-        return;
-    }
-
-    // Push a kDistanceUpdate for this inside cell.
-    worker.queue.push(
-        {idx, 0U, 0U, RefinementTaskKind::kDistanceUpdate},
-        worker.worker_id);
-}
-
-inline void process_occupancy_update_task(
-    const RefinementTask &task,
-    ClosureWorkerState &worker) {
-
-    const std::size_t idx = task.cell_index;
     RefinementContext &context = worker.context;
     if (idx >= context.size()) {
         return;
@@ -2059,6 +1937,180 @@ inline void process_occupancy_update_task(
     context.occupancy_state_bits()[idx].store(
         occupancy,
         std::memory_order_release);
+}
+
+inline void refresh_occupancy_state_for_cell_and_neighbors(
+    std::size_t idx,
+    ClosureWorkerState &worker) {
+
+    RefinementContext &context = worker.context;
+    if (idx >= context.size()) {
+        return;
+    }
+    refresh_occupancy_state_for_cell(idx, worker);
+    if (!closure_is_leaf(context.cells()[idx])) {
+        return;
+    }
+
+    const OctreeCell &cell = context.cells()[idx];
+    std::uint32_t cell_x = 0U;
+    std::uint32_t cell_y = 0U;
+    std::uint32_t cell_z = 0U;
+    morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
+    const std::uint32_t cell_shift = worker.config.max_depth - cell.depth;
+    const std::uint32_t fine_min_x = cell_x << cell_shift;
+    const std::uint32_t fine_min_y = cell_y << cell_shift;
+    const std::uint32_t fine_min_z = cell_z << cell_shift;
+    const std::uint32_t span = 1U << cell_shift;
+    const std::uint32_t half_span = span / 2U > 0U ? span / 2U : 1U;
+    const std::int64_t fine_max = static_cast<std::int64_t>(
+        worker.config.base_resolution << worker.config.max_depth);
+
+    struct FaceInfo { int axis; bool positive; };
+    const FaceInfo faces[6] = {
+        {0, false}, {0, true}, {1, false},
+        {1, true},  {2, false}, {2, true},
+    };
+    for (const FaceInfo &face : faces) {
+        const std::int64_t base_x = static_cast<std::int64_t>(fine_min_x);
+        const std::int64_t base_y = static_cast<std::int64_t>(fine_min_y);
+        const std::int64_t base_z = static_cast<std::int64_t>(fine_min_z);
+        std::int64_t probe[3] = {
+            base_x + static_cast<std::int64_t>(half_span),
+            base_y + static_cast<std::int64_t>(half_span),
+            base_z + static_cast<std::int64_t>(half_span),
+        };
+        if (face.positive) {
+            probe[face.axis] = face.axis == 0 ?
+                base_x + static_cast<std::int64_t>(span) :
+                face.axis == 1 ?
+                    base_y + static_cast<std::int64_t>(span) :
+                    base_z + static_cast<std::int64_t>(span);
+        } else {
+            probe[face.axis] = face.axis == 0 ? base_x - 1
+                             : face.axis == 1 ? base_y - 1
+                                              : base_z - 1;
+        }
+        if (probe[0] < 0 || probe[0] >= fine_max ||
+            probe[1] < 0 || probe[1] >= fine_max ||
+            probe[2] < 0 || probe[2] >= fine_max) {
+            continue;
+        }
+        const std::uint64_t target_morton = morton_encode_3d(
+            static_cast<std::uint32_t>(probe[0]),
+            static_cast<std::uint32_t>(probe[1]),
+            static_cast<std::uint32_t>(probe[2]));
+        const std::size_t neighbor_idx = closure_locate_cell_for_target(
+            idx,
+            context.cells(),
+            target_morton,
+            worker.config.max_depth,
+            worker.config.base_resolution);
+        if (neighbor_idx == std::numeric_limits<std::size_t>::max() ||
+            neighbor_idx >= context.size() ||
+            neighbor_idx == idx) {
+            continue;
+        }
+        refresh_occupancy_state_for_cell(neighbor_idx, worker);
+    }
+}
+
+// Atomically store a float distance into the outside_distance_bits side-car
+// only if the new value is strictly smaller (i.e., maintain a min-register).
+inline void atomic_update_distance_min(
+    std::atomic<std::uint32_t> &slot,
+    float new_distance) {
+    std::uint32_t new_bits = float_to_bits(new_distance);
+    std::uint32_t observed = slot.load(std::memory_order_acquire);
+    while (bits_to_float(observed) > new_distance) {
+        if (slot.compare_exchange_weak(
+                observed, new_bits,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: kClassify task handler.
+//
+// Evaluates whether the cell centre is inside the particle field and records
+// the result in the cell_classification_ side-car.  If inside, initialises
+// outside_distance_bits_ to +inf and enqueues a kDistanceUpdate task.
+// ---------------------------------------------------------------------------
+
+inline void process_classify_task(
+    const RefinementTask &task,
+    ClosureWorkerState &worker) {
+
+    const std::size_t idx = task.cell_index;
+    RefinementContext &context = worker.context;
+
+    if (idx >= context.size()) {
+        return;
+    }
+
+    // Only classify leaf cells; internal cells are not relevant.
+    if (!closure_is_leaf(context.cells()[idx])) {
+        return;
+    }
+
+    const OctreeCell &cell = context.cells()[idx];
+
+    std::vector<std::size_t> contributors;
+    context.copy_contributors_for_cell(idx, contributors);
+
+    // Evaluate the SPH density at the cell centre.
+    const Vector3d centre = cell.bounds.center();
+    double field_value = 0.0;
+    for (std::size_t pi : contributors) {
+        const Vector3d d = {
+            centre.x - worker.positions[pi].x,
+            centre.y - worker.positions[pi].y,
+            centre.z - worker.positions[pi].z,
+        };
+        const double r = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+        field_value += evaluate_wendland_c2(
+            r, worker.smoothing_lengths[pi], true);
+    }
+
+    // Classification: inside when field_value >= isovalue (matches the
+    // classification logic used by classify_occupied_solid_leaves).
+    const bool inside = (field_value >= worker.config.isovalue);
+    context.center_value_bits()[idx].store(
+        double_to_bits(field_value), std::memory_order_release);
+    context.cell_classification()[idx].store(
+        inside ? std::uint8_t{1U} : std::uint8_t{0U},
+        std::memory_order_release);
+    refresh_occupancy_state_for_cell_and_neighbors(idx, worker);
+
+    if (!inside) {
+        // Outside cells: distance is trivially 0 (they ARE the outside);
+        // leave outside_distance_bits_ unchanged (it will be read as-is
+        // by any kDistanceUpdate that reaches a neighbour).
+        return;
+    }
+
+    // Inside cell: initialise outside distance to +inf so a kDistanceUpdate
+    // can overwrite it with a finite estimate.
+    context.outside_distance_bits()[idx].store(
+        kPlusInfBits, std::memory_order_release);
+
+    // Only enqueue a distance update for cells that could still be refined.
+    const double target = worker.config.thickening_band_target_leaf_size;
+    if (target <= 0.0) {
+        return;
+    }
+    const double edge = closure_cell_edge_length(cell);
+    if (cell.depth >= worker.config.max_depth || edge <= target) {
+        return;
+    }
+
+    // Push a kDistanceUpdate for this inside cell.
+    worker.queue.push(
+        {idx, 0U, 0U, RefinementTaskKind::kDistanceUpdate},
+        worker.worker_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -2280,11 +2332,6 @@ inline void run_closure_worker_loop(
                 worker.run_stats.distance_update_pop_count.fetch_add(
                     1U, std::memory_order_relaxed);
                 process_distance_update_task(task, worker);
-                break;
-            case RefinementTaskKind::kOccupancyUpdate:
-                worker.run_stats.occupancy_update_pop_count.fetch_add(
-                    1U, std::memory_order_relaxed);
-                process_occupancy_update_task(task, worker);
                 break;
             case RefinementTaskKind::kRefine:
             default:
