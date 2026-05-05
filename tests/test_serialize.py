@@ -307,3 +307,77 @@ def test_empty_octree_round_trip():
         assert len(result["positions"]) == 0
     finally:
         os.unlink(path)
+
+
+def test_imported_cells_can_be_reexported():
+    """Imported lazy cells can be exported again without data loss."""
+    (
+        cells,
+        contributors,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        domain_min,
+        domain_max,
+        max_depth,
+        base_resolution,
+    ) = _build_sphere_octree()
+
+    with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as src:
+        source_path = src.name
+    with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as dst:
+        round_trip_path = dst.name
+
+    try:
+        export_octree(
+            source_path,
+            isovalue=isovalue,
+            base_resolution=base_resolution,
+            max_depth=max_depth,
+            domain_minimum=domain_min,
+            domain_maximum=domain_max,
+            positions=positions,
+            smoothing_lengths=smoothing_lengths,
+            cells=cells,
+            contributors=contributors,
+        )
+
+        loaded = import_octree(source_path)
+
+        export_octree(
+            round_trip_path,
+            isovalue=loaded["isovalue"],
+            base_resolution=loaded["base_resolution"],
+            max_depth=loaded["max_depth"],
+            domain_minimum=loaded["domain_minimum"],
+            domain_maximum=loaded["domain_maximum"],
+            positions=loaded["positions"],
+            smoothing_lengths=loaded["smoothing_lengths"],
+            cells=loaded["cells"],
+            contributors=loaded["contributors"],
+            vertices=loaded["vertices"],
+            normals=loaded["normals"],
+            group_labels=loaded["group_labels"],
+            version=loaded["version"],
+        )
+
+        reloaded = import_octree(round_trip_path)
+
+        np.testing.assert_array_equal(
+            reloaded["contributors"], loaded["contributors"]
+        )
+        assert len(reloaded["cells"]) == len(loaded["cells"])
+        for first, second in zip(loaded["cells"], reloaded["cells"]):
+            assert second["morton_key"] == first["morton_key"]
+            assert second["depth"] == first["depth"]
+            assert second["bounds"] == first["bounds"]
+            assert bool(second["is_leaf"]) == bool(first["is_leaf"])
+            assert bool(second["is_active"]) == bool(first["is_active"])
+            assert bool(second["has_surface"]) == bool(first["has_surface"])
+            assert second["child_begin"] == first["child_begin"]
+            assert second["corner_sign_mask"] == first["corner_sign_mask"]
+            assert second["corner_values"] == first["corner_values"]
+            assert second["contributors"] == first["contributors"]
+    finally:
+        os.unlink(source_path)
+        os.unlink(round_trip_path)
