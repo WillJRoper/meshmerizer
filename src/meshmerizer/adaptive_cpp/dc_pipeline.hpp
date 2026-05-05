@@ -53,6 +53,7 @@ VertexAdjacency build_triangle_mesh_adjacency(
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <numeric>
 #include <vector>
 
 inline double elapsed_seconds_since(
@@ -156,23 +157,30 @@ inline DCPipelineResult run_dc_pipeline(
     std::vector<OctreeCell> initial_cells;
     initial_cells.reserve(top_cells.size());
     std::vector<std::size_t> initial_contributors;
+    std::vector<std::vector<std::size_t>> top_cell_contributors(
+        top_cells.size());
 
     ProgressBar contrib_bar(
         "Building", "run_dc_pipeline", top_cells.size());
 
-    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(ci);
-        OctreeCell cell = top_cells[ci];
+    const std::int64_t top_cell_count =
+        static_cast<std::int64_t>(top_cells.size());
+#pragma omp parallel for schedule(dynamic)
+    for (std::int64_t ci = 0; ci < top_cell_count; ++ci) {
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                static_cast<std::size_t>(ci))) {
+            contrib_bar.tick();
+            continue;
+        }
+        const OctreeCell &cell = top_cells[static_cast<std::size_t>(ci)];
+        std::vector<std::size_t> &cell_contributors =
+            top_cell_contributors[static_cast<std::size_t>(ci)];
 
         std::uint32_t sx = 0, sy = 0, sz = 0;
         std::uint32_t ex = 0, ey = 0, ez = 0;
         grid.contributor_bin_span(
             cell.bounds, smoothing_lengths,
             sx, sy, sz, ex, ey, ez);
-
-        const std::int64_t begin =
-            static_cast<std::int64_t>(
-                initial_contributors.size());
 
         for (std::uint32_t ix = sx; ix <= ex; ++ix) {
             for (std::uint32_t iy = sy; iy <= ey; ++iy) {
@@ -182,28 +190,41 @@ inline DCPipelineResult run_dc_pipeline(
                         grid.bins[grid.flatten_index(
                             ix, iy, iz)];
                     for (std::size_t pi :
-                         bin.particle_indices) {
+                          bin.particle_indices) {
                         if (particle_support_overlaps_box(
                                 positions[pi],
                                 smoothing_lengths[pi],
                                 cell.bounds)) {
-                            initial_contributors.push_back(
-                                pi);
+                            cell_contributors.push_back(pi);
                         }
                     }
                 }
             }
         }
-
-        const std::int64_t end =
-            static_cast<std::int64_t>(
-                initial_contributors.size());
-        cell.contributor_begin = begin;
-        cell.contributor_end = end;
-        initial_cells.push_back(cell);
         contrib_bar.tick();
     }
     contrib_bar.finish();
+
+    std::vector<std::size_t> contributor_offsets(top_cells.size() + 1U, 0U);
+    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+        contributor_offsets[ci + 1U] =
+            contributor_offsets[ci] + top_cell_contributors[ci].size();
+    }
+    initial_contributors.reserve(contributor_offsets.back());
+    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+        OctreeCell cell = top_cells[ci];
+        const std::size_t begin = contributor_offsets[ci];
+        const std::size_t end = contributor_offsets[ci + 1U];
+        cell.contributor_begin = static_cast<std::int64_t>(begin);
+        cell.contributor_end = static_cast<std::int64_t>(end);
+        initial_cells.push_back(cell);
+        const std::vector<std::size_t> &cell_contributors =
+            top_cell_contributors[ci];
+        initial_contributors.insert(
+            initial_contributors.end(),
+            cell_contributors.begin(),
+            cell_contributors.end());
+    }
     meshmerizer_log_detail::print_debug_status(
         "Timing",
         "run_dc_pipeline",
