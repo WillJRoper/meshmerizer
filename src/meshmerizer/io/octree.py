@@ -198,10 +198,20 @@ def _encode_cells(
             flat contributor array.
     """
     if isinstance(cells, ColumnarCells):
-        return {
-            name: values.copy()
-            for name, values in cells.columns.items()
-        }
+        return {name: values.copy() for name, values in cells.columns.items()}
+
+    contributor_array = np.asarray(contributors, dtype=np.int64)
+
+    def _match_contributor_slice(
+        begin: int,
+        end: int,
+        cell_contributors: Sequence[int],
+    ) -> bool:
+        """Return whether one flat-array slice matches one cell payload."""
+        if begin < 0 or end < begin or end > len(contributor_array):
+            return False
+        expected = np.asarray(cell_contributors, dtype=np.int64)
+        return np.array_equal(contributor_array[begin:end], expected)
 
     n_cells = len(cells)
     morton_keys = np.empty(n_cells, dtype=np.uint64)
@@ -236,27 +246,31 @@ def _encode_cells(
             contributor_end[index] = 0
             continue
 
-        search_start = flat_offset
-        found = False
-        for start in range(search_start, len(contributors)):
-            stop = start + n_contributors
-            if stop > len(contributors):
-                break
-            if all(
-                contributors[start + offset] == cell_contributors[offset]
-                for offset in range(n_contributors)
-            ):
-                contributor_begin[index] = start
-                contributor_end[index] = stop
-                flat_offset = stop
-                found = True
-                break
+        begin = cell.get("contributor_begin")
+        end = cell.get("contributor_end")
+        if begin is not None and end is not None:
+            begin = int(begin)
+            end = int(end)
+            if not _match_contributor_slice(begin, end, cell_contributors):
+                raise ValueError(
+                    f"Cell {index} contributor offsets do not match the "
+                    "flat contributor array"
+                )
+            contributor_begin[index] = begin
+            contributor_end[index] = end
+            flat_offset = max(flat_offset, end)
+            continue
 
-        if not found:
+        begin = flat_offset
+        end = begin + n_contributors
+        if not _match_contributor_slice(begin, end, cell_contributors):
             raise ValueError(
-                f"Cell {index} contributors not found in flat contributor "
-                "array at expected offset"
+                f"Cell {index} contributors do not match the flat "
+                "contributor array at the next expected offset"
             )
+        contributor_begin[index] = begin
+        contributor_end[index] = end
+        flat_offset = end
 
     return {
         "morton_keys": morton_keys,

@@ -381,3 +381,46 @@ def test_imported_cells_can_be_reexported():
     finally:
         os.unlink(source_path)
         os.unlink(round_trip_path)
+
+
+def test_export_uses_stored_contributor_offsets_without_search():
+    """Export should trust validated contributor offsets on each cell."""
+    contributors = np.array([7, 8, 9, 10], dtype=np.int64)
+    cells = [
+        {
+            "morton_key": 1,
+            "depth": 0,
+            "bounds": ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+            "is_leaf": 1,
+            "is_active": 1,
+            "has_surface": 1,
+            "child_begin": -1,
+            "corner_sign_mask": 3,
+            "corner_values": (0.0,) * 8,
+            "contributors": (9, 10),
+            "contributor_begin": 2,
+            "contributor_end": 4,
+        }
+    ]
+
+    with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as f:
+        path = f.name
+
+    try:
+        export_octree(
+            path,
+            isovalue=0.5,
+            base_resolution=1,
+            max_depth=0,
+            domain_minimum=(0.0, 0.0, 0.0),
+            domain_maximum=(1.0, 1.0, 1.0),
+            positions=[],
+            smoothing_lengths=[],
+            cells=cells,
+            contributors=contributors,
+        )
+
+        result = import_octree(path)
+        assert result["cells"][0]["contributors"] == (9, 10)
+    finally:
+        os.unlink(path)
