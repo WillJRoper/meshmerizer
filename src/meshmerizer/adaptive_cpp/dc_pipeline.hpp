@@ -911,22 +911,7 @@ inline DCPipelineResult run_dc_pipeline(
     // positioned at the best-fit intersection of Hermite data
     // from the density field.
 
-    const auto qef_solve_start = std::chrono::steady_clock::now();
-    std::vector<MeshVertex> qef_vertices =
-        solve_all_leaf_vertices(
-            all_cells, all_contributors, positions,
-            smoothing_lengths, isovalue);
-    meshmerizer_log_detail::print_debug_status(
-        "Timing",
-        "run_dc_pipeline",
-        "QEF vertex solve: %.3f s\n",
-        elapsed_seconds_since(qef_solve_start));
-
-    result.n_qef_vertices = qef_vertices.size();
-
-    if (qef_vertices.empty()) {
-        return result;
-    }
+    std::vector<MeshVertex> qef_vertices;
 
     // ================================================================
     // Step 4: Build spatial index for leaf cell lookups.
@@ -960,9 +945,19 @@ inline DCPipelineResult run_dc_pipeline(
         meshmerizer_cancel_detail::poll_for_cancellation_serial(
             qef_vertices.size() + all_cells.size());
         spatial_index.build(all_cells, domain, max_depth, base_resolution);
-        qef_vertices = solve_all_leaf_vertices(
-            all_cells, all_contributors, positions,
-            smoothing_lengths, isovalue);
+    }
+    const auto qef_solve_start = std::chrono::steady_clock::now();
+    qef_vertices = solve_all_leaf_vertices(
+        all_cells, all_contributors, positions,
+        smoothing_lengths, isovalue);
+    meshmerizer_log_detail::print_debug_status(
+        "Timing",
+        "run_dc_pipeline",
+        "QEF vertex solve: %.3f s\n",
+        elapsed_seconds_since(qef_solve_start));
+    result.n_qef_vertices = qef_vertices.size();
+    if (qef_vertices.empty()) {
+        return result;
     }
     spatial_index.build(all_cells, domain, max_depth, base_resolution);
     meshmerizer_log_detail::print_debug_status(
