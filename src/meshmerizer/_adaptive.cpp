@@ -355,6 +355,33 @@ static bool parse_bounds_pair(PyObject *object,
  */
 static bool parse_contributor_indices(PyObject *object,
                                       std::vector<std::size_t> &output) {
+    PyObject *array_object = PyArray_FROM_OTF(
+        object, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    if (array_object != NULL) {
+        PyArrayObject *array =
+            reinterpret_cast<PyArrayObject *>(array_object);
+        if (PyArray_NDIM(array) == 1) {
+            const npy_intp count = PyArray_DIM(array, 0);
+            const std::int64_t *data = reinterpret_cast<const std::int64_t *>(
+                PyArray_DATA(array));
+            output.reserve(output.size() + static_cast<std::size_t>(count));
+            for (npy_intp index = 0; index < count; ++index) {
+                if (data[index] < 0) {
+                    Py_DECREF(array_object);
+                    PyErr_SetString(PyExc_ValueError,
+                                    "contributor indices must be non-negative");
+                    return false;
+                }
+                output.push_back(static_cast<std::size_t>(data[index]));
+            }
+            Py_DECREF(array_object);
+            return true;
+        }
+        Py_DECREF(array_object);
+    } else {
+        PyErr_Clear();
+    }
+
     PyObject *fast = PySequence_Fast(object, "expected a sequence of ints");
     if (fast == NULL) {
         return false;
@@ -531,6 +558,208 @@ static bool parse_octree_cell_dict(PyObject *dictionary,
 }
 
 /**
+ * @brief Try to parse imported ``ColumnarCells`` without materializing dicts.
+ *
+ * The HDF5 import path stores octree cells as a ``ColumnarCells`` wrapper over
+ * NumPy arrays. Reading those arrays directly avoids rebuilding millions of
+ * intermediate Python dictionaries before handing the tree back to native code.
+ *
+ * @param object Candidate Python cell container.
+ * @param cells Parsed output cells.
+ * @return ``true`` if the object was recognized and parsed successfully.
+ */
+static bool try_parse_columnar_cells(PyObject *object,
+                                     std::vector<OctreeCell> &cells) {
+    PyObject *columns_object = PyObject_GetAttrString(object, "columns");
+    if (columns_object == NULL) {
+        PyErr_Clear();
+        columns_object = PyObject_GetAttrString(object, "_columns");
+    }
+    if (columns_object == NULL) {
+        PyErr_Clear();
+        return false;
+    }
+    if (!PyDict_Check(columns_object)) {
+        Py_DECREF(columns_object);
+        return false;
+    }
+
+    auto load_column = [&](const char *name,
+                           int typenum,
+                           int ndim) -> PyArrayObject * {
+        PyObject *value = PyDict_GetItemString(columns_object, name);
+        if (value == NULL) {
+            PyErr_Format(PyExc_KeyError,
+                         "missing column '%s' in imported octree cells",
+                         name);
+            return NULL;
+        }
+        PyObject *array_object =
+            PyArray_FROM_OTF(value, typenum, NPY_ARRAY_IN_ARRAY);
+        if (array_object == NULL) {
+            return NULL;
+        }
+        PyArrayObject *array =
+            reinterpret_cast<PyArrayObject *>(array_object);
+        if (PyArray_NDIM(array) != ndim) {
+            Py_DECREF(array_object);
+            PyErr_Format(PyExc_ValueError,
+                         "column '%s' has unexpected rank",
+                         name);
+            return NULL;
+        }
+        return array;
+    };
+
+    PyArrayObject *morton_keys = load_column("morton_keys", NPY_UINT64, 1);
+    PyArrayObject *depths = load_column("depths", NPY_UINT32, 1);
+    PyArrayObject *bounds_min = load_column("bounds_min", NPY_DOUBLE, 2);
+    PyArrayObject *bounds_max = load_column("bounds_max", NPY_DOUBLE, 2);
+    PyArrayObject *is_leaf = load_column("is_leaf", NPY_BOOL, 1);
+    PyArrayObject *is_active = load_column("is_active", NPY_BOOL, 1);
+    PyArrayObject *has_surface = load_column("has_surface", NPY_BOOL, 1);
+    PyArrayObject *child_begin = load_column("child_begin", NPY_INT64, 1);
+    PyArrayObject *corner_sign_mask =
+        load_column("corner_sign_mask", NPY_UINT8, 1);
+    PyArrayObject *corner_values =
+        load_column("corner_values", NPY_DOUBLE, 2);
+    PyArrayObject *contributor_begin =
+        load_column("contributor_begin", NPY_INT64, 1);
+    PyArrayObject *contributor_end =
+        load_column("contributor_end", NPY_INT64, 1);
+
+    if (morton_keys == NULL || depths == NULL || bounds_min == NULL ||
+        bounds_max == NULL || is_leaf == NULL || is_active == NULL ||
+        has_surface == NULL || child_begin == NULL ||
+        corner_sign_mask == NULL || corner_values == NULL ||
+        contributor_begin == NULL || contributor_end == NULL) {
+        Py_XDECREF(reinterpret_cast<PyObject *>(morton_keys));
+        Py_XDECREF(reinterpret_cast<PyObject *>(depths));
+        Py_XDECREF(reinterpret_cast<PyObject *>(bounds_min));
+        Py_XDECREF(reinterpret_cast<PyObject *>(bounds_max));
+        Py_XDECREF(reinterpret_cast<PyObject *>(is_leaf));
+        Py_XDECREF(reinterpret_cast<PyObject *>(is_active));
+        Py_XDECREF(reinterpret_cast<PyObject *>(has_surface));
+        Py_XDECREF(reinterpret_cast<PyObject *>(child_begin));
+        Py_XDECREF(reinterpret_cast<PyObject *>(corner_sign_mask));
+        Py_XDECREF(reinterpret_cast<PyObject *>(corner_values));
+        Py_XDECREF(reinterpret_cast<PyObject *>(contributor_begin));
+        Py_XDECREF(reinterpret_cast<PyObject *>(contributor_end));
+        Py_DECREF(columns_object);
+        return false;
+    }
+
+    const npy_intp count = PyArray_DIM(morton_keys, 0);
+    const bool shapes_match =
+        PyArray_DIM(depths, 0) == count &&
+        PyArray_DIM(bounds_min, 0) == count &&
+        PyArray_DIM(bounds_max, 0) == count &&
+        PyArray_DIM(is_leaf, 0) == count &&
+        PyArray_DIM(is_active, 0) == count &&
+        PyArray_DIM(has_surface, 0) == count &&
+        PyArray_DIM(child_begin, 0) == count &&
+        PyArray_DIM(corner_sign_mask, 0) == count &&
+        PyArray_DIM(corner_values, 0) == count &&
+        PyArray_DIM(contributor_begin, 0) == count &&
+        PyArray_DIM(contributor_end, 0) == count &&
+        PyArray_DIM(bounds_min, 1) == 3 &&
+        PyArray_DIM(bounds_max, 1) == 3 &&
+        PyArray_DIM(corner_values, 1) == 8;
+    if (!shapes_match) {
+        Py_DECREF(reinterpret_cast<PyObject *>(morton_keys));
+        Py_DECREF(reinterpret_cast<PyObject *>(depths));
+        Py_DECREF(reinterpret_cast<PyObject *>(bounds_min));
+        Py_DECREF(reinterpret_cast<PyObject *>(bounds_max));
+        Py_DECREF(reinterpret_cast<PyObject *>(is_leaf));
+        Py_DECREF(reinterpret_cast<PyObject *>(is_active));
+        Py_DECREF(reinterpret_cast<PyObject *>(has_surface));
+        Py_DECREF(reinterpret_cast<PyObject *>(child_begin));
+        Py_DECREF(reinterpret_cast<PyObject *>(corner_sign_mask));
+        Py_DECREF(reinterpret_cast<PyObject *>(corner_values));
+        Py_DECREF(reinterpret_cast<PyObject *>(contributor_begin));
+        Py_DECREF(reinterpret_cast<PyObject *>(contributor_end));
+        Py_DECREF(columns_object);
+        PyErr_SetString(PyExc_ValueError,
+                        "imported octree columns have inconsistent shapes");
+        return false;
+    }
+
+    const std::uint64_t *morton_key_data =
+        reinterpret_cast<const std::uint64_t *>(PyArray_DATA(morton_keys));
+    const std::uint32_t *depth_data =
+        reinterpret_cast<const std::uint32_t *>(PyArray_DATA(depths));
+    const double *bounds_min_data =
+        reinterpret_cast<const double *>(PyArray_DATA(bounds_min));
+    const double *bounds_max_data =
+        reinterpret_cast<const double *>(PyArray_DATA(bounds_max));
+    const npy_bool *is_leaf_data =
+        reinterpret_cast<const npy_bool *>(PyArray_DATA(is_leaf));
+    const npy_bool *is_active_data =
+        reinterpret_cast<const npy_bool *>(PyArray_DATA(is_active));
+    const npy_bool *has_surface_data =
+        reinterpret_cast<const npy_bool *>(PyArray_DATA(has_surface));
+    const std::int64_t *child_begin_data =
+        reinterpret_cast<const std::int64_t *>(PyArray_DATA(child_begin));
+    const std::uint8_t *corner_sign_mask_data =
+        reinterpret_cast<const std::uint8_t *>(PyArray_DATA(corner_sign_mask));
+    const double *corner_values_data =
+        reinterpret_cast<const double *>(PyArray_DATA(corner_values));
+    const std::int64_t *contributor_begin_data = reinterpret_cast<
+        const std::int64_t *>(PyArray_DATA(contributor_begin));
+    const std::int64_t *contributor_end_data = reinterpret_cast<
+        const std::int64_t *>(PyArray_DATA(contributor_end));
+
+    cells.clear();
+    cells.reserve(static_cast<std::size_t>(count));
+    for (npy_intp index = 0; index < count; ++index) {
+        OctreeCell cell{};
+        cell.parent_index = -1;
+        cell.slot_in_parent = 0U;
+        cell.morton_key = morton_key_data[index];
+        cell.depth = depth_data[index];
+        cell.bounds.min = {
+            bounds_min_data[index * 3 + 0],
+            bounds_min_data[index * 3 + 1],
+            bounds_min_data[index * 3 + 2],
+        };
+        cell.bounds.max = {
+            bounds_max_data[index * 3 + 0],
+            bounds_max_data[index * 3 + 1],
+            bounds_max_data[index * 3 + 2],
+        };
+        cell.is_leaf = is_leaf_data[index] != 0;
+        cell.has_surface = has_surface_data[index] != 0;
+        cell.is_active = is_active_data[index] != 0;
+        cell.is_topo_surface = false;
+        cell.child_begin = child_begin_data[index];
+        cell.representative_vertex_index = -1;
+        cell.corner_sign_mask = corner_sign_mask_data[index];
+        std::copy(
+            corner_values_data + index * 8,
+            corner_values_data + (index + 1) * 8,
+            cell.corner_values.begin());
+        cell.contributor_begin = contributor_begin_data[index];
+        cell.contributor_end = contributor_end_data[index];
+        cells.push_back(cell);
+    }
+
+    Py_DECREF(reinterpret_cast<PyObject *>(morton_keys));
+    Py_DECREF(reinterpret_cast<PyObject *>(depths));
+    Py_DECREF(reinterpret_cast<PyObject *>(bounds_min));
+    Py_DECREF(reinterpret_cast<PyObject *>(bounds_max));
+    Py_DECREF(reinterpret_cast<PyObject *>(is_leaf));
+    Py_DECREF(reinterpret_cast<PyObject *>(is_active));
+    Py_DECREF(reinterpret_cast<PyObject *>(has_surface));
+    Py_DECREF(reinterpret_cast<PyObject *>(child_begin));
+    Py_DECREF(reinterpret_cast<PyObject *>(corner_sign_mask));
+    Py_DECREF(reinterpret_cast<PyObject *>(corner_values));
+    Py_DECREF(reinterpret_cast<PyObject *>(contributor_begin));
+    Py_DECREF(reinterpret_cast<PyObject *>(contributor_end));
+    Py_DECREF(columns_object);
+    return true;
+}
+
+/**
  * @brief Parse a Python sequence of cell dictionaries.
  *
  * @param object Python sequence of dictionaries.
@@ -541,6 +770,13 @@ static bool parse_octree_cell_dict(PyObject *dictionary,
 static bool parse_octree_cell_sequence(PyObject *object,
                                        std::vector<std::size_t> &contributors,
                                        std::vector<OctreeCell> &cells) {
+    if (try_parse_columnar_cells(object, cells)) {
+        return true;
+    }
+    if (PyErr_Occurred()) {
+        return false;
+    }
+
     PyObject *fast = PySequence_Fast(object, "expected a sequence of cell dicts");
     if (fast == NULL) {
         return false;
@@ -1888,8 +2124,13 @@ static PyObject *extract_opened_surface_mesh_py(
         opened_surface_mesh = generate_opened_surface_mesh(
             solid_leaves, opened_inside, all_cells, spatial_index,
             domain, static_cast<std::uint32_t>(base_resolution), max_depth);
+        const std::vector<std::int64_t> cell_to_leaf_index =
+            build_opened_cell_to_leaf_index(all_cells, solid_leaves);
         if (resolve_opened_edge_ambiguities(
-                solid_leaves, all_cells, spatial_index,
+                solid_leaves,
+                all_cells,
+                spatial_index,
+                cell_to_leaf_index,
                 opened_inside, opened_surface_mesh)) {
             opened_surface_mesh = generate_opened_surface_mesh(
                 solid_leaves, opened_inside, all_cells, spatial_index,
@@ -2531,47 +2772,12 @@ static PyObject *classify_occupied_solid_py(
     meshmerizer_cancel_detail::reset_cancel_state();
     PyThreadState *_save = PyEval_SaveThread();
     try {
-        TopLevelParticleGrid grid(domain, base_resolution);
-        grid.insert_particles(positions);
-        grid.compute_bin_max_h(smoothing_lengths);
-
-        std::vector<OctreeCell> top_cells =
-            create_top_level_cells(domain, base_resolution);
-        std::vector<OctreeCell> initial_cells;
-        initial_cells.reserve(top_cells.size());
-        std::vector<std::size_t> initial_contributors;
-
-        for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
-            OctreeCell cell = top_cells[ci];
-            std::uint32_t sx = 0, sy = 0, sz = 0;
-            std::uint32_t ex = 0, ey = 0, ez = 0;
-            grid.contributor_bin_span(
-                cell.bounds, smoothing_lengths, sx, sy, sz, ex, ey, ez);
-
-            const std::int64_t begin =
-                static_cast<std::int64_t>(initial_contributors.size());
-            for (std::uint32_t ix = sx; ix <= ex; ++ix) {
-                for (std::uint32_t iy = sy; iy <= ey; ++iy) {
-                    for (std::uint32_t iz = sz; iz <= ez; ++iz) {
-                        const TopLevelBin &bin =
-                            grid.bins[grid.flatten_index(ix, iy, iz)];
-                        for (std::size_t pi : bin.particle_indices) {
-                            if (particle_support_overlaps_box(
-                                    positions[pi], smoothing_lengths[pi],
-                                    cell.bounds)) {
-                                initial_contributors.push_back(pi);
-                            }
-                        }
-                    }
-                }
-            }
-
-            const std::int64_t end =
-                static_cast<std::int64_t>(initial_contributors.size());
-            cell.contributor_begin = begin;
-            cell.contributor_end = end;
-            initial_cells.push_back(cell);
-        }
+        auto [initial_cells, initial_contributors] =
+            build_top_level_cells_with_contributors(
+                positions,
+                smoothing_lengths,
+                domain,
+                static_cast<std::uint32_t>(base_resolution));
 
         auto [all_cells, all_contributors] = refine_octree(
             std::move(initial_cells), std::move(initial_contributors),
@@ -2581,19 +2787,24 @@ static PyObject *classify_occupied_solid_py(
             static_cast<std::uint32_t>(worker_count),
             0.0,
             static_cast<std::uint32_t>(minimum_usable_hermite_samples),
-            max_qef_rms_residual_ratio, min_normal_alignment_threshold);
+            max_qef_rms_residual_ratio,
+            min_normal_alignment_threshold);
 
-        while (refine_surface_band_cells(
-            all_cells, all_contributors, positions, smoothing_lengths,
-            isovalue, static_cast<std::uint32_t>(max_depth),
-            domain, static_cast<std::uint32_t>(base_resolution),
+        refine_surface_band_cells(
+            all_cells,
+            all_contributors,
+            positions,
+            smoothing_lengths,
+            isovalue,
+            static_cast<std::uint32_t>(max_depth),
+            domain,
+            static_cast<std::uint32_t>(base_resolution),
             static_cast<std::uint32_t>(worker_count),
             max_surface_leaf_size,
             0.0,
             static_cast<std::uint32_t>(minimum_usable_hermite_samples),
             max_qef_rms_residual_ratio,
-            min_normal_alignment_threshold)) {
-        }
+            min_normal_alignment_threshold);
 
         LeafSpatialIndex spatial_index;
         spatial_index.build(
@@ -2604,13 +2815,12 @@ static PyObject *classify_occupied_solid_py(
             all_cells, all_contributors, positions, smoothing_lengths,
             spatial_index, isovalue, static_cast<std::uint32_t>(max_depth),
             classification_cache);
+        std::vector<std::uint8_t> inside_mask;
         solid_leaves = build_occupied_solid_leaves_from_cache(
-            all_cells, classification_cache);
+            all_cells, classification_cache, nullptr, &inside_mask);
         std::vector<std::uint8_t> inside_mask_by_cell =
             build_inside_mask_from_classification_cache(
                 all_cells, classification_cache);
-        std::vector<std::uint8_t> inside_mask = build_leaf_mask_from_cell_mask(
-            solid_leaves, inside_mask_by_cell);
         std::vector<double> thickening_distance_by_cell(
             all_cells.size(), std::numeric_limits<double>::infinity());
         thickening_distance.assign(
@@ -2643,7 +2853,10 @@ static PyObject *classify_occupied_solid_py(
         }
         const std::vector<double> clearance_by_cell =
             compute_inside_clearance_from_cell_mask(
-                all_cells, classification_cache, inside_mask_by_cell);
+                all_cells,
+                classification_cache,
+                inside_mask_by_cell,
+                static_cast<std::uint32_t>(worker_count));
         clearance = project_leaf_scalars_from_cell_state(
             solid_leaves,
             clearance_by_cell,
@@ -2656,7 +2869,10 @@ static PyObject *classify_occupied_solid_py(
             solid_leaves, eroded_inside_by_cell);
         const std::vector<double> dilation_distance_by_cell =
             compute_distance_to_eroded_solid_from_cell_mask(
-                all_cells, classification_cache, eroded_inside_by_cell);
+                all_cells,
+                classification_cache,
+                eroded_inside_by_cell,
+                static_cast<std::uint32_t>(worker_count));
         dilation_distance = project_leaf_scalars_from_cell_state(
             solid_leaves,
             dilation_distance_by_cell,

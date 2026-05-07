@@ -112,6 +112,7 @@ struct StableTreePreludeRuntime {
     std::vector<double> final_thickening_distance;
     std::vector<std::uint8_t> dilated_inside_mask_by_cell;
     std::vector<std::uint8_t> closure_inside_flags;
+    std::vector<std::uint8_t> regularization_inside_mask_seed;
     std::vector<double> closure_center_values;
     std::vector<std::uint8_t> closure_occupancy_states;
     std::array<std::atomic<std::uint32_t>, 8U> dependency_counts;
@@ -358,10 +359,13 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                                     runtime.result.solid_spatial_index,
                                     runtime.isovalue,
                                     runtime.max_depth,
-                                    runtime.result.classification_cache,
-                                    runtime.result.dirty_cells,
-                                    runtime.post_thickening_rebuild_mode);
+                                     runtime.result.classification_cache,
+                                     runtime.result.dirty_cells,
+                                     runtime.post_thickening_rebuild_mode);
+                                runtime.regularization_inside_mask_seed.clear();
                             } else {
+                                runtime.regularization_inside_mask_seed =
+                                    runtime.closure_inside_flags;
                                 merge_occupied_solid_cache_from_closure_state(
                                     *runtime.all_cells,
                                     runtime.result.solid_spatial_index,
@@ -392,10 +396,16 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                                 worker_id);
                             break;
                         case RefinementTaskKind::kBuildRegularizationInsideMask:
-                            runtime.result.regularization_inside_mask_by_cell =
-                                build_inside_mask_from_classification_cache(
-                                    *runtime.all_cells,
-                                    runtime.result.classification_cache);
+                            if (runtime.regularization_inside_mask_seed.size() ==
+                                runtime.all_cells->size()) {
+                                runtime.result.regularization_inside_mask_by_cell =
+                                    std::move(runtime.regularization_inside_mask_seed);
+                            } else {
+                                runtime.result.regularization_inside_mask_by_cell =
+                                    build_inside_mask_from_classification_cache(
+                                        *runtime.all_cells,
+                                        runtime.result.classification_cache);
+                            }
                             unlock_stable_tree_prelude_task(
                                 queue,
                                 runtime,
@@ -751,7 +761,6 @@ inline DCPipelineResult run_dc_pipeline(
         std::vector<std::uint8_t> regularization_inside_mask_by_cell =
             std::move(stable_tree_prelude.regularization_inside_mask_by_cell);
 
-        const auto morphology_start = std::chrono::steady_clock::now();
         PostRefineRegularizationResult post_refine_result =
             run_post_refine_regularization_task_graph(
                 all_cells,
@@ -774,13 +783,28 @@ inline DCPipelineResult run_dc_pipeline(
             "Timing",
             "run_dc_pipeline",
             "Regularization morphology: %.3f s\n",
-            elapsed_seconds_since(morphology_start));
+            post_refine_result.morphology_seconds);
 
         meshmerizer_log_detail::print_status(
             "Timing",
             "run_dc_pipeline",
             "Opened surface extraction: %.3f s\n",
-            elapsed_seconds_since(morphology_start));
+            post_refine_result.opened_surface_extraction_seconds);
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "Opened surface pass 1: %.3f s\n",
+            post_refine_result.opened_surface_pass1_seconds);
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "Opened surface ambiguity resolution: %.3f s\n",
+            post_refine_result.opened_surface_ambiguity_seconds);
+        meshmerizer_log_detail::print_status(
+            "Timing",
+            "run_dc_pipeline",
+            "Opened surface re-extraction: %.3f s\n",
+            post_refine_result.opened_surface_reextract_seconds);
 
         meshmerizer_log_detail::print_status(
             "Regularization",
@@ -862,6 +886,8 @@ inline DCPipelineResult run_dc_pipeline(
             "using opened-solid blocky extraction with existing smoothing\n");
 
         print_octree_structure_summary(all_cells);
+
+        compact_mesh_geometry(opened_vertices, opened_triangles);
 
         result.n_qef_vertices = 0U;
         result.vertices.reserve(opened_vertices.size());
@@ -1050,6 +1076,8 @@ inline DCPipelineResult run_dc_pipeline(
             "Dual contour gap filling: %.3f s\n",
             elapsed_seconds_since(gap_fill_start));
     }
+
+    compact_mesh_geometry(qef_vertices, dc_triangles);
 
     print_octree_structure_summary(all_cells);
 

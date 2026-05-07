@@ -21,9 +21,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <queue>
@@ -200,6 +203,34 @@ inline std::span<const std::size_t> cell_contributor_span(
  */
 inline double cell_edge_length(const OctreeCell &cell) {
     return cell.bounds.max.x - cell.bounds.min.x;
+}
+
+inline std::uint64_t adaptive_solid_double_to_bits(double value) {
+    std::uint64_t bits = 0U;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+inline double adaptive_solid_bits_to_double(std::uint64_t bits) {
+    double value = 0.0;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+inline bool adaptive_solid_atomic_update_distance_min(
+    std::atomic<std::uint64_t> &slot,
+    double new_distance) {
+    std::uint64_t observed = slot.load(std::memory_order_acquire);
+    while (adaptive_solid_bits_to_double(observed) > new_distance) {
+        if (slot.compare_exchange_weak(
+                observed,
+                adaptive_solid_double_to_bits(new_distance),
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -715,13 +746,30 @@ inline void update_occupied_solid_classification_cache_with_queue(
 inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
     const std::vector<OctreeCell> &all_cells,
     const OccupiedSolidClassificationCache &cache,
-    std::vector<std::int64_t> *out_cell_to_leaf_index = nullptr) {
+    std::vector<std::int64_t> *out_cell_to_leaf_index = nullptr,
+    std::vector<std::uint8_t> *out_inside_mask = nullptr,
+    std::vector<std::uint8_t> *out_inside_mask_by_cell = nullptr) {
     std::vector<OccupiedSolidLeaf> solid_leaves;
     solid_leaves.reserve(all_cells.size());
     std::vector<std::int64_t> cell_to_leaf_index(all_cells.size(), -1);
+    std::vector<std::uint8_t> inside_mask;
+    std::vector<std::uint8_t> inside_mask_by_cell;
+    if (out_inside_mask != nullptr) {
+        inside_mask.reserve(all_cells.size());
+    }
+    if (out_inside_mask_by_cell != nullptr) {
+        inside_mask_by_cell.assign(all_cells.size(), 0U);
+    }
+
+    ProgressCounter leaf_build_counter(
+        "Regularization",
+        "build_occupied_solid_leaves_from_cache",
+        "cells",
+        1000);
 
     for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+        leaf_build_counter.tick();
         const OctreeCell &cell = all_cells[cell_idx];
         if (!cell.is_leaf) {
             continue;
@@ -736,7 +784,23 @@ inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
         });
         cell_to_leaf_index[cell_idx] =
             static_cast<std::int64_t>(solid_leaves.size() - 1U);
+        if (out_inside_mask != nullptr) {
+            const std::uint8_t is_inside =
+                occupied_solid_cache_is_inside(cache.occupancy_states[cell_idx])
+                    ? 1U
+                    : 0U;
+            inside_mask.push_back(is_inside);
+            if (out_inside_mask_by_cell != nullptr) {
+                inside_mask_by_cell[cell_idx] = is_inside;
+            }
+        } else if (out_inside_mask_by_cell != nullptr) {
+            inside_mask_by_cell[cell_idx] =
+                occupied_solid_cache_is_inside(cache.occupancy_states[cell_idx])
+                    ? 1U
+                    : 0U;
+        }
     }
+    leaf_build_counter.finish();
 
     ProgressCounter neighbor_counter(
         "Regularization", "classify_occupied_solid_leaves", "leaves", 1000);
@@ -768,6 +832,12 @@ inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
 
     if (out_cell_to_leaf_index != nullptr) {
         *out_cell_to_leaf_index = std::move(cell_to_leaf_index);
+    }
+    if (out_inside_mask != nullptr) {
+        *out_inside_mask = std::move(inside_mask);
+    }
+    if (out_inside_mask_by_cell != nullptr) {
+        *out_inside_mask_by_cell = std::move(inside_mask_by_cell);
     }
 
     return solid_leaves;
@@ -928,18 +998,22 @@ inline OccupiedSolidExtractionView build_occupied_solid_extraction_view(
     const OccupiedSolidClassificationCache &classification_cache,
     std::vector<std::uint8_t> inside_mask_by_cell = {}) {
     OccupiedSolidExtractionView view;
+    std::vector<std::uint8_t> inside_mask;
+    const bool need_inside_mask_by_cell = inside_mask_by_cell.size() != all_cells.size();
     view.solid_leaves =
         build_occupied_solid_leaves_from_cache(
             all_cells,
             classification_cache,
-            &view.cell_to_leaf_index);
-    if (inside_mask_by_cell.size() != all_cells.size()) {
-        inside_mask_by_cell = build_inside_mask_from_classification_cache(
-            all_cells, classification_cache);
+            &view.cell_to_leaf_index,
+            need_inside_mask_by_cell ? &inside_mask : nullptr,
+            need_inside_mask_by_cell ? &inside_mask_by_cell : nullptr);
+    if (need_inside_mask_by_cell) {
+        view.inside_mask = std::move(inside_mask);
+    } else {
+        view.inside_mask = build_leaf_mask_from_cell_mask(
+            view.solid_leaves, inside_mask_by_cell);
     }
     view.inside_mask_by_cell = std::move(inside_mask_by_cell);
-    view.inside_mask = build_leaf_mask_from_cell_mask(
-        view.solid_leaves, view.inside_mask_by_cell);
     return view;
 }
 
@@ -1418,14 +1492,22 @@ inline std::vector<double> compute_inside_clearance_from_cell_mask(
     const std::vector<OctreeCell> &all_cells,
     const OccupiedSolidClassificationCache &classification_cache,
     const std::vector<std::uint8_t> &inside_mask_by_cell,
+    std::uint32_t worker_count = 1U,
     double max_distance = std::numeric_limits<double>::infinity()) {
     const double inf = std::numeric_limits<double>::infinity();
-    std::vector<double> clearance(all_cells.size(), inf);
-    using QueueEntry = std::pair<double, std::size_t>;
-    std::priority_queue<
-        QueueEntry,
-        std::vector<QueueEntry>,
-        std::greater<QueueEntry>> queue;
+    if (worker_count == 0U) {
+        worker_count = 1U;
+    }
+
+    std::vector<std::atomic<std::uint64_t>> clearance_bits(all_cells.size());
+    for (std::size_t cell_index = 0; cell_index < clearance_bits.size(); ++cell_index) {
+        clearance_bits[cell_index].store(
+            adaptive_solid_double_to_bits(inf),
+            std::memory_order_relaxed);
+    }
+
+    RefinementWorkQueue queue;
+    queue.initialize(worker_count);
 
     ProgressCounter seed_counter(
         "Regularization",
@@ -1455,8 +1537,12 @@ inline std::vector<double> compute_inside_clearance_from_cell_mask(
         }
 
         if (is_boundary_seed) {
-            clearance[cell_index] = 0.0;
-            queue.push({0.0, cell_index});
+            clearance_bits[cell_index].store(
+                adaptive_solid_double_to_bits(0.0),
+                std::memory_order_release);
+            queue.push(
+                {cell_index, 0U, 0U, RefinementTaskKind::kComputeInsideClearance},
+                static_cast<std::uint32_t>(cell_index % worker_count));
         }
     }
     seed_counter.finish();
@@ -1464,45 +1550,90 @@ inline std::vector<double> compute_inside_clearance_from_cell_mask(
     ProgressCounter wavefront_counter(
         "Regularization",
         "compute_inside_clearance_from_cell_mask",
-        "queue pops",
+        "relaxations",
         10000);
-    while (!queue.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
-        wavefront_counter.tick();
-        const auto [distance, cell_index] = queue.top();
-        queue.pop();
-        if (distance > clearance[cell_index]) {
-            continue;
-        }
-        if (distance > max_distance) {
-            continue;
-        }
 
-        for (std::size_t neighbor_cell_index :
-             classification_cache.face_neighbor_cell_indices[cell_index]) {
-            if (neighbor_cell_index == SIZE_MAX ||
-                neighbor_cell_index >= all_cells.size()) {
-                continue;
-            }
-            if (!all_cells[neighbor_cell_index].is_leaf ||
-                inside_mask_by_cell[neighbor_cell_index] == 0U) {
-                continue;
-            }
+    std::exception_ptr worker_error;
+    std::mutex error_mutex;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::uint32_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                try {
+                    wavefront_counter.tick();
+                    const std::size_t cell_index = task.cell_index;
+                    if (cell_index >= all_cells.size()) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
 
-            const double edge_cost = 0.5 * (
-                cell_edge_length(all_cells[cell_index]) +
-                cell_edge_length(all_cells[neighbor_cell_index]));
-            const double candidate = distance + edge_cost;
-            if (candidate > max_distance) {
-                continue;
+                    const double distance = adaptive_solid_bits_to_double(
+                        clearance_bits[cell_index].load(std::memory_order_acquire));
+                    if (!std::isfinite(distance) || distance > max_distance) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
+
+                    for (std::size_t neighbor_cell_index :
+                         classification_cache.face_neighbor_cell_indices[cell_index]) {
+                        if (neighbor_cell_index == SIZE_MAX ||
+                            neighbor_cell_index >= all_cells.size()) {
+                            continue;
+                        }
+                        if (!all_cells[neighbor_cell_index].is_leaf ||
+                            inside_mask_by_cell[neighbor_cell_index] == 0U) {
+                            continue;
+                        }
+
+                        const double edge_cost = 0.5 * (
+                            cell_edge_length(all_cells[cell_index]) +
+                            cell_edge_length(all_cells[neighbor_cell_index]));
+                        const double candidate = distance + edge_cost;
+                        if (candidate > max_distance) {
+                            continue;
+                        }
+                        if (adaptive_solid_atomic_update_distance_min(
+                                clearance_bits[neighbor_cell_index], candidate)) {
+                            queue.push(
+                                {neighbor_cell_index,
+                                 0U,
+                                 0U,
+                                 RefinementTaskKind::kComputeInsideClearance},
+                                static_cast<std::uint32_t>(
+                                    neighbor_cell_index % worker_count));
+                        }
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (worker_error == nullptr) {
+                        worker_error = std::current_exception();
+                    }
+                    queue.task_done();
+                    queue.shutdown();
+                    return;
+                }
+                queue.task_done();
+                queue.try_shutdown_if_idle();
             }
-            if (candidate < clearance[neighbor_cell_index]) {
-                clearance[neighbor_cell_index] = candidate;
-                queue.push({candidate, neighbor_cell_index});
-            }
-        }
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    if (worker_error != nullptr) {
+        std::rethrow_exception(worker_error);
     }
     wavefront_counter.finish();
+
+    std::vector<double> clearance(all_cells.size(), inf);
+    for (std::size_t cell_index = 0; cell_index < clearance.size(); ++cell_index) {
+        clearance[cell_index] = adaptive_solid_bits_to_double(
+            clearance_bits[cell_index].load(std::memory_order_acquire));
+    }
 
     return clearance;
 }
@@ -1538,14 +1669,22 @@ inline std::vector<double> compute_distance_to_eroded_solid_from_cell_mask(
     const std::vector<OctreeCell> &all_cells,
     const OccupiedSolidClassificationCache &classification_cache,
     const std::vector<std::uint8_t> &eroded_inside_by_cell,
+    std::uint32_t worker_count = 1U,
     double max_distance = std::numeric_limits<double>::infinity()) {
     const double inf = std::numeric_limits<double>::infinity();
-    std::vector<double> distance_to_eroded(all_cells.size(), inf);
-    using QueueEntry = std::pair<double, std::size_t>;
-    std::priority_queue<
-        QueueEntry,
-        std::vector<QueueEntry>,
-        std::greater<QueueEntry>> queue;
+    if (worker_count == 0U) {
+        worker_count = 1U;
+    }
+
+    std::vector<std::atomic<std::uint64_t>> distance_bits(all_cells.size());
+    for (std::size_t cell_index = 0; cell_index < distance_bits.size(); ++cell_index) {
+        distance_bits[cell_index].store(
+            adaptive_solid_double_to_bits(inf),
+            std::memory_order_relaxed);
+    }
+
+    RefinementWorkQueue queue;
+    queue.initialize(worker_count);
 
     ProgressCounter seed_counter(
         "Regularization",
@@ -1575,8 +1714,12 @@ inline std::vector<double> compute_distance_to_eroded_solid_from_cell_mask(
         }
 
         if (is_boundary_seed) {
-            distance_to_eroded[cell_index] = 0.0;
-            queue.push({0.0, cell_index});
+            distance_bits[cell_index].store(
+                adaptive_solid_double_to_bits(0.0),
+                std::memory_order_release);
+            queue.push(
+                {cell_index, 0U, 0U, RefinementTaskKind::kComputeDistanceToEroded},
+                static_cast<std::uint32_t>(cell_index % worker_count));
         }
     }
     seed_counter.finish();
@@ -1584,45 +1727,90 @@ inline std::vector<double> compute_distance_to_eroded_solid_from_cell_mask(
     ProgressCounter wavefront_counter(
         "Regularization",
         "compute_distance_to_eroded_solid_from_cell_mask",
-        "queue pops",
+        "relaxations",
         10000);
-    while (!queue.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
-        wavefront_counter.tick();
-        const auto [distance, cell_index] = queue.top();
-        queue.pop();
-        if (distance > distance_to_eroded[cell_index]) {
-            continue;
-        }
-        if (distance > max_distance) {
-            continue;
-        }
 
-        for (std::size_t neighbor_cell_index :
-             classification_cache.face_neighbor_cell_indices[cell_index]) {
-            if (neighbor_cell_index == SIZE_MAX ||
-                neighbor_cell_index >= all_cells.size()) {
-                continue;
-            }
-            if (!all_cells[neighbor_cell_index].is_leaf ||
-                eroded_inside_by_cell[neighbor_cell_index] != 0U) {
-                continue;
-            }
+    std::exception_ptr worker_error;
+    std::mutex error_mutex;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::uint32_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                try {
+                    wavefront_counter.tick();
+                    const std::size_t cell_index = task.cell_index;
+                    if (cell_index >= all_cells.size()) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
 
-            const double edge_cost = 0.5 * (
-                cell_edge_length(all_cells[cell_index]) +
-                cell_edge_length(all_cells[neighbor_cell_index]));
-            const double candidate = distance + edge_cost;
-            if (candidate > max_distance) {
-                continue;
+                    const double distance = adaptive_solid_bits_to_double(
+                        distance_bits[cell_index].load(std::memory_order_acquire));
+                    if (!std::isfinite(distance) || distance > max_distance) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
+
+                    for (std::size_t neighbor_cell_index :
+                         classification_cache.face_neighbor_cell_indices[cell_index]) {
+                        if (neighbor_cell_index == SIZE_MAX ||
+                            neighbor_cell_index >= all_cells.size()) {
+                            continue;
+                        }
+                        if (!all_cells[neighbor_cell_index].is_leaf ||
+                            eroded_inside_by_cell[neighbor_cell_index] != 0U) {
+                            continue;
+                        }
+
+                        const double edge_cost = 0.5 * (
+                            cell_edge_length(all_cells[cell_index]) +
+                            cell_edge_length(all_cells[neighbor_cell_index]));
+                        const double candidate = distance + edge_cost;
+                        if (candidate > max_distance) {
+                            continue;
+                        }
+                        if (adaptive_solid_atomic_update_distance_min(
+                                distance_bits[neighbor_cell_index], candidate)) {
+                            queue.push(
+                                {neighbor_cell_index,
+                                 0U,
+                                 0U,
+                                 RefinementTaskKind::kComputeDistanceToEroded},
+                                static_cast<std::uint32_t>(
+                                    neighbor_cell_index % worker_count));
+                        }
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (worker_error == nullptr) {
+                        worker_error = std::current_exception();
+                    }
+                    queue.task_done();
+                    queue.shutdown();
+                    return;
+                }
+                queue.task_done();
+                queue.try_shutdown_if_idle();
             }
-            if (candidate < distance_to_eroded[neighbor_cell_index]) {
-                distance_to_eroded[neighbor_cell_index] = candidate;
-                queue.push({candidate, neighbor_cell_index});
-            }
-        }
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    if (worker_error != nullptr) {
+        std::rethrow_exception(worker_error);
     }
     wavefront_counter.finish();
+
+    std::vector<double> distance_to_eroded(all_cells.size(), inf);
+    for (std::size_t cell_index = 0; cell_index < distance_to_eroded.size(); ++cell_index) {
+        distance_to_eroded[cell_index] = adaptive_solid_bits_to_double(
+            distance_bits[cell_index].load(std::memory_order_acquire));
+    }
 
     return distance_to_eroded;
 }
@@ -2080,6 +2268,115 @@ struct OpenedSurfaceMesh {
     std::vector<std::uint64_t> vertex_keys;
 };
 
+inline std::size_t prune_tiny_opened_surface_artifacts(OpenedSurfaceMesh &mesh) {
+    if (mesh.vertices.empty() || mesh.triangles.empty()) {
+        return 0U;
+    }
+
+    std::vector<std::vector<std::size_t>> vertex_to_triangles(mesh.vertices.size());
+    for (std::size_t triangle_index = 0; triangle_index < mesh.triangles.size();
+         ++triangle_index) {
+        const MeshTriangle &triangle = mesh.triangles[triangle_index];
+        vertex_to_triangles[triangle.vertex_indices[0]].push_back(triangle_index);
+        vertex_to_triangles[triangle.vertex_indices[1]].push_back(triangle_index);
+        vertex_to_triangles[triangle.vertex_indices[2]].push_back(triangle_index);
+    }
+
+    std::vector<std::uint8_t> visited(mesh.triangles.size(), 0U);
+    std::vector<std::uint8_t> keep_triangle(mesh.triangles.size(), 1U);
+    std::size_t removed_components = 0U;
+
+    for (std::size_t seed = 0; seed < mesh.triangles.size(); ++seed) {
+        if (visited[seed] != 0U) {
+            continue;
+        }
+
+        std::vector<std::size_t> stack = {seed};
+        std::vector<std::size_t> component_triangles;
+        std::unordered_set<std::size_t> component_vertices;
+        visited[seed] = 1U;
+
+        while (!stack.empty()) {
+            const std::size_t triangle_index = stack.back();
+            stack.pop_back();
+            component_triangles.push_back(triangle_index);
+
+            const MeshTriangle &triangle = mesh.triangles[triangle_index];
+            const std::size_t triangle_vertices[3] = {
+                triangle.vertex_indices[0],
+                triangle.vertex_indices[1],
+                triangle.vertex_indices[2],
+            };
+            for (std::size_t vertex_index : triangle_vertices) {
+                component_vertices.insert(vertex_index);
+                for (std::size_t neighbor_triangle : vertex_to_triangles[vertex_index]) {
+                    if (visited[neighbor_triangle] == 0U) {
+                        visited[neighbor_triangle] = 1U;
+                        stack.push_back(neighbor_triangle);
+                    }
+                }
+            }
+        }
+
+        if (component_vertices.size() <= 8U && component_triangles.size() <= 12U) {
+            ++removed_components;
+            for (std::size_t triangle_index : component_triangles) {
+                keep_triangle[triangle_index] = 0U;
+            }
+        }
+    }
+
+    if (removed_components == 0U) {
+        return 0U;
+    }
+
+    std::vector<MeshTriangle> kept_triangles;
+    kept_triangles.reserve(mesh.triangles.size());
+    std::vector<std::uint8_t> vertex_used(mesh.vertices.size(), 0U);
+    for (std::size_t triangle_index = 0; triangle_index < mesh.triangles.size();
+         ++triangle_index) {
+        if (keep_triangle[triangle_index] == 0U) {
+            continue;
+        }
+        const MeshTriangle &triangle = mesh.triangles[triangle_index];
+        kept_triangles.push_back(triangle);
+        vertex_used[triangle.vertex_indices[0]] = 1U;
+        vertex_used[triangle.vertex_indices[1]] = 1U;
+        vertex_used[triangle.vertex_indices[2]] = 1U;
+    }
+
+    std::vector<std::size_t> remap(mesh.vertices.size(), 0U);
+    std::vector<MeshVertex> kept_vertices;
+    std::vector<std::uint64_t> kept_vertex_keys;
+    kept_vertices.reserve(mesh.vertices.size());
+    kept_vertex_keys.reserve(mesh.vertex_keys.size());
+    for (std::size_t vertex_index = 0; vertex_index < mesh.vertices.size(); ++vertex_index) {
+        if (vertex_used[vertex_index] == 0U) {
+            continue;
+        }
+        remap[vertex_index] = kept_vertices.size();
+        kept_vertices.push_back(mesh.vertices[vertex_index]);
+        kept_vertex_keys.push_back(mesh.vertex_keys[vertex_index]);
+    }
+
+    for (MeshTriangle &triangle : kept_triangles) {
+        triangle.vertex_indices[0] = remap[triangle.vertex_indices[0]];
+        triangle.vertex_indices[1] = remap[triangle.vertex_indices[1]];
+        triangle.vertex_indices[2] = remap[triangle.vertex_indices[2]];
+    }
+
+    mesh.vertices = std::move(kept_vertices);
+    mesh.vertex_keys = std::move(kept_vertex_keys);
+    mesh.triangles = std::move(kept_triangles);
+
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "prune_tiny_opened_surface_artifacts",
+        "removed %zu tiny opened-surface artifact component(s)\n",
+        removed_components);
+    return removed_components;
+}
+
 struct SurfaceRegion;
 struct SurfaceExtractionRuntime;
 struct RegionSurfaceBuffers;
@@ -2111,6 +2408,7 @@ inline bool resolve_opened_edge_ambiguities(
     const std::vector<OccupiedSolidLeaf> &solid_leaves,
     const std::vector<OctreeCell> &all_cells,
     const LeafSpatialIndex &spatial_index,
+    const std::vector<std::int64_t> &cell_to_leaf_index,
     std::vector<std::uint8_t> &opened_inside,
     const OpenedSurfaceMesh &mesh);
 
@@ -2137,6 +2435,114 @@ struct RegionSurfaceBuffers {
     std::vector<RegionSurfaceTriangle> local_triangles;
     std::unordered_map<std::uint64_t, std::size_t> local_vertex_lookup;
 };
+
+inline std::size_t prune_tiny_opened_surface_artifacts(
+    RegionSurfaceBuffers &buffers) {
+    if (buffers.local_vertices.empty() || buffers.local_triangles.empty()) {
+        return 0U;
+    }
+
+    std::vector<std::vector<std::size_t>> vertex_to_triangles(
+        buffers.local_vertices.size());
+    for (std::size_t triangle_index = 0;
+         triangle_index < buffers.local_triangles.size();
+         ++triangle_index) {
+        const RegionSurfaceTriangle &triangle = buffers.local_triangles[triangle_index];
+        vertex_to_triangles[triangle.local_vertex_index[0]].push_back(triangle_index);
+        vertex_to_triangles[triangle.local_vertex_index[1]].push_back(triangle_index);
+        vertex_to_triangles[triangle.local_vertex_index[2]].push_back(triangle_index);
+    }
+
+    std::vector<std::uint8_t> visited(buffers.local_triangles.size(), 0U);
+    std::vector<std::uint8_t> keep_triangle(buffers.local_triangles.size(), 1U);
+    std::size_t removed_components = 0U;
+
+    for (std::size_t seed = 0; seed < buffers.local_triangles.size(); ++seed) {
+        if (visited[seed] != 0U) {
+            continue;
+        }
+
+        std::vector<std::size_t> stack = {seed};
+        std::vector<std::size_t> component_triangles;
+        std::unordered_set<std::size_t> component_vertices;
+        visited[seed] = 1U;
+
+        while (!stack.empty()) {
+            const std::size_t triangle_index = stack.back();
+            stack.pop_back();
+            component_triangles.push_back(triangle_index);
+
+            const RegionSurfaceTriangle &triangle =
+                buffers.local_triangles[triangle_index];
+            const std::size_t triangle_vertices[3] = {
+                triangle.local_vertex_index[0],
+                triangle.local_vertex_index[1],
+                triangle.local_vertex_index[2],
+            };
+            for (std::size_t vertex_index : triangle_vertices) {
+                component_vertices.insert(vertex_index);
+                for (std::size_t neighbor_triangle :
+                     vertex_to_triangles[vertex_index]) {
+                    if (visited[neighbor_triangle] == 0U) {
+                        visited[neighbor_triangle] = 1U;
+                        stack.push_back(neighbor_triangle);
+                    }
+                }
+            }
+        }
+
+        if (component_vertices.size() <= 8U && component_triangles.size() <= 12U) {
+            ++removed_components;
+            for (std::size_t triangle_index : component_triangles) {
+                keep_triangle[triangle_index] = 0U;
+            }
+        }
+    }
+
+    if (removed_components == 0U) {
+        return 0U;
+    }
+
+    std::vector<RegionSurfaceTriangle> kept_triangles;
+    kept_triangles.reserve(buffers.local_triangles.size());
+    std::vector<std::uint8_t> vertex_used(buffers.local_vertices.size(), 0U);
+    for (std::size_t triangle_index = 0;
+         triangle_index < buffers.local_triangles.size();
+         ++triangle_index) {
+        if (keep_triangle[triangle_index] == 0U) {
+            continue;
+        }
+        const RegionSurfaceTriangle &triangle = buffers.local_triangles[triangle_index];
+        kept_triangles.push_back(triangle);
+        vertex_used[triangle.local_vertex_index[0]] = 1U;
+        vertex_used[triangle.local_vertex_index[1]] = 1U;
+        vertex_used[triangle.local_vertex_index[2]] = 1U;
+    }
+
+    std::vector<std::size_t> remap(buffers.local_vertices.size(), 0U);
+    std::vector<RegionSurfaceVertex> kept_vertices;
+    kept_vertices.reserve(buffers.local_vertices.size());
+    for (std::size_t vertex_index = 0;
+         vertex_index < buffers.local_vertices.size();
+         ++vertex_index) {
+        if (vertex_used[vertex_index] == 0U) {
+            continue;
+        }
+        remap[vertex_index] = kept_vertices.size();
+        kept_vertices.push_back(buffers.local_vertices[vertex_index]);
+    }
+
+    for (RegionSurfaceTriangle &triangle : kept_triangles) {
+        triangle.local_vertex_index[0] = remap[triangle.local_vertex_index[0]];
+        triangle.local_vertex_index[1] = remap[triangle.local_vertex_index[1]];
+        triangle.local_vertex_index[2] = remap[triangle.local_vertex_index[2]];
+    }
+
+    buffers.local_vertices = std::move(kept_vertices);
+    buffers.local_triangles = std::move(kept_triangles);
+    buffers.local_vertex_lookup.clear();
+    return removed_components;
+}
 
 struct SurfaceExtractionRuntime {
     const std::vector<OccupiedSolidLeaf> *solid_leaves = nullptr;
@@ -2165,6 +2571,7 @@ struct SurfaceTaskGraphRuntime {
     std::vector<RegionSurfaceBuffers> region_buffers;
     SurfaceTaskGraphState graph;
     OpenedSurfaceMesh merged_mesh;
+    std::atomic<std::size_t> pruned_tiny_artifacts{0U};
     std::mutex merged_mesh_mutex;
 };
 
@@ -2176,6 +2583,11 @@ struct PostRefineRegularizationResult {
     std::vector<std::uint8_t> opened_inside_by_cell;
     std::vector<std::uint8_t> opened_inside;
     OpenedSurfaceMesh opened_surface;
+    double morphology_seconds = 0.0;
+    double opened_surface_extraction_seconds = 0.0;
+    double opened_surface_pass1_seconds = 0.0;
+    double opened_surface_ambiguity_seconds = 0.0;
+    double opened_surface_reextract_seconds = 0.0;
 };
 
 struct PostRefineTaskGraphRuntime {
@@ -2197,6 +2609,11 @@ struct PostRefineTaskGraphRuntime {
     std::vector<SurfaceRegion> surface_regions;
     std::vector<RegionSurfaceBuffers> region_buffers;
     std::atomic<std::size_t> pending_region_tasks{0U};
+    std::atomic<std::size_t> pruned_tiny_artifacts{0U};
+    bool surface_extraction_started = false;
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point surface_extraction_start_time;
+    std::chrono::steady_clock::time_point reextract_start_time;
     std::atomic<bool> reextract_pass{false};
     std::mutex result_mutex;
 };
@@ -2308,6 +2725,7 @@ inline void run_compute_inside_clearance_task(
         *runtime.all_cells,
         *runtime.classification_cache,
         runtime.result.extraction_view.inside_mask_by_cell,
+        runtime.worker_count,
         runtime.opening_radius);
 }
 
@@ -2327,6 +2745,7 @@ inline void run_compute_distance_to_eroded_task(
             *runtime.all_cells,
             *runtime.classification_cache,
             runtime.result.eroded_inside_by_cell,
+            runtime.worker_count,
             runtime.opening_radius);
 }
 
@@ -2435,6 +2854,7 @@ inline void prepare_post_refine_surface_extraction_runtime(
     runtime.region_buffers.resize(runtime.surface_regions.size());
     runtime.pending_region_tasks.store(
         runtime.surface_regions.size(), std::memory_order_release);
+    runtime.pruned_tiny_artifacts.store(0U, std::memory_order_release);
 }
 
 inline PostRefineRegularizationResult run_post_refine_regularization_task_graph(
@@ -2463,6 +2883,7 @@ inline PostRefineRegularizationResult run_post_refine_regularization_task_graph(
     runtime.opening_radius = opening_radius;
     runtime.table_cadence_seconds = table_cadence_seconds;
     runtime.initial_inside_mask_by_cell = std::move(initial_inside_mask_by_cell);
+    runtime.start_time = std::chrono::steady_clock::now();
     initialize_post_refine_task_graph(runtime);
 
     RefinementWorkQueue queue;
@@ -2559,6 +2980,11 @@ inline PostRefineRegularizationResult run_post_refine_regularization_task_graph(
                             break;
                         case RefinementTaskKind::kSuppressOpenedEdgeContacts:
                             run_suppress_opened_edge_contacts_task(runtime);
+                            if (!runtime.surface_extraction_started) {
+                                runtime.surface_extraction_started = true;
+                                runtime.surface_extraction_start_time =
+                                    std::chrono::steady_clock::now();
+                            }
                             prepare_post_refine_surface_extraction_runtime(runtime);
                             if (runtime.surface_regions.empty()) {
                                 runtime.result.opened_surface = {};
@@ -2592,6 +3018,10 @@ inline PostRefineRegularizationResult run_post_refine_regularization_task_graph(
                                 region_id,
                                 runtime.surface_extraction,
                                 runtime.region_buffers[region_id]);
+                            runtime.pruned_tiny_artifacts.fetch_add(
+                                prune_tiny_opened_surface_artifacts(
+                                    runtime.region_buffers[region_id]),
+                                std::memory_order_relaxed);
                             if (runtime.pending_region_tasks.fetch_sub(
                                     1U,
                                     std::memory_order_acq_rel) == 1U) {
@@ -2604,14 +3034,35 @@ inline PostRefineRegularizationResult run_post_refine_regularization_task_graph(
                             }
                             break;
                         }
-                        case RefinementTaskKind::kMergeSurfaceBuffers:
+                        case RefinementTaskKind::kMergeSurfaceBuffers: {
                             runtime.result.opened_surface =
                                 merge_region_surface_buffers(runtime.region_buffers);
+                            const auto merge_finish_time =
+                                std::chrono::steady_clock::now();
+                            if (runtime.pruned_tiny_artifacts.load(
+                                    std::memory_order_acquire) > 0U) {
+                                meshmerizer_log_detail::print_status(
+                                    "Regularization",
+                                    "prune_tiny_opened_surface_artifacts",
+                                    "removed %zu tiny opened-surface artifact component(s)\n",
+                                    runtime.pruned_tiny_artifacts.load(
+                                        std::memory_order_relaxed));
+                            }
                             if (runtime.reextract_pass.load(
                                     std::memory_order_acquire)) {
+                                runtime.result.opened_surface_reextract_seconds =
+                                    std::chrono::duration<double>(
+                                        merge_finish_time -
+                                        runtime.reextract_start_time)
+                                        .count();
                                 runtime.reextract_pass.store(
                                     false, std::memory_order_release);
                             } else {
+                                runtime.result.opened_surface_pass1_seconds =
+                                    std::chrono::duration<double>(
+                                        merge_finish_time -
+                                        runtime.surface_extraction_start_time)
+                                        .count();
                                 unlock_post_refine_task(
                                     queue,
                                     runtime,
@@ -2620,11 +3071,15 @@ inline PostRefineRegularizationResult run_post_refine_regularization_task_graph(
                                     worker_id);
                             }
                             break;
-                        case RefinementTaskKind::kResolveOpenedSurfaceAmbiguities:
+                        }
+                        case RefinementTaskKind::kResolveOpenedSurfaceAmbiguities: {
+                            const auto ambiguity_start =
+                                std::chrono::steady_clock::now();
                             if (resolve_opened_edge_ambiguities(
                                     runtime.result.extraction_view.solid_leaves,
                                     *runtime.all_cells,
                                     *runtime.solid_spatial_index,
+                                    runtime.surface_cell_to_leaf_index,
                                     runtime.result.opened_inside,
                                     runtime.result.opened_surface)) {
                                 enqueue_post_refine_task(
@@ -2634,11 +3089,19 @@ inline PostRefineRegularizationResult run_post_refine_regularization_task_graph(
                                     0U,
                                     worker_id);
                             }
+                            runtime.result.opened_surface_ambiguity_seconds +=
+                                std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() -
+                                    ambiguity_start)
+                                    .count();
                             break;
+                        }
                         case RefinementTaskKind::kReextractOpenedSurface:
                             runtime.reextract_pass.store(
                                 true,
                                 std::memory_order_release);
+                            runtime.reextract_start_time =
+                                std::chrono::steady_clock::now();
                             prepare_post_refine_surface_extraction_runtime(runtime);
                             runtime.enqueued[post_refine_task_index(
                                 PostRefineTaskNode::kMergeSurfaceBuffers)] = 0U;
@@ -2678,6 +3141,22 @@ inline PostRefineRegularizationResult run_post_refine_regularization_task_graph(
     }
     if (worker_error != nullptr) {
         std::rethrow_exception(worker_error);
+    }
+
+    const auto finish_time = std::chrono::steady_clock::now();
+    if (runtime.surface_extraction_started) {
+        runtime.result.morphology_seconds = std::chrono::duration<double>(
+            runtime.surface_extraction_start_time - runtime.start_time)
+                                                .count();
+        runtime.result.opened_surface_extraction_seconds =
+            std::chrono::duration<double>(
+                finish_time - runtime.surface_extraction_start_time)
+                .count();
+    } else {
+        runtime.result.morphology_seconds =
+            std::chrono::duration<double>(finish_time - runtime.start_time)
+                .count();
+        runtime.result.opened_surface_extraction_seconds = 0.0;
     }
 
     return std::move(runtime.result);
@@ -3100,6 +3579,7 @@ inline OpenedSurfaceMesh run_opened_surface_task_graph(
         build_surface_regions(solid_leaves, all_cells);
     runtime.extraction.regions = &regions;
     runtime.region_buffers.resize(regions.size());
+    runtime.pruned_tiny_artifacts.store(0U, std::memory_order_relaxed);
     runtime.graph.pending_region_tasks.store(regions.size(), std::memory_order_relaxed);
 
     if (regions.empty()) {
@@ -3128,6 +3608,10 @@ inline OpenedSurfaceMesh run_opened_surface_task_graph(
                             region_id,
                             runtime.extraction,
                             runtime.region_buffers[region_id]);
+                        runtime.pruned_tiny_artifacts.fetch_add(
+                            prune_tiny_opened_surface_artifacts(
+                                runtime.region_buffers[region_id]),
+                            std::memory_order_relaxed);
                         if (runtime.graph.pending_region_tasks.fetch_sub(
                                 1U, std::memory_order_acq_rel) == 1U) {
                             bool expected = false;
@@ -3145,6 +3629,15 @@ inline OpenedSurfaceMesh run_opened_surface_task_graph(
                     case RefinementTaskKind::kMergeSurfaceBuffers: {
                         OpenedSurfaceMesh merged;
                         run_merge_surface_buffers_task(runtime, merged);
+                        if (runtime.pruned_tiny_artifacts.load(
+                                std::memory_order_acquire) > 0U) {
+                            meshmerizer_log_detail::print_status(
+                                "Regularization",
+                                "prune_tiny_opened_surface_artifacts",
+                                "removed %zu tiny opened-surface artifact component(s)\n",
+                                runtime.pruned_tiny_artifacts.load(
+                                    std::memory_order_relaxed));
+                        }
                         {
                             std::lock_guard<std::mutex> lock(runtime.merged_mesh_mutex);
                             runtime.merged_mesh = std::move(merged);
@@ -3204,30 +3697,32 @@ inline bool resolve_opened_edge_ambiguities(
     const std::vector<OccupiedSolidLeaf> &solid_leaves,
     const std::vector<OctreeCell> &all_cells,
     const LeafSpatialIndex &spatial_index,
+    const std::vector<std::int64_t> &cell_to_leaf_index,
     std::vector<std::uint8_t> &opened_inside,
     const OpenedSurfaceMesh &mesh) {
     struct EdgeKey {
-        std::size_t a;
-        std::size_t b;
+        std::uint64_t base_key;
+        std::uint8_t axis;
 
         bool operator==(const EdgeKey &other) const {
-            return a == other.a && b == other.b;
+            return base_key == other.base_key && axis == other.axis;
         }
     };
     struct EdgeKeyHash {
         std::size_t operator()(const EdgeKey &key) const {
-            std::size_t h = key.a;
-            h ^= key.b + 0x9e3779b9ULL + (h << 6U) + (h >> 2U);
+            std::size_t h = static_cast<std::size_t>(key.base_key);
+            h ^= static_cast<std::size_t>(key.axis) + 0x9e3779b9ULL +
+                 (h << 6U) + (h >> 2U);
             return h;
         }
     };
+    constexpr std::uint64_t X_EDGE_DELTA = 1ULL << 42U;
+    constexpr std::uint64_t Y_EDGE_DELTA = 1ULL << 21U;
+    constexpr std::uint64_t Z_EDGE_DELTA = 1ULL;
 
     if (mesh.triangles.empty() || mesh.vertex_keys.size() != mesh.vertices.size()) {
         return false;
     }
-
-    const std::vector<std::int64_t> cell_to_leaf_index =
-        build_opened_cell_to_leaf_index(all_cells, solid_leaves);
 
     auto lookup_leaf = [&](std::int64_t qx,
                            std::int64_t qy,
@@ -3265,7 +3760,23 @@ inline bool resolve_opened_edge_ambiguities(
         for (std::size_t i = 0; i < 3U; ++i) {
             const std::size_t v0 = triangle.vertex_indices[i];
             const std::size_t v1 = triangle.vertex_indices[(i + 1U) % 3U];
-            EdgeKey key{std::min(v0, v1), std::max(v0, v1)};
+            const std::uint64_t key0 = mesh.vertex_keys[v0];
+            const std::uint64_t key1 = mesh.vertex_keys[v1];
+            const std::uint64_t lower_key = std::min(key0, key1);
+            const std::uint64_t delta = std::max(key0, key1) - lower_key;
+
+            std::uint8_t axis = 0U;
+            if (delta == X_EDGE_DELTA) {
+                axis = 0U;
+            } else if (delta == Y_EDGE_DELTA) {
+                axis = 1U;
+            } else if (delta == Z_EDGE_DELTA) {
+                axis = 2U;
+            } else {
+                continue;
+            }
+
+            EdgeKey key{lower_key, axis};
             ++edge_counts[key];
         }
     }
@@ -3288,31 +3799,16 @@ inline bool resolve_opened_edge_ambiguities(
         }
         resolve_counter.tick();
 
-        std::uint32_t ax, ay, az, bx, by, bz;
-        unpack_surface_corner_coords(mesh.vertex_keys[entry.first.a], ax, ay, az);
-        unpack_surface_corner_coords(mesh.vertex_keys[entry.first.b], bx, by, bz);
-
-        int axis = -1;
-        std::uint32_t gx = std::min(ax, bx);
-        std::uint32_t gy = std::min(ay, by);
-        std::uint32_t gz = std::min(az, bz);
-        if (ax != bx && ay == by && az == bz) {
-            axis = 0;
-        } else if (ax == bx && ay != by && az == bz) {
-            axis = 1;
-        } else if (ax == bx && ay == by && az != bz) {
-            axis = 2;
-        } else {
-            continue;
-        }
+        std::uint32_t gx, gy, gz;
+        unpack_surface_corner_coords(entry.first.base_key, gx, gy, gz);
 
         std::array<std::array<std::int64_t, 3>, 4> voxels;
-        if (axis == 0) {
+        if (entry.first.axis == 0U) {
             voxels = {{{static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy) - 1, static_cast<std::int64_t>(gz) - 1},
                        {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz) - 1},
                        {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy) - 1, static_cast<std::int64_t>(gz)},
                        {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz)}}};
-        } else if (axis == 1) {
+        } else if (entry.first.axis == 1U) {
             voxels = {{{static_cast<std::int64_t>(gx) - 1, static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz) - 1},
                        {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz) - 1},
                        {static_cast<std::int64_t>(gx) - 1, static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz)},
