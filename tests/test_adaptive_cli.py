@@ -1,5 +1,6 @@
 """Tests for adaptive CLI helpers."""
 
+import warnings
 from argparse import Namespace
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import numpy as np
 import pytest
 import trimesh
 
+from meshmerizer.cli import adaptive as adaptive_cli
 from meshmerizer.cli.adaptive import run_adaptive
 from meshmerizer.cli.args import build_parser
 from meshmerizer.cli.main import main
@@ -57,6 +59,115 @@ def test_remove_islands_keeps_large_nonwatertight_main_component() -> None:
     components = cleaned.mesh.split(only_watertight=False)
     assert len(components) == 1
     assert cleaned.mesh.bounds[1][0] < 20.0
+
+
+def test_remove_islands_ignores_flat_degenerate_component_without_warnings() -> (
+    None
+):
+    """Flat zero-volume fluff should not trigger trimesh mass warnings."""
+    main = trimesh.creation.box(extents=(10.0, 10.0, 10.0))
+    flat = trimesh.Trimesh(
+        vertices=np.array(
+            [
+                [20.0, 0.0, 0.0],
+                [21.0, 0.0, 0.0],
+                [21.0, 1.0, 0.0],
+                [20.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        faces=np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64),
+        process=False,
+    )
+    combined = trimesh.util.concatenate([main, flat])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cleaned = remove_islands(
+            Mesh(mesh=combined.copy()), remove_islands_fraction=0.1
+        )
+
+    runtime_warnings = [
+        warning
+        for warning in caught
+        if issubclass(warning.category, RuntimeWarning)
+    ]
+    assert runtime_warnings == []
+
+    components = cleaned.mesh.split(only_watertight=False)
+    assert len(components) == 1
+    assert np.allclose(components[0].extents, main.extents)
+
+
+def test_remove_islands_avoids_watertight_mass_property_warnings() -> None:
+    """Watertight-marked zero-volume fluff should not hit trimesh volume."""
+    main = trimesh.creation.box(extents=(10.0, 10.0, 10.0))
+    flat = trimesh.Trimesh(
+        vertices=np.array(
+            [
+                [20.0, 0.0, 0.0],
+                [21.0, 0.0, 0.0],
+                [21.0, 1.0, 0.0],
+                [20.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        faces=np.array(
+            [[0, 1, 2], [0, 2, 3], [2, 1, 0], [3, 2, 0]], dtype=np.int64
+        ),
+        process=False,
+    )
+    combined = trimesh.util.concatenate([main, flat])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cleaned = remove_islands(
+            Mesh(mesh=combined.copy()), remove_islands_fraction=0.1
+        )
+
+    runtime_warnings = [
+        warning
+        for warning in caught
+        if issubclass(warning.category, RuntimeWarning)
+    ]
+    assert runtime_warnings == []
+
+    components = cleaned.mesh.split(only_watertight=False)
+    assert len(components) == 1
+    assert np.allclose(components[0].extents, main.extents)
+
+
+def test_postprocess_mesh_repairs_before_island_filtering(tmp_path) -> None:
+    """CLI postprocessing should repair invalid topology before filtering."""
+    from argparse import Namespace
+
+    from meshmerizer.cli.adaptive import _postprocess_mesh
+
+    box = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    bad = trimesh.Trimesh(
+        vertices=box.vertices.copy(),
+        faces=np.vstack([box.faces.copy(), box.faces[[0]][:, ::-1]]),
+        process=False,
+    )
+    mesh = Mesh(mesh=bad)
+
+    args = Namespace(
+        remove_islands_fraction=None,
+        simplify_factor=1.0,
+        target_size=None,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        repaired = _postprocess_mesh(mesh, args)
+        _ = repaired.mesh.is_watertight
+
+    runtime_warnings = [
+        warning
+        for warning in caught
+        if issubclass(warning.category, RuntimeWarning)
+    ]
+    assert runtime_warnings == []
 
 
 def test_run_adaptive_passes_pre_thickening_radius(
@@ -726,3 +837,128 @@ def test_warning_summary_is_deferred_until_end(monkeypatch) -> None:
 def test_progress_bar_respects_silent_mode() -> None:
     with cli_logging_context(silent=True):
         assert _STATE.silent is True
+
+
+def test_reconstruct_mesh_runs_fof_groups_in_parallel_and_merges_faces(
+    monkeypatch,
+) -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.0, 0.1, 0.0],
+            [1.0, 1.0, 1.0],
+            [1.1, 1.0, 1.0],
+            [1.0, 1.1, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    smoothing_lengths = np.full(6, 0.1, dtype=np.float64)
+    labels = np.array([4, 4, 4, 9, 9, 9], dtype=np.int64)
+    seen_groups = []
+
+    def fake_run_full_pipeline(
+        group_pos,
+        group_sml,
+        domain_min,
+        domain_max,
+        base_resolution,
+        isovalue,
+        max_depth,
+        **kwargs,
+    ):
+        seen_groups.append(group_pos.copy())
+        if np.allclose(group_pos[:, 0], [0.0, 0.1, 0.0]):
+            return {
+                "vertices": np.array(
+                    [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.0]],
+                    dtype=np.float64,
+                ),
+                "faces": np.array([[0, 1, 2]], dtype=np.uint32),
+            }
+        return {
+            "vertices": np.array(
+                [[1.0, 1.0, 1.0], [1.2, 1.0, 1.0], [1.0, 1.2, 1.0]],
+                dtype=np.float64,
+            ),
+            "faces": np.array([[0, 1, 2]], dtype=np.uint32),
+        }
+
+    monkeypatch.setattr(
+        "meshmerizer.cli.adaptive.run_full_pipeline",
+        fake_run_full_pipeline,
+    )
+
+    vertices, faces = adaptive_cli._reconstruct_mesh(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (2.0, 2.0, 2.0),
+        4,
+        0.01,
+        2,
+        worker_count=2,
+        group_labels=labels,
+    )
+
+    assert len(seen_groups) == 2
+    assert vertices.shape == (6, 3)
+    np.testing.assert_array_equal(
+        faces,
+        np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64),
+    )
+
+
+def test_reconstruct_mesh_skips_undersized_fof_groups(monkeypatch) -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.0, 0.1, 0.0],
+            [1.0, 1.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    smoothing_lengths = np.full(4, 0.1, dtype=np.float64)
+    labels = np.array([1, 1, 1, 2], dtype=np.int64)
+    call_sizes = []
+
+    def fake_run_full_pipeline(
+        group_pos,
+        group_sml,
+        domain_min,
+        domain_max,
+        base_resolution,
+        isovalue,
+        max_depth,
+        **kwargs,
+    ):
+        call_sizes.append(group_pos.shape[0])
+        return {
+            "vertices": np.array(
+                [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.0]],
+                dtype=np.float64,
+            ),
+            "faces": np.array([[0, 1, 2]], dtype=np.uint32),
+        }
+
+    monkeypatch.setattr(
+        "meshmerizer.cli.adaptive.run_full_pipeline",
+        fake_run_full_pipeline,
+    )
+
+    vertices, faces = adaptive_cli._reconstruct_mesh(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (2.0, 2.0, 2.0),
+        4,
+        0.01,
+        2,
+        worker_count=2,
+        group_labels=labels,
+    )
+
+    assert call_sizes == [3]
+    assert vertices.shape == (3, 3)
+    np.testing.assert_array_equal(faces, np.array([[0, 1, 2]], dtype=np.int64))

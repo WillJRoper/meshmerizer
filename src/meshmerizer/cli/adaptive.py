@@ -18,6 +18,7 @@ reporting.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -171,8 +172,10 @@ def _postprocess_mesh(mesh: Mesh, args) -> Mesh:
     Returns:
         Post-processed mesh ready for export.
     """
-    # Apply cleanup in the same order as the CLI messaging: island removal,
-    # simplification, then optional print scaling.
+    # Apply cleanup in the same order as the CLI messaging: remove islands,
+    # simplify, then optionally scale for print. Island filtering performs
+    # targeted per-component cleanup for suspicious geometry rather than a
+    # global full-mesh repair, which is too expensive on very large meshes.
     cleanup_start = time.perf_counter()
     mesh = remove_islands(mesh, args.remove_islands_fraction)
     record_elapsed("Island removal", cleanup_start, operation="Cleaning")
@@ -288,33 +291,19 @@ def _reconstruct_mesh(
     pos = np.ascontiguousarray(positions, dtype=np.float64)
     sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
 
-    # Default to a single implicit group when no clustering labels are passed.
-    if group_labels is None:
-        labels = np.zeros(len(pos), dtype=np.int64)
-    else:
-        labels = np.asarray(group_labels, dtype=np.int64)
-        if labels.shape != (pos.shape[0],):
-            raise ValueError(
-                f"group_labels must have shape (N,), got {labels.shape}"
-            )
-
-    # Reconstruct each group independently so disconnected FOF structures are
-    # not accidentally bridged by one global extraction pass.
-    all_vertices = []
-    all_faces = []
-    vertex_offset = 0
-    for group_id in np.unique(labels):
-        mask = labels == group_id
-        group_pos = pos[mask]
-        group_sml = sml[mask]
+    def _run_group(group_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Run the native pipeline for one independent particle group."""
+        group_pos = np.ascontiguousarray(pos[group_indices], dtype=np.float64)
+        group_sml = np.ascontiguousarray(sml[group_indices], dtype=np.float64)
 
         # The native pipeline cannot form a mesh from fewer than three
         # particles, so skip undersized groups explicitly.
         if group_pos.shape[0] < 3:
-            continue
+            return (
+                np.empty((0, 3), dtype=np.float64),
+                np.empty((0, 3), dtype=np.int64),
+            )
 
-        # Run the canonical adaptive pipeline for this group and collect
-        # the raw arrays for later merge.
         result = run_full_pipeline(
             group_pos,
             group_sml,
@@ -334,9 +323,43 @@ def _reconstruct_mesh(
             min_feature_thickness=min_feature_thickness,
             pre_thickening_radius=pre_thickening_radius,
         )
-        verts = result["vertices"]
-        faces = result["faces"].astype(np.int64)
+        return result["vertices"], result["faces"].astype(np.int64)
 
+    # Default to a single implicit group when no clustering labels are passed.
+    if group_labels is None:
+        labels = np.zeros(len(pos), dtype=np.int64)
+    else:
+        labels = np.asarray(group_labels, dtype=np.int64)
+        if labels.shape != (pos.shape[0],):
+            raise ValueError(
+                f"group_labels must have shape (N,), got {labels.shape}"
+            )
+
+    group_ids, inverse = np.unique(labels, return_inverse=True)
+    if len(group_ids) == 0:
+        group_index_lists = []
+    else:
+        # Group particle indices with one stable pass instead of rescanning the
+        # full label array once per FOF group.
+        sorted_indices = np.argsort(inverse, kind="stable")
+        group_sizes = np.bincount(inverse, minlength=len(group_ids))
+        split_points = np.cumsum(group_sizes[:-1], dtype=np.int64)
+        group_index_lists = np.split(sorted_indices, split_points)
+
+    # Reconstruct each group independently so disconnected FOF structures are
+    # not accidentally bridged by one global extraction pass.
+    all_vertices = []
+    all_faces = []
+    vertex_offset = 0
+
+    if len(group_index_lists) == 1:
+        group_meshes = [_run_group(group_index_lists[0])]
+    else:
+        max_workers = min(len(group_index_lists), max(1, worker_count))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            group_meshes = list(executor.map(_run_group, group_index_lists))
+
+    for verts, faces in group_meshes:
         # Empty group results are ignored so weak or filtered groups do not add
         # degenerate entries to the final mesh buffers.
         if verts.shape[0] == 0:
