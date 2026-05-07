@@ -451,19 +451,19 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
     const std::vector<std::size_t> &all_contributors,
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
-    double isovalue) {
-    const std::size_t n_cells = all_cells.size();
+    double isovalue,
+    std::uint32_t worker_count = 0U) {
+    struct ActiveLeafSolve {
+        std::size_t cell_index = 0U;
+        MeshVertex vertex{};
+    };
 
-    // Per-cell results computed in parallel.  Each entry is either a
-    // valid MeshVertex (when the cell is an active surface leaf) or
-    // an empty placeholder.  A separate flag marks which cells are
-    // active so the serial index-assignment pass can skip non-active
-    // cells cheaply.
-    std::vector<MeshVertex> per_cell_vertex(n_cells);
-    // Use char instead of bool to avoid the std::vector<bool> bit-packing
-    // specialisation, which causes data races when adjacent elements are
-    // written by different threads (they share the same byte).
-    std::vector<char> is_active_leaf(n_cells, 0);
+    const std::size_t n_cells = all_cells.size();
+    const int active_threads = static_cast<int>(
+        worker_count == 0U ? omp_get_max_threads() : std::max(1U, worker_count));
+
+    std::vector<std::vector<ActiveLeafSolve>> solved_by_thread(
+        static_cast<std::size_t>(active_threads));
 
     ProgressBar vertex_bar("Meshing", "solve_vertices", n_cells);
 
@@ -472,9 +472,12 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
     // iteration touches only its own cell and reads shared immutable
     // data (positions, smoothing_lengths, all_contributors), so there
     // are no data races.
-#pragma omp parallel
+#pragma omp parallel num_threads(active_threads)
     {
         std::vector<HermiteSample> samples;
+        const int thread_id = omp_get_thread_num();
+        std::vector<ActiveLeafSolve> &thread_solved = solved_by_thread[
+            static_cast<std::size_t>(thread_id)];
 #pragma omp for schedule(dynamic)
         for (std::size_t cell_idx = 0; cell_idx < n_cells; ++cell_idx) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
@@ -550,27 +553,51 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
             samples);
 
         // Solve the QEF.
-        per_cell_vertex[cell_idx] =
-            solve_qef_for_leaf(samples, cell.bounds);
-        is_active_leaf[cell_idx] = 1;
+        thread_solved.push_back(
+            {cell_idx, solve_qef_for_leaf(samples, cell.bounds)});
         vertex_bar.tick();
         }
     }
 
     vertex_bar.finish();
 
+    std::size_t active_leaf_count = 0U;
+    for (const std::vector<ActiveLeafSolve> &thread_solved : solved_by_thread) {
+        active_leaf_count += thread_solved.size();
+    }
+
+    std::vector<ActiveLeafSolve> solved_leaves;
+    solved_leaves.reserve(active_leaf_count);
+    for (std::vector<ActiveLeafSolve> &thread_solved : solved_by_thread) {
+        solved_leaves.insert(
+            solved_leaves.end(),
+            std::make_move_iterator(thread_solved.begin()),
+            std::make_move_iterator(thread_solved.end()));
+        std::vector<ActiveLeafSolve>().swap(thread_solved);
+    }
+    std::sort(
+        solved_leaves.begin(),
+        solved_leaves.end(),
+        [](const ActiveLeafSolve &lhs, const ActiveLeafSolve &rhs) {
+            return lhs.cell_index < rhs.cell_index;
+        });
+
     // Pass 2 (serial): Assign contiguous vertex indices and build
     // the compact output vertex array.  This must be serial because
     // vertex indices must be dense and deterministic.
     std::vector<MeshVertex> vertices;
+    vertices.reserve(solved_leaves.size());
+    std::size_t solved_index = 0U;
     for (std::size_t cell_idx = 0; cell_idx < n_cells; ++cell_idx) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
         OctreeCell &cell = all_cells[cell_idx];
-        if (is_active_leaf[cell_idx]) {
+        if (solved_index < solved_leaves.size() &&
+            solved_leaves[solved_index].cell_index == cell_idx) {
             cell.representative_vertex_index =
                 static_cast<std::int64_t>(vertices.size());
             cell.is_active = true;
-            vertices.push_back(per_cell_vertex[cell_idx]);
+            vertices.push_back(std::move(solved_leaves[solved_index].vertex));
+            ++solved_index;
         } else {
             cell.representative_vertex_index = -1;
             cell.is_active = false;

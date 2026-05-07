@@ -1636,6 +1636,26 @@ static PyObject *build_mesh_numpy_result(
 static PyObject *build_vertices_numpy_result(
     const std::vector<MeshVertex> &vertices);
 
+template <typename T>
+static void release_binding_vector_memory(std::vector<T> &values) {
+    std::vector<T>().swap(values);
+}
+
+static int dict_set_owned_item(
+    PyObject *dict,
+    const char *key,
+    PyObject *value) {
+    if (value == NULL) {
+        return -1;
+    }
+    if (PyDict_SetItemString(dict, key, value) < 0) {
+        Py_DECREF(value);
+        return -1;
+    }
+    Py_DECREF(value);
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Binding wrappers for octree construction and per-cell helpers.
 // ---------------------------------------------------------------------------
@@ -2672,7 +2692,7 @@ static PyObject *run_octree_pipeline_py(
         // -- Step 3: Solve QEF vertices for active leaf cells --
         vertices = solve_all_leaf_vertices(
             all_cells, all_contributors, positions,
-            smoothing_lengths, isovalue);
+            smoothing_lengths, isovalue, static_cast<std::uint32_t>(worker_count));
     } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
         PyEval_RestoreThread(_save);
         return raise_cancelled_exception();
@@ -2928,51 +2948,33 @@ static PyObject *classify_occupied_solid_py(
     meshmerizer_cancel_detail::reset_cancel_state();
 
     const npy_intp dims[1] = {static_cast<npy_intp>(solid_leaves.size())};
-    PyObject *occupancy_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
-    PyObject *depth_array = PyArray_SimpleNew(1, dims, NPY_UINT32);
-    PyObject *center_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
-    PyObject *size_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
-    PyObject *clearance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
-    PyObject *thickening_distance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
-    PyObject *thickened_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
-    PyObject *eroded_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
-    PyObject *dilation_distance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
-    PyObject *opened_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
     const npy_intp sample_dims[2] = {
         static_cast<npy_intp>(opened_boundary_samples.size()), 3};
-    PyObject *sample_positions_array =
-        PyArray_SimpleNew(2, sample_dims, NPY_DOUBLE);
-    PyObject *sample_normals_array =
-        PyArray_SimpleNew(2, sample_dims, NPY_DOUBLE);
     const npy_intp mesh_vertex_dims[2] = {
         static_cast<npy_intp>(opened_surface_mesh.vertices.size()), 3};
     const npy_intp mesh_face_dims[2] = {
         static_cast<npy_intp>(opened_surface_mesh.triangles.size()), 3};
-    PyObject *mesh_vertex_array =
-        PyArray_SimpleNew(2, mesh_vertex_dims, NPY_DOUBLE);
-    PyObject *mesh_face_array =
-        PyArray_SimpleNew(2, mesh_face_dims, NPY_UINT32);
-    if (!occupancy_array || !depth_array || !center_array || !size_array ||
-        !clearance_array || !eroded_inside_array ||
-        !thickening_distance_array || !thickened_inside_array ||
-        !dilation_distance_array || !opened_inside_array ||
-        !sample_positions_array || !sample_normals_array ||
-        !mesh_vertex_array || !mesh_face_array) {
+
+    PyObject *result = PyDict_New();
+    if (result == NULL) {
+        return NULL;
+    }
+
+    auto fail_result = [&result]() -> PyObject * {
+        Py_DECREF(result);
+        return NULL;
+    };
+
+    PyObject *occupancy_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
+    PyObject *depth_array = PyArray_SimpleNew(1, dims, NPY_UINT32);
+    PyObject *center_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *size_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    if (!occupancy_array || !depth_array || !center_array || !size_array) {
         Py_XDECREF(occupancy_array);
         Py_XDECREF(depth_array);
         Py_XDECREF(center_array);
         Py_XDECREF(size_array);
-        Py_XDECREF(clearance_array);
-        Py_XDECREF(thickening_distance_array);
-        Py_XDECREF(thickened_inside_array);
-        Py_XDECREF(eroded_inside_array);
-        Py_XDECREF(dilation_distance_array);
-        Py_XDECREF(opened_inside_array);
-        Py_XDECREF(sample_positions_array);
-        Py_XDECREF(sample_normals_array);
-        Py_XDECREF(mesh_vertex_array);
-        Py_XDECREF(mesh_face_array);
-        return NULL;
+        return fail_result();
     }
 
     auto *occupancy_data = static_cast<std::uint8_t *>(
@@ -2983,6 +2985,37 @@ static PyObject *classify_occupied_solid_py(
         PyArray_DATA(reinterpret_cast<PyArrayObject *>(center_array)));
     auto *size_data = static_cast<double *>(
         PyArray_DATA(reinterpret_cast<PyArrayObject *>(size_array)));
+    for (std::size_t i = 0; i < solid_leaves.size(); ++i) {
+        occupancy_data[i] = static_cast<std::uint8_t>(solid_leaves[i].occupancy);
+        depth_data[i] = solid_leaves[i].depth;
+        center_data[i] = solid_leaves[i].center_value;
+        size_data[i] = solid_leaves[i].cell_size;
+    }
+    release_binding_vector_memory(solid_leaves);
+    if (dict_set_owned_item(result, "occupancy", occupancy_array) < 0 ||
+        dict_set_owned_item(result, "depths", depth_array) < 0 ||
+        dict_set_owned_item(result, "center_values", center_array) < 0 ||
+        dict_set_owned_item(result, "cell_sizes", size_array) < 0) {
+        return fail_result();
+    }
+
+    PyObject *clearance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *thickening_distance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *thickened_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
+    PyObject *eroded_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
+    PyObject *dilation_distance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *opened_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
+    if (!clearance_array || !thickening_distance_array || !thickened_inside_array ||
+        !eroded_inside_array || !dilation_distance_array || !opened_inside_array) {
+        Py_XDECREF(clearance_array);
+        Py_XDECREF(thickening_distance_array);
+        Py_XDECREF(thickened_inside_array);
+        Py_XDECREF(eroded_inside_array);
+        Py_XDECREF(dilation_distance_array);
+        Py_XDECREF(opened_inside_array);
+        return fail_result();
+    }
+
     auto *clearance_data = static_cast<double *>(
         PyArray_DATA(reinterpret_cast<PyArrayObject *>(clearance_array)));
     auto *thickening_distance_data = static_cast<double *>(
@@ -2995,20 +3028,7 @@ static PyObject *classify_occupied_solid_py(
         PyArray_DATA(reinterpret_cast<PyArrayObject *>(dilation_distance_array)));
     auto *opened_inside_data = static_cast<std::uint8_t *>(
         PyArray_DATA(reinterpret_cast<PyArrayObject *>(opened_inside_array)));
-    auto *sample_positions_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(sample_positions_array)));
-    auto *sample_normals_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(sample_normals_array)));
-    auto *mesh_vertex_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(mesh_vertex_array)));
-    auto *mesh_face_data = static_cast<std::uint32_t *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(mesh_face_array)));
-
-    for (std::size_t i = 0; i < solid_leaves.size(); ++i) {
-        occupancy_data[i] = static_cast<std::uint8_t>(solid_leaves[i].occupancy);
-        depth_data[i] = solid_leaves[i].depth;
-        center_data[i] = solid_leaves[i].center_value;
-        size_data[i] = solid_leaves[i].cell_size;
+    for (std::size_t i = 0; i < clearance.size(); ++i) {
         clearance_data[i] = clearance[i];
         thickening_distance_data[i] = thickening_distance[i];
         thickened_inside_data[i] = thickened_inside[i];
@@ -3016,7 +3036,35 @@ static PyObject *classify_occupied_solid_py(
         dilation_distance_data[i] = dilation_distance[i];
         opened_inside_data[i] = opened_inside[i];
     }
+    release_binding_vector_memory(clearance);
+    release_binding_vector_memory(thickening_distance);
+    release_binding_vector_memory(thickened_inside);
+    release_binding_vector_memory(eroded_inside);
+    release_binding_vector_memory(dilation_distance);
+    release_binding_vector_memory(opened_inside);
+    if (dict_set_owned_item(result, "clearance", clearance_array) < 0 ||
+        dict_set_owned_item(result, "thickening_distance", thickening_distance_array) < 0 ||
+        dict_set_owned_item(result, "thickened_inside", thickened_inside_array) < 0 ||
+        dict_set_owned_item(result, "eroded_inside", eroded_inside_array) < 0 ||
+        dict_set_owned_item(result, "dilation_distance", dilation_distance_array) < 0 ||
+        dict_set_owned_item(result, "opened_inside", opened_inside_array) < 0) {
+        return fail_result();
+    }
 
+    PyObject *sample_positions_array =
+        PyArray_SimpleNew(2, sample_dims, NPY_DOUBLE);
+    PyObject *sample_normals_array =
+        PyArray_SimpleNew(2, sample_dims, NPY_DOUBLE);
+    if (!sample_positions_array || !sample_normals_array) {
+        Py_XDECREF(sample_positions_array);
+        Py_XDECREF(sample_normals_array);
+        return fail_result();
+    }
+
+    auto *sample_positions_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(sample_positions_array)));
+    auto *sample_normals_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(sample_normals_array)));
     for (std::size_t i = 0; i < opened_boundary_samples.size(); ++i) {
         sample_positions_data[i * 3] = opened_boundary_samples[i].position.x;
         sample_positions_data[i * 3 + 1] = opened_boundary_samples[i].position.y;
@@ -3025,47 +3073,84 @@ static PyObject *classify_occupied_solid_py(
         sample_normals_data[i * 3 + 1] = opened_boundary_samples[i].outward_normal.y;
         sample_normals_data[i * 3 + 2] = opened_boundary_samples[i].outward_normal.z;
     }
+    release_binding_vector_memory(opened_boundary_samples);
+    if (dict_set_owned_item(result, "opened_boundary_positions", sample_positions_array) < 0 ||
+        dict_set_owned_item(result, "opened_boundary_normals", sample_normals_array) < 0) {
+        return fail_result();
+    }
 
+    PyObject *mesh_vertex_array =
+        PyArray_SimpleNew(2, mesh_vertex_dims, NPY_DOUBLE);
+    PyObject *mesh_face_array =
+        PyArray_SimpleNew(2, mesh_face_dims, NPY_UINT32);
+    if (!mesh_vertex_array || !mesh_face_array) {
+        Py_XDECREF(mesh_vertex_array);
+        Py_XDECREF(mesh_face_array);
+        return fail_result();
+    }
+
+    auto *mesh_vertex_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(mesh_vertex_array)));
+    auto *mesh_face_data = static_cast<std::uint32_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(mesh_face_array)));
     for (std::size_t i = 0; i < opened_surface_mesh.vertices.size(); ++i) {
         mesh_vertex_data[i * 3] = opened_surface_mesh.vertices[i].position.x;
         mesh_vertex_data[i * 3 + 1] = opened_surface_mesh.vertices[i].position.y;
         mesh_vertex_data[i * 3 + 2] = opened_surface_mesh.vertices[i].position.z;
     }
+    release_binding_vector_memory(opened_surface_mesh.vertex_keys);
+    release_binding_vector_memory(opened_surface_mesh.vertices);
     for (std::size_t i = 0; i < opened_surface_mesh.triangles.size(); ++i) {
         mesh_face_data[i * 3] = opened_surface_mesh.triangles[i].vertex_indices[0];
         mesh_face_data[i * 3 + 1] = opened_surface_mesh.triangles[i].vertex_indices[1];
         mesh_face_data[i * 3 + 2] = opened_surface_mesh.triangles[i].vertex_indices[2];
     }
+    release_binding_vector_memory(opened_surface_mesh.triangles);
+    if (dict_set_owned_item(result, "opened_surface_vertices", mesh_vertex_array) < 0 ||
+        dict_set_owned_item(result, "opened_surface_faces", mesh_face_array) < 0) {
+        return fail_result();
+    }
 
-    return Py_BuildValue(
-        "{s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:N,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n}",
-        "occupancy", occupancy_array,
-        "depths", depth_array,
-        "center_values", center_array,
-        "cell_sizes", size_array,
-        "clearance", clearance_array,
-        "thickening_distance", thickening_distance_array,
-        "thickened_inside", thickened_inside_array,
-        "eroded_inside", eroded_inside_array,
-        "dilation_distance", dilation_distance_array,
-        "opened_inside", opened_inside_array,
-        "opened_boundary_positions", sample_positions_array,
-        "opened_boundary_normals", sample_normals_array,
-        "opened_surface_vertices", mesh_vertex_array,
-        "opened_surface_faces", mesh_face_array,
-        "n_leaves", static_cast<Py_ssize_t>(solid_leaves.size()),
-        "n_inside", static_cast<Py_ssize_t>(inside_count),
-        "n_boundary_inside", static_cast<Py_ssize_t>(boundary_inside_count),
-        "n_boundary_outside", static_cast<Py_ssize_t>(boundary_outside_count),
-        "n_thickened_inside", static_cast<Py_ssize_t>(thickened_inside_count),
-        "n_eroded_inside", static_cast<Py_ssize_t>(eroded_inside_count),
-        "n_opened_inside", static_cast<Py_ssize_t>(opened_inside_count),
-        "n_opened_boundary_samples",
-        static_cast<Py_ssize_t>(opened_boundary_samples.size()),
-        "n_opened_surface_vertices",
-        static_cast<Py_ssize_t>(opened_surface_mesh.vertices.size()),
-        "n_opened_surface_faces",
-        static_cast<Py_ssize_t>(opened_surface_mesh.triangles.size()));
+    if (dict_set_owned_item(
+            result, "n_leaves", PyLong_FromSsize_t(static_cast<Py_ssize_t>(dims[0]))) < 0 ||
+        dict_set_owned_item(
+            result, "n_inside", PyLong_FromSsize_t(static_cast<Py_ssize_t>(inside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_boundary_inside",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(boundary_inside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_boundary_outside",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(boundary_outside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_thickened_inside",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(thickened_inside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_eroded_inside",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(eroded_inside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_opened_inside",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(opened_inside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_opened_boundary_samples",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(sample_dims[0]))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_opened_surface_vertices",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(mesh_vertex_dims[0]))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_opened_surface_faces",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(mesh_face_dims[0]))) < 0) {
+        return fail_result();
+    }
+
+    return result;
 }
 
 /**

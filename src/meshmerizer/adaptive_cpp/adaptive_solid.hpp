@@ -110,6 +110,11 @@ struct OccupiedSolidExtractionView {
     std::vector<std::uint8_t> inside_mask;
 };
 
+template <typename T>
+inline void release_vector_memory(std::vector<T> &values) {
+    std::vector<T>().swap(values);
+}
+
 /**
  * @brief Return whether one cached cell classification is part of the solid.
  *
@@ -2402,7 +2407,7 @@ inline void run_region_extract_surface_task(
     RegionSurfaceBuffers &out_buffers);
 
 inline OpenedSurfaceMesh merge_region_surface_buffers(
-    const std::vector<RegionSurfaceBuffers> &region_buffers);
+    std::vector<RegionSurfaceBuffers> &region_buffers);
 
 inline bool resolve_opened_edge_ambiguities(
     const std::vector<OccupiedSolidLeaf> &solid_leaves,
@@ -2577,10 +2582,6 @@ struct SurfaceTaskGraphRuntime {
 
 struct PostRefineRegularizationResult {
     OccupiedSolidExtractionView extraction_view;
-    std::vector<double> clearance_by_cell;
-    std::vector<std::uint8_t> eroded_inside_by_cell;
-    std::vector<double> dilation_distance_by_cell;
-    std::vector<std::uint8_t> opened_inside_by_cell;
     std::vector<std::uint8_t> opened_inside;
     OpenedSurfaceMesh opened_surface;
     double morphology_seconds = 0.0;
@@ -2601,6 +2602,10 @@ struct PostRefineTaskGraphRuntime {
     double opening_radius = 0.0;
     double table_cadence_seconds = 10.0;
     std::vector<std::uint8_t> initial_inside_mask_by_cell;
+    std::vector<double> clearance_by_cell;
+    std::vector<std::uint8_t> eroded_inside_by_cell;
+    std::vector<double> dilation_distance_by_cell;
+    std::vector<std::uint8_t> opened_inside_by_cell;
     PostRefineRegularizationResult result;
     std::array<std::atomic<std::uint32_t>, 13U> dependency_counts;
     std::vector<std::uint8_t> enqueued;
@@ -2721,7 +2726,7 @@ inline void run_build_extraction_view_task(
 
 inline void run_compute_inside_clearance_task(
     PostRefineTaskGraphRuntime &runtime) {
-    runtime.result.clearance_by_cell = compute_inside_clearance_from_cell_mask(
+    runtime.clearance_by_cell = compute_inside_clearance_from_cell_mask(
         *runtime.all_cells,
         *runtime.classification_cache,
         runtime.result.extraction_view.inside_mask_by_cell,
@@ -2731,38 +2736,44 @@ inline void run_compute_inside_clearance_task(
 
 inline void run_erode_occupied_solid_task(
     PostRefineTaskGraphRuntime &runtime) {
-    runtime.result.eroded_inside_by_cell = erode_occupied_solid_cells(
+    runtime.eroded_inside_by_cell = erode_occupied_solid_cells(
         *runtime.all_cells,
         runtime.result.extraction_view.inside_mask_by_cell,
-        runtime.result.clearance_by_cell,
+        runtime.clearance_by_cell,
         runtime.opening_radius);
+    release_vector_memory(runtime.clearance_by_cell);
+    release_vector_memory(runtime.result.extraction_view.inside_mask_by_cell);
 }
 
 inline void run_compute_distance_to_eroded_task(
     PostRefineTaskGraphRuntime &runtime) {
-    runtime.result.dilation_distance_by_cell =
+    runtime.dilation_distance_by_cell =
         compute_distance_to_eroded_solid_from_cell_mask(
             *runtime.all_cells,
             *runtime.classification_cache,
-            runtime.result.eroded_inside_by_cell,
+            runtime.eroded_inside_by_cell,
             runtime.worker_count,
             runtime.opening_radius);
 }
 
 inline void run_dilate_eroded_solid_task(
     PostRefineTaskGraphRuntime &runtime) {
-    runtime.result.opened_inside_by_cell = dilate_eroded_solid_cells(
+    runtime.opened_inside_by_cell = dilate_eroded_solid_cells(
         *runtime.all_cells,
-        runtime.result.eroded_inside_by_cell,
-        runtime.result.dilation_distance_by_cell,
+        runtime.eroded_inside_by_cell,
+        runtime.dilation_distance_by_cell,
         runtime.opening_radius);
+    release_vector_memory(runtime.eroded_inside_by_cell);
+    release_vector_memory(runtime.dilation_distance_by_cell);
 }
 
 inline void run_project_opened_mask_to_leaves_task(
     PostRefineTaskGraphRuntime &runtime) {
     runtime.result.opened_inside = build_leaf_mask_from_cell_mask(
         runtime.result.extraction_view.solid_leaves,
-        runtime.result.opened_inside_by_cell);
+        runtime.opened_inside_by_cell);
+    release_vector_memory(runtime.opened_inside_by_cell);
+    release_vector_memory(runtime.result.extraction_view.inside_mask);
 }
 
 inline void run_fill_opened_cavities_task(
@@ -3297,10 +3308,6 @@ inline void emit_region_opened_surface(
         }
 
         const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
-        if (!surface_region_contains_cell(all_cells, region.root_cell_index, cell_index)) {
-            continue;
-        }
-
         std::uint32_t cell_x = 0U;
         std::uint32_t cell_y = 0U;
         std::uint32_t cell_z = 0U;
@@ -3311,31 +3318,31 @@ inline void emit_region_opened_surface(
         const std::uint32_t iy0 = cell_y << (runtime.max_depth - cell.depth);
         const std::uint32_t iz0 = cell_z << (runtime.max_depth - cell.depth);
 
+        const auto neighbor_opened = [&](std::int64_t neighbor_cell_index) {
+            if (neighbor_cell_index < 0) {
+                return false;
+            }
+            return opened_inside[static_cast<std::size_t>(neighbor_cell_index)] != 0U;
+        };
+        auto lookup_neighbor = [&](std::uint32_t qx,
+                                   std::uint32_t qy,
+                                   std::uint32_t qz) {
+            if (qx >= runtime.fine_resolution ||
+                qy >= runtime.fine_resolution ||
+                qz >= runtime.fine_resolution) {
+                return false;
+            }
+            const std::size_t neighbor_cell_index =
+                spatial_index.find_leaf_at(qx, qy, qz);
+            if (neighbor_cell_index == SIZE_MAX ||
+                neighbor_cell_index >= cell_to_leaf_index.size()) {
+                return false;
+            }
+            return neighbor_opened(cell_to_leaf_index[neighbor_cell_index]);
+        };
+
         for (std::uint32_t u = 0; u < span; ++u) {
             for (std::uint32_t v = 0; v < span; ++v) {
-                const auto neighbor_opened = [&](std::int64_t neighbor_cell_index) {
-                    if (neighbor_cell_index < 0) {
-                        return false;
-                    }
-                    return opened_inside[static_cast<std::size_t>(neighbor_cell_index)] != 0U;
-                };
-                auto lookup_neighbor = [&](std::uint32_t qx,
-                                           std::uint32_t qy,
-                                           std::uint32_t qz) {
-                    if (qx >= runtime.fine_resolution ||
-                        qy >= runtime.fine_resolution ||
-                        qz >= runtime.fine_resolution) {
-                        return false;
-                    }
-                    const std::size_t neighbor_cell_index =
-                        spatial_index.find_leaf_at(qx, qy, qz);
-                    if (neighbor_cell_index == SIZE_MAX ||
-                        neighbor_cell_index >= cell_to_leaf_index.size()) {
-                        return false;
-                    }
-                    return neighbor_opened(cell_to_leaf_index[neighbor_cell_index]);
-                };
-
                 if (ix0 == 0U || !lookup_neighbor(ix0 - 1U, iy0 + u, iz0 + v)) {
                     const std::array<std::size_t, 4> ids = {
                         region_vertex_index_for(runtime, buffers, ix0, iy0 + u, iz0 + v),
@@ -3446,7 +3453,7 @@ inline void run_region_extract_surface_task(
 }
 
 inline OpenedSurfaceMesh merge_region_surface_buffers(
-    const std::vector<RegionSurfaceBuffers> &region_buffers) {
+    std::vector<RegionSurfaceBuffers> &region_buffers) {
     OpenedSurfaceMesh mesh;
     std::unordered_map<std::uint64_t, std::size_t> vertex_lookup;
     std::vector<Vector3d> normal_accum;
@@ -3487,6 +3494,13 @@ inline OpenedSurfaceMesh merge_region_surface_buffers(
                 local_to_global[triangle.local_vertex_index[2]],
             });
         }
+    }
+
+    for (RegionSurfaceBuffers &buffer : region_buffers) {
+        release_vector_memory(buffer.local_vertices);
+        release_vector_memory(buffer.local_triangles);
+        buffer.local_vertex_lookup.clear();
+        buffer.local_vertex_lookup.rehash(0U);
     }
 
     std::vector<std::size_t> order(mesh.vertices.size(), 0U);
@@ -3532,7 +3546,7 @@ inline OpenedSurfaceMesh merge_region_surface_buffers(
 }
 
 inline void run_merge_surface_buffers_task(
-    const SurfaceTaskGraphRuntime &runtime,
+    SurfaceTaskGraphRuntime &runtime,
     OpenedSurfaceMesh &out_mesh) {
     out_mesh = merge_region_surface_buffers(runtime.region_buffers);
 }
