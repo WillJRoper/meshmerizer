@@ -1656,6 +1656,61 @@ static int dict_set_owned_item(
     return 0;
 }
 
+template <typename T>
+static void delete_vector_capsule(PyObject *capsule) {
+    void *pointer = PyCapsule_GetPointer(capsule, "meshmerizer.vector");
+    if (pointer != NULL) {
+        delete static_cast<std::vector<T> *>(pointer);
+    }
+}
+
+template <typename T, int NPY_TYPE>
+static PyObject *vector_to_numpy_2d(
+    std::vector<T> &&values,
+    npy_intp width,
+    npy_intp inner_stride) {
+    auto *owned = new std::vector<T>(std::move(values));
+    npy_intp dims[2] = {
+        static_cast<npy_intp>(owned->size()),
+        width,
+    };
+    npy_intp strides[2] = {
+        static_cast<npy_intp>(sizeof(T)),
+        inner_stride,
+    };
+    PyObject *array = PyArray_New(
+        &PyArray_Type,
+        2,
+        dims,
+        NPY_TYPE,
+        strides,
+        owned->data(),
+        0,
+        NPY_ARRAY_ALIGNED | NPY_ARRAY_WRITEABLE,
+        NULL);
+    if (array == NULL) {
+        delete owned;
+        return NULL;
+    }
+
+    PyObject *capsule = PyCapsule_New(
+        owned,
+        "meshmerizer.vector",
+        &delete_vector_capsule<T>);
+    if (capsule == NULL) {
+        Py_DECREF(array);
+        delete owned;
+        return NULL;
+    }
+    if (PyArray_SetBaseObject(
+            reinterpret_cast<PyArrayObject *>(array), capsule) < 0) {
+        Py_DECREF(capsule);
+        Py_DECREF(array);
+        return NULL;
+    }
+    return array;
+}
+
 // ---------------------------------------------------------------------------
 // Binding wrappers for octree construction and per-cell helpers.
 // ---------------------------------------------------------------------------
@@ -3359,39 +3414,20 @@ static PyObject *run_full_pipeline_py(
     PyEval_RestoreThread(_save);
     meshmerizer_cancel_detail::reset_cancel_state();
 
-    // Build output NumPy arrays.
-    const std::size_t nv = result.vertices.size();
-    const std::size_t nf = result.triangles.size();
-
-    npy_intp vdims[2] = {
-        static_cast<npy_intp>(nv), 3};
-    PyObject *v_arr =
-        PyArray_SimpleNew(2, vdims, NPY_DOUBLE);
-    if (v_arr == NULL) return NULL;
-    double *v_data = static_cast<double *>(
-        PyArray_DATA(
-            reinterpret_cast<PyArrayObject *>(v_arr)));
-    for (std::size_t i = 0; i < nv; ++i) {
-        v_data[i * 3] = result.vertices[i].x;
-        v_data[i * 3 + 1] = result.vertices[i].y;
-        v_data[i * 3 + 2] = result.vertices[i].z;
+    PyObject *v_arr = vector_to_numpy_2d<Vector3d, NPY_DOUBLE>(
+        std::move(result.vertices),
+        3,
+        static_cast<npy_intp>(sizeof(double)));
+    if (v_arr == NULL) {
+        return NULL;
     }
-
-    npy_intp fdims[2] = {
-        static_cast<npy_intp>(nf), 3};
-    PyObject *f_arr =
-        PyArray_SimpleNew(2, fdims, NPY_UINT32);
+    PyObject *f_arr = vector_to_numpy_2d<std::array<std::uint32_t, 3>, NPY_UINT32>(
+        std::move(result.triangles),
+        3,
+        static_cast<npy_intp>(sizeof(std::uint32_t)));
     if (f_arr == NULL) {
         Py_DECREF(v_arr);
         return NULL;
-    }
-    std::uint32_t *f_data = static_cast<std::uint32_t *>(
-        PyArray_DATA(
-            reinterpret_cast<PyArrayObject *>(f_arr)));
-    for (std::size_t i = 0; i < nf; ++i) {
-        f_data[i * 3] = result.triangles[i][0];
-        f_data[i * 3 + 1] = result.triangles[i][1];
-        f_data[i * 3 + 2] = result.triangles[i][2];
     }
 
     // Build result dict.

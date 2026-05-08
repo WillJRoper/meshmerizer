@@ -56,6 +56,11 @@ VertexAdjacency build_triangle_mesh_adjacency(
 #include <numeric>
 #include <vector>
 
+template <typename T>
+inline void release_pipeline_vector_memory(std::vector<T> &values) {
+    std::vector<T>().swap(values);
+}
+
 inline double elapsed_seconds_since(
     const std::chrono::steady_clock::time_point &start_time) {
     return std::chrono::duration<double>(
@@ -813,6 +818,50 @@ inline DCPipelineResult run_dc_pipeline(
             opened_surface.vertices.size(),
             opened_surface.triangles.size());
 
+        std::size_t opened_inside_count = 0U;
+        for (std::uint8_t flag : opened_inside) {
+            opened_inside_count += flag != 0U ? 1U : 0U;
+        }
+        meshmerizer_log_detail::print_debug_status(
+            "Regularization",
+            "run_dc_pipeline",
+            "leaves=%zu opened_inside=%zu surface_vertices=%zu "
+            "surface_triangles=%zu qef_vertices=%zu\n",
+            solid_leaves.size(),
+            opened_inside_count,
+            opened_surface.vertices.size(),
+            opened_surface.triangles.size(),
+            static_cast<std::size_t>(0));
+
+        meshmerizer_log_detail::print_debug_status(
+            "Regularization",
+            "run_dc_pipeline",
+            "using opened-solid blocky extraction with existing smoothing\n");
+
+        print_octree_structure_summary(all_cells);
+
+        // The downstream cleanup stages operate only on the extracted opened
+        // surface, so release the octree and regularization scaffolding before
+        // smoothing and gap filling.
+        release_pipeline_vector_memory(opened_surface.vertex_keys);
+        release_pipeline_vector_memory(post_refine_result.opened_inside);
+        release_pipeline_vector_memory(
+            post_refine_result.extraction_view.solid_leaves);
+        release_pipeline_vector_memory(
+            post_refine_result.extraction_view.cell_to_leaf_index);
+        release_pipeline_vector_memory(
+            stable_tree_prelude.regularization_inside_mask_by_cell);
+        release_pipeline_vector_memory(stable_tree_prelude.dirty_cells);
+        release_pipeline_vector_memory(classification_cache.inside_flags);
+        release_pipeline_vector_memory(classification_cache.center_values);
+        release_pipeline_vector_memory(classification_cache.occupancy_states);
+        release_pipeline_vector_memory(
+            classification_cache.face_neighbor_cell_indices);
+        solid_spatial_index.lookup.clear();
+        solid_spatial_index.lookup.rehash(0U);
+        release_pipeline_vector_memory(all_contributors);
+        release_pipeline_vector_memory(all_cells);
+
         if (smoothing_iterations > 0 && !opened_surface.vertices.empty()) {
             const auto smoothing_start = std::chrono::steady_clock::now();
             meshmerizer_log_detail::print_debug_status(
@@ -864,28 +913,6 @@ inline DCPipelineResult run_dc_pipeline(
                 "Opened-surface gap filling: %.3f s\n",
                 elapsed_seconds_since(gap_fill_start));
         }
-
-        std::size_t opened_inside_count = 0U;
-        for (std::uint8_t flag : opened_inside) {
-            opened_inside_count += flag != 0U ? 1U : 0U;
-        }
-        meshmerizer_log_detail::print_debug_status(
-            "Regularization",
-            "run_dc_pipeline",
-            "leaves=%zu opened_inside=%zu surface_vertices=%zu "
-            "surface_triangles=%zu qef_vertices=%zu\n",
-            solid_leaves.size(),
-            opened_inside_count,
-            opened_vertices.size(),
-            opened_triangles.size(),
-            static_cast<std::size_t>(0));
-
-        meshmerizer_log_detail::print_debug_status(
-            "Regularization",
-            "run_dc_pipeline",
-            "using opened-solid blocky extraction with existing smoothing\n");
-
-        print_octree_structure_summary(all_cells);
 
         compact_mesh_geometry(opened_vertices, opened_triangles);
 
@@ -949,7 +976,7 @@ inline DCPipelineResult run_dc_pipeline(
     const auto qef_solve_start = std::chrono::steady_clock::now();
     qef_vertices = solve_all_leaf_vertices(
         all_cells, all_contributors, positions,
-        smoothing_lengths, isovalue);
+        smoothing_lengths, isovalue, worker_count);
     meshmerizer_log_detail::print_debug_status(
         "Timing",
         "run_dc_pipeline",

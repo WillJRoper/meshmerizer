@@ -72,12 +72,7 @@ bool RefinementWorkQueue::push(
     while (qsize > prev && !high_watermark_.compare_exchange_weak(
                prev, qsize, std::memory_order_relaxed)) {
     }
-    // Only pay the condvar wake cost if at least one worker may be
-    // sleeping. Under load every worker is busy and this is a no-op,
-    // which avoids the per-push thundering-herd.
-    if (sleeping_workers_.load(std::memory_order_acquire) > 0U) {
-        idle_condition_.notify_one();
-    }
+    idle_condition_.notify_one();
     return true;
 }
 
@@ -108,13 +103,7 @@ std::size_t RefinementWorkQueue::push_batch(
     while (qsize > prev && !high_watermark_.compare_exchange_weak(
                prev, qsize, std::memory_order_relaxed)) {
     }
-    // Same elision as ``push``: skip notify if nobody is waiting.
-    // ``notify_all`` is needed (rather than ``notify_one``) because a
-    // batch may carry more tasks than the single waiter that ``push``
-    // would wake.
-    if (sleeping_workers_.load(std::memory_order_acquire) > 0U) {
-        idle_condition_.notify_all();
-    }
+    idle_condition_.notify_all();
     return tasks.size();
 }
 
@@ -305,7 +294,9 @@ bool RefinementWorkQueue::try_claim_report_slot(double cadence_seconds) {
 }
 
 bool RefinementWorkQueue::try_claim_report(double cadence_seconds) {
-    (void)cadence_seconds;
+    if (try_claim_report_slot(cadence_seconds)) {
+        return true;
+    }
     const std::size_t pop_count =
         pop_count_.load(std::memory_order_acquire);
     const std::size_t high_watermark =

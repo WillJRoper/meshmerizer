@@ -275,6 +275,83 @@ inline std::vector<OctreeCell> create_top_level_cells(
     return cells;
 }
 
+inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>>
+build_top_level_cells_with_contributors(
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution) {
+    TopLevelParticleGrid grid(domain, base_resolution);
+    grid.insert_particles(positions);
+    grid.compute_bin_max_h(smoothing_lengths);
+
+    std::vector<OctreeCell> top_cells =
+        create_top_level_cells(domain, base_resolution);
+    std::vector<OctreeCell> initial_cells;
+    initial_cells.reserve(top_cells.size());
+    std::vector<std::size_t> initial_contributors;
+    std::vector<std::vector<std::size_t>> top_cell_contributors(
+        top_cells.size());
+
+    const std::int64_t top_cell_count =
+        static_cast<std::int64_t>(top_cells.size());
+#pragma omp parallel for schedule(dynamic)
+    for (std::int64_t ci = 0; ci < top_cell_count; ++ci) {
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                static_cast<std::size_t>(ci))) {
+            continue;
+        }
+        const OctreeCell &cell = top_cells[static_cast<std::size_t>(ci)];
+        std::vector<std::size_t> &cell_contributors =
+            top_cell_contributors[static_cast<std::size_t>(ci)];
+
+        std::uint32_t sx = 0, sy = 0, sz = 0;
+        std::uint32_t ex = 0, ey = 0, ez = 0;
+        grid.contributor_bin_span(
+            cell.bounds, smoothing_lengths, sx, sy, sz, ex, ey, ez);
+
+        for (std::uint32_t ix = sx; ix <= ex; ++ix) {
+            for (std::uint32_t iy = sy; iy <= ey; ++iy) {
+                for (std::uint32_t iz = sz; iz <= ez; ++iz) {
+                    const TopLevelBin &bin =
+                        grid.bins[grid.flatten_index(ix, iy, iz)];
+                    for (std::size_t pi : bin.particle_indices) {
+                        if (particle_support_overlaps_box(
+                                positions[pi],
+                                smoothing_lengths[pi],
+                                cell.bounds)) {
+                            cell_contributors.push_back(pi);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<std::size_t> contributor_offsets(top_cells.size() + 1U, 0U);
+    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+        contributor_offsets[ci + 1U] =
+            contributor_offsets[ci] + top_cell_contributors[ci].size();
+    }
+    initial_contributors.reserve(contributor_offsets.back());
+    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+        OctreeCell cell = top_cells[ci];
+        const std::size_t begin = contributor_offsets[ci];
+        const std::size_t end = contributor_offsets[ci + 1U];
+        cell.contributor_begin = static_cast<std::int64_t>(begin);
+        cell.contributor_end = static_cast<std::int64_t>(end);
+        initial_cells.push_back(cell);
+        const std::vector<std::size_t> &cell_contributors =
+            top_cell_contributors[ci];
+        initial_contributors.insert(
+            initial_contributors.end(),
+            cell_contributors.begin(),
+            cell_contributors.end());
+    }
+
+    return {std::move(initial_cells), std::move(initial_contributors)};
+}
+
 /**
  * @brief Return one child bounding box from a parent cell.
  *

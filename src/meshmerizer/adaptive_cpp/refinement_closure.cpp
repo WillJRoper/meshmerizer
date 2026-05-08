@@ -672,7 +672,8 @@ inline RefinementResult evaluate_refinement_for_leaf(
     const std::vector<std::size_t> &all_contributors,
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
-    const RefinementClosureConfig &config) {
+    const RefinementClosureConfig &config,
+    std::vector<HermiteSample> &samples) {
     RefinementResult result;
 
     const std::int64_t contrib_begin = current_cell.contributor_begin;
@@ -720,10 +721,15 @@ inline RefinementResult evaluate_refinement_for_leaf(
         return result;
     }
 
-    const std::vector<HermiteSample> samples = compute_cell_hermite_samples(
-        current_cell.bounds, result.corner_values,
-        result.corner_sign_mask, contributors,
-        positions, smoothing_lengths, config.isovalue);
+    compute_cell_hermite_samples(
+        current_cell.bounds,
+        result.corner_values,
+        result.corner_sign_mask,
+        contributors,
+        positions,
+        smoothing_lengths,
+        config.isovalue,
+        samples);
     const QEFLeafDiagnostics qef_diagnostics =
         analyze_qef_for_leaf(samples, current_cell.bounds);
     const double dx = current_cell.bounds.max.x - current_cell.bounds.min.x;
@@ -1579,6 +1585,7 @@ inline void process_closure_task(
     ClosureWorkerState &worker) {
     ScopedNsTimer dfs_timer(worker.profiler.ns_local_dfs_total);
     std::vector<RefinementTask> local_stack;
+    std::vector<HermiteSample> hermite_samples;
     local_stack.push_back(root_task);
     worker.profiler.local_stack_pushes.fetch_add(1U, std::memory_order_relaxed);
 
@@ -1726,7 +1733,8 @@ inline void process_closure_task(
                 contributor_snapshot,
                 worker.positions,
                 worker.smoothing_lengths,
-                worker.config);
+                worker.config,
+                hermite_samples);
         }();
 
         if (force_split_thickening) {

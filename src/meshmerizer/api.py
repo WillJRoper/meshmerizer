@@ -116,6 +116,7 @@ def build_tree(
     base_resolution: int,
     isovalue: float,
     max_depth: int,
+    worker_count: int = 1,
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
@@ -130,6 +131,8 @@ def build_tree(
         base_resolution: Number of top-level cells per axis.
         isovalue: Scalar field threshold used for refinement decisions.
         max_depth: Maximum octree refinement depth.
+        worker_count: Number of native refinement workers to use when building
+            the staged octree state.
         minimum_usable_hermite_samples: Minimum usable Hermite sample count
             required before a corner-crossing cell may stop refining.
         max_qef_rms_residual_ratio: Maximum RMS QEF residual as a fraction of
@@ -149,7 +152,7 @@ def build_tree(
         base_resolution,
         isovalue,
         max_depth,
-        1,
+        worker_count,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
@@ -175,6 +178,7 @@ def regularize(
     min_feature_thickness: float,
     *,
     pre_thickening_radius: float = 0.0,
+    worker_count: int = 1,
 ) -> TopologyState:
     """Build the opened-solid topology used by the regularized pipeline.
 
@@ -183,6 +187,8 @@ def regularize(
         min_feature_thickness: Minimum feature thickness to preserve.
         pre_thickening_radius: Optional outward thickening radius applied
             before the opening stage.
+        worker_count: Number of native refinement workers to use during the
+            topology pass.
 
     Returns:
         ``TopologyState`` representing the regularized opened solid.
@@ -202,6 +208,7 @@ def regularize(
         max_surface_leaf_size=erosion_radius,
         erosion_radius=erosion_radius,
         pre_thickening_radius=pre_thickening_radius,
+        worker_count=worker_count,
     )
     return TopologyState(
         tree=tree,

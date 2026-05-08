@@ -22,6 +22,7 @@ def extract_opened_surface_mesh(
     isovalue: float,
     max_depth: int,
     opened_inside: np.ndarray,
+    worker_count: int = 1,
     table_cadence: float = 0.0,
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
@@ -38,6 +39,8 @@ def extract_opened_surface_mesh(
         isovalue: Scalar field threshold.
         max_depth: Maximum octree refinement depth.
         opened_inside: Editable opened-solid occupancy mask on octree leaves.
+        worker_count: Number of native closure workers to use during any
+            refinement performed by the extraction path.
         table_cadence: Queue-status table cadence in seconds for any closure
             refinement used during the native preparation path. Defaults to
             ``0.0`` for this diagnostic/extraction route.
@@ -65,7 +68,7 @@ def extract_opened_surface_mesh(
         max_depth,
         opened,
         table_cadence,
-        1,
+        worker_count,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
@@ -89,6 +92,7 @@ def classify_occupied_solid(
     max_surface_leaf_size: float = 0.0,
     erosion_radius: float = 0.0,
     pre_thickening_radius: float = 0.0,
+    worker_count: int = 1,
     table_cadence: float = 0.0,
 ) -> dict:
     """Classify the adaptive occupied solid on octree leaves.
@@ -109,6 +113,8 @@ def classify_occupied_solid(
         erosion_radius: Erosion radius used by the opening operator.
         pre_thickening_radius: Optional outward thickening radius applied
             before erosion.
+        worker_count: Number of native closure workers to use during topology
+            refinement.
         table_cadence: Queue-status table cadence in seconds for queue-driven
             refinement used by this topology path. Defaults to ``0.0``.
 
@@ -130,8 +136,7 @@ def classify_occupied_solid(
         int(base_resolution),
         isovalue,
         int(max_depth),
-        # worker_count: topology path is always serial.
-        1,
+        worker_count,
         int(minimum_usable_hermite_samples),
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,

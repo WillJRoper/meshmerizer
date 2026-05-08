@@ -195,18 +195,21 @@ inline Vector3d evaluate_field_gradient_at_point(
  * @param positions Particle positions in world space.
  * @param smoothing_lengths Per-particle support radii.
  * @param isovalue The target surface level.
- * @return Hermite samples, one per sign-changing edge.
+ * @param samples Output Hermite samples, one per sign-changing edge.
  */
-inline std::vector<HermiteSample> compute_cell_hermite_samples(
+inline void compute_cell_hermite_samples(
     const BoundingBox &bounds,
     const std::array<double, 8> &corner_values,
     std::uint8_t corner_sign_mask,
     std::span<const std::size_t> contributor_indices,
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
-    double isovalue) {
-    std::vector<HermiteSample> samples;
-    samples.reserve(4);  // Most cells have at most a handful of crossings.
+    double isovalue,
+    std::vector<HermiteSample> &samples) {
+    samples.clear();
+    if (samples.capacity() < 4U) {
+        samples.reserve(4U);  // Most cells have at most a handful of crossings.
+    }
 
     for (const auto &edge : CELL_EDGE_PAIRS) {
         const std::uint8_t corner_a = edge[0];
@@ -256,6 +259,32 @@ inline std::vector<HermiteSample> compute_cell_hermite_samples(
         samples.push_back({crossing, outward_normal});
     }
 
+}
+
+/**
+ * @brief Return Hermite samples for one leaf cell.
+ *
+ * This overload preserves the value-returning convenience API for colder call
+ * sites while allowing hot loops to reuse caller-owned scratch storage.
+ */
+inline std::vector<HermiteSample> compute_cell_hermite_samples(
+    const BoundingBox &bounds,
+    const std::array<double, 8> &corner_values,
+    std::uint8_t corner_sign_mask,
+    std::span<const std::size_t> contributor_indices,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    double isovalue) {
+    std::vector<HermiteSample> samples;
+    compute_cell_hermite_samples(
+        bounds,
+        corner_values,
+        corner_sign_mask,
+        contributor_indices,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        samples);
     return samples;
 }
 

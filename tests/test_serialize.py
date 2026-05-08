@@ -10,6 +10,7 @@ from meshmerizer.adaptive import (
     refine_octree,
     solve_vertices,
 )
+from meshmerizer.cli.diagnostics import emit_tree_structure_summary
 from meshmerizer.io.octree import export_octree, import_octree
 
 
@@ -278,6 +279,115 @@ def test_round_trip_mesh_usable_for_solve_vertices():
 
         # Must produce identical results.
         assert len(verts_p) == len(orig_verts_p)
+    finally:
+        os.unlink(path)
+
+
+def test_imported_columnar_cells_bypass_python_cell_materialization():
+    """Imported octrees should parse natively without per-cell dict access."""
+    (
+        cells,
+        contributors,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        domain_min,
+        domain_max,
+        max_depth,
+        base_resolution,
+    ) = _build_sphere_octree()
+
+    with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as f:
+        path = f.name
+
+    try:
+        export_octree(
+            path,
+            isovalue=isovalue,
+            base_resolution=base_resolution,
+            max_depth=max_depth,
+            domain_minimum=domain_min,
+            domain_maximum=domain_max,
+            positions=positions,
+            smoothing_lengths=smoothing_lengths,
+            cells=cells,
+            contributors=contributors,
+        )
+
+        result = import_octree(path)
+        original_getitem = result["cells"].__class__.__getitem__
+
+        def _fail_getitem(self, index):
+            raise AssertionError(
+                "columnar cells should not materialize Python dicts"
+            )
+
+        result["cells"].__class__.__getitem__ = _fail_getitem
+        try:
+            verts_p, verts_n = solve_vertices(
+                result["cells"],
+                result["contributors"],
+                result["positions"],
+                result["smoothing_lengths"],
+                result["isovalue"],
+                result["domain_minimum"],
+                result["domain_maximum"],
+                result["max_depth"],
+                result["base_resolution"],
+            )
+        finally:
+            result["cells"].__class__.__getitem__ = original_getitem
+
+        assert len(verts_p) == len(verts_n)
+        assert len(verts_p) > 0
+    finally:
+        os.unlink(path)
+
+
+def test_tree_summary_uses_columnar_fast_path_for_imported_cells():
+    """Tree diagnostics should not materialize imported cell dictionaries."""
+    (
+        cells,
+        contributors,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        domain_min,
+        domain_max,
+        max_depth,
+        base_resolution,
+    ) = _build_sphere_octree()
+
+    with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as f:
+        path = f.name
+
+    try:
+        export_octree(
+            path,
+            isovalue=isovalue,
+            base_resolution=base_resolution,
+            max_depth=max_depth,
+            domain_minimum=domain_min,
+            domain_maximum=domain_max,
+            positions=positions,
+            smoothing_lengths=smoothing_lengths,
+            cells=cells,
+            contributors=contributors,
+        )
+
+        result = import_octree(path)
+        original_getitem = result["cells"].__class__.__getitem__
+
+        def _fail_getitem(self, index):
+            raise AssertionError(
+                "tree summary should not materialize Python dicts"
+            )
+
+        result["cells"].__class__.__getitem__ = _fail_getitem
+        try:
+            emit_tree_structure_summary(result["cells"])
+        finally:
+            result["cells"].__class__.__getitem__ = original_getitem
     finally:
         os.unlink(path)
 

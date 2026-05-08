@@ -291,6 +291,33 @@ def _reconstruct_mesh(
     pos = np.ascontiguousarray(positions, dtype=np.float64)
     sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
 
+    if group_labels is None:
+        if pos.shape[0] < 3:
+            return (
+                np.empty((0, 3), dtype=np.float64),
+                np.empty((0, 3), dtype=np.int64),
+            )
+        result = run_full_pipeline(
+            pos,
+            sml,
+            domain_min,
+            domain_max,
+            base_resolution,
+            isovalue,
+            max_depth,
+            worker_count=worker_count,
+            table_cadence=table_cadence,
+            smoothing_iterations=smoothing_iterations,
+            smoothing_strength=smoothing_strength,
+            max_edge_ratio=max_edge_ratio,
+            minimum_usable_hermite_samples=minimum_usable_hermite_samples,
+            max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
+            min_normal_alignment_threshold=min_normal_alignment_threshold,
+            min_feature_thickness=min_feature_thickness,
+            pre_thickening_radius=pre_thickening_radius,
+        )
+        return result["vertices"], result["faces"]
+
     def _run_group(group_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Run the native pipeline for one independent particle group."""
         group_pos = np.ascontiguousarray(pos[group_indices], dtype=np.float64)
@@ -472,6 +499,7 @@ def _run_full_pipeline_path(
         )
 
     mesh = _build_mesh(mesh_verts, mesh_faces, origin)
+    del mesh_verts, mesh_faces
     mesh = _postprocess_mesh(mesh, args)
     output_path = _resolve_output_path(args)
     _save_final_mesh(mesh, output_path, summary=False)
@@ -808,6 +836,7 @@ def _run_octree_backed_pipeline(
         )
 
     mesh = _build_mesh(mesh_verts, mesh_faces, origin)
+    del mesh_verts, mesh_faces
     mesh = _postprocess_mesh(mesh, args)
     output_path = _resolve_output_path(args)
     _save_final_mesh(mesh, output_path, summary=True)

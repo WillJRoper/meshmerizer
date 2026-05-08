@@ -3503,6 +3503,29 @@ inline OpenedSurfaceMesh merge_region_surface_buffers(
         buffer.local_vertex_lookup.rehash(0U);
     }
 
+    auto reorder_by_old_to_new = [](auto &values,
+                                    const std::vector<std::size_t> &old_to_new) {
+        std::vector<std::uint8_t> visited(values.size(), 0U);
+        for (std::size_t start = 0; start < values.size(); ++start) {
+            if (visited[start] != 0U || old_to_new[start] == start) {
+                visited[start] = 1U;
+                continue;
+            }
+            std::size_t current = start;
+            auto displaced = std::move(values[current]);
+            while (true) {
+                visited[current] = 1U;
+                const std::size_t next = old_to_new[current];
+                if (next == start) {
+                    values[next] = std::move(displaced);
+                    break;
+                }
+                std::swap(displaced, values[next]);
+                current = next;
+            }
+        }
+    };
+
     std::vector<std::size_t> order(mesh.vertices.size(), 0U);
     for (std::size_t i = 0; i < order.size(); ++i) {
         order[i] = i;
@@ -3511,38 +3534,38 @@ inline OpenedSurfaceMesh merge_region_surface_buffers(
         return mesh.vertex_keys[a] < mesh.vertex_keys[b];
     });
 
-    OpenedSurfaceMesh sorted_mesh;
-    sorted_mesh.vertices.resize(mesh.vertices.size());
-    sorted_mesh.vertex_keys.resize(mesh.vertex_keys.size());
-    sorted_mesh.triangles = mesh.triangles;
-    std::vector<Vector3d> sorted_normals(normal_accum.size(), {0.0, 0.0, 0.0});
     std::vector<std::size_t> old_to_new(order.size(), 0U);
     for (std::size_t new_index = 0; new_index < order.size(); ++new_index) {
         const std::size_t old_index = order[new_index];
         old_to_new[old_index] = new_index;
-        sorted_mesh.vertices[new_index] = mesh.vertices[old_index];
-        sorted_mesh.vertex_keys[new_index] = mesh.vertex_keys[old_index];
-        sorted_normals[new_index] = normal_accum[old_index];
     }
-    for (MeshTriangle &triangle : sorted_mesh.triangles) {
+    reorder_by_old_to_new(mesh.vertices, old_to_new);
+    reorder_by_old_to_new(mesh.vertex_keys, old_to_new);
+    reorder_by_old_to_new(normal_accum, old_to_new);
+    release_vector_memory(order);
+
+    for (MeshTriangle &triangle : mesh.triangles) {
         triangle.vertex_indices[0] = old_to_new[triangle.vertex_indices[0]];
         triangle.vertex_indices[1] = old_to_new[triangle.vertex_indices[1]];
         triangle.vertex_indices[2] = old_to_new[triangle.vertex_indices[2]];
     }
-    for (std::size_t i = 0; i < sorted_mesh.vertices.size(); ++i) {
+    release_vector_memory(old_to_new);
+
+    for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
         const double mag = std::sqrt(
-            sorted_normals[i].x * sorted_normals[i].x +
-            sorted_normals[i].y * sorted_normals[i].y +
-            sorted_normals[i].z * sorted_normals[i].z);
+            normal_accum[i].x * normal_accum[i].x +
+            normal_accum[i].y * normal_accum[i].y +
+            normal_accum[i].z * normal_accum[i].z);
         if (mag > 0.0) {
-            sorted_mesh.vertices[i].normal = {
-                sorted_normals[i].x / mag,
-                sorted_normals[i].y / mag,
-                sorted_normals[i].z / mag,
+            mesh.vertices[i].normal = {
+                normal_accum[i].x / mag,
+                normal_accum[i].y / mag,
+                normal_accum[i].z / mag,
             };
         }
     }
-    return sorted_mesh;
+    release_vector_memory(normal_accum);
+    return mesh;
 }
 
 inline void run_merge_surface_buffers_task(
