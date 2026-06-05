@@ -490,10 +490,6 @@ def import_octree(path: str) -> dict:
 
 
 __all__ = [
-    "CellDict",
-    "MeshVertex",
-    "SCHEMA_VERSION",
-    "Vec3",
     "export_octree",
     "import_octree",
 ]

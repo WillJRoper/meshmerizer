@@ -8,10 +8,12 @@ loosely structured dictionaries.
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-import numpy as np
+from typing import TYPE_CHECKING
 
 from meshmerizer.mesh import Mesh
+
+if TYPE_CHECKING:
+    import numpy as np
 
 Vec3 = tuple[float, float, float]
 

@@ -336,17 +336,19 @@ def test_mesh_helpers_return_mesh_instances() -> None:
 def test_smooth_mesh_skips_second_process_without_smoothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    mesh = Mesh(mesh=Mesh(
-        vertices=np.array(
-            [
-                [0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-            ],
-            dtype=np.float64,
-        ),
-        faces=np.array([[0, 1, 2]], dtype=np.uint32),
-    ).mesh.copy())
+    mesh = Mesh(
+        mesh=Mesh(
+            vertices=np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ],
+                dtype=np.float64,
+            ),
+            faces=np.array([[0, 1, 2]], dtype=np.uint32),
+        ).mesh.copy()
+    )
 
     process_calls = 0
     fix_normals_calls = 0

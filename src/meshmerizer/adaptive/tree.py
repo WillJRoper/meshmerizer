@@ -18,37 +18,6 @@ if TYPE_CHECKING:
     import numpy
 
 
-def create_top_level_cells_with_contributors(
-    positions: list[tuple[float, float, float]],
-    smoothing_lengths: list[float],
-    domain_minimum: tuple[float, float, float],
-    domain_maximum: tuple[float, float, float],
-    base_resolution: int,
-) -> tuple[dict, ...]:
-    """Create top-level cells and query contributors in one pass.
-
-    Args:
-        positions: Particle positions with shape ``(N, 3)``.
-        smoothing_lengths: Per-particle smoothing lengths with shape ``(N,)``.
-        domain_minimum: Lower corner of the working domain.
-        domain_maximum: Upper corner of the working domain.
-        base_resolution: Number of top-level cells per axis.
-
-    Returns:
-        Native tuple containing the top-level cell dictionaries and aligned
-        contributor payload needed by later refinement stages.
-    """
-    # Delegate the combined construction/query step to the native helper so
-    # Python callers can reuse the documented historical bridge format.
-    return _adaptive.create_top_level_cells_with_contributors(
-        positions,
-        smoothing_lengths,
-        domain_minimum,
-        domain_maximum,
-        base_resolution,
-    )
-
-
 def create_top_level_cells(
     domain_minimum: tuple[float, float, float],
     domain_maximum: tuple[float, float, float],
@@ -435,7 +404,6 @@ __all__ = [
     "build_refined_tree",
     "create_child_cells",
     "create_top_level_cells",
-    "create_top_level_cells_with_contributors",
     "filter_child_contributors",
     "generate_mesh",
     "hermite_samples_for_cell",

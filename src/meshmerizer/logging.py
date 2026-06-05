@@ -539,40 +539,6 @@ def cli_logging_context(*, silent: bool = False) -> Iterator[None]:
             _teardown_cli_logging()
 
 
-@contextmanager
-def progress_bar(
-    total: int,
-    *,
-    desc: str,
-    unit: str,
-    enabled: bool = True,
-) -> Iterator[tqdm]:
-    """Create a tqdm progress bar that stays quiet outside the CLI runtime.
-
-    Args:
-        total: Number of expected steps.
-        desc: Short bar description.
-        unit: Item unit label shown by tqdm.
-        enabled: Whether the caller wants a visible progress bar.
-
-    Yields:
-        Progress-bar object.
-    """
-    show_bar = enabled and _STATE.active and (not _STATE.silent) and total > 1
-    bar = tqdm(
-        total=total,
-        desc=desc,
-        unit=unit,
-        leave=False,
-        dynamic_ncols=True,
-        disable=not show_bar,
-    )
-    try:
-        yield bar
-    finally:
-        bar.close()
-
-
 def log_debug_status(
     operation: str,
     message: str,

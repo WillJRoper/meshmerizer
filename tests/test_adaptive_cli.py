@@ -139,8 +139,6 @@ def test_remove_islands_avoids_watertight_mass_property_warnings() -> None:
 
 def test_postprocess_mesh_repairs_before_island_filtering(tmp_path) -> None:
     """CLI postprocessing should repair invalid topology before filtering."""
-    from argparse import Namespace
-
     from meshmerizer.cli.adaptive import _postprocess_mesh
 
     box = trimesh.creation.box(extents=(1.0, 1.0, 1.0))

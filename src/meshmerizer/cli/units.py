@@ -63,6 +63,5 @@ def convert_print_length_to_native_units(
 
 
 __all__ = [
-    "compute_print_scale_factor_cm",
     "convert_print_length_to_native_units",
 ]

@@ -1,6 +1,7 @@
 """Tests for the adaptive C++ core utilities and diagnostics."""
 
 import numpy as np
+import pytest
 
 from meshmerizer.adaptive import (
     adaptive_status,
@@ -161,8 +162,6 @@ def test_create_top_level_cells_returns_row_major_cells() -> None:
 
 def test_create_top_level_cells_rejects_zero_resolution() -> None:
     """Top-level cell creation should reject a zero base resolution."""
-    import pytest
-
     with pytest.raises(ValueError, match="base_resolution"):
         create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 0)
 
@@ -482,26 +481,6 @@ def test_leaf_cells_share_face_consistency() -> None:
 
 # Unit cell used throughout the Hermite sample tests.
 _UNIT_BOUNDS = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
-
-
-def _unit_corner_values(isovalue: float, gradient_axis: int) -> list[float]:
-    """Return 8 corner values for a linear field along one axis.
-
-    The field varies from -1 at the low end to +1 at the high end along the
-    chosen axis, crossing zero (the isovalue) at the midpoint.
-
-    Corner index encoding: bit 0 = high x, bit 1 = high y, bit 2 = high z.
-    """
-    values = []
-    for corner in range(8):
-        position = [
-            1.0 if (corner & 1) else 0.0,
-            1.0 if (corner & 2) else 0.0,
-            1.0 if (corner & 4) else 0.0,
-        ]
-        # Linear field: -1 at 0, +1 at 1 along the chosen axis.
-        values.append(2.0 * position[gradient_axis] - 1.0)
-    return values
 
 
 def test_hermite_samples_no_crossings_on_uniform_field() -> None:
@@ -858,8 +837,6 @@ def test_solve_vertices_produces_vertices() -> None:
 
 def test_solve_vertices_normals_unit_length() -> None:
     """QEF vertex normals should be approximately unit length."""
-    import numpy as np
-
     args = _build_sphere_octree()
     vert_positions, vert_normals = solve_vertices(*args)
     norms = np.linalg.norm(vert_normals, axis=1)
@@ -1015,8 +992,6 @@ def test_refine_octree_threaded_sphere_smoke_test_repeated() -> None:
 
 def test_refine_octree_accepts_numpy_arrays() -> None:
     """C++ bindings should accept NumPy arrays via buffer protocol."""
-    import numpy as np
-
     domain_min = (0.0, 0.0, 0.0)
     domain_max = (1.0, 1.0, 1.0)
     base_resolution = 2
@@ -1049,8 +1024,6 @@ def test_refine_octree_accepts_numpy_arrays() -> None:
 
 def test_run_octree_pipeline_produces_vertices() -> None:
     """Octree pipeline should produce QEF vertices."""
-    import numpy as np
-
     domain_min = (-1.0, -1.0, -1.0)
     domain_max = (2.0, 2.0, 2.0)
     base_resolution = 2
@@ -1092,8 +1065,6 @@ def test_run_octree_pipeline_produces_vertices() -> None:
 
 def test_run_octree_pipeline_empty_particles() -> None:
     """Pipeline with no particles should produce empty arrays."""
-    import numpy as np
-
     positions = np.zeros((0, 3), dtype=np.float64)
     smoothing = np.zeros(0, dtype=np.float64)
 
@@ -1112,8 +1083,6 @@ def test_run_octree_pipeline_empty_particles() -> None:
 
 def test_run_octree_pipeline_accepts_worker_count() -> None:
     """The compact C++ octree pipeline should honor worker_count."""
-    import numpy as np
-
     positions_arr = np.array(
         [
             (0.45, 0.5, 0.5),
@@ -1150,8 +1119,6 @@ def test_run_octree_pipeline_accepts_worker_count() -> None:
 
 def test_compute_isovalue_from_percentile_basic() -> None:
     """Percentile isovalue should match manual Wendland C2 self-density."""
-    import numpy as np
-
     h = np.array([0.1, 0.2, 0.5, 1.0], dtype=np.float64)
     iso = compute_isovalue_from_percentile(h, 50.0)
     # Manual: self_density = 21 / (2*pi*h^3), median of those values.
@@ -1162,8 +1129,6 @@ def test_compute_isovalue_from_percentile_basic() -> None:
 
 def test_compute_isovalue_percentile_low_encloses_more() -> None:
     """Lower percentile should give a lower isovalue (enclose more)."""
-    import numpy as np
-
     h = np.random.default_rng(42).uniform(0.05, 1.0, size=1000)
     iso_5 = compute_isovalue_from_percentile(h, 5.0)
     iso_50 = compute_isovalue_from_percentile(h, 50.0)
@@ -1172,9 +1137,6 @@ def test_compute_isovalue_percentile_low_encloses_more() -> None:
 
 def test_compute_isovalue_percentile_rejects_invalid() -> None:
     """Out-of-range percentile should raise ValueError."""
-    import numpy as np
-    import pytest
-
     h = np.array([0.1, 0.2], dtype=np.float64)
     with pytest.raises(ValueError):
         compute_isovalue_from_percentile(h, -1.0)
@@ -1189,8 +1151,6 @@ def test_compute_isovalue_percentile_rejects_invalid() -> None:
 
 def test_fof_single_cluster() -> None:
     """Tightly packed points should form one cluster."""
-    import numpy as np
-
     rng = np.random.default_rng(42)
     positions = rng.uniform(0.4, 0.6, size=(50, 3))
     labels = fof_cluster(
@@ -1207,8 +1167,6 @@ def test_fof_single_cluster() -> None:
 
 def test_fof_two_separated_clusters() -> None:
     """Two well-separated clumps should get different labels."""
-    import numpy as np
-
     rng = np.random.default_rng(99)
     # Cluster A near origin, cluster B near (10, 10, 10).
     cluster_a = rng.uniform(0.0, 0.1, size=(30, 3))
@@ -1231,8 +1189,6 @@ def test_fof_two_separated_clusters() -> None:
 
 def test_fof_empty_input() -> None:
     """Empty positions should return an empty label array."""
-    import numpy as np
-
     positions = np.empty((0, 3), dtype=np.float64)
     labels = fof_cluster(
         positions,
@@ -1246,8 +1202,6 @@ def test_fof_empty_input() -> None:
 
 def test_fof_cluster_sizes_support_small_cluster_filtering() -> None:
     """FOF labels should allow thresholding away tiny detached clusters."""
-    import numpy as np
-
     rng = np.random.default_rng(7)
     main_cluster = rng.uniform(0.0, 0.2, size=(40, 3))
     fluff_cluster = rng.uniform(4.9, 5.0, size=(3, 3))
@@ -1269,8 +1223,6 @@ def test_fof_cluster_sizes_support_small_cluster_filtering() -> None:
 
 def test_fof_uses_tight_particle_bounds_for_linking_scale() -> None:
     """FOF should not depend on a much larger enclosing domain."""
-    import numpy as np
-
     positions = np.array(
         [
             [0.00, 0.00, 0.00],
@@ -1569,7 +1521,9 @@ def test_b2_chain_produces_inside_classified_cells() -> None:
     )
 
     # The classify pass must have run and labelled some cells inside.
-    assert result["n_inside"] > 0, "Expected at least one inside leaf after B2 classify"
+    assert result["n_inside"] > 0, (
+        "Expected at least one inside leaf after B2 classify"
+    )
     # The thickening pass must have expanded the inside count.
     assert result["n_thickened_inside"] >= result["n_inside"], (
         "Thickened inside count must be >= raw inside count"

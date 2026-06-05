@@ -19,12 +19,11 @@ from .pipeline import (
     fof_cluster,
     run_full_pipeline,
 )
-from .topology import classify_occupied_solid, extract_opened_surface_mesh
+from .topology import classify_occupied_solid
 from .tree import (
     build_refined_tree,
     create_child_cells,
     create_top_level_cells,
-    create_top_level_cells_with_contributors,
     filter_child_contributors,
     generate_mesh,
     hermite_samples_for_cell,
@@ -45,8 +44,6 @@ __all__ = [
     "corner_sign_mask",
     "create_child_cells",
     "create_top_level_cells",
-    "create_top_level_cells_with_contributors",
-    "extract_opened_surface_mesh",
     "filter_child_contributors",
     "fof_cluster",
     "generate_mesh",

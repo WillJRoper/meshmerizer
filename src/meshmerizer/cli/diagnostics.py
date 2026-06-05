@@ -121,12 +121,8 @@ def emit_tree_structure_summary(cells) -> None:
         ]
 
         depth_counts = np.bincount(depths, minlength=max_depth + 1)
-        leaf_counts = np.bincount(
-            depths[is_leaf], minlength=max_depth + 1
-        )
-        active_counts = np.bincount(
-            depths[is_active], minlength=max_depth + 1
-        )
+        leaf_counts = np.bincount(depths[is_leaf], minlength=max_depth + 1)
+        active_counts = np.bincount(depths[is_active], minlength=max_depth + 1)
         surface_counts = np.bincount(
             depths[has_surface], minlength=max_depth + 1
         )

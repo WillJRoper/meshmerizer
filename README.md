@@ -50,6 +50,19 @@ DEBUG_LOG=1 pip install -e .
 
 When `DEBUG_LOG` is unset, native debug-only diagnostics are compiled out.
 
+### Building with native progress counters
+
+Set `ATOMIC_PROGRESS` before installation to compile native hot-loop progress
+counters into the extension.
+
+```bash
+ATOMIC_PROGRESS=1 pip install -e .
+```
+
+When `ATOMIC_PROGRESS` is unset, these counters are compiled out entirely.
+Normal builds still emit coarse completion and timing summaries, but avoid
+per-iteration atomic increments and terminal flushes in long native loops.
+
 ## CLI workflow
 
 The main command is:
@@ -134,6 +147,8 @@ meshmerizer snapshot.hdf5 \
 | `--save-octree`, `--load-octree` | Save or reload octree state                       |
 | `--visualise-verts`              | Save a diagnostic QEF vertex figure               |
 | `--nthreads`                     | Set the OpenMP thread count                       |
+| `--silent`                       | Suppress per-update progress rendering            |
+| `--table-cadence`                | Set queue-status table cadence in seconds         |
 
 For further details, see `meshmerizer --help` or the [CLI documentation](https://willjroper.github.io/meshmerizer/cli.html).
 

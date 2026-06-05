@@ -13,7 +13,7 @@ import trimesh.remesh as remesh
 import trimesh.smoothing as smoothing
 from trimesh import repair as trimesh_repair
 
-from meshmerizer.logging_utils import log_status
+from meshmerizer.logging import log_status
 
 
 class Mesh:
