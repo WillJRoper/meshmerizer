@@ -61,9 +61,7 @@ def test_remove_islands_keeps_large_nonwatertight_main_component() -> None:
     assert cleaned.mesh.bounds[1][0] < 20.0
 
 
-def test_remove_islands_ignores_flat_degenerate_component_without_warnings() -> (
-    None
-):
+def test_remove_islands_ignores_flat_degenerate_component() -> None:
     """Flat zero-volume fluff should not trigger trimesh mass warnings."""
     main = trimesh.creation.box(extents=(10.0, 10.0, 10.0))
     flat = trimesh.Trimesh(

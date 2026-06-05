@@ -928,7 +928,7 @@ def test_refine_octree_threaded_sphere_smoke_test() -> None:
 
 
 def test_refine_octree_thread_count_compatibility_on_sphere() -> None:
-    """Serial and threaded sphere refinement should remain compatibility-equivalent."""
+    """Serial and threaded sphere refinement should remain compatible."""
     serial_cells, _, _, _, _, _, _, max_depth, _ = _build_sphere_octree(
         base_resolution=4,
         max_depth=3,
@@ -1426,7 +1426,7 @@ def test_opened_solid_generates_surface_mesh() -> None:
 
 
 def test_regularization_fixed_sphere_topology_fingerprint() -> None:
-    """Fixed regularization case should preserve opened-solid topology counts."""
+    """Fixed regularization preserves opened-solid topology counts."""
     positions, smoothing_lengths = _make_solid_sphere_particles(
         n=300,
         radius=0.9,

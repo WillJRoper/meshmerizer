@@ -95,6 +95,7 @@ def run_full_pipeline(
         base_resolution: Number of top-level cells per axis.
         isovalue: Scalar field threshold for reconstruction.
         max_depth: Maximum octree refinement depth.
+        worker_count: Number of native closure workers.
         table_cadence: Strict time cadence in seconds for queue-status table
             rows emitted by queue-driven refinement. Defaults to ``10.0``.
         smoothing_iterations: Number of smoothing iterations.

@@ -54,10 +54,10 @@ Dataset layout
     ``normals``: float64[V, 3]
     ``group_labels``: int64[V]
 
-The imported Python representation preserves the historical dictionary-based API
-through a lazy sequence wrapper so existing reconstruction and diagnostic code
-can continue to consume it without paying the full materialization cost up
-front.
+The imported Python representation preserves the historical dictionary-based
+API through a lazy sequence wrapper so existing reconstruction and diagnostic
+code can continue to consume it without paying the full materialization cost
+up front.
 """
 
 from __future__ import annotations

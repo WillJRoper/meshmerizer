@@ -1,10 +1,4 @@
-"""CLI logging, timing, and progress helpers.
-
-This module centralizes user-facing CLI output, progress bars, and timing
-aggregation used for end-of-run summaries. Library callers can import the
-package without seeing CLI noise; runtime handlers are only attached during an
-active CLI command.
-"""
+"""CLI logging, timing, and progress helpers."""
 
 from __future__ import annotations
 
