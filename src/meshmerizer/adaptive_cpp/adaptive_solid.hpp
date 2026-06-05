@@ -425,7 +425,7 @@ inline void update_occupied_solid_classification_cache(
         }
     }
 
-    ProgressCounter classify_counter(
+    MESHMERIZER_PROGRESS_COUNTER(classify_counter,
         "Regularization", "classify_occupied_solid_leaves", "cells", 1000);
 
 #pragma omp parallel for schedule(dynamic)
@@ -436,10 +436,10 @@ inline void update_occupied_solid_classification_cache(
             classify_cell_indices[static_cast<std::size_t>(active_idx)];
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 cell_idx)) {
-            classify_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(classify_counter);
             continue;
         }
-        classify_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(classify_counter);
         const OctreeCell &cell = all_cells[cell_idx];
 
         const bool has_precomputed_value =
@@ -471,9 +471,9 @@ inline void update_occupied_solid_classification_cache(
         cache.inside_flags[cell_idx] = inside ? 1U : 0U;
     }
 
-    classify_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(classify_counter);
 
-    ProgressCounter occupancy_counter(
+    MESHMERIZER_PROGRESS_COUNTER(occupancy_counter,
         "Regularization", "classify_occupied_solid_leaves", "cells", 1000);
 
 #pragma omp parallel for schedule(dynamic)
@@ -484,10 +484,10 @@ inline void update_occupied_solid_classification_cache(
             occupancy_cell_indices[static_cast<std::size_t>(active_idx)];
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 cell_idx)) {
-            occupancy_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(occupancy_counter);
             continue;
         }
-        occupancy_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(occupancy_counter);
         const OctreeCell &cell = all_cells[cell_idx];
 
         const bool inside = cache.inside_flags[cell_idx] != 0U;
@@ -516,7 +516,7 @@ inline void update_occupied_solid_classification_cache(
         cache.occupancy_states[cell_idx] =
             static_cast<std::uint8_t>(occupancy);
     }
-    occupancy_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(occupancy_counter);
 
     for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
         if (all_cells[cell_idx].is_leaf) {
@@ -766,7 +766,7 @@ inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
         inside_mask_by_cell.assign(all_cells.size(), 0U);
     }
 
-    ProgressCounter leaf_build_counter(
+    MESHMERIZER_PROGRESS_COUNTER(leaf_build_counter,
         "Regularization",
         "build_occupied_solid_leaves_from_cache",
         "cells",
@@ -774,7 +774,7 @@ inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
 
     for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
-        leaf_build_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(leaf_build_counter);
         const OctreeCell &cell = all_cells[cell_idx];
         if (!cell.is_leaf) {
             continue;
@@ -805,9 +805,9 @@ inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
                     : 0U;
         }
     }
-    leaf_build_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(leaf_build_counter);
 
-    ProgressCounter neighbor_counter(
+    MESHMERIZER_PROGRESS_COUNTER(neighbor_counter,
         "Regularization", "classify_occupied_solid_leaves", "leaves", 1000);
 
 #pragma omp parallel for schedule(dynamic)
@@ -816,12 +816,12 @@ inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
          ++leaf_index) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 static_cast<std::size_t>(leaf_index))) {
-            neighbor_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(neighbor_counter);
             continue;
         }
         OccupiedSolidLeaf &leaf =
             solid_leaves[static_cast<std::size_t>(leaf_index)];
-        neighbor_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(neighbor_counter);
         const auto &neighbors = cache.face_neighbor_cell_indices[leaf.cell_index];
         for (std::size_t face = 0; face < neighbors.size(); ++face) {
             const std::size_t neighbor_cell_index = neighbors[face];
@@ -833,7 +833,7 @@ inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
                 cell_to_leaf_index[neighbor_cell_index];
         }
     }
-    neighbor_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(neighbor_counter);
 
     if (out_cell_to_leaf_index != nullptr) {
         *out_cell_to_leaf_index = std::move(cell_to_leaf_index);
@@ -940,7 +940,7 @@ inline void merge_occupied_solid_cache_from_closure_state(
         }
     }
 
-    ProgressCounter neighbor_counter(
+    MESHMERIZER_PROGRESS_COUNTER(neighbor_counter,
         "Regularization",
         "merge_occupied_solid_cache_from_closure_state",
         "cells",
@@ -952,28 +952,28 @@ inline void merge_occupied_solid_cache_from_closure_state(
         const std::size_t idx =
             active_leaf_indices[static_cast<std::size_t>(active_idx)];
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(idx)) {
-            neighbor_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(neighbor_counter);
             continue;
         }
-        neighbor_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(neighbor_counter);
         cache.face_neighbor_cell_indices[idx] = face_neighbor_cells(
             all_cells[idx], spatial_index, max_depth);
     }
-    neighbor_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(neighbor_counter);
 }
 
 inline std::vector<std::uint8_t> build_inside_mask_from_classification_cache(
     const std::vector<OctreeCell> &all_cells,
     const OccupiedSolidClassificationCache &classification_cache) {
     std::vector<std::uint8_t> inside_mask(all_cells.size(), 0U);
-    ProgressCounter mask_counter(
+    MESHMERIZER_PROGRESS_COUNTER(mask_counter,
         "Regularization",
         "build_inside_mask_from_classification_cache",
         "cells",
         1000);
     for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
-        mask_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(mask_counter);
         if (!all_cells[cell_index].is_leaf) {
             continue;
         }
@@ -983,7 +983,7 @@ inline std::vector<std::uint8_t> build_inside_mask_from_classification_cache(
                                       ? 1U
                                       : 0U;
     }
-    mask_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(mask_counter);
     return inside_mask;
 }
 
@@ -1026,20 +1026,20 @@ inline std::vector<std::uint8_t> build_leaf_mask_from_cell_mask(
     const std::vector<OccupiedSolidLeaf> &solid_leaves,
     const std::vector<std::uint8_t> &cell_mask) {
     std::vector<std::uint8_t> inside_mask(solid_leaves.size(), 0U);
-    ProgressCounter mask_counter(
+    MESHMERIZER_PROGRESS_COUNTER(mask_counter,
         "Regularization",
         "build_leaf_mask_from_cell_mask",
         "leaves",
         1000);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        mask_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(mask_counter);
         const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
         if (cell_index < cell_mask.size()) {
             inside_mask[leaf_index] = cell_mask[cell_index];
         }
     }
-    mask_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(mask_counter);
     return inside_mask;
 }
 
@@ -1048,20 +1048,20 @@ inline std::vector<double> project_leaf_scalars_from_cell_state(
     const std::vector<double> &cell_values,
     double default_value) {
     std::vector<double> leaf_values(solid_leaves.size(), default_value);
-    ProgressCounter value_counter(
+    MESHMERIZER_PROGRESS_COUNTER(value_counter,
         "Regularization",
         "project_leaf_scalars_from_cell_state",
         "leaves",
         1000);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        value_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(value_counter);
         const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
         if (cell_index < cell_values.size()) {
             leaf_values[leaf_index] = cell_values[cell_index];
         }
     }
-    value_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(value_counter);
     return leaf_values;
 }
 
@@ -1077,14 +1077,15 @@ inline std::vector<double> compute_outside_distance_from_classification_cache(
         std::vector<QueueEntry>,
         std::greater<QueueEntry>> queue;
 
-    ProgressCounter seed_counter(
+    MESHMERIZER_PROGRESS_COUNTER(seed_counter,
         "Regularization",
         "compute_outside_distance_from_classification_cache",
         "cells",
         1000);
+    std::size_t boundary_seed_count = 0U;
     for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
-        seed_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(seed_counter);
         if (!all_cells[cell_index].is_leaf ||
             !occupied_solid_cache_is_inside(
                 classification_cache.occupancy_states[cell_index])) {
@@ -1110,21 +1111,27 @@ inline std::vector<double> compute_outside_distance_from_classification_cache(
         if (is_boundary_seed) {
             distance_from_inside[cell_index] = 0.0;
             queue.push({0.0, cell_index});
+            ++boundary_seed_count;
         }
     }
-    seed_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(seed_counter);
 
-    ProgressCounter wavefront_counter(
+    MESHMERIZER_PROGRESS_COUNTER(wavefront_counter,
         "Regularization",
         "compute_outside_distance_from_classification_cache",
         "queue pops",
         10000);
+    std::size_t pop_count = 0U;
+    std::size_t stale_pop_count = 0U;
+    std::size_t update_count = 0U;
     while (!queue.empty()) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
-        wavefront_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(wavefront_counter);
         const auto [distance, cell_index] = queue.top();
         queue.pop();
+        ++pop_count;
         if (distance > distance_from_inside[cell_index]) {
+            ++stale_pop_count;
             continue;
         }
         if (distance > max_distance) {
@@ -1159,10 +1166,22 @@ inline std::vector<double> compute_outside_distance_from_classification_cache(
             if (candidate < distance_from_inside[neighbor_cell_index]) {
                 distance_from_inside[neighbor_cell_index] = candidate;
                 queue.push({candidate, neighbor_cell_index});
+                ++update_count;
             }
         }
     }
-    wavefront_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(wavefront_counter);
+
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "compute_outside_distance_from_classification_cache",
+        "completed distance wavefront: seeds=%zu pops=%zu stale_pops=%zu updates=%zu max_distance=%.6g cells=%zu\n",
+        boundary_seed_count,
+        pop_count,
+        stale_pop_count,
+        update_count,
+        max_distance,
+        all_cells.size());
 
     return distance_from_inside;
 }
@@ -1174,7 +1193,7 @@ inline std::vector<std::uint8_t> dilate_inside_cell_mask(
     double dilation_radius) {
     std::vector<std::uint8_t> dilated_inside(all_cells.size(), 0U);
 
-    ProgressCounter dilate_counter(
+    MESHMERIZER_PROGRESS_COUNTER(dilate_counter,
         "Regularization",
         "dilate_inside_cell_mask",
         "cells",
@@ -1183,10 +1202,10 @@ inline std::vector<std::uint8_t> dilate_inside_cell_mask(
     for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 cell_index)) {
-            dilate_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(dilate_counter);
             continue;
         }
-        dilate_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(dilate_counter);
         if (!all_cells[cell_index].is_leaf) {
             continue;
         }
@@ -1196,7 +1215,7 @@ inline std::vector<std::uint8_t> dilate_inside_cell_mask(
                 ? 1U
                 : 0U;
     }
-    dilate_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(dilate_counter);
 
     return dilated_inside;
 }
@@ -1380,12 +1399,12 @@ inline bool thickening_band_is_fully_refined(
         return true;
     }
 
-    ProgressCounter check_counter(
+    MESHMERIZER_PROGRESS_COUNTER(check_counter,
         "Regularization", "thickening_band_is_fully_refined", "leaves", 1000);
     std::size_t unresolved_count = 0U;
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        check_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(check_counter);
         if (inside_mask[leaf_index] != 0U) {
             continue;
         }
@@ -1397,7 +1416,7 @@ inline bool thickening_band_is_fully_refined(
             break;
         }
     }
-    check_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(check_counter);
 
     meshmerizer_log_detail::print_debug_status(
         "Regularization",
@@ -1514,14 +1533,14 @@ inline std::vector<double> compute_inside_clearance_from_cell_mask(
     RefinementWorkQueue queue;
     queue.initialize(worker_count);
 
-    ProgressCounter seed_counter(
+    MESHMERIZER_PROGRESS_COUNTER(seed_counter,
         "Regularization",
         "compute_inside_clearance_from_cell_mask",
         "cells",
         1000);
     for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
-        seed_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(seed_counter);
         if (!all_cells[cell_index].is_leaf || inside_mask_by_cell[cell_index] == 0U) {
             continue;
         }
@@ -1550,9 +1569,10 @@ inline std::vector<double> compute_inside_clearance_from_cell_mask(
                 static_cast<std::uint32_t>(cell_index % worker_count));
         }
     }
-    seed_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(seed_counter);
+    queue.capture_initial_queue_size();
 
-    ProgressCounter wavefront_counter(
+    MESHMERIZER_PROGRESS_COUNTER(wavefront_counter,
         "Regularization",
         "compute_inside_clearance_from_cell_mask",
         "relaxations",
@@ -1567,7 +1587,7 @@ inline std::vector<double> compute_inside_clearance_from_cell_mask(
             RefinementTask task;
             while (queue.pop(worker_id, task)) {
                 try {
-                    wavefront_counter.tick();
+                    MESHMERIZER_PROGRESS_TICK(wavefront_counter);
                     const std::size_t cell_index = task.cell_index;
                     if (cell_index >= all_cells.size()) {
                         queue.task_done();
@@ -1632,7 +1652,18 @@ inline std::vector<double> compute_inside_clearance_from_cell_mask(
     if (worker_error != nullptr) {
         std::rethrow_exception(worker_error);
     }
-    wavefront_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(wavefront_counter);
+    const RefinementWorkQueueStats clearance_stats = queue.stats();
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "compute_inside_clearance_from_cell_mask",
+        "completed clearance wavefront: seeds=%zu pops=%zu pushes=%zu queue_peak=%zu max_distance=%.6g cells=%zu\n",
+        clearance_stats.initial_queue_size,
+        clearance_stats.pop_count,
+        clearance_stats.push_count,
+        clearance_stats.high_watermark,
+        max_distance,
+        all_cells.size());
 
     std::vector<double> clearance(all_cells.size(), inf);
     for (std::size_t cell_index = 0; cell_index < clearance.size(); ++cell_index) {
@@ -1650,23 +1681,23 @@ inline std::vector<std::uint8_t> erode_occupied_solid_cells(
     double erosion_radius) {
     std::vector<std::uint8_t> kept_inside(all_cells.size(), 0U);
 
-    ProgressCounter erode_counter(
+    MESHMERIZER_PROGRESS_COUNTER(erode_counter,
         "Regularization", "erode_occupied_solid_cells", "cells", 1000);
 #pragma omp parallel for schedule(static)
     for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 cell_index)) {
-            erode_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(erode_counter);
             continue;
         }
-        erode_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(erode_counter);
         if (!all_cells[cell_index].is_leaf || inside_mask_by_cell[cell_index] == 0U) {
             continue;
         }
         kept_inside[cell_index] =
             clearance_by_cell[cell_index] >= erosion_radius ? 1U : 0U;
     }
-    erode_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(erode_counter);
     return kept_inside;
 }
 
@@ -1691,14 +1722,14 @@ inline std::vector<double> compute_distance_to_eroded_solid_from_cell_mask(
     RefinementWorkQueue queue;
     queue.initialize(worker_count);
 
-    ProgressCounter seed_counter(
+    MESHMERIZER_PROGRESS_COUNTER(seed_counter,
         "Regularization",
         "compute_distance_to_eroded_solid_from_cell_mask",
         "cells",
         1000);
     for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
-        seed_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(seed_counter);
         if (!all_cells[cell_index].is_leaf || eroded_inside_by_cell[cell_index] == 0U) {
             continue;
         }
@@ -1727,9 +1758,10 @@ inline std::vector<double> compute_distance_to_eroded_solid_from_cell_mask(
                 static_cast<std::uint32_t>(cell_index % worker_count));
         }
     }
-    seed_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(seed_counter);
+    queue.capture_initial_queue_size();
 
-    ProgressCounter wavefront_counter(
+    MESHMERIZER_PROGRESS_COUNTER(wavefront_counter,
         "Regularization",
         "compute_distance_to_eroded_solid_from_cell_mask",
         "relaxations",
@@ -1744,7 +1776,7 @@ inline std::vector<double> compute_distance_to_eroded_solid_from_cell_mask(
             RefinementTask task;
             while (queue.pop(worker_id, task)) {
                 try {
-                    wavefront_counter.tick();
+                    MESHMERIZER_PROGRESS_TICK(wavefront_counter);
                     const std::size_t cell_index = task.cell_index;
                     if (cell_index >= all_cells.size()) {
                         queue.task_done();
@@ -1809,7 +1841,18 @@ inline std::vector<double> compute_distance_to_eroded_solid_from_cell_mask(
     if (worker_error != nullptr) {
         std::rethrow_exception(worker_error);
     }
-    wavefront_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(wavefront_counter);
+    const RefinementWorkQueueStats distance_stats = queue.stats();
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "compute_distance_to_eroded_solid_from_cell_mask",
+        "completed distance wavefront: seeds=%zu pops=%zu pushes=%zu queue_peak=%zu max_distance=%.6g cells=%zu\n",
+        distance_stats.initial_queue_size,
+        distance_stats.pop_count,
+        distance_stats.push_count,
+        distance_stats.high_watermark,
+        max_distance,
+        all_cells.size());
 
     std::vector<double> distance_to_eroded(all_cells.size(), inf);
     for (std::size_t cell_index = 0; cell_index < distance_to_eroded.size(); ++cell_index) {
@@ -1827,16 +1870,16 @@ inline std::vector<std::uint8_t> dilate_eroded_solid_cells(
     double dilation_radius) {
     std::vector<std::uint8_t> opened_inside(all_cells.size(), 0U);
 
-    ProgressCounter dilate_counter(
+    MESHMERIZER_PROGRESS_COUNTER(dilate_counter,
         "Regularization", "dilate_eroded_solid_cells", "cells", 1000);
 #pragma omp parallel for schedule(static)
     for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 cell_index)) {
-            dilate_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(dilate_counter);
             continue;
         }
-        dilate_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(dilate_counter);
         if (!all_cells[cell_index].is_leaf) {
             continue;
         }
@@ -1846,7 +1889,7 @@ inline std::vector<std::uint8_t> dilate_eroded_solid_cells(
                 ? 1U
                 : 0U;
     }
-    dilate_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(dilate_counter);
     return opened_inside;
 }
 
@@ -1862,11 +1905,11 @@ inline void prune_small_opened_components(
     std::vector<std::vector<std::size_t>> components;
     std::vector<double> component_volumes;
 
-    ProgressCounter component_counter(
+    MESHMERIZER_PROGRESS_COUNTER(component_counter,
         "Regularization", "prune_small_opened_components", "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < opened_inside.size(); ++leaf_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        component_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(component_counter);
         if (opened_inside[leaf_index] == 0U || visited[leaf_index] != 0U) {
             continue;
         }
@@ -1905,7 +1948,7 @@ inline void prune_small_opened_components(
         components.push_back(std::move(component));
         component_volumes.push_back(component_volume);
     }
-    component_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(component_counter);
 
     if (components.size() <= 1U) {
         return;
@@ -1972,11 +2015,11 @@ inline void fill_small_opened_cavities(
 
     std::vector<std::uint8_t> visited(opened_inside.size(), 0U);
     std::vector<OutsideComponent> outside_components;
-    ProgressCounter cavity_counter(
+    MESHMERIZER_PROGRESS_COUNTER(cavity_counter,
         "Regularization", "fill_small_opened_cavities", "leaves", 1000);
 
     for (std::size_t leaf_index = 0; leaf_index < opened_inside.size(); ++leaf_index) {
-        cavity_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(cavity_counter);
         if (opened_inside[leaf_index] != 0U || visited[leaf_index] != 0U) {
             continue;
         }
@@ -2013,7 +2056,7 @@ inline void fill_small_opened_cavities(
 
         outside_components.push_back(std::move(component));
     }
-    cavity_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(cavity_counter);
 
     const double max_cavity_volume = max_cavity_volume_ratio * opened_volume;
     std::size_t filled_components = 0U;
@@ -2092,11 +2135,11 @@ inline void suppress_opened_edge_contacts(
     candidates.reserve(opened_inside.size() / 16U + 1U);
     const std::vector<std::int64_t> cell_to_leaf_index =
         build_opened_cell_to_leaf_index(all_cells, solid_leaves);
-    ProgressCounter contact_counter(
+    MESHMERIZER_PROGRESS_COUNTER(contact_counter,
         "Regularization", "suppress_opened_edge_contacts", "leaves", 1000);
 
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        contact_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(contact_counter);
         if (opened_inside[leaf_index] == 0U) {
             continue;
         }
@@ -2159,7 +2202,7 @@ inline void suppress_opened_edge_contacts(
             candidates.push_back({leaf_index, exposed_faces, span * span * span});
         }
     }
-    contact_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(contact_counter);
 
     if (candidates.empty()) {
         return;
@@ -2198,12 +2241,12 @@ inline std::vector<OpenedBoundarySample> generate_opened_boundary_samples(
     const int n_threads = omp_get_max_threads();
     std::vector<std::vector<OpenedBoundarySample>> thread_samples(
         static_cast<std::size_t>(n_threads));
-    ProgressCounter sample_counter(
+    MESHMERIZER_PROGRESS_COUNTER(sample_counter,
         "Meshing", "generate_opened_boundary_samples", "leaves", 1000);
 
 #pragma omp parallel for schedule(dynamic)
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        sample_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(sample_counter);
         if (opened_inside[leaf_index] == 0U) {
             continue;
         }
@@ -2258,7 +2301,7 @@ inline std::vector<OpenedBoundarySample> generate_opened_boundary_samples(
         }
     }
 
-    sample_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(sample_counter);
 
     for (const auto &local_samples : thread_samples) {
         samples.insert(samples.end(), local_samples.begin(), local_samples.end());
@@ -3790,10 +3833,10 @@ inline bool resolve_opened_edge_ambiguities(
 
     std::unordered_map<EdgeKey, std::uint32_t, EdgeKeyHash> edge_counts;
     edge_counts.reserve(mesh.triangles.size() * 2U);
-    ProgressCounter edge_counter(
+    MESHMERIZER_PROGRESS_COUNTER(edge_counter,
         "Regularization", "resolve_opened_edge_ambiguities", "triangles", 1000);
     for (const MeshTriangle &triangle : mesh.triangles) {
-        edge_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(edge_counter);
         for (std::size_t i = 0; i < 3U; ++i) {
             const std::size_t v0 = triangle.vertex_indices[i];
             const std::size_t v1 = triangle.vertex_indices[(i + 1U) % 3U];
@@ -3817,7 +3860,7 @@ inline bool resolve_opened_edge_ambiguities(
             ++edge_counts[key];
         }
     }
-    edge_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(edge_counter);
 
     struct CandidateFill {
         std::size_t leaf_index;
@@ -3827,14 +3870,14 @@ inline bool resolve_opened_edge_ambiguities(
 
     std::vector<CandidateFill> fills;
     fills.reserve(16U);
-    ProgressCounter resolve_counter(
+    MESHMERIZER_PROGRESS_COUNTER(resolve_counter,
         "Regularization", "resolve_opened_edge_ambiguities", "edges", 100);
 
     for (const auto &entry : edge_counts) {
         if (entry.second <= 2U) {
             continue;
         }
-        resolve_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(resolve_counter);
 
         std::uint32_t gx, gy, gz;
         unpack_surface_corner_coords(entry.first.base_key, gx, gy, gz);
@@ -3907,7 +3950,7 @@ inline bool resolve_opened_edge_ambiguities(
             fills.push_back(best);
         }
     }
-    resolve_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(resolve_counter);
 
     if (fills.empty()) {
         return false;

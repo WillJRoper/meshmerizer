@@ -399,6 +399,8 @@ private:
 };
 
 
+#ifdef ATOMIC_PROGRESS
+
 /**
  * @class ProgressCounter
  * @brief Terminal-width counter for loops with unknown totals.
@@ -509,6 +511,25 @@ private:
         std::fflush(stdout);
     }
 };
+
+#endif
+
+#ifdef ATOMIC_PROGRESS
+#define MESHMERIZER_PROGRESS_COUNTER(name, ...) \
+    ProgressCounter name(__VA_ARGS__)
+#define MESHMERIZER_PROGRESS_TICK(name) name.tick()
+#define MESHMERIZER_PROGRESS_FINISH(name) name.finish()
+#else
+#define MESHMERIZER_PROGRESS_COUNTER(name, ...) \
+    do {                                      \
+    } while (false)
+#define MESHMERIZER_PROGRESS_TICK(name) \
+    do {                               \
+    } while (false)
+#define MESHMERIZER_PROGRESS_FINISH(name) \
+    do {                                 \
+    } while (false)
+#endif
 
 
 #endif /* MESHMERIZER_PROGRESS_BAR_HPP */

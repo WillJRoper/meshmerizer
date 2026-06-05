@@ -189,7 +189,7 @@ struct LeafSpatialIndex {
         }
         lookup.reserve(n_leaves);
 
-        ProgressCounter build_counter(
+        MESHMERIZER_PROGRESS_COUNTER(build_counter,
             "Regularization",
             "LeafSpatialIndex::build",
             "leaves",
@@ -200,7 +200,7 @@ struct LeafSpatialIndex {
             if (!cell.is_leaf) {
                 continue;
             }
-            build_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(build_counter);
 
             // Quantize the cell's min corner to fine-grid coordinates.
             // This gives the unique key for this leaf.
@@ -218,7 +218,13 @@ struct LeafSpatialIndex {
                 ix_min, iy_min, iz_min)};
             lookup[key] = cell_idx;
         }
-        build_counter.finish();
+        MESHMERIZER_PROGRESS_FINISH(build_counter);
+        meshmerizer_log_detail::print_debug_status(
+            "Regularization",
+            "LeafSpatialIndex::build",
+            "indexed %zu leaves from %zu cells\n",
+            n_leaves,
+            all_cells.size());
     }
 
     /**
@@ -982,12 +988,12 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
          closure_iteration <= MAX_CLOSURE_ITERATIONS;
          ++closure_iteration) {
         std::vector<char> next_needs_vertex = expanded_needs_vertex;
-        ProgressCounter closure_counter(
+        MESHMERIZER_PROGRESS_COUNTER(closure_counter,
             "Meshing", "close_incident_neighbourhood", "cells", 100);
         std::size_t newly_marked = 0;
         for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
             meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
-            closure_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(closure_counter);
             if (!expanded_needs_vertex[cell_idx]) {
                 continue;
             }
@@ -1036,7 +1042,7 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
                 }
             }
         }
-        closure_counter.finish();
+        MESHMERIZER_PROGRESS_FINISH(closure_counter);
         meshmerizer_log_detail::print_debug_status(
             "Meshing",
             "close_incident_neighbourhood",
