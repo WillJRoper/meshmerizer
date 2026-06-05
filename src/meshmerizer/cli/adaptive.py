@@ -212,8 +212,7 @@ def _build_mesh(mesh_verts, mesh_faces, origin: np.ndarray) -> Mesh:
     """
     # The native pipeline works in local coordinates, so shift vertices back to
     # snapshot/world coordinates before wrapping them for export.
-    mesh_verts += origin
-    return Mesh(vertices=mesh_verts, faces=mesh_faces)
+    return Mesh(vertices=mesh_verts + origin, faces=mesh_faces)
 
 
 def _save_final_mesh(mesh: Mesh, output_path: Path, *, summary: bool) -> None:
@@ -759,12 +758,14 @@ def _run_octree_backed_pipeline(
     else:
         group_labels = np.zeros(len(positions), dtype=np.int64)
 
+    # Reuse the saved tree only when reconstruction would be a pure dual-
+    # contour extraction pass. Any FOF regrouping, topology regularization, or
+    # smoothing requires the full reconstruction pipeline instead.
     can_reuse_loaded_tree = (
         not getattr(args, "fof", False)
         and min_feature_thickness <= 0.0
         and pre_thickening_radius <= 0.0
         and getattr(args, "smoothing_iterations", 0) == 0
-        and getattr(args, "max_edge_ratio", 1.5) <= 0.0
     )
     reconstruction_depth = max_depth
     log_status(

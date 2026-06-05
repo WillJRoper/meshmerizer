@@ -79,7 +79,6 @@ SCHEMA_VERSION = "1.0"
 
 CellDict = Dict[str, object]
 Vec3 = Tuple[float, float, float]
-MeshVertex = Tuple[Vec3, Vec3]
 
 
 class ColumnarCells:

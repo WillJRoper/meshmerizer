@@ -41,7 +41,15 @@ def save_mesh_output(mesh: Mesh, output_path: Path) -> None:
             return
         # Replace atomically once the temporary write succeeded.
         temp_path.replace(output_path)
-    except BaseException:
+    except KeyboardInterrupt:
+        try:
+            # Best-effort cleanup of the temporary file keeps repeated retries
+            # from accumulating stale artifacts.
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    except Exception:
         try:
             # Best-effort cleanup of the temporary file keeps repeated retries
             # from accumulating stale artifacts.

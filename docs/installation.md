@@ -41,3 +41,14 @@ DEBUG_LOG=1 pip install -e .
 ```
 
 If `DEBUG_LOG` is unset, native debug-only diagnostics are compiled out.
+
+## Native progress-counter builds
+
+If you want per-update native progress counters for profiling or diagnostics,
+set `ATOMIC_PROGRESS` before install.
+
+```bash
+ATOMIC_PROGRESS=1 pip install -e .
+```
+
+If `ATOMIC_PROGRESS` is unset, those hot-loop counters are compiled out.

@@ -452,12 +452,13 @@ def test_run_adaptive_allows_missing_filename_with_loaded_octree(
         },
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive._reconstruct_mesh",
+        "meshmerizer.cli.adaptive.generate_mesh",
         lambda *args, **kwargs: (
             np.array(
                 [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
                 dtype=np.float64,
             ),
+            np.zeros((3, 3), dtype=np.float64),
             np.array([[0, 1, 2]], dtype=np.uint32),
         ),
     )

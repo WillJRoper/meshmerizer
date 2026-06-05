@@ -62,3 +62,4 @@ understand in context. Each option page includes:
 - [`--visualise-verts`](visualise-verts.md)
 - [`--nthreads`](nthreads.md)
 - [`--silent`](silent.md)
+- [`--table-cadence`](table-cadence.md)

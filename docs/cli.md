@@ -173,6 +173,8 @@ more detail.
 - [`--nthreads`](cli-options/nthreads.md): set OpenMP thread count
 - [`--silent`](cli-options/silent.md): hide progress bars while keeping status
   logs on stdout
+- [`--table-cadence`](cli-options/table-cadence.md): control queue-status table
+  update cadence during queue-driven refinement
 
 ## Full option reference
 

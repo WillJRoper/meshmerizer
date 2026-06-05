@@ -1,11 +1,16 @@
-"""Helpers for converting print-space controls into meshing units."""
+"""Helpers for converting print-space controls into meshing units.
+
+``convert_print_length_to_native_units`` is the public entry point. The helper
+below remains private because it exposes an implementation detail of how the
+CLI derives print scaling from the working domain bounds.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 
 
-def compute_print_scale_factor_cm(
+def _compute_print_scale_factor_cm(
     domain_min: tuple[float, float, float],
     domain_max: tuple[float, float, float],
     target_size_cm: float,
@@ -56,7 +61,7 @@ def convert_print_length_to_native_units(
     """
     # Reuse the same domain-derived scale factor as final print scaling so the
     # regularization controls remain consistent with the exported mesh size.
-    scale_factor = compute_print_scale_factor_cm(
+    scale_factor = _compute_print_scale_factor_cm(
         domain_min, domain_max, target_size_cm
     )
     return (float(length_cm) * 10.0) / scale_factor

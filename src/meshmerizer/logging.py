@@ -1,6 +1,27 @@
-"""CLI logging, timing, and progress helpers."""
+"""CLI logging, timing, and progress helpers.
+
+The public API of this module is intentionally small and is listed in
+``__all__`` below. Everything else should be treated as implementation detail
+for the CLI runtime.
+"""
 
 from __future__ import annotations
+
+__all__ = [
+    "LOGGER_NAME",
+    "abort_with_error",
+    "cli_logging_context",
+    "emit_timing_summary",
+    "emit_warning_summary",
+    "get_logger",
+    "log_debug_status",
+    "log_error_status",
+    "log_status",
+    "log_summary_status",
+    "log_warning_status",
+    "record_elapsed",
+    "record_timing",
+]
 
 import inspect
 import logging as std_logging

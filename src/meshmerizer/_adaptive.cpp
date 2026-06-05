@@ -3480,7 +3480,9 @@ static PyMethodDef adaptive_methods[] = {
                                 "nthreads must be >= 1");
                 return NULL;
             }
+#ifdef WITH_OPENMP
             omp_set_num_threads(n);
+#endif
             Py_RETURN_NONE;
         },
         METH_VARARGS,

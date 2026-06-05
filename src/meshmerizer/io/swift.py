@@ -334,7 +334,7 @@ def load_swift_particles(
     if box_size is not None:
         # Prefer an explicit user override when present so the CLI can repair
         # incomplete snapshot metadata.
-        box_size_source = "--box-size"
+        full_box_size_source = "--box-size"
     else:
         meta_box = None
         if hasattr(data, "metadata"):
@@ -349,10 +349,9 @@ def load_swift_particles(
         # Normalize the metadata representation once here because SWIFT can
         # expose box size as either scalar or vector-like quantities.
         box_size = boxsize_to_float(meta_box)
-        box_size_source = "snapshot metadata"
+        full_box_size_source = "snapshot metadata"
 
     full_box_size = float(box_size)
-    full_box_size_source = box_size_source
 
     # Map the CLI particle-family name to the corresponding SWIFT dataset.
     if particle_type == "gas":
