@@ -81,6 +81,7 @@ inline void rebuild_occupied_solid_classification_cache(
     const LeafSpatialIndex &solid_spatial_index,
     double isovalue,
     std::uint32_t max_depth,
+    std::uint32_t worker_count,
     OccupiedSolidClassificationCache &classification_cache,
     const std::vector<std::uint8_t> &dirty_cells,
     OccupiedSolidCacheRebuildMode rebuild_mode);
@@ -187,6 +188,28 @@ inline void unlock_stable_tree_prelude_task(
     }
 }
 
+inline const char *stable_tree_prelude_name(StableTreePreludeNode node) {
+    switch (node) {
+        case StableTreePreludeNode::kBuildSolidSpatialIndex:
+            return "Build solid spatial index";
+        case StableTreePreludeNode::kInitialSolidClassification:
+            return "Initial solid classification";
+        case StableTreePreludeNode::kComputeThickeningSeedDistance:
+            return "Thickening seed distance";
+        case StableTreePreludeNode::kRunThickeningClosure:
+            return "Thickening closure";
+        case StableTreePreludeNode::kMaterializePostThickeningCache:
+            return "Post-thickening cache materialization";
+        case StableTreePreludeNode::kComputeFinalThickeningDistance:
+            return "Final thickening distance";
+        case StableTreePreludeNode::kBuildRegularizationInsideMask:
+            return "Regularization inside mask";
+        case StableTreePreludeNode::kDilatePreThickeningMask:
+            return "Pre-thickening dilation";
+    }
+    return "Unknown stable-tree prelude stage";
+}
+
 inline void initialize_stable_tree_prelude_runtime(
     StableTreePreludeRuntime &runtime) {
     runtime.enqueued.assign(8U, 0U);
@@ -257,18 +280,32 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                 try {
                     switch (task.kind) {
                         case RefinementTaskKind::kBuildSolidSpatialIndex:
+                            {
+                            const auto stage_start =
+                                std::chrono::steady_clock::now();
                             runtime.result.solid_spatial_index.build(
                                 *runtime.all_cells,
                                 *runtime.domain,
                                 runtime.max_depth,
                                 runtime.base_resolution);
+                            meshmerizer_log_detail::print_status(
+                                "Timing",
+                                "run_stable_tree_prelude_task_graph",
+                                "%s: %.3f s\n",
+                                stable_tree_prelude_name(
+                                    StableTreePreludeNode::kBuildSolidSpatialIndex),
+                                elapsed_seconds_since(stage_start));
                             unlock_stable_tree_prelude_task(
                                 queue,
                                 runtime,
                                 StableTreePreludeNode::kInitialSolidClassification,
                                 worker_id);
                             break;
+                            }
                         case RefinementTaskKind::kInitialSolidClassification:
+                            {
+                            const auto stage_start =
+                                std::chrono::steady_clock::now();
                             rebuild_occupied_solid_classification_cache(
                                 *runtime.all_cells,
                                 *runtime.all_contributors,
@@ -277,9 +314,17 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                                 runtime.result.solid_spatial_index,
                                 runtime.isovalue,
                                 runtime.max_depth,
+                                runtime.worker_count,
                                 runtime.result.classification_cache,
                                 runtime.result.dirty_cells,
                                 runtime.initial_rebuild_mode);
+                            meshmerizer_log_detail::print_status(
+                                "Timing",
+                                "run_stable_tree_prelude_task_graph",
+                                "%s: %.3f s\n",
+                                stable_tree_prelude_name(
+                                    StableTreePreludeNode::kInitialSolidClassification),
+                                elapsed_seconds_since(stage_start));
                             if (runtime.pre_thickening_radius > 0.0) {
                                 unlock_stable_tree_prelude_task(
                                     queue,
@@ -288,7 +333,10 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                                     worker_id);
                             }
                             break;
+                            }
                         case RefinementTaskKind::kComputeThickeningSeedDistance: {
+                            const auto stage_start =
+                                std::chrono::steady_clock::now();
                             const double thickening_leaf_size_target = std::max(
                                 runtime.pre_thickening_radius * 0.5,
                                 runtime.finest_leaf_size);
@@ -296,8 +344,16 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                                 compute_outside_distance_from_classification_cache(
                                     *runtime.all_cells,
                                     runtime.result.classification_cache,
+                                    runtime.worker_count,
                                     runtime.pre_thickening_radius +
                                         2.0 * thickening_leaf_size_target);
+                            meshmerizer_log_detail::print_status(
+                                "Timing",
+                                "run_stable_tree_prelude_task_graph",
+                                "%s: %.3f s\n",
+                                stable_tree_prelude_name(
+                                    StableTreePreludeNode::kComputeThickeningSeedDistance),
+                                elapsed_seconds_since(stage_start));
                             unlock_stable_tree_prelude_task(
                                 queue,
                                 runtime,
@@ -306,6 +362,8 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                             break;
                         }
                         case RefinementTaskKind::kRunThickeningClosure: {
+                            const auto stage_start =
+                                std::chrono::steady_clock::now();
                             const double thickening_leaf_size_target = std::max(
                                 runtime.pre_thickening_radius * 0.5,
                                 runtime.finest_leaf_size);
@@ -333,6 +391,13 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                                 &runtime.closure_inside_flags,
                                 &runtime.closure_center_values,
                                 &runtime.closure_occupancy_states);
+                            meshmerizer_log_detail::print_status(
+                                "Timing",
+                                "run_stable_tree_prelude_task_graph",
+                                "%s: %.3f s\n",
+                                stable_tree_prelude_name(
+                                    StableTreePreludeNode::kRunThickeningClosure),
+                                elapsed_seconds_since(stage_start));
                             unlock_stable_tree_prelude_task(
                                 queue,
                                 runtime,
@@ -341,6 +406,8 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                             break;
                         }
                         case RefinementTaskKind::kMaterializePostThickeningCache: {
+                            const auto stage_start =
+                                std::chrono::steady_clock::now();
                             runtime.result.solid_spatial_index.build(
                                 *runtime.all_cells,
                                 *runtime.domain,
@@ -364,9 +431,10 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                                     runtime.result.solid_spatial_index,
                                     runtime.isovalue,
                                     runtime.max_depth,
-                                     runtime.result.classification_cache,
-                                     runtime.result.dirty_cells,
-                                     runtime.post_thickening_rebuild_mode);
+                                    runtime.worker_count,
+                                    runtime.result.classification_cache,
+                                    runtime.result.dirty_cells,
+                                    runtime.post_thickening_rebuild_mode);
                                 runtime.regularization_inside_mask_seed.clear();
                             } else {
                                 runtime.regularization_inside_mask_seed =
@@ -379,28 +447,50 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                                     std::move(runtime.closure_inside_flags),
                                     std::move(runtime.closure_center_values),
                                     std::move(runtime.closure_occupancy_states),
-                                    runtime.result.dirty_cells);
-                            }
-                            unlock_stable_tree_prelude_task(
-                                queue,
-                                runtime,
+                                     runtime.result.dirty_cells);
+                             }
+                            meshmerizer_log_detail::print_status(
+                                "Timing",
+                                "run_stable_tree_prelude_task_graph",
+                                "%s: %.3f s\n",
+                                stable_tree_prelude_name(
+                                    StableTreePreludeNode::kMaterializePostThickeningCache),
+                                elapsed_seconds_since(stage_start));
+                             unlock_stable_tree_prelude_task(
+                                 queue,
+                                 runtime,
                                 StableTreePreludeNode::kComputeFinalThickeningDistance,
                                 worker_id);
-                            break;
-                        }
+                             break;
+                         }
                         case RefinementTaskKind::kComputeFinalThickeningDistance:
+                            {
+                            const auto stage_start =
+                                std::chrono::steady_clock::now();
                             runtime.final_thickening_distance =
                                 compute_outside_distance_from_classification_cache(
                                     *runtime.all_cells,
                                     runtime.result.classification_cache,
+                                    runtime.worker_count,
                                     runtime.pre_thickening_radius);
+                            meshmerizer_log_detail::print_status(
+                                "Timing",
+                                "run_stable_tree_prelude_task_graph",
+                                "%s: %.3f s\n",
+                                stable_tree_prelude_name(
+                                    StableTreePreludeNode::kComputeFinalThickeningDistance),
+                                elapsed_seconds_since(stage_start));
                             unlock_stable_tree_prelude_task(
                                 queue,
                                 runtime,
                                 StableTreePreludeNode::kBuildRegularizationInsideMask,
                                 worker_id);
                             break;
+                            }
                         case RefinementTaskKind::kBuildRegularizationInsideMask:
+                            {
+                            const auto stage_start =
+                                std::chrono::steady_clock::now();
                             if (runtime.regularization_inside_mask_seed.size() ==
                                 runtime.all_cells->size()) {
                                 runtime.result.regularization_inside_mask_by_cell =
@@ -411,13 +501,24 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                                         *runtime.all_cells,
                                         runtime.result.classification_cache);
                             }
+                            meshmerizer_log_detail::print_status(
+                                "Timing",
+                                "run_stable_tree_prelude_task_graph",
+                                "%s: %.3f s\n",
+                                stable_tree_prelude_name(
+                                    StableTreePreludeNode::kBuildRegularizationInsideMask),
+                                elapsed_seconds_since(stage_start));
                             unlock_stable_tree_prelude_task(
                                 queue,
                                 runtime,
                                 StableTreePreludeNode::kDilatePreThickeningMask,
                                 worker_id);
                             break;
+                            }
                         case RefinementTaskKind::kDilatePreThickeningMask:
+                            {
+                            const auto stage_start =
+                                std::chrono::steady_clock::now();
                             runtime.dilated_inside_mask_by_cell =
                                 dilate_inside_cell_mask(
                                     *runtime.all_cells,
@@ -426,7 +527,15 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                                     runtime.pre_thickening_radius);
                             runtime.result.regularization_inside_mask_by_cell =
                                 std::move(runtime.dilated_inside_mask_by_cell);
+                            meshmerizer_log_detail::print_status(
+                                "Timing",
+                                "run_stable_tree_prelude_task_graph",
+                                "%s: %.3f s\n",
+                                stable_tree_prelude_name(
+                                    StableTreePreludeNode::kDilatePreThickeningMask),
+                                elapsed_seconds_since(stage_start));
                             break;
+                            }
                         default:
                             break;
                     }
@@ -462,6 +571,7 @@ inline void rebuild_occupied_solid_classification_cache(
     const LeafSpatialIndex &solid_spatial_index,
     double isovalue,
     std::uint32_t max_depth,
+    std::uint32_t worker_count,
     OccupiedSolidClassificationCache &classification_cache,
     const std::vector<std::uint8_t> &dirty_cells,
     OccupiedSolidCacheRebuildMode rebuild_mode) {
@@ -487,7 +597,7 @@ inline void rebuild_occupied_solid_classification_cache(
                 solid_spatial_index,
                 isovalue,
                 max_depth,
-                1U,
+                std::max(1U, worker_count),
                 classification_cache,
                 &dirty_cells);
             break;

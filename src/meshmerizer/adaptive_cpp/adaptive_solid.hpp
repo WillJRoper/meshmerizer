@@ -1068,14 +1068,23 @@ inline std::vector<double> project_leaf_scalars_from_cell_state(
 inline std::vector<double> compute_outside_distance_from_classification_cache(
     const std::vector<OctreeCell> &all_cells,
     const OccupiedSolidClassificationCache &classification_cache,
+    std::uint32_t worker_count = 1U,
     double max_distance = std::numeric_limits<double>::infinity()) {
     const double inf = std::numeric_limits<double>::infinity();
-    std::vector<double> distance_from_inside(all_cells.size(), inf);
-    using QueueEntry = std::pair<double, std::size_t>;
-    std::priority_queue<
-        QueueEntry,
-        std::vector<QueueEntry>,
-        std::greater<QueueEntry>> queue;
+    if (worker_count == 0U) {
+        worker_count = 1U;
+    }
+
+    std::vector<std::atomic<std::uint64_t>> distance_bits(all_cells.size());
+    for (std::size_t cell_index = 0; cell_index < distance_bits.size();
+         ++cell_index) {
+        distance_bits[cell_index].store(
+            adaptive_solid_double_to_bits(inf),
+            std::memory_order_relaxed);
+    }
+
+    RefinementWorkQueue queue;
+    queue.initialize(worker_count);
 
     MESHMERIZER_PROGRESS_COUNTER(seed_counter,
         "Regularization",
@@ -1109,79 +1118,141 @@ inline std::vector<double> compute_outside_distance_from_classification_cache(
         }
 
         if (is_boundary_seed) {
-            distance_from_inside[cell_index] = 0.0;
-            queue.push({0.0, cell_index});
+            distance_bits[cell_index].store(
+                adaptive_solid_double_to_bits(0.0),
+                std::memory_order_release);
+            queue.push(
+                {
+                    cell_index,
+                    0U,
+                    0U,
+                    RefinementTaskKind::kComputeThickeningSeedDistance,
+                },
+                static_cast<std::uint32_t>(cell_index % worker_count));
             ++boundary_seed_count;
         }
     }
     MESHMERIZER_PROGRESS_FINISH(seed_counter);
+    queue.capture_initial_queue_size();
 
     MESHMERIZER_PROGRESS_COUNTER(wavefront_counter,
         "Regularization",
         "compute_outside_distance_from_classification_cache",
-        "queue pops",
+        "relaxations",
         10000);
-    std::size_t pop_count = 0U;
-    std::size_t stale_pop_count = 0U;
-    std::size_t update_count = 0U;
-    while (!queue.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
-        MESHMERIZER_PROGRESS_TICK(wavefront_counter);
-        const auto [distance, cell_index] = queue.top();
-        queue.pop();
-        ++pop_count;
-        if (distance > distance_from_inside[cell_index]) {
-            ++stale_pop_count;
-            continue;
-        }
-        if (distance > max_distance) {
-            continue;
-        }
 
-        for (std::size_t neighbor_cell_index :
-             classification_cache.face_neighbor_cell_indices[cell_index]) {
-            if (neighbor_cell_index == SIZE_MAX ||
-                neighbor_cell_index >= all_cells.size()) {
-                continue;
-            }
-            if (!all_cells[neighbor_cell_index].is_leaf ||
-                occupied_solid_cache_is_inside(
-                    classification_cache.occupancy_states[neighbor_cell_index])) {
-                continue;
-            }
+    std::exception_ptr worker_error;
+    std::mutex error_mutex;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::uint32_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                try {
+                    MESHMERIZER_PROGRESS_TICK(wavefront_counter);
+                    const std::size_t cell_index = task.cell_index;
+                    if (cell_index >= all_cells.size()) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
 
-            const double source_size = std::max(
-                std::min(cell_edge_length(all_cells[cell_index]), max_distance),
-                0.0);
-            const double neighbor_size = std::max(
-                std::min(
-                    cell_edge_length(all_cells[neighbor_cell_index]),
-                    max_distance),
-                0.0);
-            const double edge_cost = 0.5 * (source_size + neighbor_size);
-            const double candidate = distance + edge_cost;
-            if (candidate > max_distance) {
-                continue;
+                    const double distance = adaptive_solid_bits_to_double(
+                        distance_bits[cell_index].load(
+                            std::memory_order_acquire));
+                    if (!std::isfinite(distance) || distance > max_distance) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
+
+                    for (std::size_t neighbor_cell_index :
+                         classification_cache
+                             .face_neighbor_cell_indices[cell_index]) {
+                        if (neighbor_cell_index == SIZE_MAX ||
+                            neighbor_cell_index >= all_cells.size()) {
+                            continue;
+                        }
+                        if (!all_cells[neighbor_cell_index].is_leaf ||
+                            occupied_solid_cache_is_inside(
+                                classification_cache
+                                    .occupancy_states[neighbor_cell_index])) {
+                            continue;
+                        }
+
+                        const double source_size = std::max(
+                            std::min(
+                                cell_edge_length(all_cells[cell_index]),
+                                max_distance),
+                            0.0);
+                        const double neighbor_size = std::max(
+                            std::min(
+                                cell_edge_length(
+                                    all_cells[neighbor_cell_index]),
+                                max_distance),
+                            0.0);
+                        const double edge_cost =
+                            0.5 * (source_size + neighbor_size);
+                        const double candidate = distance + edge_cost;
+                        if (candidate > max_distance) {
+                            continue;
+                        }
+                        if (adaptive_solid_atomic_update_distance_min(
+                                distance_bits[neighbor_cell_index],
+                                candidate)) {
+                            queue.push(
+                                {
+                                    neighbor_cell_index,
+                                    0U,
+                                    0U,
+                                    RefinementTaskKind::kComputeThickeningSeedDistance,
+                                },
+                                static_cast<std::uint32_t>(
+                                    neighbor_cell_index % worker_count));
+                        }
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (worker_error == nullptr) {
+                        worker_error = std::current_exception();
+                    }
+                    queue.task_done();
+                    queue.shutdown();
+                    return;
+                }
+                queue.task_done();
+                queue.try_shutdown_if_idle();
             }
-            if (candidate < distance_from_inside[neighbor_cell_index]) {
-                distance_from_inside[neighbor_cell_index] = candidate;
-                queue.push({candidate, neighbor_cell_index});
-                ++update_count;
-            }
-        }
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    if (worker_error != nullptr) {
+        std::rethrow_exception(worker_error);
     }
     MESHMERIZER_PROGRESS_FINISH(wavefront_counter);
+
+    const RefinementWorkQueueStats distance_stats = queue.stats();
 
     meshmerizer_log_detail::print_status(
         "Regularization",
         "compute_outside_distance_from_classification_cache",
-        "completed distance wavefront: seeds=%zu pops=%zu stale_pops=%zu updates=%zu max_distance=%.6g cells=%zu\n",
+        "completed distance wavefront: seeds=%zu pops=%zu pushes=%zu queue_peak=%zu max_distance=%.6g cells=%zu\n",
         boundary_seed_count,
-        pop_count,
-        stale_pop_count,
-        update_count,
+        distance_stats.pop_count,
+        distance_stats.push_count,
+        distance_stats.high_watermark,
         max_distance,
         all_cells.size());
+
+    std::vector<double> distance_from_inside(all_cells.size(), inf);
+    for (std::size_t cell_index = 0; cell_index < distance_from_inside.size();
+         ++cell_index) {
+        distance_from_inside[cell_index] = adaptive_solid_bits_to_double(
+            distance_bits[cell_index].load(std::memory_order_acquire));
+    }
 
     return distance_from_inside;
 }

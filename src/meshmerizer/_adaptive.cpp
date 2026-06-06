@@ -2627,7 +2627,9 @@ static PyObject *classify_occupied_solid_py(
         if (pre_thickening_radius > 0.0) {
             thickening_distance_by_cell =
                 compute_outside_distance_from_classification_cache(
-                    all_cells, classification_cache);
+                    all_cells,
+                    classification_cache,
+                    static_cast<std::uint32_t>(worker_count));
             thickening_distance = project_leaf_scalars_from_cell_state(
                 solid_leaves,
                 thickening_distance_by_cell,
@@ -2643,7 +2645,9 @@ static PyObject *classify_occupied_solid_py(
         } else {
             thickening_distance_by_cell =
                 compute_outside_distance_from_classification_cache(
-                    all_cells, classification_cache);
+                    all_cells,
+                    classification_cache,
+                    static_cast<std::uint32_t>(worker_count));
             thickening_distance = project_leaf_scalars_from_cell_state(
                 solid_leaves,
                 thickening_distance_by_cell,
