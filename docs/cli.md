@@ -11,6 +11,10 @@ The CLI is intended for end-to-end snapshot-to-STL usage.
 For detailed per-option behavior, see the
 [CLI option reference](cli-options/index.md).
 
+For a conceptual explanation of the adaptive meshing stages, see
+[Reconstruction Workflow](reconstruction-workflow.md). For runtime and quality
+tradeoffs, see [Tuning Performance](tuning-performance.md).
+
 ## Workflow
 
 At a high level, the CLI:
@@ -38,26 +42,27 @@ meshmerizer snapshot.hdf5 \
   --output mesh.stl
 ```
 
-This builds an octree around the surface with a maximum depth of 4, which both
-limits the computational load and sets the smallest local feature scale the
-octree can represent. The isovalue is chosen automatically from the 5th
-percentile of the particle self-density distribution.
+This builds an octree around the surface with a maximum depth of 4. In practice
+that means you are capping both the computational cost and the smallest local
+feature scale the octree is allowed to represent. The isovalue is chosen
+automatically from the 5th percentile of the particle self-density
+distribution.
 
 ### Print-oriented cleanup
 
 To construct a mesh with print-oriented cleanup, set `--target-size` to scale
-the final mesh to a target size in centimetres. This makes print-oriented
-parameters such as `--min-feature-thickness` meaningful in the final printed
-object rather than in the input simulation units. The `--pre-thickening-radius`
-option puffs up thin features before opening so that delicate disconnected
-features are less likely to disappear. In this example, `--simplify-factor 0.5`
-also reduces the final face count after cleanup.
+the final mesh to a target size in centimetres. Once you do that,
+print-oriented parameters such as `--min-feature-thickness` are interpreted in
+the final printed object rather than in the input simulation units. The
+`--pre-thickening-radius` option puffs up thin features before opening so that
+delicate disconnected structures are less likely to disappear. In this example,
+`--simplify-factor 0.5` also trims down the final face count after cleanup.
 
 ```bash
 meshmerizer snapshot.hdf5 \
   --base-resolution 128 \
   --max-depth 4 \
-  --surface-percentile 0.1 \
+  --surface-percentile 5 \
   --min-feature-thickness 0.05 \
   --pre-thickening-radius 0.01 \
   --smoothing-iterations 10 \
@@ -71,12 +76,42 @@ This is a good pattern when the goal is a printable mesh rather than a purely
 diagnostic one: regularize thin structures, smooth the result, remove tiny
 fragments, simplify the final surface, and then scale it into print space.
 
+## Choosing key controls
+
+### `--surface-percentile` vs `--isovalue`
+
+- Use `--surface-percentile` when you want a sensible default that adapts to
+  the particle distribution in each snapshot.
+- Use `--isovalue` when you already know the threshold you want and need direct
+  comparability across runs.
+
+`--surface-percentile` uses the normal percentile scale from `0` to `100`.
+For example, `--surface-percentile 5` means the 5th percentile.
+
+### `--base-resolution` and `--max-depth`
+
+- `--base-resolution` controls the coarse top-level grid.
+- `--max-depth` controls the smallest local feature scale the adaptive octree
+  may represent.
+
+Increase these gradually. Larger values can improve fidelity, but they will
+also push up runtime and memory use.
+
+### Print-oriented controls
+
+When `--target-size` is provided, print-oriented controls such as
+`--min-feature-thickness` and `--pre-thickening-radius` are interpreted in
+print centimetres and converted back to native meshing units.
+
+Without `--target-size`, those controls are interpreted directly in the input
+simulation units.
+
 ### Subregion extraction
 
 You can also focus the reconstruction on a smaller region by defining a centre
 and extent. Setting `--tight-bounds` then shrinks the working domain to the
-occupied particles inside that crop, which often improves performance when the
-selected region contains large empty margins.
+occupied particles inside that crop, which often helps when the selected region
+contains large empty margins.
 
 ```bash
 meshmerizer snapshot.hdf5 \
@@ -89,8 +124,9 @@ meshmerizer snapshot.hdf5 \
 ### Save and reuse an octree
 
 When you want to experiment with cleanup settings, diagnostics, or export
-choices without paying the cost of rebuilding the adaptive tree each time, save
-the octree state after the initial reconstruction pass and reload it later.
+choices without paying the cost of rebuilding the adaptive tree every time,
+save the octree state after the initial reconstruction pass and reload it
+later.
 
 ```bash
 meshmerizer snapshot.hdf5 --save-octree tree.hdf5 --output first.stl
@@ -101,6 +137,11 @@ The first command builds the octree from the snapshot and stores the particles,
 bounds, isovalue, refined cells, and contributor data in HDF5. The second
 command reuses that saved state directly, which is useful when iterating on
 post-processing and export behavior rather than on the tree construction.
+
+Saved octrees help most when you are repeating runs that keep the particle
+data, domain, and refinement inputs fixed while changing cleanup and export
+settings. Some workflows can reuse the saved tree directly, while others still
+need a fuller reconstruction pass after loading.
 
 ## Important options
 
@@ -181,8 +222,12 @@ more detail.
 For per-option usage and behavior, including input/output flags and simpler
 controls, see [CLI option reference](cli-options/index.md).
 
-## Notes on units
+## Batch and quiet runs
 
-When `--target-size` is provided, print-oriented controls such as
-`--min-feature-thickness` and `--pre-thickening-radius` are interpreted in
-print centimetres and converted back to native meshing units.
+For quieter long runs, especially on HPC:
+
+- use `--silent` to suppress per-update progress rendering,
+- use `--table-cadence` to control how often queue-status rows are emitted.
+
+That combination is usually a good starting point for batch jobs where you want
+clean logs but still want to see occasional progress updates.

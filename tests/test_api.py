@@ -54,7 +54,7 @@ def test_build_tree_returns_tree_state() -> None:
     assert isinstance(tree.contributors, np.ndarray)
 
 
-def test_build_tree_passes_worker_count(
+def test_build_tree_passes_nthreads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     positions, smoothing_lengths = _simple_particles()
@@ -89,7 +89,7 @@ def test_build_tree_passes_worker_count(
         base_resolution=2,
         isovalue=0.01,
         max_depth=2,
-        worker_count=3,
+        nthreads=3,
     )
 
     assert captured["worker_count"] == 3
@@ -112,7 +112,7 @@ def test_regularize_returns_topology_state() -> None:
     assert topology.opened_inside.ndim == 1
 
 
-def test_regularize_passes_worker_count(
+def test_regularize_passes_nthreads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     positions, smoothing_lengths = _simple_particles()
@@ -156,11 +156,84 @@ def test_regularize_passes_worker_count(
     topology = regularize(
         tree,
         min_feature_thickness=0.2,
-        worker_count=4,
+        nthreads=4,
     )
 
     assert captured["worker_count"] == 4
     assert isinstance(topology, TopologyState)
+
+
+def test_generate_mesh_passes_nthreads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    positions, smoothing_lengths = _simple_particles()
+    captured = {}
+
+    def fake_run_full_pipeline(*args, **kwargs):
+        captured["worker_count"] = kwargs["worker_count"]
+        return {
+            "vertices": np.zeros((0, 3), dtype=np.float64),
+            "faces": np.zeros((0, 3), dtype=np.uint32),
+            "isovalue": 0.01,
+            "n_qef_vertices": 0,
+        }
+
+    monkeypatch.setattr(
+        "meshmerizer.api.run_full_pipeline",
+        fake_run_full_pipeline,
+    )
+
+    result = generate_mesh(
+        positions,
+        smoothing_lengths,
+        domain_min=(0.0, 0.0, 0.0),
+        domain_max=(2.0, 2.0, 2.0),
+        base_resolution=2,
+        max_depth=2,
+        isovalue=0.01,
+        nthreads=5,
+    )
+
+    assert captured["worker_count"] == 5
+    assert isinstance(result, MeshResult)
+
+
+def test_extract_mesh_passes_nthreads_on_pipeline_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    positions, smoothing_lengths = _simple_particles()
+    captured = {}
+
+    def fake_run_full_pipeline(*args, **kwargs):
+        captured["worker_count"] = kwargs["worker_count"]
+        return {
+            "vertices": np.zeros((0, 3), dtype=np.float64),
+            "faces": np.zeros((0, 3), dtype=np.uint32),
+            "isovalue": 0.01,
+            "n_qef_vertices": 0,
+        }
+
+    monkeypatch.setattr(
+        "meshmerizer.api.run_full_pipeline",
+        fake_run_full_pipeline,
+    )
+
+    tree = TreeState(
+        cells=(),
+        contributors=np.array([], dtype=np.int64),
+        positions=positions,
+        smoothing_lengths=smoothing_lengths,
+        domain_min=(0.0, 0.0, 0.0),
+        domain_max=(2.0, 2.0, 2.0),
+        base_resolution=2,
+        max_depth=2,
+        isovalue=0.01,
+    )
+
+    result = extract_mesh(tree, nthreads=6)
+
+    assert captured["worker_count"] == 6
+    assert isinstance(result, MeshResult)
 
 
 def test_regularize_supports_pre_thickening() -> None:

@@ -2,7 +2,9 @@
 
 Meshmerizer is organized around a small number of clear layers.
 
-This page is intended for developers who want to understand the codebase structure and where to add new features or fix bugs. If you're a user, you can safely ignore this page and think no more about the spaghetti that lies underneath the surface.
+This page is intended for developers who want to understand the codebase
+structure and where to add new features or fix bugs. If you are only using the
+CLI or Python API, you can safely skip it.
 
 ## Public workflow layer
 
