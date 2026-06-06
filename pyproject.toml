@@ -52,6 +52,7 @@ classifiers = [
 # Dependencies
 dependencies = [
   "numpy>=1.21",
+  "scipy>=1.8",
   "trimesh>=3.9",
   "tqdm>=4.0",
   "fast-simplification>=0.1",
