@@ -13,6 +13,7 @@ from meshmerizer.cli.adaptive import run_adaptive
 from meshmerizer.cli.args import build_parser
 from meshmerizer.cli.main import main
 from meshmerizer.cli.units import convert_print_length_to_native_units
+from meshmerizer.io import swift as swift_io
 from meshmerizer.logging import (
     _STATE,
     cli_logging_context,
@@ -421,6 +422,113 @@ def test_build_parser_accepts_table_cadence() -> None:
     args = parser.parse_args(["snapshot.hdf5", "--table-cadence", "7.5"])
 
     assert args.table_cadence == pytest.approx(7.5)
+
+
+def test_build_parser_accepts_threshold_filter_arguments() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "snapshot.hdf5",
+            "--threshold-key",
+            "/PartType0/Densities",
+            "--low-thresh",
+            "1.5",
+            "--up-thresh",
+            "3.5",
+        ]
+    )
+
+    assert args.threshold_key == "/PartType0/Densities"
+    assert args.low_thresh == pytest.approx(1.5)
+    assert args.up_thresh == pytest.approx(3.5)
+
+
+def test_apply_particle_threshold_filter_keeps_bandpass_values(
+    tmp_path,
+) -> None:
+    h5py = pytest.importorskip("h5py")
+    snapshot = tmp_path / "snapshot.hdf5"
+    with h5py.File(snapshot, "w") as handle:
+        handle.create_dataset(
+            "/PartType0/Densities",
+            data=np.array([0.5, 1.5, 2.5, 3.5], dtype=np.float64),
+        )
+
+    coords = np.arange(12, dtype=np.float64).reshape(4, 3)
+    smoothing_lengths = np.array([10.0, 20.0, 30.0, 40.0])
+
+    filtered_coords, filtered_h = swift_io.apply_particle_threshold_filter(
+        snapshot,
+        coords,
+        smoothing_lengths,
+        threshold_key="/PartType0/Densities",
+        low_thresh=1.0,
+        up_thresh=3.0,
+    )
+
+    assert np.array_equal(filtered_coords, coords[[1, 2]])
+    assert np.array_equal(filtered_h, smoothing_lengths[[1, 2]])
+
+
+def test_apply_particle_threshold_filter_supports_one_sided_bounds(
+    tmp_path,
+) -> None:
+    h5py = pytest.importorskip("h5py")
+    snapshot = tmp_path / "snapshot.hdf5"
+    with h5py.File(snapshot, "w") as handle:
+        handle.create_dataset(
+            "/PartType0/Densities",
+            data=np.array([0.5, 1.5, 2.5, 3.5], dtype=np.float64),
+        )
+
+    coords = np.arange(12, dtype=np.float64).reshape(4, 3)
+
+    low_coords, low_h = swift_io.apply_particle_threshold_filter(
+        snapshot,
+        coords,
+        None,
+        threshold_key="/PartType0/Densities",
+        low_thresh=2.0,
+        up_thresh=None,
+    )
+    up_coords, up_h = swift_io.apply_particle_threshold_filter(
+        snapshot,
+        coords,
+        None,
+        threshold_key="/PartType0/Densities",
+        low_thresh=None,
+        up_thresh=1.5,
+    )
+
+    assert np.array_equal(low_coords, coords[[2, 3]])
+    assert low_h is None
+    assert np.array_equal(up_coords, coords[[0, 1]])
+    assert up_h is None
+
+
+def test_apply_particle_threshold_filter_rejects_invalid_arguments() -> None:
+    coords = np.zeros((2, 3), dtype=np.float64)
+
+    with pytest.raises(ValueError, match="threshold-key"):
+        swift_io.apply_particle_threshold_filter(
+            Path("snapshot.hdf5"),
+            coords,
+            None,
+            threshold_key=None,
+            low_thresh=1.0,
+            up_thresh=None,
+        )
+
+    with pytest.raises(ValueError, match="low-thresh"):
+        swift_io.apply_particle_threshold_filter(
+            Path("snapshot.hdf5"),
+            coords,
+            None,
+            threshold_key="/PartType0/Densities",
+            low_thresh=2.0,
+            up_thresh=1.0,
+        )
 
 
 def test_main_without_arguments_prints_usage(capsys) -> None:
