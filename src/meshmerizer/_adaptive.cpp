@@ -2629,7 +2629,8 @@ static PyObject *classify_occupied_solid_py(
                 compute_outside_distance_from_classification_cache(
                     all_cells,
                     classification_cache,
-                    static_cast<std::uint32_t>(worker_count));
+                    static_cast<std::uint32_t>(worker_count),
+                    pre_thickening_radius);
             thickening_distance = project_leaf_scalars_from_cell_state(
                 solid_leaves,
                 thickening_distance_by_cell,
@@ -2642,49 +2643,56 @@ static PyObject *classify_occupied_solid_py(
             thickened_inside = build_leaf_mask_from_cell_mask(
                 solid_leaves, inside_mask_by_cell);
             inside_mask = thickened_inside;
-        } else {
-            thickening_distance_by_cell =
-                compute_outside_distance_from_classification_cache(
-                    all_cells,
-                    classification_cache,
-                    static_cast<std::uint32_t>(worker_count));
-            thickening_distance = project_leaf_scalars_from_cell_state(
-                solid_leaves,
-                thickening_distance_by_cell,
-                std::numeric_limits<double>::infinity());
         }
-        const std::vector<double> clearance_by_cell =
-            compute_inside_clearance_from_cell_mask(
+        std::vector<double> clearance_by_cell(
+            all_cells.size(), std::numeric_limits<double>::infinity());
+        clearance.assign(
+            solid_leaves.size(), std::numeric_limits<double>::infinity());
+        if (erosion_radius > 0.0) {
+            clearance_by_cell = compute_inside_clearance_from_cell_mask(
                 all_cells,
                 classification_cache,
                 inside_mask_by_cell,
-                static_cast<std::uint32_t>(worker_count));
-        clearance = project_leaf_scalars_from_cell_state(
-            solid_leaves,
-            clearance_by_cell,
-            std::numeric_limits<double>::infinity());
-        const std::vector<std::uint8_t> eroded_inside_by_cell =
-            erode_occupied_solid_cells(
-                all_cells, inside_mask_by_cell, clearance_by_cell,
+                static_cast<std::uint32_t>(worker_count),
                 erosion_radius);
+            clearance = project_leaf_scalars_from_cell_state(
+                solid_leaves,
+                clearance_by_cell,
+                std::numeric_limits<double>::infinity());
+        }
+        std::vector<std::uint8_t> eroded_inside_by_cell = inside_mask_by_cell;
+        if (erosion_radius > 0.0) {
+            eroded_inside_by_cell = erode_occupied_solid_cells(
+                all_cells,
+                inside_mask_by_cell,
+                clearance_by_cell,
+                erosion_radius);
+        }
         eroded_inside = build_leaf_mask_from_cell_mask(
             solid_leaves, eroded_inside_by_cell);
-        const std::vector<double> dilation_distance_by_cell =
-            compute_distance_to_eroded_solid_from_cell_mask(
-                all_cells,
-                classification_cache,
-                eroded_inside_by_cell,
-                static_cast<std::uint32_t>(worker_count));
-        dilation_distance = project_leaf_scalars_from_cell_state(
-            solid_leaves,
-            dilation_distance_by_cell,
-            std::numeric_limits<double>::infinity());
-        const std::vector<std::uint8_t> opened_inside_by_cell =
-            dilate_eroded_solid_cells(
+        std::vector<double> dilation_distance_by_cell(
+            all_cells.size(), std::numeric_limits<double>::infinity());
+        dilation_distance.assign(
+            solid_leaves.size(), std::numeric_limits<double>::infinity());
+        std::vector<std::uint8_t> opened_inside_by_cell = eroded_inside_by_cell;
+        if (erosion_radius > 0.0) {
+            dilation_distance_by_cell =
+                compute_distance_to_eroded_solid_from_cell_mask(
+                    all_cells,
+                    classification_cache,
+                    eroded_inside_by_cell,
+                    static_cast<std::uint32_t>(worker_count),
+                    erosion_radius);
+            dilation_distance = project_leaf_scalars_from_cell_state(
+                solid_leaves,
+                dilation_distance_by_cell,
+                std::numeric_limits<double>::infinity());
+            opened_inside_by_cell = dilate_eroded_solid_cells(
                 all_cells,
                 eroded_inside_by_cell,
                 dilation_distance_by_cell,
                 erosion_radius);
+        }
         opened_inside = build_leaf_mask_from_cell_mask(
             solid_leaves, opened_inside_by_cell);
         opened_boundary_samples = generate_opened_boundary_samples(
