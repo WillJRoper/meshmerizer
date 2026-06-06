@@ -116,7 +116,7 @@ def build_tree(
     base_resolution: int,
     isovalue: float,
     max_depth: int,
-    worker_count: int = 1,
+    nthreads: int = 1,
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
@@ -131,7 +131,7 @@ def build_tree(
         base_resolution: Number of top-level cells per axis.
         isovalue: Scalar field threshold used for refinement decisions.
         max_depth: Maximum octree refinement depth.
-        worker_count: Number of native refinement workers to use when building
+        nthreads: Number of native refinement workers to use when building
             the staged octree state.
         minimum_usable_hermite_samples: Minimum usable Hermite sample count
             required before a corner-crossing cell may stop refining.
@@ -152,7 +152,7 @@ def build_tree(
         base_resolution,
         isovalue,
         max_depth,
-        worker_count,
+        nthreads,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
@@ -178,7 +178,7 @@ def regularize(
     min_feature_thickness: float,
     *,
     pre_thickening_radius: float = 0.0,
-    worker_count: int = 1,
+    nthreads: int = 1,
 ) -> TopologyState:
     """Build the opened-solid topology used by the regularized pipeline.
 
@@ -187,7 +187,7 @@ def regularize(
         min_feature_thickness: Minimum feature thickness to preserve.
         pre_thickening_radius: Optional outward thickening radius applied
             before the opening stage.
-        worker_count: Number of native refinement workers to use during the
+        nthreads: Number of native refinement workers to use during the
             topology pass.
 
     Returns:
@@ -208,7 +208,7 @@ def regularize(
         max_surface_leaf_size=erosion_radius,
         erosion_radius=erosion_radius,
         pre_thickening_radius=pre_thickening_radius,
-        worker_count=worker_count,
+        worker_count=nthreads,
     )
     return TopologyState(
         tree=tree,
@@ -233,6 +233,7 @@ def regularize(
 def _extract_mesh_from_tree(
     tree: TreeState,
     *,
+    nthreads: int = 1,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
     max_edge_ratio: float = 1.5,
@@ -244,6 +245,8 @@ def _extract_mesh_from_tree(
 
     Args:
         tree: Refined tree state to extract from.
+        nthreads: Number of native refinement workers to use for the full
+            pipeline fallback.
         smoothing_iterations: Number of smoothing iterations for the full
             pipeline fallback.
         smoothing_strength: Laplacian smoothing strength for the fallback path.
@@ -294,6 +297,7 @@ def _extract_mesh_from_tree(
             tree.base_resolution,
             tree.isovalue,
             tree.max_depth,
+            worker_count=nthreads,
             smoothing_iterations=smoothing_iterations,
             smoothing_strength=smoothing_strength,
             max_edge_ratio=max_edge_ratio,
@@ -351,6 +355,7 @@ def _extract_mesh_from_topology(
 def extract_mesh(
     state: TreeState | TopologyState,
     *,
+    nthreads: int = 1,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
     max_edge_ratio: float = 1.5,
@@ -362,6 +367,8 @@ def extract_mesh(
 
     Args:
         state: ``TreeState`` or ``TopologyState`` to extract from.
+        nthreads: Number of native refinement workers to use when
+            extracting from a tree state via the full pipeline path.
         smoothing_iterations: Number of smoothing iterations to apply when
             extracting from a tree state.
         smoothing_strength: Laplacian smoothing strength in ``(0, 1]`` when
@@ -386,6 +393,7 @@ def extract_mesh(
     if isinstance(state, TreeState):
         return _extract_mesh_from_tree(
             state,
+            nthreads=nthreads,
             smoothing_iterations=smoothing_iterations,
             smoothing_strength=smoothing_strength,
             max_edge_ratio=max_edge_ratio,
@@ -412,6 +420,7 @@ def generate_mesh(
     base_resolution: int,
     max_depth: int,
     isovalue: float,
+    nthreads: int = 1,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
     max_edge_ratio: float = 1.5,
@@ -432,6 +441,8 @@ def generate_mesh(
         base_resolution: Number of top-level cells per axis.
         max_depth: Maximum octree refinement depth.
         isovalue: Scalar field threshold for surface extraction.
+        nthreads: Number of native refinement workers to use during the
+            one-shot reconstruction pipeline.
         smoothing_iterations: Number of smoothing iterations to apply.
         smoothing_strength: Laplacian smoothing strength in ``(0, 1]``.
         max_edge_ratio: Maximum edge length as a multiple of local cell size.
@@ -459,6 +470,7 @@ def generate_mesh(
         base_resolution,
         isovalue,
         max_depth,
+        worker_count=nthreads,
         smoothing_iterations=smoothing_iterations,
         smoothing_strength=smoothing_strength,
         max_edge_ratio=max_edge_ratio,
