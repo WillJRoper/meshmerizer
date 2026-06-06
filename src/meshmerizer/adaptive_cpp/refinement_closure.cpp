@@ -1580,6 +1580,30 @@ inline void enqueue_internal_children_if_needed(
     child_indices.swap(demanded_child_indices);
 }
 
+inline bool requeue_current_cell_if_required_depth_rose(
+    std::size_t cell_index,
+    std::uint32_t cell_depth,
+    ClosureWorkerState &worker,
+    std::vector<RefinementTask> &local_stack) {
+    if (cell_index >= worker.context.size()) {
+        return false;
+    }
+    const std::uint32_t live_required_depth =
+        worker.context.get_required_depth(cell_index);
+    if (live_required_depth <= cell_depth) {
+        return false;
+    }
+
+    worker.context.mark_idle(cell_index);
+    if (!worker.context.mark_queued(cell_index)) {
+        return true;
+    }
+    local_stack.push_back({cell_index, live_required_depth, 0U});
+    worker.profiler.local_stack_pushes.fetch_add(
+        1U, std::memory_order_relaxed);
+    return true;
+}
+
 inline void process_closure_task(
     const RefinementTask &root_task,
     ClosureWorkerState &worker) {
@@ -1630,6 +1654,13 @@ inline void process_closure_task(
             worker.profiler.internal_cells_visited.fetch_add(
                 1U, std::memory_order_relaxed);
             if (required_depth_snapshot <= current_cell_snapshot.depth) {
+                if (requeue_current_cell_if_required_depth_rose(
+                        task.cell_index,
+                        current_cell_snapshot.depth,
+                        worker,
+                        local_stack)) {
+                    continue;
+                }
                 context.mark_retired(task.cell_index);
                 worker.profiler.non_leaf_retired_immediately.fetch_add(
                     1U, std::memory_order_relaxed);
@@ -1776,6 +1807,13 @@ inline void process_closure_task(
                 current_cell.has_surface = false;
                 current_cell.is_topo_surface = false;
                 current_cell.child_begin = -1;
+                if (requeue_current_cell_if_required_depth_rose(
+                        task.cell_index,
+                        current_cell.depth,
+                        worker,
+                        local_stack)) {
+                    continue;
+                }
                 context.mark_idle(task.cell_index);
                 should_continue = true;
                 worker.profiler.tasks_retired_no_split.fetch_add(
@@ -1787,6 +1825,13 @@ inline void process_closure_task(
                 current_cell.has_surface = true;
                 current_cell.is_topo_surface = false;
                 current_cell.child_begin = -1;
+                if (requeue_current_cell_if_required_depth_rose(
+                        task.cell_index,
+                        current_cell.depth,
+                        worker,
+                        local_stack)) {
+                    continue;
+                }
                 context.mark_idle(task.cell_index);
                 should_continue = true;
                 worker.profiler.tasks_retired_no_split.fetch_add(
