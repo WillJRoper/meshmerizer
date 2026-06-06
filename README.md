@@ -69,3 +69,19 @@ meshmerizer snapshot.hdf5 \
 
 The public Python API also exposes `nthreads` on the main reconstruction entry
 points if you want to control native parallelism from Python.
+
+## Threshold histogram helper
+
+Use `plot_mask_histogram.py` to inspect a candidate masking variable before
+choosing CLI threshold values:
+
+```bash
+python plot_mask_histogram.py snapshot.hdf5 \
+  --threshold-key /PartType0/Densities \
+  --log-x \
+  --low-thresh 1e-3 \
+  --up-thresh 1e2
+```
+
+The helper prints a compact percentile summary and saves a histogram PNG with
+percentile markers plus any threshold guide lines you provide.
