@@ -10,6 +10,7 @@ from meshmerizer.adaptive import (
     refine_octree,
     solve_vertices,
 )
+from meshmerizer.cli.diagnostics import emit_tree_structure_summary
 from meshmerizer.io.octree import export_octree, import_octree
 
 
@@ -111,12 +112,14 @@ def test_round_trip_without_mesh():
         # Particles
         assert len(result["positions"]) == len(positions)
         for orig, loaded in zip(positions, result["positions"]):
-            assert orig == loaded
+            np.testing.assert_allclose(loaded, orig)
 
-        assert result["smoothing_lengths"] == list(smoothing_lengths)
+        np.testing.assert_allclose(
+            result["smoothing_lengths"], smoothing_lengths
+        )
 
         # Contributors
-        assert result["contributors"] == list(contributors)
+        np.testing.assert_array_equal(result["contributors"], contributors)
 
         # Cells
         assert len(result["cells"]) == len(cells)
@@ -280,6 +283,115 @@ def test_round_trip_mesh_usable_for_solve_vertices():
         os.unlink(path)
 
 
+def test_imported_columnar_cells_bypass_python_cell_materialization():
+    """Imported octrees should parse natively without per-cell dict access."""
+    (
+        cells,
+        contributors,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        domain_min,
+        domain_max,
+        max_depth,
+        base_resolution,
+    ) = _build_sphere_octree()
+
+    with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as f:
+        path = f.name
+
+    try:
+        export_octree(
+            path,
+            isovalue=isovalue,
+            base_resolution=base_resolution,
+            max_depth=max_depth,
+            domain_minimum=domain_min,
+            domain_maximum=domain_max,
+            positions=positions,
+            smoothing_lengths=smoothing_lengths,
+            cells=cells,
+            contributors=contributors,
+        )
+
+        result = import_octree(path)
+        original_getitem = result["cells"].__class__.__getitem__
+
+        def _fail_getitem(self, index):
+            raise AssertionError(
+                "columnar cells should not materialize Python dicts"
+            )
+
+        result["cells"].__class__.__getitem__ = _fail_getitem
+        try:
+            verts_p, verts_n = solve_vertices(
+                result["cells"],
+                result["contributors"],
+                result["positions"],
+                result["smoothing_lengths"],
+                result["isovalue"],
+                result["domain_minimum"],
+                result["domain_maximum"],
+                result["max_depth"],
+                result["base_resolution"],
+            )
+        finally:
+            result["cells"].__class__.__getitem__ = original_getitem
+
+        assert len(verts_p) == len(verts_n)
+        assert len(verts_p) > 0
+    finally:
+        os.unlink(path)
+
+
+def test_tree_summary_uses_columnar_fast_path_for_imported_cells():
+    """Tree diagnostics should not materialize imported cell dictionaries."""
+    (
+        cells,
+        contributors,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        domain_min,
+        domain_max,
+        max_depth,
+        base_resolution,
+    ) = _build_sphere_octree()
+
+    with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as f:
+        path = f.name
+
+    try:
+        export_octree(
+            path,
+            isovalue=isovalue,
+            base_resolution=base_resolution,
+            max_depth=max_depth,
+            domain_minimum=domain_min,
+            domain_maximum=domain_max,
+            positions=positions,
+            smoothing_lengths=smoothing_lengths,
+            cells=cells,
+            contributors=contributors,
+        )
+
+        result = import_octree(path)
+        original_getitem = result["cells"].__class__.__getitem__
+
+        def _fail_getitem(self, index):
+            raise AssertionError(
+                "tree summary should not materialize Python dicts"
+            )
+
+        result["cells"].__class__.__getitem__ = _fail_getitem
+        try:
+            emit_tree_structure_summary(result["cells"])
+        finally:
+            result["cells"].__class__.__getitem__ = original_getitem
+    finally:
+        os.unlink(path)
+
+
 def test_empty_octree_round_trip():
     """An octree with no cells round-trips correctly."""
     with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as f:
@@ -303,5 +415,122 @@ def test_empty_octree_round_trip():
         assert len(result["cells"]) == 0
         assert len(result["contributors"]) == 0
         assert len(result["positions"]) == 0
+    finally:
+        os.unlink(path)
+
+
+def test_imported_cells_can_be_reexported():
+    """Imported lazy cells can be exported again without data loss."""
+    (
+        cells,
+        contributors,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        domain_min,
+        domain_max,
+        max_depth,
+        base_resolution,
+    ) = _build_sphere_octree()
+
+    with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as src:
+        source_path = src.name
+    with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as dst:
+        round_trip_path = dst.name
+
+    try:
+        export_octree(
+            source_path,
+            isovalue=isovalue,
+            base_resolution=base_resolution,
+            max_depth=max_depth,
+            domain_minimum=domain_min,
+            domain_maximum=domain_max,
+            positions=positions,
+            smoothing_lengths=smoothing_lengths,
+            cells=cells,
+            contributors=contributors,
+        )
+
+        loaded = import_octree(source_path)
+
+        export_octree(
+            round_trip_path,
+            isovalue=loaded["isovalue"],
+            base_resolution=loaded["base_resolution"],
+            max_depth=loaded["max_depth"],
+            domain_minimum=loaded["domain_minimum"],
+            domain_maximum=loaded["domain_maximum"],
+            positions=loaded["positions"],
+            smoothing_lengths=loaded["smoothing_lengths"],
+            cells=loaded["cells"],
+            contributors=loaded["contributors"],
+            vertices=loaded["vertices"],
+            normals=loaded["normals"],
+            group_labels=loaded["group_labels"],
+            version=loaded["version"],
+        )
+
+        reloaded = import_octree(round_trip_path)
+
+        np.testing.assert_array_equal(
+            reloaded["contributors"], loaded["contributors"]
+        )
+        assert len(reloaded["cells"]) == len(loaded["cells"])
+        for first, second in zip(loaded["cells"], reloaded["cells"]):
+            assert second["morton_key"] == first["morton_key"]
+            assert second["depth"] == first["depth"]
+            assert second["bounds"] == first["bounds"]
+            assert bool(second["is_leaf"]) == bool(first["is_leaf"])
+            assert bool(second["is_active"]) == bool(first["is_active"])
+            assert bool(second["has_surface"]) == bool(first["has_surface"])
+            assert second["child_begin"] == first["child_begin"]
+            assert second["corner_sign_mask"] == first["corner_sign_mask"]
+            assert second["corner_values"] == first["corner_values"]
+            assert second["contributors"] == first["contributors"]
+    finally:
+        os.unlink(source_path)
+        os.unlink(round_trip_path)
+
+
+def test_export_uses_stored_contributor_offsets_without_search():
+    """Export should trust validated contributor offsets on each cell."""
+    contributors = np.array([7, 8, 9, 10], dtype=np.int64)
+    cells = [
+        {
+            "morton_key": 1,
+            "depth": 0,
+            "bounds": ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+            "is_leaf": 1,
+            "is_active": 1,
+            "has_surface": 1,
+            "child_begin": -1,
+            "corner_sign_mask": 3,
+            "corner_values": (0.0,) * 8,
+            "contributors": (9, 10),
+            "contributor_begin": 2,
+            "contributor_end": 4,
+        }
+    ]
+
+    with tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False) as f:
+        path = f.name
+
+    try:
+        export_octree(
+            path,
+            isovalue=0.5,
+            base_resolution=1,
+            max_depth=0,
+            domain_minimum=(0.0, 0.0, 0.0),
+            domain_maximum=(1.0, 1.0, 1.0),
+            positions=[],
+            smoothing_lengths=[],
+            cells=cells,
+            contributors=contributors,
+        )
+
+        result = import_octree(path)
+        assert result["cells"][0]["contributors"] == (9, 10)
     finally:
         os.unlink(path)

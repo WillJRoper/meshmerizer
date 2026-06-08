@@ -39,9 +39,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "hermite.hpp"
@@ -51,6 +53,7 @@
 #include "omp_config.hpp"
 #include "progress_bar.hpp"
 #include "qef.hpp"
+#include "refinement_closure.hpp"
 #include "vector3d.hpp"
 
 /**
@@ -186,12 +189,18 @@ struct LeafSpatialIndex {
         }
         lookup.reserve(n_leaves);
 
+        MESHMERIZER_PROGRESS_COUNTER(build_counter,
+            "Regularization",
+            "LeafSpatialIndex::build",
+            "leaves",
+            10000);
         for (std::size_t cell_idx = 0; cell_idx < all_cells.size();
              ++cell_idx) {
             const OctreeCell &cell = all_cells[cell_idx];
             if (!cell.is_leaf) {
                 continue;
             }
+            MESHMERIZER_PROGRESS_TICK(build_counter);
 
             // Quantize the cell's min corner to fine-grid coordinates.
             // This gives the unique key for this leaf.
@@ -209,6 +218,13 @@ struct LeafSpatialIndex {
                 ix_min, iy_min, iz_min)};
             lookup[key] = cell_idx;
         }
+        MESHMERIZER_PROGRESS_FINISH(build_counter);
+        meshmerizer_log_detail::print_debug_status(
+            "Regularization",
+            "LeafSpatialIndex::build",
+            "indexed %zu leaves from %zu cells\n",
+            n_leaves,
+            all_cells.size());
     }
 
     /**
@@ -292,6 +308,130 @@ struct LeafSpatialIndex {
     }
 };
 
+inline double triangle_double_area_squared(
+    const Vector3d &a,
+    const Vector3d &b,
+    const Vector3d &c) {
+    const Vector3d ab = b - a;
+    const Vector3d ac = c - a;
+    const double cx = ab.y * ac.z - ab.z * ac.y;
+    const double cy = ab.z * ac.x - ab.x * ac.z;
+    const double cz = ab.x * ac.y - ab.y * ac.x;
+    return cx * cx + cy * cy + cz * cz;
+}
+
+struct TriangleKey {
+    std::size_t i0;
+    std::size_t i1;
+    std::size_t i2;
+
+    bool operator==(const TriangleKey &other) const {
+        return i0 == other.i0 && i1 == other.i1 && i2 == other.i2;
+    }
+};
+
+struct TriangleKeyHash {
+    std::size_t operator()(const TriangleKey &key) const {
+        std::uint64_t h = static_cast<std::uint64_t>(key.i0);
+        h ^= static_cast<std::uint64_t>(key.i1) + 0x9e3779b97f4a7c15ULL +
+             (h << 6U) + (h >> 2U);
+        h ^= static_cast<std::uint64_t>(key.i2) + 0x9e3779b97f4a7c15ULL +
+             (h << 6U) + (h >> 2U);
+        return static_cast<std::size_t>(h);
+    }
+};
+
+inline void compact_mesh_geometry(
+    std::vector<MeshVertex> &vertices,
+    std::vector<MeshTriangle> &triangles) {
+    if (vertices.empty() || triangles.empty()) {
+        return;
+    }
+
+    const double max_coordinate_magnitude = [&vertices]() {
+        double max_abs = 0.0;
+        for (const MeshVertex &vertex : vertices) {
+            max_abs = std::max(max_abs, std::abs(vertex.position.x));
+            max_abs = std::max(max_abs, std::abs(vertex.position.y));
+            max_abs = std::max(max_abs, std::abs(vertex.position.z));
+        }
+        return max_abs;
+    }();
+    const double coordinate_scale = std::max(1.0, max_coordinate_magnitude);
+    const double degenerate_area_squared =
+        std::numeric_limits<double>::epsilon() * coordinate_scale *
+        coordinate_scale;
+
+    std::vector<MeshTriangle> kept_triangles;
+    kept_triangles.reserve(triangles.size());
+    std::vector<std::uint8_t> vertex_used(vertices.size(), 0U);
+    std::unordered_set<TriangleKey, TriangleKeyHash> seen_triangles;
+    seen_triangles.reserve(triangles.size());
+
+    for (const MeshTriangle &triangle : triangles) {
+        const std::size_t i0 = triangle.vertex_indices[0];
+        const std::size_t i1 = triangle.vertex_indices[1];
+        const std::size_t i2 = triangle.vertex_indices[2];
+        if (i0 >= vertices.size() || i1 >= vertices.size() || i2 >= vertices.size()) {
+            continue;
+        }
+        if (i0 == i1 || i1 == i2 || i0 == i2) {
+            continue;
+        }
+
+        const double area_squared = triangle_double_area_squared(
+            vertices[i0].position,
+            vertices[i1].position,
+            vertices[i2].position);
+        if (!(area_squared > degenerate_area_squared)) {
+            continue;
+        }
+
+        TriangleKey key{i0, i1, i2};
+        if (key.i1 < key.i0) {
+            std::swap(key.i0, key.i1);
+        }
+        if (key.i2 < key.i1) {
+            std::swap(key.i1, key.i2);
+        }
+        if (key.i1 < key.i0) {
+            std::swap(key.i0, key.i1);
+        }
+        if (!seen_triangles.insert(key).second) {
+            continue;
+        }
+
+        kept_triangles.push_back(triangle);
+        vertex_used[i0] = 1U;
+        vertex_used[i1] = 1U;
+        vertex_used[i2] = 1U;
+    }
+
+    if (kept_triangles.size() == triangles.size()) {
+        return;
+    }
+
+    std::vector<std::uint32_t> remap(vertices.size(), std::uint32_t{0});
+    std::vector<MeshVertex> compacted_vertices;
+    compacted_vertices.reserve(vertices.size());
+    for (std::size_t index = 0; index < vertices.size(); ++index) {
+        if (vertex_used[index] == 0U) {
+            continue;
+        }
+        remap[index] = static_cast<std::uint32_t>(compacted_vertices.size());
+        compacted_vertices.push_back(vertices[index]);
+    }
+
+    for (MeshTriangle &triangle : kept_triangles) {
+        triangle.vertex_indices[0] = remap[triangle.vertex_indices[0]];
+        triangle.vertex_indices[1] = remap[triangle.vertex_indices[1]];
+        triangle.vertex_indices[2] = remap[triangle.vertex_indices[2]];
+    }
+
+    vertices = std::move(compacted_vertices);
+    triangles = std::move(kept_triangles);
+}
+
 /**
  * @brief Solve QEF vertices for all active leaf cells and assign indices.
  *
@@ -317,19 +457,19 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
     const std::vector<std::size_t> &all_contributors,
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
-    double isovalue) {
-    const std::size_t n_cells = all_cells.size();
+    double isovalue,
+    std::uint32_t worker_count = 0U) {
+    struct ActiveLeafSolve {
+        std::size_t cell_index = 0U;
+        MeshVertex vertex{};
+    };
 
-    // Per-cell results computed in parallel.  Each entry is either a
-    // valid MeshVertex (when the cell is an active surface leaf) or
-    // an empty placeholder.  A separate flag marks which cells are
-    // active so the serial index-assignment pass can skip non-active
-    // cells cheaply.
-    std::vector<MeshVertex> per_cell_vertex(n_cells);
-    // Use char instead of bool to avoid the std::vector<bool> bit-packing
-    // specialisation, which causes data races when adjacent elements are
-    // written by different threads (they share the same byte).
-    std::vector<char> is_active_leaf(n_cells, 0);
+    const std::size_t n_cells = all_cells.size();
+    const int active_threads = static_cast<int>(
+        worker_count == 0U ? omp_get_max_threads() : std::max(1U, worker_count));
+
+    std::vector<std::vector<ActiveLeafSolve>> solved_by_thread(
+        static_cast<std::size_t>(active_threads));
 
     ProgressBar vertex_bar("Meshing", "solve_vertices", n_cells);
 
@@ -338,8 +478,14 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
     // iteration touches only its own cell and reads shared immutable
     // data (positions, smoothing_lengths, all_contributors), so there
     // are no data races.
-#pragma omp parallel for schedule(dynamic)
-    for (std::size_t cell_idx = 0; cell_idx < n_cells; ++cell_idx) {
+#pragma omp parallel num_threads(active_threads)
+    {
+        std::vector<HermiteSample> samples;
+        const int thread_id = omp_get_thread_num();
+        std::vector<ActiveLeafSolve> &thread_solved = solved_by_thread[
+            static_cast<std::size_t>(thread_id)];
+#pragma omp for schedule(dynamic)
+        for (std::size_t cell_idx = 0; cell_idx < n_cells; ++cell_idx) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 cell_idx)) {
             vertex_bar.tick();
@@ -402,33 +548,62 @@ inline std::vector<MeshVertex> solve_all_leaf_vertices(
         }
 
         // Compute Hermite samples for this leaf.
-        const std::vector<HermiteSample> samples =
-            compute_cell_hermite_samples(
-                cell.bounds, cell.corner_values,
-                cell.corner_sign_mask, contributors,
-                positions, smoothing_lengths, isovalue);
+        compute_cell_hermite_samples(
+            cell.bounds,
+            cell.corner_values,
+            cell.corner_sign_mask,
+            contributors,
+            positions,
+            smoothing_lengths,
+            isovalue,
+            samples);
 
         // Solve the QEF.
-        per_cell_vertex[cell_idx] =
-            solve_qef_for_leaf(samples, cell.bounds);
-        is_active_leaf[cell_idx] = 1;
+        thread_solved.push_back(
+            {cell_idx, solve_qef_for_leaf(samples, cell.bounds)});
         vertex_bar.tick();
+        }
     }
 
     vertex_bar.finish();
+
+    std::size_t active_leaf_count = 0U;
+    for (const std::vector<ActiveLeafSolve> &thread_solved : solved_by_thread) {
+        active_leaf_count += thread_solved.size();
+    }
+
+    std::vector<ActiveLeafSolve> solved_leaves;
+    solved_leaves.reserve(active_leaf_count);
+    for (std::vector<ActiveLeafSolve> &thread_solved : solved_by_thread) {
+        solved_leaves.insert(
+            solved_leaves.end(),
+            std::make_move_iterator(thread_solved.begin()),
+            std::make_move_iterator(thread_solved.end()));
+        std::vector<ActiveLeafSolve>().swap(thread_solved);
+    }
+    std::sort(
+        solved_leaves.begin(),
+        solved_leaves.end(),
+        [](const ActiveLeafSolve &lhs, const ActiveLeafSolve &rhs) {
+            return lhs.cell_index < rhs.cell_index;
+        });
 
     // Pass 2 (serial): Assign contiguous vertex indices and build
     // the compact output vertex array.  This must be serial because
     // vertex indices must be dense and deterministic.
     std::vector<MeshVertex> vertices;
+    vertices.reserve(solved_leaves.size());
+    std::size_t solved_index = 0U;
     for (std::size_t cell_idx = 0; cell_idx < n_cells; ++cell_idx) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
         OctreeCell &cell = all_cells[cell_idx];
-        if (is_active_leaf[cell_idx]) {
+        if (solved_index < solved_leaves.size() &&
+            solved_leaves[solved_index].cell_index == cell_idx) {
             cell.representative_vertex_index =
                 static_cast<std::int64_t>(vertices.size());
             cell.is_active = true;
-            vertices.push_back(per_cell_vertex[cell_idx]);
+            vertices.push_back(std::move(solved_leaves[solved_index].vertex));
+            ++solved_index;
         } else {
             cell.representative_vertex_index = -1;
             cell.is_active = false;
@@ -477,13 +652,13 @@ inline void emit_quad(
     }
 
     // Get representative vertex indices for all four cells.
-    const std::int64_t vi0 =
+    const std::int32_t vi0 =
         all_cells[c0].representative_vertex_index;
-    const std::int64_t vi1 =
+    const std::int32_t vi1 =
         all_cells[c1].representative_vertex_index;
-    const std::int64_t vi2 =
+    const std::int32_t vi2 =
         all_cells[c2].representative_vertex_index;
-    const std::int64_t vi3 =
+    const std::int32_t vi3 =
         all_cells[c3].representative_vertex_index;
 
     // All four cells must have representative vertices (be active).
@@ -813,12 +988,12 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
          closure_iteration <= MAX_CLOSURE_ITERATIONS;
          ++closure_iteration) {
         std::vector<char> next_needs_vertex = expanded_needs_vertex;
-        ProgressCounter closure_counter(
+        MESHMERIZER_PROGRESS_COUNTER(closure_counter,
             "Meshing", "close_incident_neighbourhood", "cells", 100);
         std::size_t newly_marked = 0;
         for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
             meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
-            closure_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(closure_counter);
             if (!expanded_needs_vertex[cell_idx]) {
                 continue;
             }
@@ -867,7 +1042,7 @@ inline std::vector<std::size_t> collect_missing_incident_cells(
                 }
             }
         }
-        closure_counter.finish();
+        MESHMERIZER_PROGRESS_FINISH(closure_counter);
         meshmerizer_log_detail::print_debug_status(
             "Meshing",
             "close_incident_neighbourhood",
@@ -906,18 +1081,19 @@ inline bool refine_zero_sample_incident_cells(
     std::uint32_t max_depth,
     std::uint32_t base_resolution,
     double isovalue,
-    const BoundingBox &domain) {
+    const BoundingBox &domain,
+    double table_cadence_seconds = 0.0) {
+    const std::size_t initial_cell_count = all_cells.size();
     const std::vector<std::size_t> missing_cells =
         collect_missing_incident_cells(
             all_cells, spatial_index, max_depth, base_resolution, isovalue);
 
-    ProgressCounter refine_counter(
-        "Meshing", "refine_incident_cells", "cells", 100);
-    std::size_t split_count = 0;
+    std::vector<std::size_t> zero_sample_cells;
+    zero_sample_cells.reserve(missing_cells.size());
     std::size_t zero_sample_count = 0;
+    std::vector<HermiteSample> samples;
     for (std::size_t cell_idx : missing_cells) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
-        refine_counter.tick();
         if (cell_idx >= all_cells.size()) {
             continue;
         }
@@ -934,23 +1110,47 @@ inline bool refine_zero_sample_incident_cells(
             cell.corner_sign_mask = compute_corner_sign_mask(
                 cell.corner_values, isovalue);
         }
-        const std::vector<HermiteSample> samples =
-            compute_cell_hermite_samples(
-                cell.bounds, cell.corner_values, cell.corner_sign_mask,
-                contributors, positions, smoothing_lengths, isovalue);
+        compute_cell_hermite_samples(
+            cell.bounds,
+            cell.corner_values,
+            cell.corner_sign_mask,
+            contributors,
+            positions,
+            smoothing_lengths,
+            isovalue,
+            samples);
         if (!samples.empty()) {
             continue;
         }
 
         ++zero_sample_count;
         if (cell.depth < max_depth) {
-            split_octree_leaf(
-                cell_idx, all_cells, all_contributors,
-                positions, smoothing_lengths);
-            ++split_count;
+            zero_sample_cells.push_back(cell_idx);
         }
     }
-    refine_counter.finish();
+
+    const RefinementClosureConfig closure_config = {
+        isovalue,
+        max_depth,
+        domain,
+        base_resolution,
+        1U,
+        3U,
+        0.1,
+        0.97,
+        table_cadence_seconds,
+        "Meshing",
+        "refine_zero_sample_incident_cells",
+        "incident_zero_sample",
+    };
+
+    const bool split_any = refine_cells_to_next_depth_with_closure(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        closure_config,
+        zero_sample_cells);
 
     meshmerizer_log_detail::print_debug_status(
         "Meshing",
@@ -958,15 +1158,11 @@ inline bool refine_zero_sample_incident_cells(
         "missing=%zu zero_sample=%zu split=%zu\n",
         missing_cells.size(),
         zero_sample_count,
-        split_count);
+        split_any ? all_cells.size() - initial_cell_count : 0U);
 
-    if (split_count == 0) {
+    if (!split_any) {
         return false;
     }
-
-    balance_octree(
-        all_cells, all_contributors, positions, smoothing_lengths,
-        isovalue, domain, base_resolution, max_depth);
     return true;
 }
 
@@ -991,40 +1187,91 @@ inline void activate_missing_incident_cells(
     std::size_t already_present_count = 0;
     std::size_t zero_sample_count = 0;
     std::size_t activated_count = 0;
+    std::vector<MeshVertex> per_missing_vertex(missing_cells.size());
+    std::vector<char> should_activate(missing_cells.size(), 0);
+
     for (std::size_t cell_idx : missing_cells) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
-        OctreeCell &cell = all_cells[cell_idx];
-        if (!cell.is_leaf) {
-            continue;
-        }
-        if (cell.representative_vertex_index >= 0) {
+        if (cell_idx < all_cells.size() &&
+            all_cells[cell_idx].representative_vertex_index >= 0) {
             ++already_present_count;
+        }
+    }
+
+#pragma omp parallel
+    {
+        std::vector<HermiteSample> samples;
+#pragma omp for schedule(dynamic) reduction(+ : zero_sample_count, activated_count)
+        for (std::int64_t missing_index = 0;
+             missing_index < static_cast<std::int64_t>(missing_cells.size());
+             ++missing_index) {
+            const std::size_t ordinal = static_cast<std::size_t>(missing_index);
+            const std::size_t cell_idx = missing_cells[ordinal];
+            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                    cell_idx)) {
+                continue;
+            }
+            if (cell_idx >= all_cells.size()) {
+                continue;
+            }
+
+            OctreeCell &cell = all_cells[cell_idx];
+            if (!cell.is_leaf || cell.representative_vertex_index >= 0) {
+                continue;
+            }
+
+            const std::span<const std::size_t> contributors =
+                gather_face_cell_contributors(cell, all_contributors);
+            if (cell.corner_sign_mask == 0U && !contributors.empty()) {
+                cell.corner_values = sample_cell_corners(
+                    cell, contributors, positions, smoothing_lengths);
+                cell.corner_sign_mask = compute_corner_sign_mask(
+                    cell.corner_values, isovalue);
+            }
+
+            compute_cell_hermite_samples(
+                cell.bounds,
+                cell.corner_values,
+                cell.corner_sign_mask,
+                contributors,
+                positions,
+                smoothing_lengths,
+                isovalue,
+                samples);
+            if (samples.empty()) {
+                ++zero_sample_count;
+                continue;
+            }
+
+            per_missing_vertex[ordinal] = solve_qef_for_leaf(samples, cell.bounds);
+            should_activate[ordinal] = 1;
+            ++activated_count;
+        }
+    }
+
+    for (std::size_t cell_idx : missing_cells) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+        if (cell_idx >= all_cells.size()) {
             continue;
         }
+    }
 
-        const std::span<const std::size_t> contributors =
-            gather_face_cell_contributors(cell, all_contributors);
-        if (cell.corner_sign_mask == 0U && !contributors.empty()) {
-            cell.corner_values = sample_cell_corners(
-                cell, contributors, positions, smoothing_lengths);
-            cell.corner_sign_mask = compute_corner_sign_mask(
-                cell.corner_values, isovalue);
+    for (std::size_t ordinal = 0; ordinal < missing_cells.size(); ++ordinal) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(ordinal);
+        const std::size_t cell_idx = missing_cells[ordinal];
+        if (cell_idx >= all_cells.size()) {
+            continue;
         }
-
-        const std::vector<HermiteSample> samples =
-            compute_cell_hermite_samples(
-                cell.bounds, cell.corner_values, cell.corner_sign_mask,
-                contributors, positions, smoothing_lengths, isovalue);
-        if (samples.empty()) {
-            ++zero_sample_count;
+        OctreeCell &cell = all_cells[cell_idx];
+        if (!cell.is_leaf || cell.representative_vertex_index >= 0 ||
+            !should_activate[ordinal]) {
             continue;
         }
 
         cell.representative_vertex_index =
             static_cast<std::int64_t>(vertices.size());
         cell.is_active = true;
-        vertices.push_back(solve_qef_for_leaf(samples, cell.bounds));
-        ++activated_count;
+        vertices.push_back(per_missing_vertex[ordinal]);
     }
 
     meshmerizer_log_detail::print_debug_status(
@@ -1359,6 +1606,8 @@ generate_mesh(
         generate_dual_contour_faces(
             all_cells, vertices, spatial_index,
             max_depth, base_resolution, isovalue);
+
+    compact_mesh_geometry(vertices, triangles);
 
     return {vertices, triangles};
 }

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import numpy as np
+
 from meshmerizer.logging import (
     abort_with_error,
     log_status,
@@ -95,6 +97,69 @@ def emit_tree_structure_summary(cells) -> None:
             "Summary:\n"
             "total=0 leaf=0 internal=0 active=0 inactive=0 surface=0",
         )
+        return
+
+    columns = getattr(cells, "columns", None)
+    if columns is not None:
+        depths = np.asarray(columns["depths"], dtype=np.int64)
+        is_leaf = np.asarray(columns["is_leaf"], dtype=bool)
+        is_active = np.asarray(columns["is_active"], dtype=bool)
+        has_surface = np.asarray(columns["has_surface"], dtype=bool)
+
+        if depths.size == 0:
+            log_status(
+                "Tree",
+                "Summary:\n"
+                "total=0 leaf=0 internal=0 active=0 inactive=0 surface=0",
+            )
+            return
+
+        max_depth = int(depths.max(initial=0))
+        per_depth = [
+            {"total": 0, "leaf": 0, "active": 0, "surface": 0}
+            for _ in range(max_depth + 1)
+        ]
+
+        depth_counts = np.bincount(depths, minlength=max_depth + 1)
+        leaf_counts = np.bincount(depths[is_leaf], minlength=max_depth + 1)
+        active_counts = np.bincount(depths[is_active], minlength=max_depth + 1)
+        surface_counts = np.bincount(
+            depths[has_surface], minlength=max_depth + 1
+        )
+
+        for depth in range(max_depth + 1):
+            per_depth[depth]["total"] = int(depth_counts[depth])
+            per_depth[depth]["leaf"] = int(leaf_counts[depth])
+            per_depth[depth]["active"] = int(active_counts[depth])
+            per_depth[depth]["surface"] = int(surface_counts[depth])
+
+        total_cells = int(depths.size)
+        total_leaf = int(is_leaf.sum())
+        total_active = int(is_active.sum())
+        total_surface = int(has_surface.sum())
+
+        lines = [
+            "Summary:",
+            (
+                f"total={total_cells} leaf={total_leaf} "
+                f"internal={total_cells - total_leaf} "
+                f"active={total_active} inactive={total_cells - total_active} "
+                f"surface={total_surface}"
+            ),
+        ]
+        for depth, summary in enumerate(per_depth):
+            lines.append(
+                (
+                    f"depth {depth}: total={summary['total']} "
+                    f"leaf={summary['leaf']} "
+                    f"internal={summary['total'] - summary['leaf']} "
+                    f"active={summary['active']} "
+                    f"inactive={summary['total'] - summary['active']} "
+                    f"surface={summary['surface']}"
+                )
+            )
+
+        log_summary_status("Tree", "\n".join(lines))
         return
 
     # Size the per-depth summary table from the deepest observed cell so the

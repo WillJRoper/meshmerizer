@@ -6,8 +6,11 @@ theme:
   name: material
 nav:
   - Home: index.md
+  - Quickstart: quickstart.md
   - Installation: installation.md
   - CLI: cli.md
+  - Reconstruction Workflow: reconstruction-workflow.md
+  - Tuning Performance: tuning-performance.md
   - CLI Option Reference:
       - Overview: cli-options/index.md
       - filename: cli-options/filename.md
@@ -45,6 +48,7 @@ nav:
       - --visualise-verts: cli-options/visualise-verts.md
       - --nthreads: cli-options/nthreads.md
       - --silent: cli-options/silent.md
+      - --table-cadence: cli-options/table-cadence.md
   - Python API: python-api.md
   - Architecture: architecture.md
   - Release & Deployment: release.md

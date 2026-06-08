@@ -158,6 +158,22 @@ inline void print_status(
     va_end(args);
 }
 
+inline void vprint_indented_status(
+    const char* format,
+    std::va_list args) {
+    std::lock_guard<std::mutex> lock(status_log_mutex());
+    std::fprintf(stdout, "    ");
+    std::vfprintf(stdout, format, args);
+    std::fflush(stdout);
+}
+
+inline void print_indented_status(const char* format, ...) {
+    std::va_list args;
+    va_start(args, format);
+    vprint_indented_status(format, args);
+    va_end(args);
+}
+
 #ifdef DEBUG_LOG
 
 inline void print_debug_status(
@@ -383,6 +399,8 @@ private:
 };
 
 
+#ifdef ATOMIC_PROGRESS
+
 /**
  * @class ProgressCounter
  * @brief Terminal-width counter for loops with unknown totals.
@@ -493,6 +511,25 @@ private:
         std::fflush(stdout);
     }
 };
+
+#endif
+
+#ifdef ATOMIC_PROGRESS
+#define MESHMERIZER_PROGRESS_COUNTER(name, ...) \
+    ProgressCounter name(__VA_ARGS__)
+#define MESHMERIZER_PROGRESS_TICK(name) name.tick()
+#define MESHMERIZER_PROGRESS_FINISH(name) name.finish()
+#else
+#define MESHMERIZER_PROGRESS_COUNTER(name, ...) \
+    do {                                      \
+    } while (false)
+#define MESHMERIZER_PROGRESS_TICK(name) \
+    do {                               \
+    } while (false)
+#define MESHMERIZER_PROGRESS_FINISH(name) \
+    do {                                 \
+    } while (false)
+#endif
 
 
 #endif /* MESHMERIZER_PROGRESS_BAR_HPP */

@@ -1,12 +1,27 @@
 """CLI logging, timing, and progress helpers.
 
-This module centralizes user-facing CLI output, progress bars, and timing
-aggregation used for end-of-run summaries. Library callers can import the
-package without seeing CLI noise; runtime handlers are only attached during an
-active CLI command.
+The public API of this module is intentionally small and is listed in
+``__all__`` below. Everything else should be treated as implementation detail
+for the CLI runtime.
 """
 
 from __future__ import annotations
+
+__all__ = [
+    "LOGGER_NAME",
+    "abort_with_error",
+    "cli_logging_context",
+    "emit_timing_summary",
+    "emit_warning_summary",
+    "get_logger",
+    "log_debug_status",
+    "log_error_status",
+    "log_status",
+    "log_summary_status",
+    "log_warning_status",
+    "record_elapsed",
+    "record_timing",
+]
 
 import inspect
 import logging as std_logging
@@ -537,40 +552,6 @@ def cli_logging_context(*, silent: bool = False) -> Iterator[None]:
                 should_teardown = True
         if should_teardown:
             _teardown_cli_logging()
-
-
-@contextmanager
-def progress_bar(
-    total: int,
-    *,
-    desc: str,
-    unit: str,
-    enabled: bool = True,
-) -> Iterator[tqdm]:
-    """Create a tqdm progress bar that stays quiet outside the CLI runtime.
-
-    Args:
-        total: Number of expected steps.
-        desc: Short bar description.
-        unit: Item unit label shown by tqdm.
-        enabled: Whether the caller wants a visible progress bar.
-
-    Yields:
-        Progress-bar object.
-    """
-    show_bar = enabled and _STATE.active and (not _STATE.silent) and total > 1
-    bar = tqdm(
-        total=total,
-        desc=desc,
-        unit=unit,
-        leave=False,
-        dynamic_ncols=True,
-        disable=not show_bar,
-    )
-    try:
-        yield bar
-    finally:
-        bar.close()
 
 
 def log_debug_status(

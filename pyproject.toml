@@ -52,7 +52,9 @@ classifiers = [
 # Dependencies
 dependencies = [
   "numpy>=1.21",
+  "scipy>=1.8",
   "trimesh>=3.9",
+  "tqdm>=4.0",
   "fast-simplification>=0.1",
   "networkx>=3",
   "swiftsimio>=10.2.0",
@@ -64,7 +66,6 @@ dependencies = [
 dev = [
   "pytest>=6.0",
   "ruff>=0.5",
-  "black>=22.1.0",
   "flake8>=4.0.1",
   "mypy>=0.971",
   "build>=1.2",
@@ -81,7 +82,7 @@ meshmerizer = "meshmerizer.cli.main:main"
 # Set up the build system
 [build-system]
 
-# Use latest setuotools, setuptools_scm for git versioning and
+# Use latest setuptools, setuptools_scm for git versioning and
 # numpy (numpy includes are needed for compilation of C extensions)
 requires = ["setuptools>=64", "setuptools_scm>=8", "numpy>=1.23"]
 build-backend = "setuptools.build_meta"
@@ -123,7 +124,7 @@ exclude = [
     "site-packages",
     "venv",
     ".pre-commit-config.yaml",
-    "*__init__.py",
+    "**/__init__.py",
 ]
 # Line length and indentation
 line-length = 79

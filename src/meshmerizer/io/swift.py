@@ -269,11 +269,113 @@ def raise_if_empty_subregion_selection(
     raise RuntimeError(msg)
 
 
+def apply_particle_threshold_filter(
+    filename: Path,
+    coords: np.ndarray,
+    smoothing_lengths: Optional[np.ndarray],
+    *,
+    threshold_key: Optional[str],
+    low_thresh: Optional[float],
+    up_thresh: Optional[float],
+) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    """Filter particles by a scalar dataset stored in the HDF5 snapshot.
+
+    Args:
+        filename: Snapshot filename.
+        coords: Particle coordinates with shape ``(N, 3)``.
+        smoothing_lengths: Optional per-particle smoothing lengths.
+        threshold_key: Full HDF5 dataset path for the scalar field.
+        low_thresh: Optional inclusive lower bound.
+        up_thresh: Optional inclusive upper bound.
+
+    Returns:
+        Tuple of filtered coordinates and smoothing lengths.
+
+    Raises:
+        ValueError: If the threshold arguments are inconsistent or the dataset
+            shape does not match the particle count.
+        RuntimeError: If the HDF5 dataset cannot be read.
+    """
+    # Treat the threshold filter as disabled unless the user supplies at least
+    # one bound or a dataset path. This keeps the common path fast and simple.
+    if threshold_key is None and low_thresh is None and up_thresh is None:
+        return coords, smoothing_lengths
+
+    if threshold_key is None:
+        raise ValueError(
+            "--threshold-key is required when using --low-thresh or "
+            "--up-thresh"
+        )
+    if low_thresh is None and up_thresh is None:
+        raise ValueError(
+            "--low-thresh and/or --up-thresh must be provided when using "
+            "--threshold-key"
+        )
+    if (
+        low_thresh is not None
+        and up_thresh is not None
+        and low_thresh > up_thresh
+    ):
+        raise ValueError("--low-thresh must be <= --up-thresh")
+
+    try:
+        import h5py
+    except ImportError as exc:
+        raise RuntimeError(
+            "h5py is required for --threshold-key particle filtering. "
+            "Install it with: pip install h5py"
+        ) from exc
+
+    # Read the requested scalar directly from the HDF5 file so the filter can
+    # target any per-particle field, not just those exposed by swiftsimio.
+    try:
+        with h5py.File(filename, "r") as handle:
+            values = np.asarray(handle[threshold_key])
+    except Exception as exc:
+        raise RuntimeError(
+            f"Error reading threshold dataset '{threshold_key}': {exc}"
+        ) from exc
+
+    flat_values = np.ravel(values)
+    n_particles = int(np.asarray(coords).shape[0])
+    if flat_values.size != n_particles:
+        raise ValueError(
+            f"Threshold dataset '{threshold_key}' has {flat_values.size} "
+            f"values but expected {n_particles}"
+        )
+
+    keep_mask = np.ones(flat_values.shape[0], dtype=bool)
+    if low_thresh is not None:
+        keep_mask &= flat_values >= low_thresh
+    if up_thresh is not None:
+        keep_mask &= flat_values <= up_thresh
+
+    n_kept = int(np.count_nonzero(keep_mask))
+    log_status(
+        "Loading",
+        (
+            f"Threshold filter '{threshold_key}': kept {n_kept}/{n_particles} "
+            "particles."
+        ),
+    )
+
+    filtered_coords = coords[keep_mask]
+    if smoothing_lengths is None:
+        filtered_h = None
+    else:
+        filtered_h = smoothing_lengths[keep_mask]
+
+    return filtered_coords, filtered_h
+
+
 def load_swift_particles(
     filename: Path,
     particle_type: str,
     smoothing_factor: float,
     box_size: Optional[float],
+    threshold_key: Optional[str],
+    low_thresh: Optional[float],
+    up_thresh: Optional[float],
     shift: list[float],
     wrap_shift: bool,
     center: Optional[list[float]],
@@ -293,6 +395,9 @@ def load_swift_particles(
         particle_type: Particle family to extract.
         smoothing_factor: Multiplier applied to smoothing lengths.
         box_size: Optional box size override.
+        threshold_key: Optional HDF5 dataset path for scalar filtering.
+        low_thresh: Optional inclusive lower threshold.
+        up_thresh: Optional inclusive upper threshold.
         shift: Coordinate shift applied before cropping.
         wrap_shift: Whether to wrap shifted coordinates periodically.
         center: Optional crop centre.
@@ -334,7 +439,7 @@ def load_swift_particles(
     if box_size is not None:
         # Prefer an explicit user override when present so the CLI can repair
         # incomplete snapshot metadata.
-        box_size_source = "--box-size"
+        full_box_size_source = "--box-size"
     else:
         meta_box = None
         if hasattr(data, "metadata"):
@@ -349,10 +454,9 @@ def load_swift_particles(
         # Normalize the metadata representation once here because SWIFT can
         # expose box size as either scalar or vector-like quantities.
         box_size = boxsize_to_float(meta_box)
-        box_size_source = "snapshot metadata"
+        full_box_size_source = "snapshot metadata"
 
     full_box_size = float(box_size)
-    full_box_size_source = box_size_source
 
     # Map the CLI particle-family name to the corresponding SWIFT dataset.
     if particle_type == "gas":
@@ -453,6 +557,17 @@ def load_swift_particles(
         f"Snapshot box size: {full_box_size:.6g} "
         f"(sim units; from {full_box_size_source})",
     )
+
+    filter_start = time.perf_counter()
+    coords, h = apply_particle_threshold_filter(
+        filename,
+        coords,
+        h,
+        threshold_key=threshold_key,
+        low_thresh=low_thresh,
+        up_thresh=up_thresh,
+    )
+    record_elapsed("Threshold filtering", filter_start, operation="Loading")
 
     # Track the current world-space origin and effective cube size explicitly.
     # Later crop and tighten operations update these values step by step.

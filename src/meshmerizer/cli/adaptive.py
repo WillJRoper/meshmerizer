@@ -18,15 +18,16 @@ reporting.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
 from meshmerizer.adaptive import (
+    build_refined_tree,
     compute_isovalue_from_percentile,
-    create_top_level_cells_with_contributors,
     fof_cluster,
-    refine_octree,
+    generate_mesh,
     run_full_pipeline,
     solve_vertices,
 )
@@ -171,8 +172,10 @@ def _postprocess_mesh(mesh: Mesh, args) -> Mesh:
     Returns:
         Post-processed mesh ready for export.
     """
-    # Apply cleanup in the same order as the CLI messaging: island removal,
-    # simplification, then optional print scaling.
+    # Apply cleanup in the same order as the CLI messaging: remove islands,
+    # simplify, then optionally scale for print. Island filtering performs
+    # targeted per-component cleanup for suspicious geometry rather than a
+    # global full-mesh repair, which is too expensive on very large meshes.
     cleanup_start = time.perf_counter()
     mesh = remove_islands(mesh, args.remove_islands_fraction)
     record_elapsed("Island removal", cleanup_start, operation="Cleaning")
@@ -209,8 +212,7 @@ def _build_mesh(mesh_verts, mesh_faces, origin: np.ndarray) -> Mesh:
     """
     # The native pipeline works in local coordinates, so shift vertices back to
     # snapshot/world coordinates before wrapping them for export.
-    mesh_verts += origin
-    return Mesh(vertices=mesh_verts, faces=mesh_faces)
+    return Mesh(vertices=mesh_verts + origin, faces=mesh_faces)
 
 
 def _save_final_mesh(mesh: Mesh, output_path: Path, *, summary: bool) -> None:
@@ -245,6 +247,7 @@ def _reconstruct_mesh(
     isovalue: float,
     max_depth: int,
     *,
+    worker_count: int = 1,
     group_labels: np.ndarray | None = None,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
@@ -254,6 +257,7 @@ def _reconstruct_mesh(
     min_normal_alignment_threshold: float = 0.97,
     min_feature_thickness: float = 0.0,
     pre_thickening_radius: float = 0.0,
+    table_cadence: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Reconstruct and merge one or more particle groups for the CLI.
 
@@ -265,6 +269,7 @@ def _reconstruct_mesh(
         base_resolution: Number of top-level cells per axis.
         isovalue: Scalar field threshold for extraction.
         max_depth: Maximum octree refinement depth.
+        worker_count: Number of native refinement workers to use.
         group_labels: Optional per-particle group labels.
         smoothing_iterations: Number of smoothing iterations.
         smoothing_strength: Laplacian smoothing strength in ``(0, 1]``.
@@ -274,6 +279,8 @@ def _reconstruct_mesh(
         min_normal_alignment_threshold: Minimum acceptable normal alignment.
         min_feature_thickness: Minimum preserved feature thickness.
         pre_thickening_radius: Optional outward pre-thickening radius.
+        table_cadence: Strict time cadence in seconds for queue-status table
+            rows emitted by queue-driven refinement.
 
     Returns:
         Tuple of merged ``(vertices, faces)`` arrays.
@@ -282,6 +289,67 @@ def _reconstruct_mesh(
     # native bridge's expected dtype and contiguity guarantees.
     pos = np.ascontiguousarray(positions, dtype=np.float64)
     sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
+
+    if group_labels is None:
+        if pos.shape[0] < 3:
+            return (
+                np.empty((0, 3), dtype=np.float64),
+                np.empty((0, 3), dtype=np.int64),
+            )
+        result = run_full_pipeline(
+            pos,
+            sml,
+            domain_min,
+            domain_max,
+            base_resolution,
+            isovalue,
+            max_depth,
+            worker_count=worker_count,
+            table_cadence=table_cadence,
+            smoothing_iterations=smoothing_iterations,
+            smoothing_strength=smoothing_strength,
+            max_edge_ratio=max_edge_ratio,
+            minimum_usable_hermite_samples=minimum_usable_hermite_samples,
+            max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
+            min_normal_alignment_threshold=min_normal_alignment_threshold,
+            min_feature_thickness=min_feature_thickness,
+            pre_thickening_radius=pre_thickening_radius,
+        )
+        return result["vertices"], result["faces"]
+
+    def _run_group(group_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Run the native pipeline for one independent particle group."""
+        group_pos = np.ascontiguousarray(pos[group_indices], dtype=np.float64)
+        group_sml = np.ascontiguousarray(sml[group_indices], dtype=np.float64)
+
+        # The native pipeline cannot form a mesh from fewer than three
+        # particles, so skip undersized groups explicitly.
+        if group_pos.shape[0] < 3:
+            return (
+                np.empty((0, 3), dtype=np.float64),
+                np.empty((0, 3), dtype=np.int64),
+            )
+
+        result = run_full_pipeline(
+            group_pos,
+            group_sml,
+            domain_min,
+            domain_max,
+            base_resolution,
+            isovalue,
+            max_depth,
+            worker_count=worker_count,
+            table_cadence=table_cadence,
+            smoothing_iterations=smoothing_iterations,
+            smoothing_strength=smoothing_strength,
+            max_edge_ratio=max_edge_ratio,
+            minimum_usable_hermite_samples=minimum_usable_hermite_samples,
+            max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
+            min_normal_alignment_threshold=min_normal_alignment_threshold,
+            min_feature_thickness=min_feature_thickness,
+            pre_thickening_radius=pre_thickening_radius,
+        )
+        return result["vertices"], result["faces"].astype(np.int64)
 
     # Default to a single implicit group when no clustering labels are passed.
     if group_labels is None:
@@ -293,43 +361,31 @@ def _reconstruct_mesh(
                 f"group_labels must have shape (N,), got {labels.shape}"
             )
 
+    group_ids, inverse = np.unique(labels, return_inverse=True)
+    if len(group_ids) == 0:
+        group_index_lists = []
+    else:
+        # Group particle indices with one stable pass instead of rescanning the
+        # full label array once per FOF group.
+        sorted_indices = np.argsort(inverse, kind="stable")
+        group_sizes = np.bincount(inverse, minlength=len(group_ids))
+        split_points = np.cumsum(group_sizes[:-1], dtype=np.int64)
+        group_index_lists = np.split(sorted_indices, split_points)
+
     # Reconstruct each group independently so disconnected FOF structures are
     # not accidentally bridged by one global extraction pass.
     all_vertices = []
     all_faces = []
     vertex_offset = 0
-    for group_id in np.unique(labels):
-        mask = labels == group_id
-        group_pos = pos[mask]
-        group_sml = sml[mask]
 
-        # The native pipeline cannot form a mesh from fewer than three
-        # particles, so skip undersized groups explicitly.
-        if group_pos.shape[0] < 3:
-            continue
+    if len(group_index_lists) == 1:
+        group_meshes = [_run_group(group_index_lists[0])]
+    else:
+        max_workers = min(len(group_index_lists), max(1, worker_count))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            group_meshes = list(executor.map(_run_group, group_index_lists))
 
-        # Run the canonical adaptive pipeline for this group and collect
-        # the raw arrays for later merge.
-        result = run_full_pipeline(
-            group_pos,
-            group_sml,
-            domain_min,
-            domain_max,
-            base_resolution,
-            isovalue,
-            max_depth,
-            smoothing_iterations=smoothing_iterations,
-            smoothing_strength=smoothing_strength,
-            max_edge_ratio=max_edge_ratio,
-            minimum_usable_hermite_samples=minimum_usable_hermite_samples,
-            max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
-            min_normal_alignment_threshold=min_normal_alignment_threshold,
-            min_feature_thickness=min_feature_thickness,
-            pre_thickening_radius=pre_thickening_radius,
-        )
-        verts = result["vertices"]
-        faces = result["faces"].astype(np.int64)
-
+    for verts, faces in group_meshes:
         # Empty group results are ignored so weak or filtered groups do not add
         # degenerate entries to the final mesh buffers.
         if verts.shape[0] == 0:
@@ -404,6 +460,7 @@ def _run_full_pipeline_path(
         base_resolution,
         isovalue,
         max_depth,
+        worker_count=max(1, int(getattr(args, "nthreads", 1) or 1)),
         group_labels=group_labels,
         smoothing_iterations=getattr(args, "smoothing_iterations", 0),
         smoothing_strength=getattr(args, "smoothing_strength", 0.5),
@@ -419,6 +476,7 @@ def _run_full_pipeline_path(
         ),
         min_feature_thickness=min_feature_thickness,
         pre_thickening_radius=pre_thickening_radius,
+        table_cadence=getattr(args, "table_cadence", 10.0),
     )
     record_elapsed(
         "Mesh reconstruction core",
@@ -440,6 +498,7 @@ def _run_full_pipeline_path(
         )
 
     mesh = _build_mesh(mesh_verts, mesh_faces, origin)
+    del mesh_verts, mesh_faces
     mesh = _postprocess_mesh(mesh, args)
     output_path = _resolve_output_path(args)
     _save_final_mesh(mesh, output_path, summary=False)
@@ -562,8 +621,6 @@ def _build_and_optionally_save_octree(
     base_resolution: int,
     max_depth: int,
     isovalue: float,
-    min_feature_thickness: float,
-    pre_thickening_radius: float,
 ):
     """Build and optionally persist an octree from particle inputs.
 
@@ -576,8 +633,6 @@ def _build_and_optionally_save_octree(
         base_resolution: Number of top-level cells per axis.
         max_depth: Maximum octree refinement depth.
         isovalue: Scalar field threshold used during refinement.
-        min_feature_thickness: Regularization control in native units.
-        pre_thickening_radius: Optional pre-thickening control in native units.
 
     Returns:
         Tuple ``(cells, contributors)`` describing the refined octree.
@@ -589,30 +644,15 @@ def _build_and_optionally_save_octree(
     )
     tree_start = time.perf_counter()
 
-    top_cells = create_top_level_cells_with_contributors(
+    cells, contributors = build_refined_tree(
         positions,
         smoothing_lengths,
         domain_min,
         domain_max,
         base_resolution,
-    )
-    initial_cells = []
-    for cell in top_cells:
-        cell_dict = dict(cell)
-        contributors = cell_dict.pop("contributors")
-        cell_dict["contributor_begin"] = 0
-        cell_dict["contributor_end"] = len(contributors)
-        cell_dict["contributors"] = contributors
-        initial_cells.append(cell_dict)
-
-    cells, contributors = refine_octree(
-        initial_cells,
-        positions,
-        smoothing_lengths,
         isovalue,
         max_depth,
-        domain=(domain_min, domain_max),
-        base_resolution=base_resolution,
+        worker_count=max(1, int(getattr(args, "nthreads", 1) or 1)),
         minimum_usable_hermite_samples=getattr(
             args, "min_usable_hermite_samples", 3
         ),
@@ -622,8 +662,7 @@ def _build_and_optionally_save_octree(
         min_normal_alignment_threshold=getattr(
             args, "min_normal_alignment_threshold", 0.97
         ),
-        min_feature_thickness=min_feature_thickness,
-        pre_thickening_radius=pre_thickening_radius,
+        table_cadence=getattr(args, "table_cadence", 10.0),
     )
     record_elapsed("Octree construction", tree_start, operation="Building")
 
@@ -719,6 +758,15 @@ def _run_octree_backed_pipeline(
     else:
         group_labels = np.zeros(len(positions), dtype=np.int64)
 
+    # Reuse the saved tree only when reconstruction would be a pure dual-
+    # contour extraction pass. Any FOF regrouping, topology regularization, or
+    # smoothing requires the full reconstruction pipeline instead.
+    can_reuse_loaded_tree = (
+        not getattr(args, "fof", False)
+        and min_feature_thickness <= 0.0
+        and pre_thickening_radius <= 0.0
+        and getattr(args, "smoothing_iterations", 0) == 0
+    )
     reconstruction_depth = max_depth
     log_status(
         "Meshing",
@@ -726,30 +774,45 @@ def _run_octree_backed_pipeline(
         f"(depth={reconstruction_depth})...",
     )
     reconstruction_start = time.perf_counter()
-    mesh_verts, mesh_faces = _reconstruct_mesh(
-        positions,
-        smoothing_lengths,
-        domain_min,
-        domain_max,
-        base_resolution,
-        isovalue,
-        reconstruction_depth,
-        group_labels=group_labels,
-        smoothing_iterations=getattr(args, "smoothing_iterations", 0),
-        smoothing_strength=getattr(args, "smoothing_strength", 0.5),
-        max_edge_ratio=getattr(args, "max_edge_ratio", 1.5),
-        minimum_usable_hermite_samples=getattr(
-            args, "min_usable_hermite_samples", 3
-        ),
-        max_qef_rms_residual_ratio=getattr(
-            args, "max_qef_rms_residual_ratio", 0.1
-        ),
-        min_normal_alignment_threshold=getattr(
-            args, "min_normal_alignment_threshold", 0.97
-        ),
-        min_feature_thickness=min_feature_thickness,
-        pre_thickening_radius=pre_thickening_radius,
-    )
+    if can_reuse_loaded_tree:
+        mesh_verts, _, mesh_faces = generate_mesh(
+            cells,
+            contributors,
+            positions,
+            smoothing_lengths,
+            isovalue,
+            domain_min,
+            domain_max,
+            reconstruction_depth,
+            base_resolution,
+        )
+    else:
+        mesh_verts, mesh_faces = _reconstruct_mesh(
+            positions,
+            smoothing_lengths,
+            domain_min,
+            domain_max,
+            base_resolution,
+            isovalue,
+            reconstruction_depth,
+            worker_count=max(1, int(getattr(args, "nthreads", 1) or 1)),
+            group_labels=group_labels,
+            smoothing_iterations=getattr(args, "smoothing_iterations", 0),
+            smoothing_strength=getattr(args, "smoothing_strength", 0.5),
+            max_edge_ratio=getattr(args, "max_edge_ratio", 1.5),
+            minimum_usable_hermite_samples=getattr(
+                args, "min_usable_hermite_samples", 3
+            ),
+            max_qef_rms_residual_ratio=getattr(
+                args, "max_qef_rms_residual_ratio", 0.1
+            ),
+            min_normal_alignment_threshold=getattr(
+                args, "min_normal_alignment_threshold", 0.97
+            ),
+            min_feature_thickness=min_feature_thickness,
+            pre_thickening_radius=pre_thickening_radius,
+            table_cadence=getattr(args, "table_cadence", 10.0),
+        )
     record_elapsed(
         "Mesh reconstruction core",
         reconstruction_start,
@@ -774,6 +837,7 @@ def _run_octree_backed_pipeline(
         )
 
     mesh = _build_mesh(mesh_verts, mesh_faces, origin)
+    del mesh_verts, mesh_faces
     mesh = _postprocess_mesh(mesh, args)
     output_path = _resolve_output_path(args)
     _save_final_mesh(mesh, output_path, summary=True)
@@ -845,8 +909,6 @@ def run_adaptive(args) -> None:
             base_resolution=state["base_resolution"],
             max_depth=state["max_depth"],
             isovalue=state["isovalue"],
-            min_feature_thickness=effective_min_feature_thickness,
-            pre_thickening_radius=effective_pre_thickening_radius,
         )
     elif args.save_octree is not None:
         log_status("Saving", f"Saving octree to {args.save_octree}")

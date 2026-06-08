@@ -20,6 +20,16 @@ Example usage::
 
     WITH_OPENMP=1 pip install -e .
     WITH_OPENMP=/opt/homebrew/opt/libomp pip install -e .
+
+Diagnostic progress counters
+----------------------------
+Set ``ATOMIC_PROGRESS`` to compile native hot-loop progress counters into the
+extension.  By default these counters are compiled out so normal builds avoid
+per-iteration atomic increments and terminal flushes in long native loops.
+
+Example usage::
+
+    ATOMIC_PROGRESS=1 pip install -e .
 """
 
 from __future__ import annotations
@@ -39,8 +49,12 @@ from setuptools import Extension, setup
 # DEBUG_LOG:
 #   Any non-empty value enables compilation of optional native debug-log file
 #   support. When unset, native debug-only diagnostics are compiled out.
+# ATOMIC_PROGRESS:
+#   Any non-empty value enables native hot-loop progress counters. When unset,
+#   those counters are compiled out while completion/timing summaries remain.
 WITH_OPENMP = os.environ.get("WITH_OPENMP", "")
 DEBUG_LOG = os.environ.get("DEBUG_LOG", "")
+ATOMIC_PROGRESS = os.environ.get("ATOMIC_PROGRESS", "")
 
 
 def _build_adaptive_extension() -> Extension:
@@ -88,9 +102,17 @@ def _build_adaptive_extension() -> Extension:
     if len(DEBUG_LOG) > 0:
         compile_flags.append("-DDEBUG_LOG")
 
+    if len(ATOMIC_PROGRESS) > 0:
+        compile_flags.append("-DATOMIC_PROGRESS")
+
     return Extension(
         "meshmerizer._adaptive",
-        sources=["src/meshmerizer/_adaptive.cpp"],
+        sources=[
+            "src/meshmerizer/_adaptive.cpp",
+            "src/meshmerizer/adaptive_cpp/refinement_work_queue.cpp",
+            "src/meshmerizer/adaptive_cpp/refinement_context.cpp",
+            "src/meshmerizer/adaptive_cpp/refinement_closure.cpp",
+        ],
         include_dirs=include_dirs,
         language="c++",
         extra_compile_args=compile_flags,

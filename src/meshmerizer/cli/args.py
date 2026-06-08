@@ -288,6 +288,34 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Multiplier for particle smoothing lengths. Default: 1.0",
     )
+    parser.add_argument(
+        "--threshold-key",
+        type=str,
+        default=None,
+        help=(
+            "HDF5 dataset path for a per-particle scalar used to filter the "
+            "loaded particle set before meshing. Use with --low-thresh and/or "
+            "--up-thresh."
+        ),
+    )
+    parser.add_argument(
+        "--low-thresh",
+        type=_finite_float,
+        default=None,
+        help=(
+            "Lower inclusive threshold for --threshold-key. Particles with "
+            "values below this are removed."
+        ),
+    )
+    parser.add_argument(
+        "--up-thresh",
+        type=_finite_float,
+        default=None,
+        help=(
+            "Upper inclusive threshold for --threshold-key. Particles with "
+            "values above this are removed."
+        ),
+    )
 
     parser.add_argument(
         "--base-resolution",
@@ -481,6 +509,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Suppress per-update progress rendering while keeping Python "
             "status logs on stdout."
+        ),
+    )
+    parser.add_argument(
+        "--table-cadence",
+        type=_positive_float,
+        default=10.0,
+        help=(
+            "Seconds between queue-driven refinement status table rows. "
+            "This cadence is always honored even under --silent. "
+            "Default: 10"
         ),
     )
 

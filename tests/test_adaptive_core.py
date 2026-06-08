@@ -1,6 +1,7 @@
 """Tests for the adaptive C++ core utilities and diagnostics."""
 
 import numpy as np
+import pytest
 
 from meshmerizer.adaptive import (
     adaptive_status,
@@ -29,9 +30,9 @@ from meshmerizer.adaptive import (
 )
 
 
-def test_adaptive_extension_scaffold_imports() -> None:
+def test_adaptive_extension_imports() -> None:
     """The adaptive C++ extension should import through its Python wrapper."""
-    assert adaptive_status() == "adaptive core scaffold ready"
+    assert adaptive_status() == "adaptive core ready"
 
 
 def test_morton_encode_decode_round_trip() -> None:
@@ -161,8 +162,6 @@ def test_create_top_level_cells_returns_row_major_cells() -> None:
 
 def test_create_top_level_cells_rejects_zero_resolution() -> None:
     """Top-level cell creation should reject a zero base resolution."""
-    import pytest
-
     with pytest.raises(ValueError, match="base_resolution"):
         create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 0)
 
@@ -397,6 +396,60 @@ def test_refine_octree_balance_does_not_exceed_max_depth() -> None:
     assert violations == []
 
 
+def test_refine_octree_balances_multiple_shared_face_patches() -> None:
+    """Multiple particles near one face should still preserve 2:1 balance."""
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+
+    for cell in cells:
+        cell["contributor_begin"] = 0
+        cell["contributor_end"] = 4
+
+    refined_cells, _ = refine_octree(
+        cells,
+        positions=[
+            (0.99, 0.05, 0.05),
+            (0.99, 0.45, 0.05),
+            (0.99, 0.05, 0.45),
+            (0.99, 0.45, 0.45),
+        ],
+        smoothing_lengths=[0.02, 0.02, 0.02, 0.02],
+        isovalue=0.5,
+        max_depth=4,
+        domain=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        base_resolution=2,
+    )
+
+    violations = _check_balance_invariant(refined_cells)
+    assert violations == []
+
+
+def test_refine_octree_balances_orthogonal_face_refinement_near_corner() -> (
+    None
+):
+    """Corner-adjacent particles should still preserve 2:1 balance."""
+    cells = create_top_level_cells((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 2)
+
+    for cell in cells:
+        cell["contributor_begin"] = 0
+        cell["contributor_end"] = 2
+
+    refined_cells, _ = refine_octree(
+        cells,
+        positions=[
+            (0.99, 0.99, 0.25),
+            (0.99, 0.99, 0.45),
+        ],
+        smoothing_lengths=[0.02, 0.02],
+        isovalue=0.5,
+        max_depth=4,
+        domain=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        base_resolution=2,
+    )
+
+    violations = _check_balance_invariant(refined_cells)
+    assert violations == []
+
+
 def test_neighbor_morton_key_returns_adjacent_cell() -> None:
     """Morton neighbor at depth 0 should step by one coordinate unit."""
     # At depth 0, coordinates are in [0, root_resolution).
@@ -428,26 +481,6 @@ def test_leaf_cells_share_face_consistency() -> None:
 
 # Unit cell used throughout the Hermite sample tests.
 _UNIT_BOUNDS = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
-
-
-def _unit_corner_values(isovalue: float, gradient_axis: int) -> list[float]:
-    """Return 8 corner values for a linear field along one axis.
-
-    The field varies from -1 at the low end to +1 at the high end along the
-    chosen axis, crossing zero (the isovalue) at the midpoint.
-
-    Corner index encoding: bit 0 = high x, bit 1 = high y, bit 2 = high z.
-    """
-    values = []
-    for corner in range(8):
-        position = [
-            1.0 if (corner & 1) else 0.0,
-            1.0 if (corner & 2) else 0.0,
-            1.0 if (corner & 4) else 0.0,
-        ]
-        # Linear field: -1 at 0, +1 at 1 along the chosen axis.
-        values.append(2.0 * position[gradient_axis] - 1.0)
-    return values
 
 
 def test_hermite_samples_no_crossings_on_uniform_field() -> None:
@@ -727,6 +760,7 @@ def _build_sphere_octree(
     base_resolution=4,
     max_depth=2,
     isovalue=0.5,
+    worker_count=1,
 ):
     """Helper: build a refined octree from a cluster of particles.
 
@@ -775,6 +809,7 @@ def _build_sphere_octree(
         max_depth,
         domain=(domain_min, domain_max),
         base_resolution=base_resolution,
+        worker_count=worker_count,
     )
 
     return (
@@ -802,8 +837,6 @@ def test_solve_vertices_produces_vertices() -> None:
 
 def test_solve_vertices_normals_unit_length() -> None:
     """QEF vertex normals should be approximately unit length."""
-    import numpy as np
-
     args = _build_sphere_octree()
     vert_positions, vert_normals = solve_vertices(*args)
     norms = np.linalg.norm(vert_normals, axis=1)
@@ -881,6 +914,77 @@ def test_refine_octree_quality_stop_preserves_mixed_leaf_depths() -> None:
     assert len(set(surface_leaf_depths)) > 1
 
 
+def test_refine_octree_threaded_sphere_smoke_test() -> None:
+    """Threaded low-level sphere refinement should remain balanced."""
+    cells, _, _, _, _, _, _, _, _ = _build_sphere_octree(
+        base_resolution=4,
+        max_depth=3,
+        worker_count=2,
+    )
+
+    assert len(cells) > 0
+    assert any(cell.get("is_leaf") for cell in cells)
+    assert _check_balance_invariant(cells) == []
+
+
+def test_refine_octree_thread_count_compatibility_on_sphere() -> None:
+    """Serial and threaded sphere refinement should remain compatible."""
+    serial_cells, _, _, _, _, _, _, max_depth, _ = _build_sphere_octree(
+        base_resolution=4,
+        max_depth=3,
+        worker_count=1,
+    )
+    threaded_cells, _, _, _, _, _, _, _, _ = _build_sphere_octree(
+        base_resolution=4,
+        max_depth=3,
+        worker_count=2,
+    )
+
+    assert _check_balance_invariant(serial_cells) == []
+    assert _check_balance_invariant(threaded_cells) == []
+
+    serial_leaf_depths = [
+        cell["depth"] for cell in serial_cells if cell.get("is_leaf")
+    ]
+    threaded_leaf_depths = [
+        cell["depth"] for cell in threaded_cells if cell.get("is_leaf")
+    ]
+
+    assert serial_leaf_depths
+    assert threaded_leaf_depths
+    assert max(serial_leaf_depths) <= max_depth
+    assert max(threaded_leaf_depths) <= max_depth
+
+    serial_leaf_count = sum(1 for cell in serial_cells if cell.get("is_leaf"))
+    threaded_leaf_count = sum(
+        1 for cell in threaded_cells if cell.get("is_leaf")
+    )
+
+    assert len(serial_cells) > 0
+    assert len(threaded_cells) > 0
+    assert serial_leaf_count > 0
+    assert threaded_leaf_count > 0
+    assert abs(len(serial_cells) - len(threaded_cells)) <= max(
+        1, len(serial_cells) // 20
+    )
+    assert abs(serial_leaf_count - threaded_leaf_count) <= max(
+        1, serial_leaf_count // 20
+    )
+
+
+def test_refine_octree_threaded_sphere_smoke_test_repeated() -> None:
+    """Repeated threaded sphere runs should stay balanced and complete."""
+    for _ in range(3):
+        cells, _, _, _, _, _, _, _, _ = _build_sphere_octree(
+            base_resolution=4,
+            max_depth=3,
+            worker_count=2,
+        )
+
+        assert len(cells) > 0
+        assert _check_balance_invariant(cells) == []
+
+
 # ---------------------------------------------------------------------------
 # NumPy buffer-protocol tests
 # ---------------------------------------------------------------------------
@@ -888,8 +992,6 @@ def test_refine_octree_quality_stop_preserves_mixed_leaf_depths() -> None:
 
 def test_refine_octree_accepts_numpy_arrays() -> None:
     """C++ bindings should accept NumPy arrays via buffer protocol."""
-    import numpy as np
-
     domain_min = (0.0, 0.0, 0.0)
     domain_max = (1.0, 1.0, 1.0)
     base_resolution = 2
@@ -922,8 +1024,6 @@ def test_refine_octree_accepts_numpy_arrays() -> None:
 
 def test_run_octree_pipeline_produces_vertices() -> None:
     """Octree pipeline should produce QEF vertices."""
-    import numpy as np
-
     domain_min = (-1.0, -1.0, -1.0)
     domain_max = (2.0, 2.0, 2.0)
     base_resolution = 2
@@ -965,8 +1065,6 @@ def test_run_octree_pipeline_produces_vertices() -> None:
 
 def test_run_octree_pipeline_empty_particles() -> None:
     """Pipeline with no particles should produce empty arrays."""
-    import numpy as np
-
     positions = np.zeros((0, 3), dtype=np.float64)
     smoothing = np.zeros(0, dtype=np.float64)
 
@@ -983,6 +1081,37 @@ def test_run_octree_pipeline_empty_particles() -> None:
     assert len(vert_normals) == 0
 
 
+def test_run_octree_pipeline_accepts_worker_count() -> None:
+    """The compact C++ octree pipeline should honor worker_count."""
+    positions_arr = np.array(
+        [
+            (0.45, 0.5, 0.5),
+            (0.55, 0.5, 0.5),
+            (0.5, 0.45, 0.5),
+            (0.5, 0.55, 0.5),
+            (0.5, 0.5, 0.45),
+            (0.5, 0.5, 0.55),
+        ],
+        dtype=np.float64,
+    )
+    smoothing_arr = np.full(len(positions_arr), 0.8, dtype=np.float64)
+
+    vert_positions, vert_normals = run_octree_pipeline(
+        positions_arr,
+        smoothing_arr,
+        (-1.0, -1.0, -1.0),
+        (2.0, 2.0, 2.0),
+        4,
+        0.5,
+        3,
+        worker_count=2,
+    )
+
+    assert len(vert_positions) > 0
+    assert vert_positions.shape[1] == 3
+    assert vert_normals.shape[1] == 3
+
+
 # ---------------------------------------------------------------------------
 # Density percentile isovalue tests
 # ---------------------------------------------------------------------------
@@ -990,8 +1119,6 @@ def test_run_octree_pipeline_empty_particles() -> None:
 
 def test_compute_isovalue_from_percentile_basic() -> None:
     """Percentile isovalue should match manual Wendland C2 self-density."""
-    import numpy as np
-
     h = np.array([0.1, 0.2, 0.5, 1.0], dtype=np.float64)
     iso = compute_isovalue_from_percentile(h, 50.0)
     # Manual: self_density = 21 / (2*pi*h^3), median of those values.
@@ -1002,8 +1129,6 @@ def test_compute_isovalue_from_percentile_basic() -> None:
 
 def test_compute_isovalue_percentile_low_encloses_more() -> None:
     """Lower percentile should give a lower isovalue (enclose more)."""
-    import numpy as np
-
     h = np.random.default_rng(42).uniform(0.05, 1.0, size=1000)
     iso_5 = compute_isovalue_from_percentile(h, 5.0)
     iso_50 = compute_isovalue_from_percentile(h, 50.0)
@@ -1012,9 +1137,6 @@ def test_compute_isovalue_percentile_low_encloses_more() -> None:
 
 def test_compute_isovalue_percentile_rejects_invalid() -> None:
     """Out-of-range percentile should raise ValueError."""
-    import numpy as np
-    import pytest
-
     h = np.array([0.1, 0.2], dtype=np.float64)
     with pytest.raises(ValueError):
         compute_isovalue_from_percentile(h, -1.0)
@@ -1029,8 +1151,6 @@ def test_compute_isovalue_percentile_rejects_invalid() -> None:
 
 def test_fof_single_cluster() -> None:
     """Tightly packed points should form one cluster."""
-    import numpy as np
-
     rng = np.random.default_rng(42)
     positions = rng.uniform(0.4, 0.6, size=(50, 3))
     labels = fof_cluster(
@@ -1047,8 +1167,6 @@ def test_fof_single_cluster() -> None:
 
 def test_fof_two_separated_clusters() -> None:
     """Two well-separated clumps should get different labels."""
-    import numpy as np
-
     rng = np.random.default_rng(99)
     # Cluster A near origin, cluster B near (10, 10, 10).
     cluster_a = rng.uniform(0.0, 0.1, size=(30, 3))
@@ -1071,8 +1189,6 @@ def test_fof_two_separated_clusters() -> None:
 
 def test_fof_empty_input() -> None:
     """Empty positions should return an empty label array."""
-    import numpy as np
-
     positions = np.empty((0, 3), dtype=np.float64)
     labels = fof_cluster(
         positions,
@@ -1086,8 +1202,6 @@ def test_fof_empty_input() -> None:
 
 def test_fof_cluster_sizes_support_small_cluster_filtering() -> None:
     """FOF labels should allow thresholding away tiny detached clusters."""
-    import numpy as np
-
     rng = np.random.default_rng(7)
     main_cluster = rng.uniform(0.0, 0.2, size=(40, 3))
     fluff_cluster = rng.uniform(4.9, 5.0, size=(3, 3))
@@ -1109,8 +1223,6 @@ def test_fof_cluster_sizes_support_small_cluster_filtering() -> None:
 
 def test_fof_uses_tight_particle_bounds_for_linking_scale() -> None:
     """FOF should not depend on a much larger enclosing domain."""
-    import numpy as np
-
     positions = np.array(
         [
             [0.00, 0.00, 0.00],
@@ -1313,6 +1425,37 @@ def test_opened_solid_generates_surface_mesh() -> None:
     assert faces.shape[1] == 3
 
 
+def test_regularization_fixed_sphere_topology_fingerprint() -> None:
+    """Fixed regularization preserves opened-solid topology counts."""
+    positions, smoothing_lengths = _make_solid_sphere_particles(
+        n=300,
+        radius=0.9,
+        center=(2.0, 2.0, 2.0),
+        h=0.20,
+        seed=404,
+    )
+
+    opened = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        4,
+        0.01,
+        3,
+        erosion_radius=0.225,
+        pre_thickening_radius=0.0,
+    )
+
+    assert opened["n_leaves"] == 3914
+    assert opened["n_inside"] == 1348
+    assert opened["n_eroded_inside"] == 276
+    assert opened["n_opened_inside"] == 579
+    assert opened["n_opened_boundary_samples"] == 774
+    assert opened["n_opened_surface_vertices"] == 1024
+    assert 2040 <= opened["n_opened_surface_faces"] <= 2060
+
+
 def test_pre_thickening_increases_leaf_count_when_refinement_is_needed() -> (
     None
 ):
@@ -1344,3 +1487,86 @@ def test_pre_thickening_increases_leaf_count_when_refinement_is_needed() -> (
 
     assert thickened["n_leaves"] >= baseline["n_leaves"]
     assert thickened["n_thickened_inside"] >= thickened["n_inside"]
+
+
+# ---------------------------------------------------------------------------
+# B2 classify→distance→refine chain unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_b2_chain_produces_inside_classified_cells() -> None:
+    """B2 kClassify tasks must label at least one leaf cell as inside.
+
+    Exercises the full incremental chain:
+      kClassify → kDistanceUpdate → kRefine → kClassify(children) → …
+
+    We use a small solid-sphere particle cloud with a non-zero
+    pre_thickening_radius so the thickening-band task chain is active.
+    The result dict must report at least one inside leaf (the chain has run)
+    and no crash must occur.
+    """
+    positions, smoothing_lengths = _make_solid_sphere_particles(
+        n=200, radius=0.6, center=(2.0, 2.0, 2.0), h=0.25, seed=7
+    )
+
+    result = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (4.0, 4.0, 4.0),
+        base_resolution=4,
+        isovalue=0.01,
+        max_depth=2,
+        pre_thickening_radius=0.3,
+    )
+
+    # The classify pass must have run and labelled some cells inside.
+    assert result["n_inside"] > 0, (
+        "Expected at least one inside leaf after B2 classify"
+    )
+    # The thickening pass must have expanded the inside count.
+    assert result["n_thickened_inside"] >= result["n_inside"], (
+        "Thickened inside count must be >= raw inside count"
+    )
+
+
+def test_b2_chain_refines_more_than_no_thickening() -> None:
+    """B2 kDistanceUpdate→kRefine cascade must produce additional leaves.
+
+    Compares leaf counts from a run with pre_thickening_radius=0 (chain
+    disabled) versus pre_thickening_radius>0 (chain active).  The thickening
+    run must produce at least as many leaves because the cascade refines cells
+    within the outward band.
+    """
+    positions, smoothing_lengths = _make_solid_sphere_particles(
+        n=200, radius=0.6, center=(2.0, 2.0, 2.0), h=0.25, seed=7
+    )
+
+    common_kwargs = dict(
+        domain_minimum=(0.0, 0.0, 0.0),
+        domain_maximum=(4.0, 4.0, 4.0),
+        base_resolution=4,
+        isovalue=0.01,
+        max_depth=2,
+        erosion_radius=0.0,
+    )
+
+    baseline = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        pre_thickening_radius=0.0,
+        **common_kwargs,
+    )
+    thickened = classify_occupied_solid(
+        positions,
+        smoothing_lengths,
+        pre_thickening_radius=0.3,
+        **common_kwargs,
+    )
+
+    assert thickened["n_leaves"] >= baseline["n_leaves"], (
+        "Thickening band refinement should not reduce leaf count"
+    )
+    assert thickened["n_thickened_inside"] >= thickened["n_inside"], (
+        "Thickened inside count must be >= raw inside count"
+    )

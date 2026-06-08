@@ -218,21 +218,23 @@ inline void subdivide_long_edges(
         }
     }
 
-    std::unordered_map<EdgeKey, std::size_t, EdgeKeyHash> requested_segments;
+    std::unordered_map<EdgeKey, std::size_t, EdgeKeyHash> edge_subdivision_counts;
     for (const auto &thread_vec : thread_requests) {
         for (const auto &request : thread_vec) {
-            auto it = requested_segments.find(request.key);
-            if (it == requested_segments.end() ||
+            auto it = edge_subdivision_counts.find(request.key);
+            if (it == edge_subdivision_counts.end() ||
                 request.n_segments > it->second) {
-                requested_segments[request.key] = request.n_segments;
+                edge_subdivision_counts[request.key] = request.n_segments;
             }
         }
     }
+    std::vector<std::vector<EdgeSubdivisionRequest>>().swap(thread_requests);
 
     std::unordered_map<EdgeKey, SubdividedEdge, EdgeKeyHash>
         edge_subdivisions;
+    edge_subdivisions.reserve(edge_subdivision_counts.size());
 
-    for (const auto &entry : requested_segments) {
+    for (const auto &entry : edge_subdivision_counts) {
         const EdgeKey &key = entry.first;
         const std::size_t n_segments = entry.second;
 
@@ -274,6 +276,8 @@ inline void subdivide_long_edges(
 
         edge_subdivisions[key] = std::move(sub);
     }
+    std::unordered_map<EdgeKey, std::size_t, EdgeKeyHash>().swap(
+        edge_subdivision_counts);
 
     // If no edges were subdivided, nothing to do.
     if (edge_subdivisions.empty()) {

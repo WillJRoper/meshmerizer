@@ -67,9 +67,20 @@ Meshmerizer is a good fit when you want to:
 
 ## Start here
 
-- [Installation](installation.md) for local setup and build notes
-- [CLI](cli.md) for snapshot-to-STL usage
-- [CLI Option Reference](cli-options/index.md) for detailed per-option behavior
-- [Python API](python-api.md) for scripted workflows
-- [Architecture](architecture.md) for package structure and native boundaries
-- [Release & Deployment](release.md) for build and PyPI publishing
+Recommended reading order:
+
+1. [Quickstart](quickstart.md) for a first successful mesh build
+2. [Installation](installation.md) for build options and troubleshooting
+3. [CLI](cli.md) for task-oriented usage patterns
+4. [Python API](python-api.md) if you want scripted or staged workflows
+5. [Reconstruction Workflow](reconstruction-workflow.md) to understand how the
+   adaptive meshing stages fit together
+6. [Tuning Performance](tuning-performance.md) for runtime and quality tradeoffs
+
+Reference material:
+
+- [Reconstruction Workflow](reconstruction-workflow.md)
+- [Tuning Performance](tuning-performance.md)
+- [CLI Option Reference](cli-options/index.md)
+- [Architecture](architecture.md)
+- [Release & Deployment](release.md)

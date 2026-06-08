@@ -18,12 +18,20 @@
 #ifndef MESHMERIZER_ADAPTIVE_CPP_ADAPTIVE_SOLID_HPP_
 #define MESHMERIZER_ADAPTIVE_CPP_ADAPTIVE_SOLID_HPP_
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <exception>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <span>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -32,6 +40,8 @@
 #include "cancellation.hpp"
 #include "faces.hpp"
 #include "octree_cell.hpp"
+#include "refinement_closure.hpp"
+#include "refinement_work_queue.hpp"
 
 /**
  * @brief Occupancy classification used by the opened-solid pipeline.
@@ -81,6 +91,41 @@ struct OccupiedSolidClassificationCache {
     /** Face-neighbor lookup into the global cell array. */
     std::vector<std::array<std::size_t, 6>> face_neighbor_cell_indices;
 };
+
+/**
+ * @brief Compact extraction views derived from the full-tree classification cache.
+ *
+ * Phase 5 groundwork: keep cell-local material state authoritative on the full
+ * octree, and build compact leaf-only views explicitly at the
+ * morphology/extraction boundary.
+ */
+struct OccupiedSolidExtractionView {
+    /** Compact occupied-solid leaf records used by morphology/extraction. */
+    std::vector<OccupiedSolidLeaf> solid_leaves;
+    /** Reverse lookup from global cell index to ``solid_leaves`` index. */
+    std::vector<std::int64_t> cell_to_leaf_index;
+    /** Full-tree inside mask aligned with ``all_cells``. */
+    std::vector<std::uint8_t> inside_mask_by_cell;
+    /** Leaf-compact inside mask aligned with ``solid_leaves``. */
+    std::vector<std::uint8_t> inside_mask;
+};
+
+template <typename T>
+inline void release_vector_memory(std::vector<T> &values) {
+    std::vector<T>().swap(values);
+}
+
+/**
+ * @brief Return whether one cached cell classification is part of the solid.
+ *
+ * @param occupancy Cached occupancy state stored in the full-tree side-car.
+ * @return ``true`` when the cell is inside or boundary-inside.
+ */
+inline bool occupied_solid_cache_is_inside(std::uint8_t occupancy) {
+    const auto state = static_cast<OccupancyState>(occupancy);
+    return state == OccupancyState::kInside ||
+           state == OccupancyState::kBoundaryInside;
+}
 
 /**
  * @brief Boundary sample emitted from the opened solid.
@@ -165,6 +210,34 @@ inline double cell_edge_length(const OctreeCell &cell) {
     return cell.bounds.max.x - cell.bounds.min.x;
 }
 
+inline std::uint64_t adaptive_solid_double_to_bits(double value) {
+    std::uint64_t bits = 0U;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+inline double adaptive_solid_bits_to_double(std::uint64_t bits) {
+    double value = 0.0;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+inline bool adaptive_solid_atomic_update_distance_min(
+    std::atomic<std::uint64_t> &slot,
+    double new_distance) {
+    std::uint64_t observed = slot.load(std::memory_order_acquire);
+    while (adaptive_solid_bits_to_double(observed) > new_distance) {
+        if (slot.compare_exchange_weak(
+                observed,
+                adaptive_solid_double_to_bits(new_distance),
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * @brief Refine surface-adjacent leaves until they satisfy a target size.
  *
@@ -199,7 +272,11 @@ inline bool refine_surface_band_cells(
     const std::vector<double> &smoothing_lengths,
     double isovalue,
     std::uint32_t max_depth,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution,
+    std::uint32_t worker_count,
     double max_surface_leaf_size,
+    double table_cadence_seconds,
     std::uint32_t minimum_usable_hermite_samples,
     double max_qef_rms_residual_ratio,
     double min_normal_alignment_threshold) {
@@ -207,158 +284,28 @@ inline bool refine_surface_band_cells(
         return false;
     }
 
-    std::queue<std::size_t> cells_to_visit;
-    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
-        const OctreeCell &cell = all_cells[cell_idx];
-        if (!cell.is_leaf || !cell.has_surface || cell.depth >= max_depth) {
-            continue;
-        }
-        if (cell_edge_length(cell) > max_surface_leaf_size) {
-            cells_to_visit.push(cell_idx);
-        }
-    }
-
-    if (cells_to_visit.empty()) {
-        meshmerizer_log_detail::print_debug_status(
-            "Regularization",
-            "refine_surface_band_cells",
-            "no surface-band splits needed (leaf_size_target=%.6g, total_cells=%zu)\n",
-            max_surface_leaf_size,
-            all_cells.size());
-        return false;
-    }
-
-    meshmerizer_log_detail::print_debug_status(
+    const RefinementClosureConfig closure_config = {
+        isovalue,
+        max_depth,
+        domain,
+        base_resolution,
+        worker_count,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+        table_cadence_seconds,
         "Regularization",
         "refine_surface_band_cells",
-        "starting from %zu surface-band cells to reach leaf_size<=%.6g (total_cells_before=%zu)\n",
-        cells_to_visit.size(),
-        max_surface_leaf_size,
-        all_cells.size());
+        "surface_band",
+    };
 
-    ProgressCounter refine_counter(
-        "Regularization", "refine_surface_band_cells", "cells", 100);
-    std::size_t split_count = 0U;
-    std::size_t processed_count = 0U;
-
-    // Process only the surface-focused work queue so the refinement cost scales
-    // with the morphology band rather than the full tree size.
-    while (!cells_to_visit.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(
-            processed_count + split_count + 1U);
-        const std::size_t cell_idx = cells_to_visit.front();
-        cells_to_visit.pop();
-        refine_counter.tick();
-        ++processed_count;
-
-        if (cell_idx >= all_cells.size()) {
-            continue;
-        }
-
-        OctreeCell &cell = all_cells[cell_idx];
-        if (!cell.is_leaf || !cell.has_surface || cell.depth >= max_depth) {
-            continue;
-        }
-        if (cell_edge_length(cell) <= max_surface_leaf_size) {
-            continue;
-        }
-
-        // Splitting appends children into the flat arrays, so we always re-read
-        // the parent from ``all_cells`` after the mutation before inspecting
-        // child offsets.
-        split_octree_leaf(
-            cell_idx, all_cells, all_contributors,
-            positions, smoothing_lengths);
-        ++split_count;
-
-        const std::int64_t child_begin = all_cells[cell_idx].child_begin;
-        if (child_begin < 0) {
-            continue;
-        }
-
-        for (std::size_t child_offset = 0; child_offset < 8U; ++child_offset) {
-            const std::size_t child_index =
-                static_cast<std::size_t>(child_begin) + child_offset;
-            if (child_index >= all_cells.size()) {
-                continue;
-            }
-
-            OctreeCell &child = all_cells[child_index];
-            const std::span<const std::size_t> contributors =
-                cell_contributor_span(child, all_contributors);
-            child.is_active = false;
-            child.is_topo_surface = false;
-            child.representative_vertex_index = -1;
-
-            if (contributors.size() < 2U) {
-                child.has_surface = false;
-                child.corner_values = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-                child.corner_sign_mask = 0U;
-                continue;
-            }
-
-            child.corner_values = sample_cell_corners(
-                child, contributors, positions, smoothing_lengths);
-            child.corner_sign_mask = compute_corner_sign_mask(
-                child.corner_values, isovalue);
-
-            const bool corner_surface = cell_may_contain_isosurface(
-                child.corner_values, isovalue);
-            const bool inherited_surface_hint =
-                all_cells[cell_idx].has_surface && !corner_surface;
-            child.has_surface = corner_surface || inherited_surface_hint;
-            if (!child.has_surface) {
-                continue;
-            }
-
-            bool should_continue_refining =
-                child.depth < max_depth &&
-                cell_edge_length(child) > max_surface_leaf_size;
-
-            if (!should_continue_refining &&
-                child.depth < max_depth && corner_surface) {
-                const std::vector<HermiteSample> samples =
-                    compute_cell_hermite_samples(
-                        child.bounds, child.corner_values,
-                        child.corner_sign_mask, contributors,
-                        positions, smoothing_lengths, isovalue);
-                const QEFLeafDiagnostics qef_diagnostics =
-                    analyze_qef_for_leaf(samples, child.bounds);
-                const double dx = child.bounds.max.x - child.bounds.min.x;
-                const double dy = child.bounds.max.y - child.bounds.min.y;
-                const double dz = child.bounds.max.z - child.bounds.min.z;
-                const double cell_radius =
-                    0.5 * std::sqrt(dx * dx + dy * dy + dz * dz);
-                const bool poor_qef_fit =
-                    qef_diagnostics.usable_sample_count <
-                        minimum_usable_hermite_samples ||
-                    qef_diagnostics.used_fallback ||
-                    minimum_hermite_normal_alignment(samples) <
-                        min_normal_alignment_threshold ||
-                    qef_diagnostics.rms_plane_residual >
-                        max_qef_rms_residual_ratio * cell_radius;
-                should_continue_refining = poor_qef_fit;
-            }
-
-            if (should_continue_refining) {
-                cells_to_visit.push(child_index);
-            } else {
-                child.is_active = true;
-            }
-        }
-    }
-
-    refine_counter.finish();
-
-    meshmerizer_log_detail::print_debug_status(
-        "Regularization",
-        "refine_surface_band_cells",
-        "processed=%zu split=%zu (total_cells_after_refine=%zu)\n",
-        processed_count,
-        split_count,
-        all_cells.size());
-    return split_count > 0U;
+    return refine_surface_band_with_closure(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        closure_config,
+        max_surface_leaf_size);
 }
 
 inline std::array<std::size_t, 6> face_neighbor_cells(
@@ -405,7 +352,7 @@ inline std::array<std::size_t, 6> face_neighbor_cells(
     return neighbors;
 }
 
-inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
+inline void update_occupied_solid_classification_cache(
     const std::vector<OctreeCell> &all_cells,
     const std::vector<std::size_t> &all_contributors,
     const std::vector<Vector3d> &positions,
@@ -413,45 +360,21 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
     const LeafSpatialIndex &spatial_index,
     double isovalue,
     std::uint32_t max_depth,
-    OccupiedSolidClassificationCache *cache = nullptr,
+    OccupiedSolidClassificationCache &cache,
     const std::vector<std::uint8_t> *dirty_cells = nullptr,
-    std::vector<std::uint8_t> *inside_mask = nullptr) {
-    std::vector<OccupiedSolidLeaf> solid_leaves;
-    solid_leaves.reserve(all_cells.size());
-    std::vector<std::uint8_t> local_inside_flags;
-    std::vector<double> local_center_values;
-    if (cache == nullptr) {
-        local_inside_flags.assign(all_cells.size(), 0U);
-        local_center_values.assign(all_cells.size(), 0.0);
-    } else {
-        cache->inside_flags.resize(all_cells.size(), 0U);
-        cache->center_values.resize(all_cells.size(), 0.0);
-        cache->occupancy_states.resize(
-            all_cells.size(),
-            static_cast<std::uint8_t>(OccupancyState::kOutside));
-        cache->face_neighbor_cell_indices.resize(
-            all_cells.size(),
-            {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
-    }
-    std::vector<std::uint8_t> &inside_flags =
-        cache == nullptr ? local_inside_flags : cache->inside_flags;
-    std::vector<double> &center_values =
-        cache == nullptr ? local_center_values : cache->center_values;
-    std::vector<std::int64_t> cell_to_leaf_index(all_cells.size(), -1);
-    std::vector<std::uint8_t> leaf_is_included(all_cells.size(), 0U);
-    std::vector<OccupiedSolidLeaf> leaf_buffer(all_cells.size());
-    std::vector<std::uint8_t> local_occupancy_states(
+    const std::vector<std::uint8_t> *precomputed_inside_flags = nullptr,
+    const std::vector<double> *precomputed_center_values = nullptr) {
+    cache.inside_flags.resize(all_cells.size(), 0U);
+    cache.center_values.resize(all_cells.size(), 0.0);
+    cache.occupancy_states.resize(
         all_cells.size(),
         static_cast<std::uint8_t>(OccupancyState::kOutside));
-    std::vector<std::array<std::size_t, 6>> local_face_neighbor_cell_indices(
+    cache.face_neighbor_cell_indices.resize(
         all_cells.size(),
         {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
-    std::vector<std::uint8_t> &occupancy_states = cache == nullptr ?
-        local_occupancy_states : cache->occupancy_states;
-    std::vector<std::array<std::size_t, 6>> &face_neighbor_cell_indices =
-        cache == nullptr ? local_face_neighbor_cell_indices :
-                           cache->face_neighbor_cell_indices;
     std::vector<std::uint8_t> occupancy_dirty;
+    std::vector<std::size_t> classify_cell_indices;
+    std::vector<std::size_t> occupancy_cell_indices;
 
     if (dirty_cells != nullptr) {
         occupancy_dirty = *dirty_cells;
@@ -460,11 +383,18 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
         }
         for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
             meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            const OctreeCell &cell = all_cells[cell_idx];
+            if (!cell.is_leaf) {
+                continue;
+            }
+            if (cell_idx < dirty_cells->size() && (*dirty_cells)[cell_idx] != 0U) {
+                classify_cell_indices.push_back(cell_idx);
+            }
             if (cell_idx >= occupancy_dirty.size() || occupancy_dirty[cell_idx] == 0U) {
                 continue;
             }
             const auto neighbors = face_neighbor_cells(
-                all_cells[cell_idx], spatial_index, max_depth);
+                cell, spatial_index, max_depth);
             for (std::size_t neighbor_idx : neighbors) {
                 if (neighbor_idx == SIZE_MAX || neighbor_idx >= occupancy_dirty.size()) {
                     continue;
@@ -472,33 +402,54 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
                 occupancy_dirty[neighbor_idx] = 1U;
             }
         }
+        occupancy_cell_indices.reserve(classify_cell_indices.size());
+        for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            if (!all_cells[cell_idx].is_leaf) {
+                continue;
+            }
+            if (occupancy_dirty[cell_idx] != 0U) {
+                occupancy_cell_indices.push_back(cell_idx);
+            }
+        }
+    } else {
+        classify_cell_indices.reserve(all_cells.size());
+        occupancy_cell_indices.reserve(all_cells.size());
+        for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            if (!all_cells[cell_idx].is_leaf) {
+                continue;
+            }
+            classify_cell_indices.push_back(cell_idx);
+            occupancy_cell_indices.push_back(cell_idx);
+        }
     }
 
-    if (inside_mask != nullptr) {
-        inside_mask->clear();
-        inside_mask->reserve(all_cells.size());
-    }
-
-    ProgressCounter classify_counter(
+    MESHMERIZER_PROGRESS_COUNTER(classify_counter,
         "Regularization", "classify_occupied_solid_leaves", "cells", 1000);
 
 #pragma omp parallel for schedule(dynamic)
-    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+    for (std::int64_t active_idx = 0;
+         active_idx < static_cast<std::int64_t>(classify_cell_indices.size());
+         ++active_idx) {
+        const std::size_t cell_idx =
+            classify_cell_indices[static_cast<std::size_t>(active_idx)];
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 cell_idx)) {
-            classify_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(classify_counter);
             continue;
         }
-        classify_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(classify_counter);
         const OctreeCell &cell = all_cells[cell_idx];
-        if (!cell.is_leaf) {
-            continue;
-        }
 
-        const bool reuse_cached_value =
-            dirty_cells != nullptr && cell_idx < dirty_cells->size() &&
-            (*dirty_cells)[cell_idx] == 0U;
-        if (reuse_cached_value) {
+        const bool has_precomputed_value =
+            precomputed_inside_flags != nullptr &&
+            precomputed_center_values != nullptr &&
+            cell_idx < precomputed_inside_flags->size() &&
+            cell_idx < precomputed_center_values->size();
+        if (has_precomputed_value) {
+            cache.center_values[cell_idx] = (*precomputed_center_values)[cell_idx];
+            cache.inside_flags[cell_idx] = (*precomputed_inside_flags)[cell_idx];
             continue;
         }
 
@@ -506,7 +457,7 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
             cell_contributor_span(cell, all_contributors);
         const double center_value = evaluate_field_at_point(
             cell.bounds.center(), contributors, positions, smoothing_lengths);
-        center_values[cell_idx] = center_value;
+        cache.center_values[cell_idx] = center_value;
 
         std::size_t inside_corner_count = 0;
         for (double corner_value : cell.corner_values) {
@@ -517,42 +468,258 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
 
         const bool inside =
             center_value >= isovalue || inside_corner_count >= 4U;
-        inside_flags[cell_idx] = inside ? 1U : 0U;
+        cache.inside_flags[cell_idx] = inside ? 1U : 0U;
     }
 
-    classify_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(classify_counter);
 
-    ProgressCounter occupancy_counter(
+    MESHMERIZER_PROGRESS_COUNTER(occupancy_counter,
         "Regularization", "classify_occupied_solid_leaves", "cells", 1000);
 
 #pragma omp parallel for schedule(dynamic)
-    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+    for (std::int64_t active_idx = 0;
+         active_idx < static_cast<std::int64_t>(occupancy_cell_indices.size());
+         ++active_idx) {
+        const std::size_t cell_idx =
+            occupancy_cell_indices[static_cast<std::size_t>(active_idx)];
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 cell_idx)) {
-            occupancy_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(occupancy_counter);
             continue;
         }
-        occupancy_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(occupancy_counter);
         const OctreeCell &cell = all_cells[cell_idx];
-        if (!cell.is_leaf) {
-            continue;
+
+        const bool inside = cache.inside_flags[cell_idx] != 0U;
+        OccupancyState occupancy = OccupancyState::kOutside;
+        bool touches_opposite = false;
+        const auto neighbors = face_neighbor_cells(
+            cell, spatial_index, max_depth);
+        cache.face_neighbor_cell_indices[cell_idx] = neighbors;
+        for (std::size_t neighbor_idx : neighbors) {
+            if (neighbor_idx == SIZE_MAX || neighbor_idx >= all_cells.size()) {
+                continue;
+            }
+            if (cache.inside_flags[neighbor_idx] !=
+                cache.inside_flags[cell_idx]) {
+                touches_opposite = true;
+                break;
+            }
         }
 
-        const bool inside = inside_flags[cell_idx] != 0U;
-        OccupancyState occupancy = OccupancyState::kOutside;
-        if (dirty_cells != nullptr && cell_idx < occupancy_dirty.size() &&
-            occupancy_dirty[cell_idx] == 0U) {
-            occupancy = static_cast<OccupancyState>(occupancy_states[cell_idx]);
-        } else {
+        occupancy = inside ? OccupancyState::kInside
+                           : OccupancyState::kOutside;
+        if (touches_opposite) {
+            occupancy = inside ? OccupancyState::kBoundaryInside
+                               : OccupancyState::kBoundaryOutside;
+        }
+        cache.occupancy_states[cell_idx] =
+            static_cast<std::uint8_t>(occupancy);
+    }
+    MESHMERIZER_PROGRESS_FINISH(occupancy_counter);
+
+    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+        if (all_cells[cell_idx].is_leaf) {
+            continue;
+        }
+        cache.inside_flags[cell_idx] = 0U;
+        cache.center_values[cell_idx] = 0.0;
+        cache.occupancy_states[cell_idx] =
+            static_cast<std::uint8_t>(OccupancyState::kOutside);
+        cache.face_neighbor_cell_indices[cell_idx] = {
+            SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
+    }
+}
+
+template <typename ProcessCell>
+inline void run_static_leaf_queue_epoch(
+    const std::vector<std::size_t> &cell_indices,
+    std::uint32_t worker_count,
+    ProcessCell process_cell) {
+    if (cell_indices.empty()) {
+        return;
+    }
+
+    RefinementWorkQueue queue;
+    const std::uint32_t active_workers = std::max(1U, worker_count);
+    queue.initialize(active_workers);
+    for (std::size_t ordinal = 0; ordinal < cell_indices.size(); ++ordinal) {
+        queue.push(
+            {cell_indices[ordinal], 0U, 0U, RefinementTaskKind::kRefine},
+            static_cast<std::uint32_t>(ordinal % active_workers));
+    }
+    queue.capture_initial_queue_size();
+
+    std::exception_ptr worker_error;
+    std::mutex error_mutex;
+    std::vector<std::thread> workers;
+    workers.reserve(active_workers);
+    for (std::uint32_t worker_id = 0; worker_id < active_workers; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                try {
+                    process_cell(task.cell_index);
+                } catch (...) {
+                    {
+                        std::lock_guard<std::mutex> lock(error_mutex);
+                        if (worker_error == nullptr) {
+                            worker_error = std::current_exception();
+                        }
+                    }
+                    queue.task_done();
+                    queue.shutdown();
+                    return;
+                }
+                queue.task_done();
+                queue.try_shutdown_if_idle();
+            }
+        });
+    }
+
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    if (worker_error != nullptr) {
+        std::rethrow_exception(worker_error);
+    }
+}
+
+inline void update_occupied_solid_classification_cache_with_queue(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const LeafSpatialIndex &spatial_index,
+    double isovalue,
+    std::uint32_t max_depth,
+    std::uint32_t worker_count,
+    OccupiedSolidClassificationCache &cache,
+    const std::vector<std::uint8_t> *dirty_cells = nullptr,
+    const std::vector<std::uint8_t> *precomputed_inside_flags = nullptr,
+    const std::vector<double> *precomputed_center_values = nullptr) {
+    cache.inside_flags.resize(all_cells.size(), 0U);
+    cache.center_values.resize(all_cells.size(), 0.0);
+    cache.occupancy_states.resize(
+        all_cells.size(),
+        static_cast<std::uint8_t>(OccupancyState::kOutside));
+    cache.face_neighbor_cell_indices.resize(
+        all_cells.size(),
+        {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
+    std::vector<std::uint8_t> occupancy_dirty;
+    std::vector<std::size_t> classify_cell_indices;
+    std::vector<std::size_t> occupancy_cell_indices;
+
+    if (dirty_cells != nullptr) {
+        occupancy_dirty = *dirty_cells;
+        if (occupancy_dirty.size() < all_cells.size()) {
+            occupancy_dirty.resize(all_cells.size(), 0U);
+        }
+        for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            const OctreeCell &cell = all_cells[cell_idx];
+            if (!cell.is_leaf) {
+                continue;
+            }
+            if (cell_idx < dirty_cells->size() && (*dirty_cells)[cell_idx] != 0U) {
+                classify_cell_indices.push_back(cell_idx);
+            }
+            if (cell_idx >= occupancy_dirty.size() || occupancy_dirty[cell_idx] == 0U) {
+                continue;
+            }
+            const auto neighbors = face_neighbor_cells(
+                cell, spatial_index, max_depth);
+            for (std::size_t neighbor_idx : neighbors) {
+                if (neighbor_idx == SIZE_MAX || neighbor_idx >= occupancy_dirty.size()) {
+                    continue;
+                }
+                occupancy_dirty[neighbor_idx] = 1U;
+            }
+        }
+        occupancy_cell_indices.reserve(classify_cell_indices.size());
+        for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            if (!all_cells[cell_idx].is_leaf) {
+                continue;
+            }
+            if (occupancy_dirty[cell_idx] != 0U) {
+                occupancy_cell_indices.push_back(cell_idx);
+            }
+        }
+    } else {
+        classify_cell_indices.reserve(all_cells.size());
+        occupancy_cell_indices.reserve(all_cells.size());
+        for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+            meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
+            if (!all_cells[cell_idx].is_leaf) {
+                continue;
+            }
+            classify_cell_indices.push_back(cell_idx);
+            occupancy_cell_indices.push_back(cell_idx);
+        }
+    }
+
+    run_static_leaf_queue_epoch(
+        classify_cell_indices,
+        worker_count,
+        [&](std::size_t cell_idx) {
+            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                    cell_idx)) {
+                return;
+            }
+            const OctreeCell &cell = all_cells[cell_idx];
+
+            const bool has_precomputed_value =
+                precomputed_inside_flags != nullptr &&
+                precomputed_center_values != nullptr &&
+                cell_idx < precomputed_inside_flags->size() &&
+                cell_idx < precomputed_center_values->size();
+            if (has_precomputed_value) {
+                cache.center_values[cell_idx] = (*precomputed_center_values)[cell_idx];
+                cache.inside_flags[cell_idx] = (*precomputed_inside_flags)[cell_idx];
+                return;
+            }
+
+            const std::span<const std::size_t> contributors =
+                cell_contributor_span(cell, all_contributors);
+            const double center_value = evaluate_field_at_point(
+                cell.bounds.center(), contributors, positions, smoothing_lengths);
+            cache.center_values[cell_idx] = center_value;
+
+            std::size_t inside_corner_count = 0;
+            for (double corner_value : cell.corner_values) {
+                if (corner_value >= isovalue) {
+                    ++inside_corner_count;
+                }
+            }
+
+            const bool inside =
+                center_value >= isovalue || inside_corner_count >= 4U;
+            cache.inside_flags[cell_idx] = inside ? 1U : 0U;
+        });
+
+    run_static_leaf_queue_epoch(
+        occupancy_cell_indices,
+        worker_count,
+        [&](std::size_t cell_idx) {
+            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                    cell_idx)) {
+                return;
+            }
+            const OctreeCell &cell = all_cells[cell_idx];
+
+            const bool inside = cache.inside_flags[cell_idx] != 0U;
+            OccupancyState occupancy = OccupancyState::kOutside;
             bool touches_opposite = false;
             const auto neighbors = face_neighbor_cells(
                 cell, spatial_index, max_depth);
-            face_neighbor_cell_indices[cell_idx] = neighbors;
+            cache.face_neighbor_cell_indices[cell_idx] = neighbors;
             for (std::size_t neighbor_idx : neighbors) {
                 if (neighbor_idx == SIZE_MAX || neighbor_idx >= all_cells.size()) {
                     continue;
                 }
-                if (inside_flags[neighbor_idx] != inside_flags[cell_idx]) {
+                if (cache.inside_flags[neighbor_idx] !=
+                    cache.inside_flags[cell_idx]) {
                     touches_opposite = true;
                     break;
                 }
@@ -564,36 +731,83 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
                 occupancy = inside ? OccupancyState::kBoundaryInside
                                    : OccupancyState::kBoundaryOutside;
             }
-            occupancy_states[cell_idx] =
+            cache.occupancy_states[cell_idx] =
                 static_cast<std::uint8_t>(occupancy);
-        }
+        });
 
-        leaf_is_included[cell_idx] = 1U;
-        leaf_buffer[cell_idx] = {
-            cell_idx,
-            center_values[cell_idx],
-            cell_edge_length(cell),
-            cell.depth,
-            occupancy,
-            {-1, -1, -1, -1, -1, -1},
-        };
+    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
+        if (all_cells[cell_idx].is_leaf) {
+            continue;
+        }
+        cache.inside_flags[cell_idx] = 0U;
+        cache.center_values[cell_idx] = 0.0;
+        cache.occupancy_states[cell_idx] =
+            static_cast<std::uint8_t>(OccupancyState::kOutside);
+        cache.face_neighbor_cell_indices[cell_idx] = {
+            SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
     }
-    occupancy_counter.finish();
+}
+
+inline std::vector<OccupiedSolidLeaf> build_occupied_solid_leaves_from_cache(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &cache,
+    std::vector<std::int64_t> *out_cell_to_leaf_index = nullptr,
+    std::vector<std::uint8_t> *out_inside_mask = nullptr,
+    std::vector<std::uint8_t> *out_inside_mask_by_cell = nullptr) {
+    std::vector<OccupiedSolidLeaf> solid_leaves;
+    solid_leaves.reserve(all_cells.size());
+    std::vector<std::int64_t> cell_to_leaf_index(all_cells.size(), -1);
+    std::vector<std::uint8_t> inside_mask;
+    std::vector<std::uint8_t> inside_mask_by_cell;
+    if (out_inside_mask != nullptr) {
+        inside_mask.reserve(all_cells.size());
+    }
+    if (out_inside_mask_by_cell != nullptr) {
+        inside_mask_by_cell.assign(all_cells.size(), 0U);
+    }
+
+    MESHMERIZER_PROGRESS_COUNTER(leaf_build_counter,
+        "Regularization",
+        "build_occupied_solid_leaves_from_cache",
+        "cells",
+        1000);
 
     for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_idx);
-        if (leaf_is_included[cell_idx] == 0U) {
+        MESHMERIZER_PROGRESS_TICK(leaf_build_counter);
+        const OctreeCell &cell = all_cells[cell_idx];
+        if (!cell.is_leaf) {
             continue;
         }
-        solid_leaves.push_back(leaf_buffer[cell_idx]);
+        solid_leaves.push_back({
+            cell_idx,
+            cache.center_values[cell_idx],
+            cell_edge_length(cell),
+            cell.depth,
+            static_cast<OccupancyState>(cache.occupancy_states[cell_idx]),
+            {-1, -1, -1, -1, -1, -1},
+        });
         cell_to_leaf_index[cell_idx] =
             static_cast<std::int64_t>(solid_leaves.size() - 1U);
-        if (inside_mask != nullptr) {
-            inside_mask->push_back(inside_flags[cell_idx] != 0U ? 1U : 0U);
+        if (out_inside_mask != nullptr) {
+            const std::uint8_t is_inside =
+                occupied_solid_cache_is_inside(cache.occupancy_states[cell_idx])
+                    ? 1U
+                    : 0U;
+            inside_mask.push_back(is_inside);
+            if (out_inside_mask_by_cell != nullptr) {
+                inside_mask_by_cell[cell_idx] = is_inside;
+            }
+        } else if (out_inside_mask_by_cell != nullptr) {
+            inside_mask_by_cell[cell_idx] =
+                occupied_solid_cache_is_inside(cache.occupancy_states[cell_idx])
+                    ? 1U
+                    : 0U;
         }
     }
+    MESHMERIZER_PROGRESS_FINISH(leaf_build_counter);
 
-    ProgressCounter neighbor_counter(
+    MESHMERIZER_PROGRESS_COUNTER(neighbor_counter,
         "Regularization", "classify_occupied_solid_leaves", "leaves", 1000);
 
 #pragma omp parallel for schedule(dynamic)
@@ -602,13 +816,13 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
          ++leaf_index) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
                 static_cast<std::size_t>(leaf_index))) {
-            neighbor_counter.tick();
+            MESHMERIZER_PROGRESS_TICK(neighbor_counter);
             continue;
         }
         OccupiedSolidLeaf &leaf =
             solid_leaves[static_cast<std::size_t>(leaf_index)];
-        neighbor_counter.tick();
-        const auto &neighbors = face_neighbor_cell_indices[leaf.cell_index];
+        MESHMERIZER_PROGRESS_TICK(neighbor_counter);
+        const auto &neighbors = cache.face_neighbor_cell_indices[leaf.cell_index];
         for (std::size_t face = 0; face < neighbors.size(); ++face) {
             const std::size_t neighbor_cell_index = neighbors[face];
             if (neighbor_cell_index == SIZE_MAX ||
@@ -619,147 +833,460 @@ inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
                 cell_to_leaf_index[neighbor_cell_index];
         }
     }
-    neighbor_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(neighbor_counter);
+
+    if (out_cell_to_leaf_index != nullptr) {
+        *out_cell_to_leaf_index = std::move(cell_to_leaf_index);
+    }
+    if (out_inside_mask != nullptr) {
+        *out_inside_mask = std::move(inside_mask);
+    }
+    if (out_inside_mask_by_cell != nullptr) {
+        *out_inside_mask_by_cell = std::move(inside_mask_by_cell);
+    }
 
     return solid_leaves;
 }
 
-inline std::vector<std::uint8_t> build_inside_mask(
-    const std::vector<OccupiedSolidLeaf> &solid_leaves) {
-    std::vector<std::uint8_t> inside_mask(solid_leaves.size(), 0U);
-    ProgressCounter mask_counter(
-        "Regularization", "build_inside_mask", "leaves", 1000);
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        mask_counter.tick();
-        inside_mask[leaf_index] =
-            (solid_leaves[leaf_index].occupancy == OccupancyState::kInside ||
-             solid_leaves[leaf_index].occupancy == OccupancyState::kBoundaryInside)
-                ? 1U
-                : 0U;
+inline std::vector<OccupiedSolidLeaf> classify_occupied_solid_leaves(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const LeafSpatialIndex &spatial_index,
+    double isovalue,
+    std::uint32_t max_depth,
+    OccupiedSolidClassificationCache *cache = nullptr,
+    const std::vector<std::uint8_t> *dirty_cells = nullptr) {
+    OccupiedSolidClassificationCache local_cache;
+    OccupiedSolidClassificationCache &cache_ref =
+        cache == nullptr ? local_cache : *cache;
+    update_occupied_solid_classification_cache(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        spatial_index,
+        isovalue,
+        max_depth,
+        cache_ref,
+        dirty_cells);
+    return build_occupied_solid_leaves_from_cache(all_cells, cache_ref);
+}
+
+inline void merge_occupied_solid_cache_from_closure_state(
+    const std::vector<OctreeCell> &all_cells,
+    const LeafSpatialIndex &spatial_index,
+    std::uint32_t max_depth,
+    OccupiedSolidClassificationCache &cache,
+    std::vector<std::uint8_t> inside_flags,
+    std::vector<double> center_values,
+    std::vector<std::uint8_t> occupancy_states,
+    const std::vector<std::uint8_t> &dirty_cells) {
+    cache.inside_flags = std::move(inside_flags);
+    cache.center_values = std::move(center_values);
+    cache.occupancy_states = std::move(occupancy_states);
+    if (cache.inside_flags.size() < all_cells.size()) {
+        cache.inside_flags.resize(all_cells.size(), 0U);
     }
-    mask_counter.finish();
+    if (cache.center_values.size() < all_cells.size()) {
+        cache.center_values.resize(all_cells.size(), 0.0);
+    }
+    if (cache.occupancy_states.size() < all_cells.size()) {
+        cache.occupancy_states.resize(
+            all_cells.size(),
+            static_cast<std::uint8_t>(OccupancyState::kOutside));
+    }
+    cache.face_neighbor_cell_indices.resize(
+        all_cells.size(),
+        {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
+
+    std::vector<std::uint8_t> active_mask(all_cells.size(), 0U);
+    std::vector<std::size_t> active_leaf_indices;
+    active_leaf_indices.reserve(dirty_cells.size() * 2U);
+
+    auto activate_leaf = [&](std::size_t cell_idx) {
+        if (cell_idx >= all_cells.size() || !all_cells[cell_idx].is_leaf ||
+            active_mask[cell_idx] != 0U) {
+            return;
+        }
+        active_mask[cell_idx] = 1U;
+        active_leaf_indices.push_back(cell_idx);
+    };
+
+    for (std::size_t dirty_idx = 0; dirty_idx < dirty_cells.size(); ++dirty_idx) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(dirty_idx);
+        if (dirty_cells[dirty_idx] == 0U || dirty_idx >= all_cells.size()) {
+            continue;
+        }
+        if (!all_cells[dirty_idx].is_leaf) {
+            cache.face_neighbor_cell_indices[dirty_idx] = {
+                SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
+            cache.inside_flags[dirty_idx] = 0U;
+            cache.center_values[dirty_idx] = 0.0;
+            cache.occupancy_states[dirty_idx] =
+                static_cast<std::uint8_t>(OccupancyState::kOutside);
+            continue;
+        }
+        activate_leaf(dirty_idx);
+        const auto neighbors = face_neighbor_cells(
+            all_cells[dirty_idx], spatial_index, max_depth);
+        cache.face_neighbor_cell_indices[dirty_idx] = neighbors;
+        for (std::size_t neighbor_idx : neighbors) {
+            if (neighbor_idx == SIZE_MAX || neighbor_idx >= all_cells.size()) {
+                continue;
+            }
+            activate_leaf(neighbor_idx);
+        }
+    }
+
+    MESHMERIZER_PROGRESS_COUNTER(neighbor_counter,
+        "Regularization",
+        "merge_occupied_solid_cache_from_closure_state",
+        "cells",
+        1000);
+#pragma omp parallel for schedule(dynamic)
+    for (std::int64_t active_idx = 0;
+         active_idx < static_cast<std::int64_t>(active_leaf_indices.size());
+         ++active_idx) {
+        const std::size_t idx =
+            active_leaf_indices[static_cast<std::size_t>(active_idx)];
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(idx)) {
+            MESHMERIZER_PROGRESS_TICK(neighbor_counter);
+            continue;
+        }
+        MESHMERIZER_PROGRESS_TICK(neighbor_counter);
+        cache.face_neighbor_cell_indices[idx] = face_neighbor_cells(
+            all_cells[idx], spatial_index, max_depth);
+    }
+    MESHMERIZER_PROGRESS_FINISH(neighbor_counter);
+}
+
+inline std::vector<std::uint8_t> build_inside_mask_from_classification_cache(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache) {
+    std::vector<std::uint8_t> inside_mask(all_cells.size(), 0U);
+    MESHMERIZER_PROGRESS_COUNTER(mask_counter,
+        "Regularization",
+        "build_inside_mask_from_classification_cache",
+        "cells",
+        1000);
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
+        MESHMERIZER_PROGRESS_TICK(mask_counter);
+        if (!all_cells[cell_index].is_leaf) {
+            continue;
+        }
+        inside_mask[cell_index] = occupied_solid_cache_is_inside(
+                                      classification_cache.occupancy_states[
+                                          cell_index])
+                                      ? 1U
+                                      : 0U;
+    }
+    MESHMERIZER_PROGRESS_FINISH(mask_counter);
     return inside_mask;
 }
 
-inline std::vector<double> compute_outside_distance_from_inside_mask(
+inline std::vector<std::uint8_t> build_leaf_mask_from_cell_mask(
     const std::vector<OccupiedSolidLeaf> &solid_leaves,
-    const std::vector<std::uint8_t> &inside_mask,
-    double max_distance = std::numeric_limits<double>::infinity()) {
-    const double inf = std::numeric_limits<double>::infinity();
-    std::vector<double> distance_from_inside(solid_leaves.size(), inf);
-    using QueueEntry = std::pair<double, std::size_t>;
-    std::priority_queue<
-        QueueEntry,
-        std::vector<QueueEntry>,
-        std::greater<QueueEntry>> queue;
+    const std::vector<std::uint8_t> &cell_mask);
 
-    ProgressCounter seed_counter(
-        "Regularization", "compute_outside_distance_from_inside_mask",
-        "leaves", 1000);
+/**
+ * @brief Build compact morphology/extraction views from the classification cache.
+ *
+ * This is the current queue boundary between full-tree side-cars and legacy
+ * compact leaf views. Later phases should shrink the amount of work done here,
+ * but for now this helper makes that boundary explicit and single-shot.
+ */
+inline OccupiedSolidExtractionView build_occupied_solid_extraction_view(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache,
+    std::vector<std::uint8_t> inside_mask_by_cell = {}) {
+    OccupiedSolidExtractionView view;
+    std::vector<std::uint8_t> inside_mask;
+    const bool need_inside_mask_by_cell = inside_mask_by_cell.size() != all_cells.size();
+    view.solid_leaves =
+        build_occupied_solid_leaves_from_cache(
+            all_cells,
+            classification_cache,
+            &view.cell_to_leaf_index,
+            need_inside_mask_by_cell ? &inside_mask : nullptr,
+            need_inside_mask_by_cell ? &inside_mask_by_cell : nullptr);
+    if (need_inside_mask_by_cell) {
+        view.inside_mask = std::move(inside_mask);
+    } else {
+        view.inside_mask = build_leaf_mask_from_cell_mask(
+            view.solid_leaves, inside_mask_by_cell);
+    }
+    view.inside_mask_by_cell = std::move(inside_mask_by_cell);
+    return view;
+}
+
+inline std::vector<std::uint8_t> build_leaf_mask_from_cell_mask(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<std::uint8_t> &cell_mask) {
+    std::vector<std::uint8_t> inside_mask(solid_leaves.size(), 0U);
+    MESHMERIZER_PROGRESS_COUNTER(mask_counter,
+        "Regularization",
+        "build_leaf_mask_from_cell_mask",
+        "leaves",
+        1000);
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        seed_counter.tick();
-        if (inside_mask[leaf_index] == 0U) {
+        MESHMERIZER_PROGRESS_TICK(mask_counter);
+        const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
+        if (cell_index < cell_mask.size()) {
+            inside_mask[leaf_index] = cell_mask[cell_index];
+        }
+    }
+    MESHMERIZER_PROGRESS_FINISH(mask_counter);
+    return inside_mask;
+}
+
+inline std::vector<double> project_leaf_scalars_from_cell_state(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<double> &cell_values,
+    double default_value) {
+    std::vector<double> leaf_values(solid_leaves.size(), default_value);
+    MESHMERIZER_PROGRESS_COUNTER(value_counter,
+        "Regularization",
+        "project_leaf_scalars_from_cell_state",
+        "leaves",
+        1000);
+    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
+        MESHMERIZER_PROGRESS_TICK(value_counter);
+        const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
+        if (cell_index < cell_values.size()) {
+            leaf_values[leaf_index] = cell_values[cell_index];
+        }
+    }
+    MESHMERIZER_PROGRESS_FINISH(value_counter);
+    return leaf_values;
+}
+
+inline std::vector<double> compute_outside_distance_from_classification_cache(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache,
+    std::uint32_t worker_count = 1U,
+    double max_distance = std::numeric_limits<double>::infinity()) {
+    const double inf = std::numeric_limits<double>::infinity();
+    if (worker_count == 0U) {
+        worker_count = 1U;
+    }
+
+    std::vector<std::atomic<std::uint64_t>> distance_bits(all_cells.size());
+    for (std::size_t cell_index = 0; cell_index < distance_bits.size();
+         ++cell_index) {
+        distance_bits[cell_index].store(
+            adaptive_solid_double_to_bits(inf),
+            std::memory_order_relaxed);
+    }
+
+    RefinementWorkQueue queue;
+    queue.initialize(worker_count);
+
+    MESHMERIZER_PROGRESS_COUNTER(seed_counter,
+        "Regularization",
+        "compute_outside_distance_from_classification_cache",
+        "cells",
+        1000);
+    std::size_t boundary_seed_count = 0U;
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
+        MESHMERIZER_PROGRESS_TICK(seed_counter);
+        if (!all_cells[cell_index].is_leaf ||
+            !occupied_solid_cache_is_inside(
+                classification_cache.occupancy_states[cell_index])) {
             continue;
         }
 
         bool is_boundary_seed = false;
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
+        for (std::size_t neighbor_cell_index :
+             classification_cache.face_neighbor_cell_indices[cell_index]) {
+            if (neighbor_cell_index == SIZE_MAX ||
+                neighbor_cell_index >= all_cells.size()) {
                 is_boundary_seed = true;
                 break;
             }
-
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (inside_mask[neighbor] == 0U) {
+            if (!all_cells[neighbor_cell_index].is_leaf ||
+                !occupied_solid_cache_is_inside(
+                    classification_cache.occupancy_states[neighbor_cell_index])) {
                 is_boundary_seed = true;
                 break;
             }
         }
 
         if (is_boundary_seed) {
-            distance_from_inside[leaf_index] = 0.0;
-            queue.push({0.0, leaf_index});
+            distance_bits[cell_index].store(
+                adaptive_solid_double_to_bits(0.0),
+                std::memory_order_release);
+            queue.push(
+                {
+                    cell_index,
+                    0U,
+                    0U,
+                    RefinementTaskKind::kComputeThickeningSeedDistance,
+                },
+                static_cast<std::uint32_t>(cell_index % worker_count));
+            ++boundary_seed_count;
         }
     }
-    seed_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(seed_counter);
+    queue.capture_initial_queue_size();
 
-    ProgressCounter wavefront_counter(
-        "Regularization", "compute_outside_distance_from_inside_mask",
-        "queue pops", 10000);
-    while (!queue.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
-        wavefront_counter.tick();
-        const auto [distance, leaf_index] = queue.top();
-        queue.pop();
-        if (distance > distance_from_inside[leaf_index]) {
-            continue;
-        }
-        if (distance > max_distance) {
-            continue;
-        }
+    MESHMERIZER_PROGRESS_COUNTER(wavefront_counter,
+        "Regularization",
+        "compute_outside_distance_from_classification_cache",
+        "relaxations",
+        10000);
 
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
-                continue;
-            }
+    std::exception_ptr worker_error;
+    std::mutex error_mutex;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::uint32_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                try {
+                    MESHMERIZER_PROGRESS_TICK(wavefront_counter);
+                    const std::size_t cell_index = task.cell_index;
+                    if (cell_index >= all_cells.size()) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
 
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (inside_mask[neighbor] != 0U) {
-                continue;
-            }
+                    const double distance = adaptive_solid_bits_to_double(
+                        distance_bits[cell_index].load(
+                            std::memory_order_acquire));
+                    if (!std::isfinite(distance) || distance > max_distance) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
 
-            const double source_size = std::max(
-                std::min(solid_leaves[leaf_index].cell_size, max_distance),
-                0.0);
-            const double neighbor_size = std::max(
-                std::min(solid_leaves[neighbor].cell_size, max_distance),
-                0.0);
-            const double edge_cost = 0.5 * (
-                source_size + neighbor_size);
-            const double candidate = distance + edge_cost;
-            if (candidate > max_distance) {
-                continue;
+                    for (std::size_t neighbor_cell_index :
+                         classification_cache
+                             .face_neighbor_cell_indices[cell_index]) {
+                        if (neighbor_cell_index == SIZE_MAX ||
+                            neighbor_cell_index >= all_cells.size()) {
+                            continue;
+                        }
+                        if (!all_cells[neighbor_cell_index].is_leaf ||
+                            occupied_solid_cache_is_inside(
+                                classification_cache
+                                    .occupancy_states[neighbor_cell_index])) {
+                            continue;
+                        }
+
+                        const double source_size = std::max(
+                            std::min(
+                                cell_edge_length(all_cells[cell_index]),
+                                max_distance),
+                            0.0);
+                        const double neighbor_size = std::max(
+                            std::min(
+                                cell_edge_length(
+                                    all_cells[neighbor_cell_index]),
+                                max_distance),
+                            0.0);
+                        const double edge_cost =
+                            0.5 * (source_size + neighbor_size);
+                        const double candidate = distance + edge_cost;
+                        if (candidate > max_distance) {
+                            continue;
+                        }
+                        if (adaptive_solid_atomic_update_distance_min(
+                                distance_bits[neighbor_cell_index],
+                                candidate)) {
+                            queue.push(
+                                {
+                                    neighbor_cell_index,
+                                    0U,
+                                    0U,
+                                    RefinementTaskKind::kComputeThickeningSeedDistance,
+                                },
+                                static_cast<std::uint32_t>(
+                                    neighbor_cell_index % worker_count));
+                        }
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (worker_error == nullptr) {
+                        worker_error = std::current_exception();
+                    }
+                    queue.task_done();
+                    queue.shutdown();
+                    return;
+                }
+                queue.task_done();
+                queue.try_shutdown_if_idle();
             }
-            if (candidate < distance_from_inside[neighbor]) {
-                distance_from_inside[neighbor] = candidate;
-                queue.push({candidate, neighbor});
-            }
-        }
+        });
     }
-    wavefront_counter.finish();
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    if (worker_error != nullptr) {
+        std::rethrow_exception(worker_error);
+    }
+    MESHMERIZER_PROGRESS_FINISH(wavefront_counter);
+
+    const RefinementWorkQueueStats distance_stats = queue.stats();
+
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "compute_outside_distance_from_classification_cache",
+        "completed distance wavefront: seeds=%zu pops=%zu pushes=%zu queue_peak=%zu max_distance=%.6g cells=%zu\n",
+        boundary_seed_count,
+        distance_stats.pop_count,
+        distance_stats.push_count,
+        distance_stats.high_watermark,
+        max_distance,
+        all_cells.size());
+
+    std::vector<double> distance_from_inside(all_cells.size(), inf);
+    for (std::size_t cell_index = 0; cell_index < distance_from_inside.size();
+         ++cell_index) {
+        distance_from_inside[cell_index] = adaptive_solid_bits_to_double(
+            distance_bits[cell_index].load(std::memory_order_acquire));
+    }
 
     return distance_from_inside;
 }
 
-inline std::vector<std::uint8_t> dilate_inside_mask(
-    const std::vector<std::uint8_t> &inside_mask,
-    const std::vector<double> &distance_from_inside,
+inline std::vector<std::uint8_t> dilate_inside_cell_mask(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::uint8_t> &inside_mask_by_cell,
+    const std::vector<double> &distance_from_inside_by_cell,
     double dilation_radius) {
-    std::vector<std::uint8_t> dilated_inside(inside_mask.size(), 0U);
+    std::vector<std::uint8_t> dilated_inside(all_cells.size(), 0U);
 
-    ProgressCounter dilate_counter(
-        "Regularization", "dilate_inside_mask", "leaves", 1000);
+    MESHMERIZER_PROGRESS_COUNTER(dilate_counter,
+        "Regularization",
+        "dilate_inside_cell_mask",
+        "cells",
+        1000);
 #pragma omp parallel for schedule(static)
-    for (std::size_t leaf_index = 0; leaf_index < inside_mask.size(); ++leaf_index) {
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
-                leaf_index)) {
-            dilate_counter.tick();
+                cell_index)) {
+            MESHMERIZER_PROGRESS_TICK(dilate_counter);
             continue;
         }
-        dilate_counter.tick();
-        dilated_inside[leaf_index] =
-            (inside_mask[leaf_index] != 0U ||
-             distance_from_inside[leaf_index] <= dilation_radius)
+        MESHMERIZER_PROGRESS_TICK(dilate_counter);
+        if (!all_cells[cell_index].is_leaf) {
+            continue;
+        }
+        dilated_inside[cell_index] =
+            (inside_mask_by_cell[cell_index] != 0U ||
+             distance_from_inside_by_cell[cell_index] <= dilation_radius)
                 ? 1U
                 : 0U;
     }
-    dilate_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(dilate_counter);
 
     return dilated_inside;
 }
@@ -771,15 +1298,21 @@ inline bool refine_thickening_band_cells(
     const std::vector<double> &smoothing_lengths,
     double isovalue,
     std::uint32_t max_depth,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution,
+    std::uint32_t worker_count,
     double target_leaf_size,
-    const std::vector<OccupiedSolidLeaf> &solid_leaves,
-    const std::vector<std::uint8_t> &inside_mask,
-    const std::vector<double> &distance_from_inside,
+    const OccupiedSolidClassificationCache &classification_cache,
+    const std::vector<double> &distance_from_inside_by_cell,
     double thickening_radius,
+    double table_cadence_seconds,
     std::uint32_t minimum_usable_hermite_samples,
     double max_qef_rms_residual_ratio,
     double min_normal_alignment_threshold,
-    std::vector<std::uint8_t> *dirty_cells = nullptr) {
+    std::vector<std::uint8_t> *dirty_cells = nullptr,
+    std::vector<std::uint8_t> *classified_inside_flags = nullptr,
+    std::vector<double> *classified_center_values = nullptr,
+    std::vector<std::uint8_t> *classified_occupancy_states = nullptr) {
     if (target_leaf_size <= 0.0 || thickening_radius <= 0.0) {
         return false;
     }
@@ -788,9 +1321,9 @@ inline bool refine_thickening_band_cells(
         thickening_radius + 2.0 * target_leaf_size;
 
     const auto target_depth_for_cell =
-        [&](const OccupiedSolidLeaf &leaf) -> std::uint32_t {
-            std::uint32_t target_depth = leaf.depth;
-            double size = leaf.cell_size;
+        [&](const OctreeCell &cell) -> std::uint32_t {
+            std::uint32_t target_depth = cell.depth;
+            double size = cell_edge_length(cell);
             while (target_depth < max_depth && size > target_leaf_size) {
                 size *= 0.5;
                 ++target_depth;
@@ -799,23 +1332,31 @@ inline bool refine_thickening_band_cells(
         };
 
     std::queue<std::size_t> cells_to_visit;
-    std::vector<std::uint32_t> queued_target_depths(all_cells.size(), 0U);
+    std::vector<std::size_t> queued_cell_indices;
+    const std::uint32_t kNoTargetDepth =
+        std::numeric_limits<std::uint32_t>::max();
+    std::vector<std::uint32_t> queued_target_depths(
+        all_cells.size(), kNoTargetDepth);
     std::vector<std::uint8_t> enqueued_cells(all_cells.size(), 0U);
-    std::vector<std::size_t> band_seed_leaf_indices;
 
     auto enqueue_cell = [&](std::size_t cell_index, std::uint32_t target_depth) {
         if (cell_index >= all_cells.size()) {
             return;
         }
         if (cell_index >= queued_target_depths.size()) {
-            queued_target_depths.resize(all_cells.size(), 0U);
+            queued_target_depths.resize(all_cells.size(), kNoTargetDepth);
         }
         if (cell_index >= enqueued_cells.size()) {
             enqueued_cells.resize(all_cells.size(), 0U);
         }
         if (enqueued_cells[cell_index] == 0U) {
             cells_to_visit.push(cell_index);
+            queued_cell_indices.push_back(cell_index);
             enqueued_cells[cell_index] = 1U;
+            queued_target_depths[cell_index] = target_depth;
+            return;
+        }
+        if (queued_target_depths[cell_index] == kNoTargetDepth) {
             queued_target_depths[cell_index] = target_depth;
             return;
         }
@@ -823,44 +1364,42 @@ inline bool refine_thickening_band_cells(
             queued_target_depths[cell_index], target_depth);
     };
 
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        if (inside_mask[leaf_index] != 0U) {
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
+        const OctreeCell &cell = all_cells[cell_index];
+        if (!cell.is_leaf) {
             continue;
         }
-        if (distance_from_inside[leaf_index] > refinement_halo_radius) {
+        if (!std::isfinite(distance_from_inside_by_cell[cell_index]) ||
+            distance_from_inside_by_cell[cell_index] > refinement_halo_radius) {
             continue;
         }
-        if (solid_leaves[leaf_index].depth >= max_depth ||
-            solid_leaves[leaf_index].cell_size <= target_leaf_size) {
+        const OccupancyState occupancy = static_cast<OccupancyState>(
+            classification_cache.occupancy_states[cell_index]);
+        if (occupancy != OccupancyState::kBoundaryInside) {
             continue;
         }
-        const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
-        enqueue_cell(
-            cell_index, target_depth_for_cell(solid_leaves[leaf_index]));
-        band_seed_leaf_indices.push_back(leaf_index);
+        if (cell.depth >= max_depth || cell_edge_length(cell) <= target_leaf_size) {
+            continue;
+        }
+        enqueue_cell(cell_index, target_depth_for_cell(cell));
     }
 
-    for (std::size_t leaf_index : band_seed_leaf_indices) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
-                continue;
-            }
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (inside_mask[neighbor] != 0U) {
-                continue;
-            }
-            if (solid_leaves[neighbor].depth >= max_depth ||
-                solid_leaves[neighbor].cell_size <= target_leaf_size) {
-                continue;
-            }
-            enqueue_cell(
-                solid_leaves[neighbor].cell_index,
-                target_depth_for_cell(solid_leaves[neighbor]));
+    // Build seed vectors with correct ordinal mapping for the closure.
+    std::vector<std::size_t> closure_seed_indices;
+    std::vector<std::uint32_t> closure_seed_depths;
+    closure_seed_indices.reserve(queued_cell_indices.size());
+    closure_seed_depths.reserve(queued_cell_indices.size());
+    for (std::size_t idx : queued_cell_indices) {
+        if (idx >= queued_target_depths.size()) {
+            continue;
         }
+        const std::uint32_t td = queued_target_depths[idx];
+        if (td == kNoTargetDepth) {
+            continue;
+        }
+        closure_seed_indices.push_back(idx);
+        closure_seed_depths.push_back(td);
     }
 
     if (cells_to_visit.empty()) {
@@ -885,139 +1424,40 @@ inline bool refine_thickening_band_cells(
         refinement_halo_radius,
         all_cells.size());
 
-    ProgressCounter refine_counter(
-        "Regularization", "refine_thickening_band_cells", "cells", 100);
-    std::size_t split_count = 0U;
-    std::size_t processed_count = 0U;
-
-    auto mark_dirty = [&](std::size_t cell_index) {
-        if (dirty_cells == nullptr) {
-            return;
-        }
-        if (dirty_cells->size() <= cell_index) {
-            dirty_cells->resize(cell_index + 1U, 0U);
-        }
-        (*dirty_cells)[cell_index] = 1U;
-    };
-
-    while (!cells_to_visit.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(
-            processed_count + split_count + 1U);
-        const std::size_t cell_idx = cells_to_visit.front();
-        cells_to_visit.pop();
-        if (cell_idx < enqueued_cells.size()) {
-            enqueued_cells[cell_idx] = 0U;
-        }
-        refine_counter.tick();
-        ++processed_count;
-
-        if (cell_idx >= all_cells.size()) {
-            continue;
-        }
-
-        OctreeCell &cell = all_cells[cell_idx];
-        if (!cell.is_leaf || cell.depth >= max_depth ||
-            cell_edge_length(cell) <= target_leaf_size) {
-            continue;
-        }
-
-        const std::uint32_t target_depth =
-            cell_idx < queued_target_depths.size() ?
-                queued_target_depths[cell_idx] :
-                cell.depth;
-
-        split_octree_leaf(
-            cell_idx, all_cells, all_contributors, positions,
-            smoothing_lengths);
-        ++split_count;
-        mark_dirty(cell_idx);
-
-        const std::int64_t child_begin = all_cells[cell_idx].child_begin;
-        if (child_begin < 0) {
-            continue;
-        }
-
-        for (std::size_t child_offset = 0; child_offset < 8U; ++child_offset) {
-            const std::size_t child_index =
-                static_cast<std::size_t>(child_begin) + child_offset;
-            if (child_index >= all_cells.size()) {
-                continue;
-            }
-            mark_dirty(child_index);
-
-            OctreeCell &child = all_cells[child_index];
-            const std::span<const std::size_t> contributors =
-                cell_contributor_span(child, all_contributors);
-            child.is_active = false;
-            child.is_topo_surface = false;
-            child.representative_vertex_index = -1;
-
-            if (contributors.size() < 2U) {
-                child.has_surface = false;
-                child.corner_values = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-                child.corner_sign_mask = 0U;
-                continue;
-            }
-
-            child.corner_values = sample_cell_corners(
-                child, contributors, positions, smoothing_lengths);
-            child.corner_sign_mask = compute_corner_sign_mask(
-                child.corner_values, isovalue);
-
-            const bool corner_surface = cell_may_contain_isosurface(
-                child.corner_values, isovalue);
-            const bool inherited_surface_hint =
-                all_cells[cell_idx].has_surface && !corner_surface;
-            child.has_surface = corner_surface || inherited_surface_hint;
-
-            bool should_continue_refining =
-                child.depth < max_depth &&
-                (cell_edge_length(child) > target_leaf_size ||
-                 child.depth < target_depth);
-
-            if (!should_continue_refining && child.depth < max_depth &&
-                corner_surface) {
-                const std::vector<HermiteSample> samples =
-                    compute_cell_hermite_samples(
-                        child.bounds, child.corner_values,
-                        child.corner_sign_mask, contributors,
-                        positions, smoothing_lengths, isovalue);
-                const QEFLeafDiagnostics qef_diagnostics =
-                    analyze_qef_for_leaf(samples, child.bounds);
-                const double dx = child.bounds.max.x - child.bounds.min.x;
-                const double dy = child.bounds.max.y - child.bounds.min.y;
-                const double dz = child.bounds.max.z - child.bounds.min.z;
-                const double cell_radius =
-                    0.5 * std::sqrt(dx * dx + dy * dy + dz * dz);
-                const bool poor_qef_fit =
-                    qef_diagnostics.usable_sample_count <
-                        minimum_usable_hermite_samples ||
-                    qef_diagnostics.used_fallback ||
-                    minimum_hermite_normal_alignment(samples) <
-                        min_normal_alignment_threshold ||
-                    qef_diagnostics.rms_plane_residual >
-                        max_qef_rms_residual_ratio * cell_radius;
-                should_continue_refining = poor_qef_fit;
-            }
-
-            if (should_continue_refining) {
-                enqueue_cell(child_index, target_depth);
-            } else {
-                child.is_active = true;
-            }
-        }
-    }
-
-    refine_counter.finish();
-
-    meshmerizer_log_detail::print_debug_status(
+    const RefinementClosureConfig closure_config = {
+        isovalue,
+        max_depth,
+        domain,
+        base_resolution,
+        worker_count,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+        table_cadence_seconds,
         "Regularization",
         "refine_thickening_band_cells",
-        "processed=%zu split=%zu (total_cells_after_refine=%zu)\n",
-        processed_count,
-        split_count,
-        all_cells.size());
-    return split_count > 0U;
+        "thickening_band",
+        /*surface_band_target_leaf_size=*/0.0,
+        /*thickening_band_target_leaf_size=*/target_leaf_size,
+        /*thickening_radius=*/thickening_radius,
+    };
+
+    return refine_thickening_band_with_closure(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        closure_config,
+        target_leaf_size,
+        closure_seed_indices,
+        closure_seed_depths,
+        &classification_cache.inside_flags,
+        &classification_cache.center_values,
+        &classification_cache.occupancy_states,
+        dirty_cells,
+        classified_inside_flags,
+        classified_center_values,
+        classified_occupancy_states);
 }
 
 inline bool thickening_band_is_fully_refined(
@@ -1030,12 +1470,12 @@ inline bool thickening_band_is_fully_refined(
         return true;
     }
 
-    ProgressCounter check_counter(
+    MESHMERIZER_PROGRESS_COUNTER(check_counter,
         "Regularization", "thickening_band_is_fully_refined", "leaves", 1000);
     std::size_t unresolved_count = 0U;
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        check_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(check_counter);
         if (inside_mask[leaf_index] != 0U) {
             continue;
         }
@@ -1047,7 +1487,7 @@ inline bool thickening_band_is_fully_refined(
             break;
         }
     }
-    check_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(check_counter);
 
     meshmerizer_log_detail::print_debug_status(
         "Regularization",
@@ -1060,229 +1500,467 @@ inline bool thickening_band_is_fully_refined(
     return unresolved_count == 0U;
 }
 
-inline std::vector<double> compute_inside_clearance(
-    const std::vector<OccupiedSolidLeaf> &solid_leaves,
-    const std::vector<std::uint8_t> &inside_mask,
+/**
+ * @brief B2 incremental single-pass thickening-band refinement.
+ *
+ * Replaces the outer classify→distance→refine→reclassify loop with a single
+ * closure run seeded by kClassify tasks for all current leaf cells.  The
+ * incremental chain
+ *   kClassify → kDistanceUpdate → kRefine → kClassify(children) → ...
+ * converges without any outer iteration.
+ *
+ * @param all_cells    Flat cell array updated in place.
+ * @param all_contributors Flat contributor array updated in place.
+ * @param positions    Particle positions.
+ * @param smoothing_lengths Per-particle support radii.
+ * @param isovalue     Field isovalue for classification.
+ * @param max_depth    Maximum octree depth.
+ * @param domain       Domain bounding box.
+ * @param base_resolution Top-level cell count per axis.
+ * @param worker_count Number of worker threads.
+ * @param target_leaf_size Target leaf size for the thickening band.
+ * @param thickening_radius Outward thickening radius.
+ * @param table_cadence_seconds Status table cadence.
+ * @param minimum_usable_hermite_samples Min Hermite samples for QEF.
+ * @param max_qef_rms_residual_ratio Max QEF residual ratio.
+ * @param min_normal_alignment_threshold Min Hermite normal alignment.
+ * @param dirty_cells Optional output dirty-cell mask.
+ * @return ``true`` when at least one new cell was created.
+ */
+inline bool refine_thickening_band_incremental(
+    std::vector<OctreeCell> &all_cells,
+    std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    double isovalue,
+    std::uint32_t max_depth,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution,
+    std::uint32_t worker_count,
+    double target_leaf_size,
+    double thickening_radius,
+    double table_cadence_seconds,
+    std::uint32_t minimum_usable_hermite_samples,
+    double max_qef_rms_residual_ratio,
+    double min_normal_alignment_threshold,
+    std::vector<std::uint8_t> *dirty_cells = nullptr) {
+    if (target_leaf_size <= 0.0 || thickening_radius <= 0.0) {
+        return false;
+    }
+
+    // Thread both thickening parameters into the config so the closure
+    // workers can drive the kClassify → kDistanceUpdate → kRefine chain.
+    const RefinementClosureConfig closure_config = {
+        isovalue,
+        max_depth,
+        domain,
+        base_resolution,
+        worker_count,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+        table_cadence_seconds,
+        "Regularization",
+        "refine_thickening_band_incremental",
+        "thickening_incremental",
+        /*surface_band_target_leaf_size=*/0.0,
+        /*thickening_band_target_leaf_size=*/target_leaf_size,
+        /*thickening_radius=*/thickening_radius,
+    };
+
+    return refine_thickening_band_with_closure(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        closure_config,
+        target_leaf_size,
+        /*seed_cell_indices=*/{},
+        /*seed_target_depths=*/{},
+        /*initial_inside_flags=*/nullptr,
+        /*initial_center_values=*/nullptr,
+        /*initial_occupancy_states=*/nullptr,
+        dirty_cells);
+}
+
+inline std::vector<double> compute_inside_clearance_from_cell_mask(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache,
+    const std::vector<std::uint8_t> &inside_mask_by_cell,
+    std::uint32_t worker_count = 1U,
     double max_distance = std::numeric_limits<double>::infinity()) {
     const double inf = std::numeric_limits<double>::infinity();
-    std::vector<double> clearance(solid_leaves.size(), inf);
-    using QueueEntry = std::pair<double, std::size_t>;
-    std::priority_queue<
-        QueueEntry,
-        std::vector<QueueEntry>,
-        std::greater<QueueEntry>> queue;
+    if (worker_count == 0U) {
+        worker_count = 1U;
+    }
 
-    ProgressCounter seed_counter(
-        "Regularization", "compute_inside_clearance", "leaves", 1000);
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        seed_counter.tick();
-        if (inside_mask[leaf_index] == 0U) {
+    std::vector<std::atomic<std::uint64_t>> clearance_bits(all_cells.size());
+    for (std::size_t cell_index = 0; cell_index < clearance_bits.size(); ++cell_index) {
+        clearance_bits[cell_index].store(
+            adaptive_solid_double_to_bits(inf),
+            std::memory_order_relaxed);
+    }
+
+    RefinementWorkQueue queue;
+    queue.initialize(worker_count);
+
+    MESHMERIZER_PROGRESS_COUNTER(seed_counter,
+        "Regularization",
+        "compute_inside_clearance_from_cell_mask",
+        "cells",
+        1000);
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
+        MESHMERIZER_PROGRESS_TICK(seed_counter);
+        if (!all_cells[cell_index].is_leaf || inside_mask_by_cell[cell_index] == 0U) {
             continue;
         }
 
         bool is_boundary_seed = false;
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
+        for (std::size_t neighbor_cell_index :
+             classification_cache.face_neighbor_cell_indices[cell_index]) {
+            if (neighbor_cell_index == SIZE_MAX ||
+                neighbor_cell_index >= all_cells.size()) {
                 is_boundary_seed = true;
                 break;
             }
-
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (inside_mask[neighbor] == 0U) {
+            if (!all_cells[neighbor_cell_index].is_leaf ||
+                inside_mask_by_cell[neighbor_cell_index] == 0U) {
                 is_boundary_seed = true;
                 break;
             }
         }
 
         if (is_boundary_seed) {
-            clearance[leaf_index] = 0.0;
-            queue.push({0.0, leaf_index});
+            clearance_bits[cell_index].store(
+                adaptive_solid_double_to_bits(0.0),
+                std::memory_order_release);
+            queue.push(
+                {cell_index, 0U, 0U, RefinementTaskKind::kComputeInsideClearance},
+                static_cast<std::uint32_t>(cell_index % worker_count));
         }
     }
-    seed_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(seed_counter);
+    queue.capture_initial_queue_size();
 
-    ProgressCounter wavefront_counter(
-        "Regularization", "compute_inside_clearance", "queue pops", 10000);
+    MESHMERIZER_PROGRESS_COUNTER(wavefront_counter,
+        "Regularization",
+        "compute_inside_clearance_from_cell_mask",
+        "relaxations",
+        10000);
 
-    while (!queue.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
-        wavefront_counter.tick();
-        const auto [distance, leaf_index] = queue.top();
-        queue.pop();
-        if (distance > clearance[leaf_index]) {
-            continue;
-        }
-        if (distance > max_distance) {
-            continue;
-        }
+    std::exception_ptr worker_error;
+    std::mutex error_mutex;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::uint32_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                try {
+                    MESHMERIZER_PROGRESS_TICK(wavefront_counter);
+                    const std::size_t cell_index = task.cell_index;
+                    if (cell_index >= all_cells.size()) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
 
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
-                continue;
-            }
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (inside_mask[neighbor] == 0U) {
-                continue;
-            }
+                    const double distance = adaptive_solid_bits_to_double(
+                        clearance_bits[cell_index].load(std::memory_order_acquire));
+                    if (!std::isfinite(distance) || distance > max_distance) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
 
-            const double edge_cost = 0.5 * (
-                solid_leaves[leaf_index].cell_size +
-                solid_leaves[neighbor].cell_size);
-            const double candidate = distance + edge_cost;
-            if (candidate > max_distance) {
-                continue;
+                    for (std::size_t neighbor_cell_index :
+                         classification_cache.face_neighbor_cell_indices[cell_index]) {
+                        if (neighbor_cell_index == SIZE_MAX ||
+                            neighbor_cell_index >= all_cells.size()) {
+                            continue;
+                        }
+                        if (!all_cells[neighbor_cell_index].is_leaf ||
+                            inside_mask_by_cell[neighbor_cell_index] == 0U) {
+                            continue;
+                        }
+
+                        const double edge_cost = 0.5 * (
+                            cell_edge_length(all_cells[cell_index]) +
+                            cell_edge_length(all_cells[neighbor_cell_index]));
+                        const double candidate = distance + edge_cost;
+                        if (candidate > max_distance) {
+                            continue;
+                        }
+                        if (adaptive_solid_atomic_update_distance_min(
+                                clearance_bits[neighbor_cell_index], candidate)) {
+                            queue.push(
+                                {neighbor_cell_index,
+                                 0U,
+                                 0U,
+                                 RefinementTaskKind::kComputeInsideClearance},
+                                static_cast<std::uint32_t>(
+                                    neighbor_cell_index % worker_count));
+                        }
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (worker_error == nullptr) {
+                        worker_error = std::current_exception();
+                    }
+                    queue.task_done();
+                    queue.shutdown();
+                    return;
+                }
+                queue.task_done();
+                queue.try_shutdown_if_idle();
             }
-            if (candidate < clearance[neighbor]) {
-                clearance[neighbor] = candidate;
-                queue.push({candidate, neighbor});
-            }
-        }
+        });
     }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    if (worker_error != nullptr) {
+        std::rethrow_exception(worker_error);
+    }
+    MESHMERIZER_PROGRESS_FINISH(wavefront_counter);
+    const RefinementWorkQueueStats clearance_stats = queue.stats();
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "compute_inside_clearance_from_cell_mask",
+        "completed clearance wavefront: seeds=%zu pops=%zu pushes=%zu queue_peak=%zu max_distance=%.6g cells=%zu\n",
+        clearance_stats.initial_queue_size,
+        clearance_stats.pop_count,
+        clearance_stats.push_count,
+        clearance_stats.high_watermark,
+        max_distance,
+        all_cells.size());
 
-    wavefront_counter.finish();
+    std::vector<double> clearance(all_cells.size(), inf);
+    for (std::size_t cell_index = 0; cell_index < clearance.size(); ++cell_index) {
+        clearance[cell_index] = adaptive_solid_bits_to_double(
+            clearance_bits[cell_index].load(std::memory_order_acquire));
+    }
 
     return clearance;
 }
 
-inline std::vector<std::uint8_t> erode_occupied_solid_leaves(
-    const std::vector<std::uint8_t> &inside_mask,
-    const std::vector<double> &clearance,
+inline std::vector<std::uint8_t> erode_occupied_solid_cells(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::uint8_t> &inside_mask_by_cell,
+    const std::vector<double> &clearance_by_cell,
     double erosion_radius) {
-    std::vector<std::uint8_t> kept_inside(inside_mask.size(), 0U);
+    std::vector<std::uint8_t> kept_inside(all_cells.size(), 0U);
 
-    ProgressCounter erode_counter(
-        "Regularization", "erode_occupied_solid_leaves", "leaves", 1000);
+    MESHMERIZER_PROGRESS_COUNTER(erode_counter,
+        "Regularization", "erode_occupied_solid_cells", "cells", 1000);
 #pragma omp parallel for schedule(static)
-    for (std::size_t leaf_index = 0; leaf_index < inside_mask.size(); ++leaf_index) {
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
-                leaf_index)) {
-            erode_counter.tick();
+                cell_index)) {
+            MESHMERIZER_PROGRESS_TICK(erode_counter);
             continue;
         }
-        erode_counter.tick();
-        if (inside_mask[leaf_index] == 0U) {
+        MESHMERIZER_PROGRESS_TICK(erode_counter);
+        if (!all_cells[cell_index].is_leaf || inside_mask_by_cell[cell_index] == 0U) {
             continue;
         }
-        kept_inside[leaf_index] = clearance[leaf_index] >= erosion_radius ? 1U : 0U;
+        kept_inside[cell_index] =
+            clearance_by_cell[cell_index] >= erosion_radius ? 1U : 0U;
     }
-    erode_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(erode_counter);
     return kept_inside;
 }
 
-inline std::vector<double> compute_distance_to_eroded_solid(
-    const std::vector<OccupiedSolidLeaf> &solid_leaves,
-    const std::vector<std::uint8_t> &eroded_inside,
+inline std::vector<double> compute_distance_to_eroded_solid_from_cell_mask(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache,
+    const std::vector<std::uint8_t> &eroded_inside_by_cell,
+    std::uint32_t worker_count = 1U,
     double max_distance = std::numeric_limits<double>::infinity()) {
     const double inf = std::numeric_limits<double>::infinity();
-    std::vector<double> distance_to_eroded(solid_leaves.size(), inf);
-    using QueueEntry = std::pair<double, std::size_t>;
-    std::priority_queue<
-        QueueEntry,
-        std::vector<QueueEntry>,
-        std::greater<QueueEntry>> queue;
+    if (worker_count == 0U) {
+        worker_count = 1U;
+    }
 
-    ProgressCounter seed_counter(
-        "Regularization", "compute_distance_to_eroded_solid", "leaves", 1000);
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        seed_counter.tick();
-        if (eroded_inside[leaf_index] == 0U) {
+    std::vector<std::atomic<std::uint64_t>> distance_bits(all_cells.size());
+    for (std::size_t cell_index = 0; cell_index < distance_bits.size(); ++cell_index) {
+        distance_bits[cell_index].store(
+            adaptive_solid_double_to_bits(inf),
+            std::memory_order_relaxed);
+    }
+
+    RefinementWorkQueue queue;
+    queue.initialize(worker_count);
+
+    MESHMERIZER_PROGRESS_COUNTER(seed_counter,
+        "Regularization",
+        "compute_distance_to_eroded_solid_from_cell_mask",
+        "cells",
+        1000);
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
+        MESHMERIZER_PROGRESS_TICK(seed_counter);
+        if (!all_cells[cell_index].is_leaf || eroded_inside_by_cell[cell_index] == 0U) {
             continue;
         }
 
         bool is_boundary_seed = false;
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
+        for (std::size_t neighbor_cell_index :
+             classification_cache.face_neighbor_cell_indices[cell_index]) {
+            if (neighbor_cell_index == SIZE_MAX ||
+                neighbor_cell_index >= all_cells.size()) {
                 is_boundary_seed = true;
                 break;
             }
-            if (eroded_inside[static_cast<std::size_t>(neighbor_leaf_index)] == 0U) {
+            if (!all_cells[neighbor_cell_index].is_leaf ||
+                eroded_inside_by_cell[neighbor_cell_index] == 0U) {
                 is_boundary_seed = true;
                 break;
             }
         }
 
         if (is_boundary_seed) {
-            distance_to_eroded[leaf_index] = 0.0;
-            queue.push({0.0, leaf_index});
+            distance_bits[cell_index].store(
+                adaptive_solid_double_to_bits(0.0),
+                std::memory_order_release);
+            queue.push(
+                {cell_index, 0U, 0U, RefinementTaskKind::kComputeDistanceToEroded},
+                static_cast<std::uint32_t>(cell_index % worker_count));
         }
     }
-    seed_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(seed_counter);
+    queue.capture_initial_queue_size();
 
-    ProgressCounter wavefront_counter(
-        "Regularization", "compute_distance_to_eroded_solid", "queue pops", 10000);
+    MESHMERIZER_PROGRESS_COUNTER(wavefront_counter,
+        "Regularization",
+        "compute_distance_to_eroded_solid_from_cell_mask",
+        "relaxations",
+        10000);
 
-    while (!queue.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(queue.size());
-        wavefront_counter.tick();
-        const auto [distance, leaf_index] = queue.top();
-        queue.pop();
-        if (distance > distance_to_eroded[leaf_index]) {
-            continue;
-        }
-        if (distance > max_distance) {
-            continue;
-        }
+    std::exception_ptr worker_error;
+    std::mutex error_mutex;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::uint32_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                try {
+                    MESHMERIZER_PROGRESS_TICK(wavefront_counter);
+                    const std::size_t cell_index = task.cell_index;
+                    if (cell_index >= all_cells.size()) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
 
-        for (std::int64_t neighbor_leaf_index :
-             solid_leaves[leaf_index].face_neighbor_leaf_indices) {
-            if (neighbor_leaf_index < 0) {
-                continue;
-            }
-            const std::size_t neighbor =
-                static_cast<std::size_t>(neighbor_leaf_index);
-            if (eroded_inside[neighbor] != 0U) {
-                continue;
-            }
+                    const double distance = adaptive_solid_bits_to_double(
+                        distance_bits[cell_index].load(std::memory_order_acquire));
+                    if (!std::isfinite(distance) || distance > max_distance) {
+                        queue.task_done();
+                        queue.try_shutdown_if_idle();
+                        continue;
+                    }
 
-            const double edge_cost = 0.5 * (
-                solid_leaves[leaf_index].cell_size +
-                solid_leaves[neighbor].cell_size);
-            const double candidate = distance + edge_cost;
-            if (candidate > max_distance) {
-                continue;
+                    for (std::size_t neighbor_cell_index :
+                         classification_cache.face_neighbor_cell_indices[cell_index]) {
+                        if (neighbor_cell_index == SIZE_MAX ||
+                            neighbor_cell_index >= all_cells.size()) {
+                            continue;
+                        }
+                        if (!all_cells[neighbor_cell_index].is_leaf ||
+                            eroded_inside_by_cell[neighbor_cell_index] != 0U) {
+                            continue;
+                        }
+
+                        const double edge_cost = 0.5 * (
+                            cell_edge_length(all_cells[cell_index]) +
+                            cell_edge_length(all_cells[neighbor_cell_index]));
+                        const double candidate = distance + edge_cost;
+                        if (candidate > max_distance) {
+                            continue;
+                        }
+                        if (adaptive_solid_atomic_update_distance_min(
+                                distance_bits[neighbor_cell_index], candidate)) {
+                            queue.push(
+                                {neighbor_cell_index,
+                                 0U,
+                                 0U,
+                                 RefinementTaskKind::kComputeDistanceToEroded},
+                                static_cast<std::uint32_t>(
+                                    neighbor_cell_index % worker_count));
+                        }
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (worker_error == nullptr) {
+                        worker_error = std::current_exception();
+                    }
+                    queue.task_done();
+                    queue.shutdown();
+                    return;
+                }
+                queue.task_done();
+                queue.try_shutdown_if_idle();
             }
-            if (candidate < distance_to_eroded[neighbor]) {
-                distance_to_eroded[neighbor] = candidate;
-                queue.push({candidate, neighbor});
-            }
-        }
+        });
     }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    if (worker_error != nullptr) {
+        std::rethrow_exception(worker_error);
+    }
+    MESHMERIZER_PROGRESS_FINISH(wavefront_counter);
+    const RefinementWorkQueueStats distance_stats = queue.stats();
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "compute_distance_to_eroded_solid_from_cell_mask",
+        "completed distance wavefront: seeds=%zu pops=%zu pushes=%zu queue_peak=%zu max_distance=%.6g cells=%zu\n",
+        distance_stats.initial_queue_size,
+        distance_stats.pop_count,
+        distance_stats.push_count,
+        distance_stats.high_watermark,
+        max_distance,
+        all_cells.size());
 
-    wavefront_counter.finish();
+    std::vector<double> distance_to_eroded(all_cells.size(), inf);
+    for (std::size_t cell_index = 0; cell_index < distance_to_eroded.size(); ++cell_index) {
+        distance_to_eroded[cell_index] = adaptive_solid_bits_to_double(
+            distance_bits[cell_index].load(std::memory_order_acquire));
+    }
 
     return distance_to_eroded;
 }
 
-inline std::vector<std::uint8_t> dilate_eroded_solid_leaves(
-    const std::vector<std::uint8_t> &eroded_inside,
-    const std::vector<double> &distance_to_eroded,
+inline std::vector<std::uint8_t> dilate_eroded_solid_cells(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::uint8_t> &eroded_inside_by_cell,
+    const std::vector<double> &distance_to_eroded_by_cell,
     double dilation_radius) {
-    std::vector<std::uint8_t> opened_inside(eroded_inside.size(), 0U);
+    std::vector<std::uint8_t> opened_inside(all_cells.size(), 0U);
 
-    ProgressCounter dilate_counter(
-        "Regularization", "dilate_eroded_solid_leaves", "leaves", 1000);
+    MESHMERIZER_PROGRESS_COUNTER(dilate_counter,
+        "Regularization", "dilate_eroded_solid_cells", "cells", 1000);
 #pragma omp parallel for schedule(static)
-    for (std::size_t leaf_index = 0; leaf_index < eroded_inside.size(); ++leaf_index) {
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
         if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
-                leaf_index)) {
-            dilate_counter.tick();
+                cell_index)) {
+            MESHMERIZER_PROGRESS_TICK(dilate_counter);
             continue;
         }
-        dilate_counter.tick();
-        opened_inside[leaf_index] =
-            (eroded_inside[leaf_index] != 0U ||
-             distance_to_eroded[leaf_index] <= dilation_radius)
+        MESHMERIZER_PROGRESS_TICK(dilate_counter);
+        if (!all_cells[cell_index].is_leaf) {
+            continue;
+        }
+        opened_inside[cell_index] =
+            (eroded_inside_by_cell[cell_index] != 0U ||
+             distance_to_eroded_by_cell[cell_index] <= dilation_radius)
                 ? 1U
                 : 0U;
     }
-    dilate_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(dilate_counter);
     return opened_inside;
 }
 
@@ -1298,11 +1976,11 @@ inline void prune_small_opened_components(
     std::vector<std::vector<std::size_t>> components;
     std::vector<double> component_volumes;
 
-    ProgressCounter component_counter(
+    MESHMERIZER_PROGRESS_COUNTER(component_counter,
         "Regularization", "prune_small_opened_components", "leaves", 1000);
     for (std::size_t leaf_index = 0; leaf_index < opened_inside.size(); ++leaf_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(leaf_index);
-        component_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(component_counter);
         if (opened_inside[leaf_index] == 0U || visited[leaf_index] != 0U) {
             continue;
         }
@@ -1341,7 +2019,7 @@ inline void prune_small_opened_components(
         components.push_back(std::move(component));
         component_volumes.push_back(component_volume);
     }
-    component_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(component_counter);
 
     if (components.size() <= 1U) {
         return;
@@ -1408,11 +2086,11 @@ inline void fill_small_opened_cavities(
 
     std::vector<std::uint8_t> visited(opened_inside.size(), 0U);
     std::vector<OutsideComponent> outside_components;
-    ProgressCounter cavity_counter(
+    MESHMERIZER_PROGRESS_COUNTER(cavity_counter,
         "Regularization", "fill_small_opened_cavities", "leaves", 1000);
 
     for (std::size_t leaf_index = 0; leaf_index < opened_inside.size(); ++leaf_index) {
-        cavity_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(cavity_counter);
         if (opened_inside[leaf_index] != 0U || visited[leaf_index] != 0U) {
             continue;
         }
@@ -1449,7 +2127,7 @@ inline void fill_small_opened_cavities(
 
         outside_components.push_back(std::move(component));
     }
-    cavity_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(cavity_counter);
 
     const double max_cavity_volume = max_cavity_volume_ratio * opened_volume;
     std::size_t filled_components = 0U;
@@ -1528,11 +2206,11 @@ inline void suppress_opened_edge_contacts(
     candidates.reserve(opened_inside.size() / 16U + 1U);
     const std::vector<std::int64_t> cell_to_leaf_index =
         build_opened_cell_to_leaf_index(all_cells, solid_leaves);
-    ProgressCounter contact_counter(
+    MESHMERIZER_PROGRESS_COUNTER(contact_counter,
         "Regularization", "suppress_opened_edge_contacts", "leaves", 1000);
 
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        contact_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(contact_counter);
         if (opened_inside[leaf_index] == 0U) {
             continue;
         }
@@ -1595,7 +2273,7 @@ inline void suppress_opened_edge_contacts(
             candidates.push_back({leaf_index, exposed_faces, span * span * span});
         }
     }
-    contact_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(contact_counter);
 
     if (candidates.empty()) {
         return;
@@ -1634,12 +2312,12 @@ inline std::vector<OpenedBoundarySample> generate_opened_boundary_samples(
     const int n_threads = omp_get_max_threads();
     std::vector<std::vector<OpenedBoundarySample>> thread_samples(
         static_cast<std::size_t>(n_threads));
-    ProgressCounter sample_counter(
+    MESHMERIZER_PROGRESS_COUNTER(sample_counter,
         "Meshing", "generate_opened_boundary_samples", "leaves", 1000);
 
 #pragma omp parallel for schedule(dynamic)
     for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        sample_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(sample_counter);
         if (opened_inside[leaf_index] == 0U) {
             continue;
         }
@@ -1694,7 +2372,7 @@ inline std::vector<OpenedBoundarySample> generate_opened_boundary_samples(
         }
     }
 
-    sample_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(sample_counter);
 
     for (const auto &local_samples : thread_samples) {
         samples.insert(samples.end(), local_samples.begin(), local_samples.end());
@@ -1708,6 +2386,1441 @@ struct OpenedSurfaceMesh {
     std::vector<MeshTriangle> triangles;
     std::vector<std::uint64_t> vertex_keys;
 };
+
+inline std::size_t prune_tiny_opened_surface_artifacts(OpenedSurfaceMesh &mesh) {
+    if (mesh.vertices.empty() || mesh.triangles.empty()) {
+        return 0U;
+    }
+
+    std::vector<std::vector<std::size_t>> vertex_to_triangles(mesh.vertices.size());
+    for (std::size_t triangle_index = 0; triangle_index < mesh.triangles.size();
+         ++triangle_index) {
+        const MeshTriangle &triangle = mesh.triangles[triangle_index];
+        vertex_to_triangles[triangle.vertex_indices[0]].push_back(triangle_index);
+        vertex_to_triangles[triangle.vertex_indices[1]].push_back(triangle_index);
+        vertex_to_triangles[triangle.vertex_indices[2]].push_back(triangle_index);
+    }
+
+    std::vector<std::uint8_t> visited(mesh.triangles.size(), 0U);
+    std::vector<std::uint8_t> keep_triangle(mesh.triangles.size(), 1U);
+    std::size_t removed_components = 0U;
+
+    for (std::size_t seed = 0; seed < mesh.triangles.size(); ++seed) {
+        if (visited[seed] != 0U) {
+            continue;
+        }
+
+        std::vector<std::size_t> stack = {seed};
+        std::vector<std::size_t> component_triangles;
+        std::unordered_set<std::size_t> component_vertices;
+        visited[seed] = 1U;
+
+        while (!stack.empty()) {
+            const std::size_t triangle_index = stack.back();
+            stack.pop_back();
+            component_triangles.push_back(triangle_index);
+
+            const MeshTriangle &triangle = mesh.triangles[triangle_index];
+            const std::size_t triangle_vertices[3] = {
+                triangle.vertex_indices[0],
+                triangle.vertex_indices[1],
+                triangle.vertex_indices[2],
+            };
+            for (std::size_t vertex_index : triangle_vertices) {
+                component_vertices.insert(vertex_index);
+                for (std::size_t neighbor_triangle : vertex_to_triangles[vertex_index]) {
+                    if (visited[neighbor_triangle] == 0U) {
+                        visited[neighbor_triangle] = 1U;
+                        stack.push_back(neighbor_triangle);
+                    }
+                }
+            }
+        }
+
+        if (component_vertices.size() <= 8U && component_triangles.size() <= 12U) {
+            ++removed_components;
+            for (std::size_t triangle_index : component_triangles) {
+                keep_triangle[triangle_index] = 0U;
+            }
+        }
+    }
+
+    if (removed_components == 0U) {
+        return 0U;
+    }
+
+    std::vector<MeshTriangle> kept_triangles;
+    kept_triangles.reserve(mesh.triangles.size());
+    std::vector<std::uint8_t> vertex_used(mesh.vertices.size(), 0U);
+    for (std::size_t triangle_index = 0; triangle_index < mesh.triangles.size();
+         ++triangle_index) {
+        if (keep_triangle[triangle_index] == 0U) {
+            continue;
+        }
+        const MeshTriangle &triangle = mesh.triangles[triangle_index];
+        kept_triangles.push_back(triangle);
+        vertex_used[triangle.vertex_indices[0]] = 1U;
+        vertex_used[triangle.vertex_indices[1]] = 1U;
+        vertex_used[triangle.vertex_indices[2]] = 1U;
+    }
+
+    std::vector<std::size_t> remap(mesh.vertices.size(), 0U);
+    std::vector<MeshVertex> kept_vertices;
+    std::vector<std::uint64_t> kept_vertex_keys;
+    kept_vertices.reserve(mesh.vertices.size());
+    kept_vertex_keys.reserve(mesh.vertex_keys.size());
+    for (std::size_t vertex_index = 0; vertex_index < mesh.vertices.size(); ++vertex_index) {
+        if (vertex_used[vertex_index] == 0U) {
+            continue;
+        }
+        remap[vertex_index] = kept_vertices.size();
+        kept_vertices.push_back(mesh.vertices[vertex_index]);
+        kept_vertex_keys.push_back(mesh.vertex_keys[vertex_index]);
+    }
+
+    for (MeshTriangle &triangle : kept_triangles) {
+        triangle.vertex_indices[0] = remap[triangle.vertex_indices[0]];
+        triangle.vertex_indices[1] = remap[triangle.vertex_indices[1]];
+        triangle.vertex_indices[2] = remap[triangle.vertex_indices[2]];
+    }
+
+    mesh.vertices = std::move(kept_vertices);
+    mesh.vertex_keys = std::move(kept_vertex_keys);
+    mesh.triangles = std::move(kept_triangles);
+
+    meshmerizer_log_detail::print_status(
+        "Regularization",
+        "prune_tiny_opened_surface_artifacts",
+        "removed %zu tiny opened-surface artifact component(s)\n",
+        removed_components);
+    return removed_components;
+}
+
+struct SurfaceRegion;
+struct SurfaceExtractionRuntime;
+struct RegionSurfaceBuffers;
+
+inline void unpack_surface_corner_coords(
+    std::uint64_t key,
+    std::uint32_t &ix,
+    std::uint32_t &iy,
+    std::uint32_t &iz);
+
+inline std::uint64_t pack_surface_corner_coords(
+    std::uint32_t ix,
+    std::uint32_t iy,
+    std::uint32_t iz);
+
+inline std::vector<SurfaceRegion> build_surface_regions(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<OctreeCell> &all_cells);
+
+inline void run_region_extract_surface_task(
+    std::size_t region_id,
+    const SurfaceExtractionRuntime &runtime,
+    RegionSurfaceBuffers &out_buffers);
+
+inline OpenedSurfaceMesh merge_region_surface_buffers(
+    std::vector<RegionSurfaceBuffers> &region_buffers);
+
+inline bool resolve_opened_edge_ambiguities(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<OctreeCell> &all_cells,
+    const LeafSpatialIndex &spatial_index,
+    const std::vector<std::int64_t> &cell_to_leaf_index,
+    std::vector<std::uint8_t> &opened_inside,
+    const OpenedSurfaceMesh &mesh);
+
+struct SurfaceRegion {
+    std::size_t region_id = 0U;
+    std::size_t root_cell_index = 0U;
+    std::uint32_t root_depth = 0U;
+    std::vector<std::size_t> leaf_indices;
+};
+
+struct RegionSurfaceVertex {
+    std::uint64_t key = 0U;
+    Vector3d position = {0.0, 0.0, 0.0};
+    Vector3d normal_sum = {0.0, 0.0, 0.0};
+};
+
+struct RegionSurfaceTriangle {
+    std::size_t local_vertex_index[3] = {0U, 0U, 0U};
+};
+
+struct RegionSurfaceBuffers {
+    std::size_t region_id = 0U;
+    std::vector<RegionSurfaceVertex> local_vertices;
+    std::vector<RegionSurfaceTriangle> local_triangles;
+    std::unordered_map<std::uint64_t, std::size_t> local_vertex_lookup;
+};
+
+inline std::size_t prune_tiny_opened_surface_artifacts(
+    RegionSurfaceBuffers &buffers) {
+    if (buffers.local_vertices.empty() || buffers.local_triangles.empty()) {
+        return 0U;
+    }
+
+    std::vector<std::vector<std::size_t>> vertex_to_triangles(
+        buffers.local_vertices.size());
+    for (std::size_t triangle_index = 0;
+         triangle_index < buffers.local_triangles.size();
+         ++triangle_index) {
+        const RegionSurfaceTriangle &triangle = buffers.local_triangles[triangle_index];
+        vertex_to_triangles[triangle.local_vertex_index[0]].push_back(triangle_index);
+        vertex_to_triangles[triangle.local_vertex_index[1]].push_back(triangle_index);
+        vertex_to_triangles[triangle.local_vertex_index[2]].push_back(triangle_index);
+    }
+
+    std::vector<std::uint8_t> visited(buffers.local_triangles.size(), 0U);
+    std::vector<std::uint8_t> keep_triangle(buffers.local_triangles.size(), 1U);
+    std::size_t removed_components = 0U;
+
+    for (std::size_t seed = 0; seed < buffers.local_triangles.size(); ++seed) {
+        if (visited[seed] != 0U) {
+            continue;
+        }
+
+        std::vector<std::size_t> stack = {seed};
+        std::vector<std::size_t> component_triangles;
+        std::unordered_set<std::size_t> component_vertices;
+        visited[seed] = 1U;
+
+        while (!stack.empty()) {
+            const std::size_t triangle_index = stack.back();
+            stack.pop_back();
+            component_triangles.push_back(triangle_index);
+
+            const RegionSurfaceTriangle &triangle =
+                buffers.local_triangles[triangle_index];
+            const std::size_t triangle_vertices[3] = {
+                triangle.local_vertex_index[0],
+                triangle.local_vertex_index[1],
+                triangle.local_vertex_index[2],
+            };
+            for (std::size_t vertex_index : triangle_vertices) {
+                component_vertices.insert(vertex_index);
+                for (std::size_t neighbor_triangle :
+                     vertex_to_triangles[vertex_index]) {
+                    if (visited[neighbor_triangle] == 0U) {
+                        visited[neighbor_triangle] = 1U;
+                        stack.push_back(neighbor_triangle);
+                    }
+                }
+            }
+        }
+
+        if (component_vertices.size() <= 8U && component_triangles.size() <= 12U) {
+            ++removed_components;
+            for (std::size_t triangle_index : component_triangles) {
+                keep_triangle[triangle_index] = 0U;
+            }
+        }
+    }
+
+    if (removed_components == 0U) {
+        return 0U;
+    }
+
+    std::vector<RegionSurfaceTriangle> kept_triangles;
+    kept_triangles.reserve(buffers.local_triangles.size());
+    std::vector<std::uint8_t> vertex_used(buffers.local_vertices.size(), 0U);
+    for (std::size_t triangle_index = 0;
+         triangle_index < buffers.local_triangles.size();
+         ++triangle_index) {
+        if (keep_triangle[triangle_index] == 0U) {
+            continue;
+        }
+        const RegionSurfaceTriangle &triangle = buffers.local_triangles[triangle_index];
+        kept_triangles.push_back(triangle);
+        vertex_used[triangle.local_vertex_index[0]] = 1U;
+        vertex_used[triangle.local_vertex_index[1]] = 1U;
+        vertex_used[triangle.local_vertex_index[2]] = 1U;
+    }
+
+    std::vector<std::size_t> remap(buffers.local_vertices.size(), 0U);
+    std::vector<RegionSurfaceVertex> kept_vertices;
+    kept_vertices.reserve(buffers.local_vertices.size());
+    for (std::size_t vertex_index = 0;
+         vertex_index < buffers.local_vertices.size();
+         ++vertex_index) {
+        if (vertex_used[vertex_index] == 0U) {
+            continue;
+        }
+        remap[vertex_index] = kept_vertices.size();
+        kept_vertices.push_back(buffers.local_vertices[vertex_index]);
+    }
+
+    for (RegionSurfaceTriangle &triangle : kept_triangles) {
+        triangle.local_vertex_index[0] = remap[triangle.local_vertex_index[0]];
+        triangle.local_vertex_index[1] = remap[triangle.local_vertex_index[1]];
+        triangle.local_vertex_index[2] = remap[triangle.local_vertex_index[2]];
+    }
+
+    buffers.local_vertices = std::move(kept_vertices);
+    buffers.local_triangles = std::move(kept_triangles);
+    buffers.local_vertex_lookup.clear();
+    return removed_components;
+}
+
+struct SurfaceExtractionRuntime {
+    const std::vector<OccupiedSolidLeaf> *solid_leaves = nullptr;
+    const std::vector<std::uint8_t> *opened_inside = nullptr;
+    const std::vector<OctreeCell> *all_cells = nullptr;
+    const LeafSpatialIndex *spatial_index = nullptr;
+    const BoundingBox *domain = nullptr;
+    const std::vector<std::int64_t> *cell_to_leaf_index = nullptr;
+    const std::vector<SurfaceRegion> *regions = nullptr;
+    std::uint32_t base_resolution = 0U;
+    std::uint32_t max_depth = 0U;
+    std::uint32_t fine_resolution = 0U;
+    double fine_dx = 0.0;
+    double fine_dy = 0.0;
+    double fine_dz = 0.0;
+};
+
+struct SurfaceTaskGraphState {
+    std::atomic<std::size_t> pending_region_tasks{0U};
+    std::atomic<bool> merge_enqueued{false};
+    std::atomic<bool> merge_completed{false};
+};
+
+struct SurfaceTaskGraphRuntime {
+    SurfaceExtractionRuntime extraction;
+    std::vector<RegionSurfaceBuffers> region_buffers;
+    SurfaceTaskGraphState graph;
+    OpenedSurfaceMesh merged_mesh;
+    std::atomic<std::size_t> pruned_tiny_artifacts{0U};
+    std::mutex merged_mesh_mutex;
+};
+
+struct PostRefineRegularizationResult {
+    OccupiedSolidExtractionView extraction_view;
+    std::vector<std::uint8_t> opened_inside;
+    OpenedSurfaceMesh opened_surface;
+    double morphology_seconds = 0.0;
+    double opened_surface_extraction_seconds = 0.0;
+    double opened_surface_pass1_seconds = 0.0;
+    double opened_surface_ambiguity_seconds = 0.0;
+    double opened_surface_reextract_seconds = 0.0;
+};
+
+struct PostRefineTaskGraphRuntime {
+    const std::vector<OctreeCell> *all_cells = nullptr;
+    const OccupiedSolidClassificationCache *classification_cache = nullptr;
+    const LeafSpatialIndex *solid_spatial_index = nullptr;
+    const BoundingBox *domain = nullptr;
+    std::uint32_t base_resolution = 0U;
+    std::uint32_t max_depth = 0U;
+    std::uint32_t worker_count = 1U;
+    double opening_radius = 0.0;
+    double table_cadence_seconds = 10.0;
+    std::vector<std::uint8_t> initial_inside_mask_by_cell;
+    std::vector<double> clearance_by_cell;
+    std::vector<std::uint8_t> eroded_inside_by_cell;
+    std::vector<double> dilation_distance_by_cell;
+    std::vector<std::uint8_t> opened_inside_by_cell;
+    PostRefineRegularizationResult result;
+    std::array<std::atomic<std::uint32_t>, 13U> dependency_counts;
+    std::vector<std::uint8_t> enqueued;
+    SurfaceExtractionRuntime surface_extraction;
+    std::vector<std::int64_t> surface_cell_to_leaf_index;
+    std::vector<SurfaceRegion> surface_regions;
+    std::vector<RegionSurfaceBuffers> region_buffers;
+    std::atomic<std::size_t> pending_region_tasks{0U};
+    std::atomic<std::size_t> pruned_tiny_artifacts{0U};
+    bool surface_extraction_started = false;
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point surface_extraction_start_time;
+    std::chrono::steady_clock::time_point reextract_start_time;
+    std::atomic<bool> reextract_pass{false};
+    std::mutex result_mutex;
+};
+
+enum class PostRefineTaskNode : std::uint8_t {
+    kBuildExtractionView = 0U,
+    kComputeInsideClearance = 1U,
+    kErodeOccupiedSolid = 2U,
+    kComputeDistanceToEroded = 3U,
+    kDilateErodedSolid = 4U,
+    kProjectOpenedMaskToLeaves = 5U,
+    kFillOpenedCavities = 6U,
+    kPruneOpenedComponents = 7U,
+    kSuppressOpenedEdgeContacts = 8U,
+    kRegionExtractSurface = 9U,
+    kResolveOpenedSurfaceAmbiguities = 10U,
+    kReextractOpenedSurface = 11U,
+    kMergeSurfaceBuffers = 12U,
+    kCount = 13U,
+};
+
+inline constexpr std::size_t post_refine_task_node_count() {
+    return static_cast<std::size_t>(PostRefineTaskNode::kCount);
+}
+
+inline std::size_t post_refine_task_index(PostRefineTaskNode node) {
+    return static_cast<std::size_t>(node);
+}
+
+inline RefinementTaskKind post_refine_task_kind(PostRefineTaskNode node) {
+    switch (node) {
+        case PostRefineTaskNode::kBuildExtractionView:
+            return RefinementTaskKind::kBuildExtractionView;
+        case PostRefineTaskNode::kComputeInsideClearance:
+            return RefinementTaskKind::kComputeInsideClearance;
+        case PostRefineTaskNode::kErodeOccupiedSolid:
+            return RefinementTaskKind::kErodeOccupiedSolid;
+        case PostRefineTaskNode::kComputeDistanceToEroded:
+            return RefinementTaskKind::kComputeDistanceToEroded;
+        case PostRefineTaskNode::kDilateErodedSolid:
+            return RefinementTaskKind::kDilateErodedSolid;
+        case PostRefineTaskNode::kProjectOpenedMaskToLeaves:
+            return RefinementTaskKind::kProjectOpenedMaskToLeaves;
+        case PostRefineTaskNode::kFillOpenedCavities:
+            return RefinementTaskKind::kFillOpenedCavities;
+        case PostRefineTaskNode::kPruneOpenedComponents:
+            return RefinementTaskKind::kPruneOpenedComponents;
+        case PostRefineTaskNode::kSuppressOpenedEdgeContacts:
+            return RefinementTaskKind::kSuppressOpenedEdgeContacts;
+        case PostRefineTaskNode::kResolveOpenedSurfaceAmbiguities:
+            return RefinementTaskKind::kResolveOpenedSurfaceAmbiguities;
+        case PostRefineTaskNode::kReextractOpenedSurface:
+            return RefinementTaskKind::kReextractOpenedSurface;
+        case PostRefineTaskNode::kMergeSurfaceBuffers:
+            return RefinementTaskKind::kMergeSurfaceBuffers;
+        case PostRefineTaskNode::kRegionExtractSurface:
+            return RefinementTaskKind::kRegionExtractSurface;
+        case PostRefineTaskNode::kCount:
+            break;
+    }
+    return RefinementTaskKind::kBuildExtractionView;
+}
+
+inline void enqueue_post_refine_task(
+    RefinementWorkQueue &queue,
+    PostRefineTaskGraphRuntime &runtime,
+    PostRefineTaskNode node,
+    std::size_t cell_index,
+    std::uint32_t preferred_worker) {
+    const std::size_t node_index = post_refine_task_index(node);
+    if (node_index >= runtime.enqueued.size()) {
+        return;
+    }
+    if (runtime.enqueued[node_index] != 0U) {
+        return;
+    }
+    runtime.enqueued[node_index] = 1U;
+    queue.push(
+        {cell_index, 0U, 0U, post_refine_task_kind(node)},
+        preferred_worker);
+}
+
+inline void unlock_post_refine_task(
+    RefinementWorkQueue &queue,
+    PostRefineTaskGraphRuntime &runtime,
+    PostRefineTaskNode node,
+    std::size_t cell_index,
+    std::uint32_t preferred_worker) {
+    const std::size_t node_index = post_refine_task_index(node);
+    const std::uint32_t remaining = runtime.dependency_counts[node_index].fetch_sub(
+        1U, std::memory_order_acq_rel);
+    if (remaining == 1U) {
+        enqueue_post_refine_task(
+            queue, runtime, node, cell_index, preferred_worker);
+    }
+}
+
+inline void run_build_extraction_view_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.result.extraction_view = build_occupied_solid_extraction_view(
+        *runtime.all_cells,
+        *runtime.classification_cache,
+        std::move(runtime.initial_inside_mask_by_cell));
+}
+
+inline void run_compute_inside_clearance_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.clearance_by_cell = compute_inside_clearance_from_cell_mask(
+        *runtime.all_cells,
+        *runtime.classification_cache,
+        runtime.result.extraction_view.inside_mask_by_cell,
+        runtime.worker_count,
+        runtime.opening_radius);
+}
+
+inline void run_erode_occupied_solid_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.eroded_inside_by_cell = erode_occupied_solid_cells(
+        *runtime.all_cells,
+        runtime.result.extraction_view.inside_mask_by_cell,
+        runtime.clearance_by_cell,
+        runtime.opening_radius);
+    release_vector_memory(runtime.clearance_by_cell);
+    release_vector_memory(runtime.result.extraction_view.inside_mask_by_cell);
+}
+
+inline void run_compute_distance_to_eroded_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.dilation_distance_by_cell =
+        compute_distance_to_eroded_solid_from_cell_mask(
+            *runtime.all_cells,
+            *runtime.classification_cache,
+            runtime.eroded_inside_by_cell,
+            runtime.worker_count,
+            runtime.opening_radius);
+}
+
+inline void run_dilate_eroded_solid_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.opened_inside_by_cell = dilate_eroded_solid_cells(
+        *runtime.all_cells,
+        runtime.eroded_inside_by_cell,
+        runtime.dilation_distance_by_cell,
+        runtime.opening_radius);
+    release_vector_memory(runtime.eroded_inside_by_cell);
+    release_vector_memory(runtime.dilation_distance_by_cell);
+}
+
+inline void run_project_opened_mask_to_leaves_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.result.opened_inside = build_leaf_mask_from_cell_mask(
+        runtime.result.extraction_view.solid_leaves,
+        runtime.opened_inside_by_cell);
+    release_vector_memory(runtime.opened_inside_by_cell);
+    release_vector_memory(runtime.result.extraction_view.inside_mask);
+}
+
+inline void run_fill_opened_cavities_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    fill_small_opened_cavities(
+        runtime.result.extraction_view.solid_leaves,
+        runtime.result.opened_inside);
+}
+
+inline void run_prune_opened_components_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    prune_small_opened_components(
+        runtime.result.extraction_view.solid_leaves,
+        runtime.result.opened_inside);
+}
+
+inline void run_suppress_opened_edge_contacts_task(
+    PostRefineTaskGraphRuntime &runtime) {
+    suppress_opened_edge_contacts(
+        runtime.result.extraction_view.solid_leaves,
+        *runtime.all_cells,
+        *runtime.solid_spatial_index,
+        runtime.result.opened_inside);
+}
+
+inline void initialize_post_refine_task_graph(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.enqueued.assign(post_refine_task_node_count(), 0U);
+
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kBuildExtractionView)].store(0U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kComputeInsideClearance)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kErodeOccupiedSolid)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kComputeDistanceToEroded)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kDilateErodedSolid)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kProjectOpenedMaskToLeaves)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kFillOpenedCavities)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kPruneOpenedComponents)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kSuppressOpenedEdgeContacts)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kResolveOpenedSurfaceAmbiguities)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kReextractOpenedSurface)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kMergeSurfaceBuffers)].store(1U);
+    runtime.dependency_counts[post_refine_task_index(
+        PostRefineTaskNode::kRegionExtractSurface)].store(1U);
+}
+
+inline void prepare_post_refine_surface_extraction_runtime(
+    PostRefineTaskGraphRuntime &runtime) {
+    runtime.surface_extraction.solid_leaves =
+        &runtime.result.extraction_view.solid_leaves;
+    runtime.surface_extraction.opened_inside = &runtime.result.opened_inside;
+    runtime.surface_extraction.all_cells = runtime.all_cells;
+    runtime.surface_extraction.spatial_index = runtime.solid_spatial_index;
+    runtime.surface_extraction.domain = runtime.domain;
+    runtime.surface_extraction.base_resolution = runtime.base_resolution;
+    runtime.surface_extraction.max_depth = runtime.max_depth;
+    runtime.surface_extraction.fine_resolution =
+        runtime.base_resolution * (1U << runtime.max_depth);
+    runtime.surface_extraction.fine_dx =
+        (runtime.domain->max.x - runtime.domain->min.x) /
+        static_cast<double>(runtime.surface_extraction.fine_resolution);
+    runtime.surface_extraction.fine_dy =
+        (runtime.domain->max.y - runtime.domain->min.y) /
+        static_cast<double>(runtime.surface_extraction.fine_resolution);
+    runtime.surface_extraction.fine_dz =
+        (runtime.domain->max.z - runtime.domain->min.z) /
+        static_cast<double>(runtime.surface_extraction.fine_resolution);
+    runtime.surface_cell_to_leaf_index = build_opened_cell_to_leaf_index(
+        *runtime.all_cells,
+        runtime.result.extraction_view.solid_leaves);
+    runtime.surface_extraction.cell_to_leaf_index =
+        &runtime.surface_cell_to_leaf_index;
+    runtime.surface_regions = build_surface_regions(
+        runtime.result.extraction_view.solid_leaves,
+        *runtime.all_cells);
+    runtime.surface_extraction.regions = &runtime.surface_regions;
+    runtime.region_buffers.clear();
+    runtime.region_buffers.resize(runtime.surface_regions.size());
+    runtime.pending_region_tasks.store(
+        runtime.surface_regions.size(), std::memory_order_release);
+    runtime.pruned_tiny_artifacts.store(0U, std::memory_order_release);
+}
+
+inline PostRefineRegularizationResult run_post_refine_regularization_task_graph(
+    const std::vector<OctreeCell> &all_cells,
+    const OccupiedSolidClassificationCache &classification_cache,
+    const LeafSpatialIndex &solid_spatial_index,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution,
+    std::uint32_t max_depth,
+    std::uint32_t worker_count,
+    double opening_radius,
+    double table_cadence_seconds,
+    std::vector<std::uint8_t> initial_inside_mask_by_cell) {
+    if (worker_count == 0U) {
+        worker_count = 1U;
+    }
+
+    PostRefineTaskGraphRuntime runtime;
+    runtime.all_cells = &all_cells;
+    runtime.classification_cache = &classification_cache;
+    runtime.solid_spatial_index = &solid_spatial_index;
+    runtime.domain = &domain;
+    runtime.base_resolution = base_resolution;
+    runtime.max_depth = max_depth;
+    runtime.worker_count = worker_count;
+    runtime.opening_radius = opening_radius;
+    runtime.table_cadence_seconds = table_cadence_seconds;
+    runtime.initial_inside_mask_by_cell = std::move(initial_inside_mask_by_cell);
+    runtime.start_time = std::chrono::steady_clock::now();
+    initialize_post_refine_task_graph(runtime);
+
+    RefinementWorkQueue queue;
+    queue.initialize(worker_count);
+    enqueue_post_refine_task(
+        queue,
+        runtime,
+        PostRefineTaskNode::kBuildExtractionView,
+        0U,
+        0U);
+    queue.capture_initial_queue_size();
+
+    std::exception_ptr worker_error;
+    std::mutex error_mutex;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::uint32_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                try {
+                    switch (task.kind) {
+                        case RefinementTaskKind::kBuildExtractionView:
+                            run_build_extraction_view_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kComputeInsideClearance,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kComputeInsideClearance:
+                            run_compute_inside_clearance_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kErodeOccupiedSolid,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kErodeOccupiedSolid:
+                            run_erode_occupied_solid_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kComputeDistanceToEroded,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kComputeDistanceToEroded:
+                            run_compute_distance_to_eroded_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kDilateErodedSolid,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kDilateErodedSolid:
+                            run_dilate_eroded_solid_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kProjectOpenedMaskToLeaves,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kProjectOpenedMaskToLeaves:
+                            run_project_opened_mask_to_leaves_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kFillOpenedCavities,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kFillOpenedCavities:
+                            run_fill_opened_cavities_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kPruneOpenedComponents,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kPruneOpenedComponents:
+                            run_prune_opened_components_task(runtime);
+                            unlock_post_refine_task(
+                                queue,
+                                runtime,
+                                PostRefineTaskNode::kSuppressOpenedEdgeContacts,
+                                0U,
+                                worker_id);
+                            break;
+                        case RefinementTaskKind::kSuppressOpenedEdgeContacts:
+                            run_suppress_opened_edge_contacts_task(runtime);
+                            if (!runtime.surface_extraction_started) {
+                                runtime.surface_extraction_started = true;
+                                runtime.surface_extraction_start_time =
+                                    std::chrono::steady_clock::now();
+                            }
+                            prepare_post_refine_surface_extraction_runtime(runtime);
+                            if (runtime.surface_regions.empty()) {
+                                runtime.result.opened_surface = {};
+                                unlock_post_refine_task(
+                                    queue,
+                                    runtime,
+                                    PostRefineTaskNode::kResolveOpenedSurfaceAmbiguities,
+                                    0U,
+                                    worker_id);
+                                break;
+                            }
+                            for (std::size_t region_id = 0;
+                                 region_id < runtime.surface_regions.size();
+                                 ++region_id) {
+                                queue.push(
+                                    {
+                                        region_id,
+                                        0U,
+                                        0U,
+                                        RefinementTaskKind::kRegionExtractSurface,
+                                    },
+                                    static_cast<std::uint32_t>(region_id %
+                                                               runtime.worker_count));
+                            }
+                            runtime.enqueued[post_refine_task_index(
+                                PostRefineTaskNode::kRegionExtractSurface)] = 1U;
+                            break;
+                        case RefinementTaskKind::kRegionExtractSurface: {
+                            const std::size_t region_id = task.cell_index;
+                            run_region_extract_surface_task(
+                                region_id,
+                                runtime.surface_extraction,
+                                runtime.region_buffers[region_id]);
+                            runtime.pruned_tiny_artifacts.fetch_add(
+                                prune_tiny_opened_surface_artifacts(
+                                    runtime.region_buffers[region_id]),
+                                std::memory_order_relaxed);
+                            if (runtime.pending_region_tasks.fetch_sub(
+                                    1U,
+                                    std::memory_order_acq_rel) == 1U) {
+                                enqueue_post_refine_task(
+                                    queue,
+                                    runtime,
+                                    PostRefineTaskNode::kMergeSurfaceBuffers,
+                                    0U,
+                                    0U);
+                            }
+                            break;
+                        }
+                        case RefinementTaskKind::kMergeSurfaceBuffers: {
+                            runtime.result.opened_surface =
+                                merge_region_surface_buffers(runtime.region_buffers);
+                            const auto merge_finish_time =
+                                std::chrono::steady_clock::now();
+                            if (runtime.pruned_tiny_artifacts.load(
+                                    std::memory_order_acquire) > 0U) {
+                                meshmerizer_log_detail::print_status(
+                                    "Regularization",
+                                    "prune_tiny_opened_surface_artifacts",
+                                    "removed %zu tiny opened-surface artifact component(s)\n",
+                                    runtime.pruned_tiny_artifacts.load(
+                                        std::memory_order_relaxed));
+                            }
+                            if (runtime.reextract_pass.load(
+                                    std::memory_order_acquire)) {
+                                runtime.result.opened_surface_reextract_seconds =
+                                    std::chrono::duration<double>(
+                                        merge_finish_time -
+                                        runtime.reextract_start_time)
+                                        .count();
+                                runtime.reextract_pass.store(
+                                    false, std::memory_order_release);
+                            } else {
+                                runtime.result.opened_surface_pass1_seconds =
+                                    std::chrono::duration<double>(
+                                        merge_finish_time -
+                                        runtime.surface_extraction_start_time)
+                                        .count();
+                                unlock_post_refine_task(
+                                    queue,
+                                    runtime,
+                                    PostRefineTaskNode::kResolveOpenedSurfaceAmbiguities,
+                                    0U,
+                                    worker_id);
+                            }
+                            break;
+                        }
+                        case RefinementTaskKind::kResolveOpenedSurfaceAmbiguities: {
+                            const auto ambiguity_start =
+                                std::chrono::steady_clock::now();
+                            if (resolve_opened_edge_ambiguities(
+                                    runtime.result.extraction_view.solid_leaves,
+                                    *runtime.all_cells,
+                                    *runtime.solid_spatial_index,
+                                    runtime.surface_cell_to_leaf_index,
+                                    runtime.result.opened_inside,
+                                    runtime.result.opened_surface)) {
+                                enqueue_post_refine_task(
+                                    queue,
+                                    runtime,
+                                    PostRefineTaskNode::kReextractOpenedSurface,
+                                    0U,
+                                    worker_id);
+                            }
+                            runtime.result.opened_surface_ambiguity_seconds +=
+                                std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() -
+                                    ambiguity_start)
+                                    .count();
+                            break;
+                        }
+                        case RefinementTaskKind::kReextractOpenedSurface:
+                            runtime.reextract_pass.store(
+                                true,
+                                std::memory_order_release);
+                            runtime.reextract_start_time =
+                                std::chrono::steady_clock::now();
+                            prepare_post_refine_surface_extraction_runtime(runtime);
+                            runtime.enqueued[post_refine_task_index(
+                                PostRefineTaskNode::kMergeSurfaceBuffers)] = 0U;
+                            for (std::size_t region_id = 0;
+                                 region_id < runtime.surface_regions.size();
+                                 ++region_id) {
+                                queue.push(
+                                    {
+                                        region_id,
+                                        0U,
+                                        0U,
+                                        RefinementTaskKind::kRegionExtractSurface,
+                                    },
+                                    static_cast<std::uint32_t>(region_id %
+                                                               runtime.worker_count));
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (worker_error == nullptr) {
+                        worker_error = std::current_exception();
+                    }
+                    queue.task_done();
+                    queue.shutdown();
+                    return;
+                }
+                queue.task_done();
+                queue.try_shutdown_if_idle();
+            }
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    if (worker_error != nullptr) {
+        std::rethrow_exception(worker_error);
+    }
+
+    const auto finish_time = std::chrono::steady_clock::now();
+    if (runtime.surface_extraction_started) {
+        runtime.result.morphology_seconds = std::chrono::duration<double>(
+            runtime.surface_extraction_start_time - runtime.start_time)
+                                                .count();
+        runtime.result.opened_surface_extraction_seconds =
+            std::chrono::duration<double>(
+                finish_time - runtime.surface_extraction_start_time)
+                .count();
+    } else {
+        runtime.result.morphology_seconds =
+            std::chrono::duration<double>(finish_time - runtime.start_time)
+                .count();
+        runtime.result.opened_surface_extraction_seconds = 0.0;
+    }
+
+    return std::move(runtime.result);
+}
+
+inline bool surface_region_contains_cell(
+    const std::vector<OctreeCell> &all_cells,
+    std::size_t root_cell_index,
+    std::size_t cell_index) {
+    if (root_cell_index >= all_cells.size() || cell_index >= all_cells.size()) {
+        return false;
+    }
+    std::size_t current = cell_index;
+    while (true) {
+        if (current == root_cell_index) {
+            return true;
+        }
+        const std::int32_t parent = all_cells[current].parent_index;
+        if (parent < 0) {
+            return false;
+        }
+        current = static_cast<std::size_t>(parent);
+    }
+}
+
+inline std::vector<SurfaceRegion> build_surface_regions(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<OctreeCell> &all_cells) {
+    std::unordered_map<std::size_t, std::size_t> region_lookup;
+    std::vector<SurfaceRegion> regions;
+    region_lookup.reserve(solid_leaves.size());
+
+    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
+        std::size_t root_cell_index = solid_leaves[leaf_index].cell_index;
+        while (root_cell_index < all_cells.size() &&
+               all_cells[root_cell_index].parent_index >= 0) {
+            root_cell_index = static_cast<std::size_t>(
+                all_cells[root_cell_index].parent_index);
+        }
+
+        auto it = region_lookup.find(root_cell_index);
+        if (it == region_lookup.end()) {
+            const std::size_t region_id = regions.size();
+            region_lookup[root_cell_index] = region_id;
+            regions.push_back({
+                region_id,
+                root_cell_index,
+                all_cells[root_cell_index].depth,
+                {leaf_index},
+            });
+            continue;
+        }
+
+        SurfaceRegion &region = regions[it->second];
+        region.leaf_indices.push_back(leaf_index);
+    }
+
+    return regions;
+}
+
+inline std::size_t region_vertex_index_for(
+    const SurfaceExtractionRuntime &runtime,
+    RegionSurfaceBuffers &buffers,
+    std::uint32_t ix,
+    std::uint32_t iy,
+    std::uint32_t iz) {
+    const std::uint64_t key = pack_surface_corner_coords(ix, iy, iz);
+    auto existing = buffers.local_vertex_lookup.find(key);
+    if (existing != buffers.local_vertex_lookup.end()) {
+        return existing->second;
+    }
+
+    const Vector3d position = {
+        runtime.domain->min.x + static_cast<double>(ix) * runtime.fine_dx,
+        runtime.domain->min.y + static_cast<double>(iy) * runtime.fine_dy,
+        runtime.domain->min.z + static_cast<double>(iz) * runtime.fine_dz,
+    };
+    const std::size_t vertex_index = buffers.local_vertices.size();
+    buffers.local_vertices.push_back({key, position, {0.0, 0.0, 0.0}});
+    buffers.local_vertex_lookup.emplace(key, vertex_index);
+    return vertex_index;
+}
+
+inline void append_region_oriented_quad(
+    RegionSurfaceBuffers &buffers,
+    const std::array<Vector3d, 4> &positions,
+    const std::array<std::size_t, 4> &indices,
+    const Vector3d &outward) {
+    const Vector3d e1 = {
+        positions[1].x - positions[0].x,
+        positions[1].y - positions[0].y,
+        positions[1].z - positions[0].z,
+    };
+    const Vector3d e2 = {
+        positions[2].x - positions[0].x,
+        positions[2].y - positions[0].y,
+        positions[2].z - positions[0].z,
+    };
+    const Vector3d cross = {
+        e1.y * e2.z - e1.z * e2.y,
+        e1.z * e2.x - e1.x * e2.z,
+        e1.x * e2.y - e1.y * e2.x,
+    };
+    const double alignment =
+        cross.x * outward.x + cross.y * outward.y + cross.z * outward.z;
+
+    std::array<std::size_t, 4> oriented = indices;
+    if (alignment < 0.0) {
+        oriented = {indices[0], indices[3], indices[2], indices[1]};
+    }
+
+    buffers.local_triangles.push_back(
+        {{oriented[0], oriented[1], oriented[2]}});
+    buffers.local_triangles.push_back(
+        {{oriented[0], oriented[2], oriented[3]}});
+
+    for (std::size_t vertex_index : oriented) {
+        buffers.local_vertices[vertex_index].normal_sum.x += outward.x;
+        buffers.local_vertices[vertex_index].normal_sum.y += outward.y;
+        buffers.local_vertices[vertex_index].normal_sum.z += outward.z;
+    }
+}
+
+inline void emit_region_opened_surface(
+    const SurfaceRegion &region,
+    const SurfaceExtractionRuntime &runtime,
+    RegionSurfaceBuffers &buffers) {
+    const std::vector<OccupiedSolidLeaf> &solid_leaves = *runtime.solid_leaves;
+    const std::vector<std::uint8_t> &opened_inside = *runtime.opened_inside;
+    const std::vector<OctreeCell> &all_cells = *runtime.all_cells;
+    const LeafSpatialIndex &spatial_index = *runtime.spatial_index;
+    const std::vector<std::int64_t> &cell_to_leaf_index =
+        *runtime.cell_to_leaf_index;
+
+    for (std::size_t leaf_index : region.leaf_indices) {
+        if (opened_inside[leaf_index] == 0U) {
+            continue;
+        }
+
+        const std::size_t cell_index = solid_leaves[leaf_index].cell_index;
+        std::uint32_t cell_x = 0U;
+        std::uint32_t cell_y = 0U;
+        std::uint32_t cell_z = 0U;
+        const OctreeCell &cell = all_cells[cell_index];
+        morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
+        const std::uint32_t span = 1U << (runtime.max_depth - cell.depth);
+        const std::uint32_t ix0 = cell_x << (runtime.max_depth - cell.depth);
+        const std::uint32_t iy0 = cell_y << (runtime.max_depth - cell.depth);
+        const std::uint32_t iz0 = cell_z << (runtime.max_depth - cell.depth);
+
+        const auto neighbor_opened = [&](std::int64_t neighbor_cell_index) {
+            if (neighbor_cell_index < 0) {
+                return false;
+            }
+            return opened_inside[static_cast<std::size_t>(neighbor_cell_index)] != 0U;
+        };
+        auto lookup_neighbor = [&](std::uint32_t qx,
+                                   std::uint32_t qy,
+                                   std::uint32_t qz) {
+            if (qx >= runtime.fine_resolution ||
+                qy >= runtime.fine_resolution ||
+                qz >= runtime.fine_resolution) {
+                return false;
+            }
+            const std::size_t neighbor_cell_index =
+                spatial_index.find_leaf_at(qx, qy, qz);
+            if (neighbor_cell_index == SIZE_MAX ||
+                neighbor_cell_index >= cell_to_leaf_index.size()) {
+                return false;
+            }
+            return neighbor_opened(cell_to_leaf_index[neighbor_cell_index]);
+        };
+
+        for (std::uint32_t u = 0; u < span; ++u) {
+            for (std::uint32_t v = 0; v < span; ++v) {
+                if (ix0 == 0U || !lookup_neighbor(ix0 - 1U, iy0 + u, iz0 + v)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0, iy0 + u, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0, iy0 + u + 1U, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0, iy0 + u + 1U, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0, iy0 + u, iz0 + v + 1U),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {-1.0, 0.0, 0.0});
+                }
+                if (ix0 + span >= runtime.fine_resolution ||
+                    !lookup_neighbor(ix0 + span, iy0 + u, iz0 + v)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0 + span, iy0 + u, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0 + span, iy0 + u, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0 + span, iy0 + u + 1U, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0 + span, iy0 + u + 1U, iz0 + v),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {1.0, 0.0, 0.0});
+                }
+                if (iy0 == 0U || !lookup_neighbor(ix0 + u, iy0 - 1U, iz0 + v)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0, iz0 + v),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {0.0, -1.0, 0.0});
+                }
+                if (iy0 + span >= runtime.fine_resolution ||
+                    !lookup_neighbor(ix0 + u, iy0 + span, iz0 + v)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + span, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + span, iz0 + v),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + span, iz0 + v + 1U),
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + span, iz0 + v + 1U),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {0.0, 1.0, 0.0});
+                }
+                if (iz0 == 0U || !lookup_neighbor(ix0 + u, iy0 + v, iz0 - 1U)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + v, iz0),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + v, iz0),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + v + 1U, iz0),
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + v + 1U, iz0),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {0.0, 0.0, -1.0});
+                }
+                if (iz0 + span >= runtime.fine_resolution ||
+                    !lookup_neighbor(ix0 + u, iy0 + v, iz0 + span)) {
+                    const std::array<std::size_t, 4> ids = {
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + v, iz0 + span),
+                        region_vertex_index_for(runtime, buffers, ix0 + u, iy0 + v + 1U, iz0 + span),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + v + 1U, iz0 + span),
+                        region_vertex_index_for(runtime, buffers, ix0 + u + 1U, iy0 + v, iz0 + span),
+                    };
+                    const std::array<Vector3d, 4> pos = {
+                        buffers.local_vertices[ids[0]].position,
+                        buffers.local_vertices[ids[1]].position,
+                        buffers.local_vertices[ids[2]].position,
+                        buffers.local_vertices[ids[3]].position,
+                    };
+                    append_region_oriented_quad(buffers, pos, ids, {0.0, 0.0, 1.0});
+                }
+            }
+        }
+    }
+}
+
+inline void run_region_extract_surface_task(
+    std::size_t region_id,
+    const SurfaceExtractionRuntime &runtime,
+    RegionSurfaceBuffers &out_buffers) {
+    out_buffers.region_id = region_id;
+    out_buffers.local_vertices.clear();
+    out_buffers.local_triangles.clear();
+    out_buffers.local_vertex_lookup.clear();
+    emit_region_opened_surface(runtime.regions->at(region_id), runtime, out_buffers);
+}
+
+inline OpenedSurfaceMesh merge_region_surface_buffers(
+    std::vector<RegionSurfaceBuffers> &region_buffers) {
+    OpenedSurfaceMesh mesh;
+    std::unordered_map<std::uint64_t, std::size_t> vertex_lookup;
+    std::vector<Vector3d> normal_accum;
+
+    std::size_t vertex_capacity = 0U;
+    std::size_t triangle_capacity = 0U;
+    for (const RegionSurfaceBuffers &buffer : region_buffers) {
+        vertex_capacity += buffer.local_vertices.size();
+        triangle_capacity += buffer.local_triangles.size();
+    }
+    vertex_lookup.reserve(vertex_capacity);
+    mesh.triangles.reserve(triangle_capacity);
+
+    for (const RegionSurfaceBuffers &buffer : region_buffers) {
+        std::vector<std::size_t> local_to_global(buffer.local_vertices.size(), 0U);
+        for (std::size_t i = 0; i < buffer.local_vertices.size(); ++i) {
+            const RegionSurfaceVertex &vertex = buffer.local_vertices[i];
+            auto existing = vertex_lookup.find(vertex.key);
+            if (existing == vertex_lookup.end()) {
+                const std::size_t global_index = mesh.vertices.size();
+                mesh.vertices.push_back({vertex.position, {0.0, 0.0, 0.0}});
+                mesh.vertex_keys.push_back(vertex.key);
+                normal_accum.push_back(vertex.normal_sum);
+                vertex_lookup.emplace(vertex.key, global_index);
+                local_to_global[i] = global_index;
+            } else {
+                local_to_global[i] = existing->second;
+                normal_accum[existing->second].x += vertex.normal_sum.x;
+                normal_accum[existing->second].y += vertex.normal_sum.y;
+                normal_accum[existing->second].z += vertex.normal_sum.z;
+            }
+        }
+
+        for (const RegionSurfaceTriangle &triangle : buffer.local_triangles) {
+            mesh.triangles.push_back({
+                local_to_global[triangle.local_vertex_index[0]],
+                local_to_global[triangle.local_vertex_index[1]],
+                local_to_global[triangle.local_vertex_index[2]],
+            });
+        }
+    }
+
+    for (RegionSurfaceBuffers &buffer : region_buffers) {
+        release_vector_memory(buffer.local_vertices);
+        release_vector_memory(buffer.local_triangles);
+        buffer.local_vertex_lookup.clear();
+        buffer.local_vertex_lookup.rehash(0U);
+    }
+
+    auto reorder_by_old_to_new = [](auto &values,
+                                    const std::vector<std::size_t> &old_to_new) {
+        std::vector<std::uint8_t> visited(values.size(), 0U);
+        for (std::size_t start = 0; start < values.size(); ++start) {
+            if (visited[start] != 0U || old_to_new[start] == start) {
+                visited[start] = 1U;
+                continue;
+            }
+            std::size_t current = start;
+            auto displaced = std::move(values[current]);
+            while (true) {
+                visited[current] = 1U;
+                const std::size_t next = old_to_new[current];
+                if (next == start) {
+                    values[next] = std::move(displaced);
+                    break;
+                }
+                std::swap(displaced, values[next]);
+                current = next;
+            }
+        }
+    };
+
+    std::vector<std::size_t> order(mesh.vertices.size(), 0U);
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return mesh.vertex_keys[a] < mesh.vertex_keys[b];
+    });
+
+    std::vector<std::size_t> old_to_new(order.size(), 0U);
+    for (std::size_t new_index = 0; new_index < order.size(); ++new_index) {
+        const std::size_t old_index = order[new_index];
+        old_to_new[old_index] = new_index;
+    }
+    reorder_by_old_to_new(mesh.vertices, old_to_new);
+    reorder_by_old_to_new(mesh.vertex_keys, old_to_new);
+    reorder_by_old_to_new(normal_accum, old_to_new);
+    release_vector_memory(order);
+
+    for (MeshTriangle &triangle : mesh.triangles) {
+        triangle.vertex_indices[0] = old_to_new[triangle.vertex_indices[0]];
+        triangle.vertex_indices[1] = old_to_new[triangle.vertex_indices[1]];
+        triangle.vertex_indices[2] = old_to_new[triangle.vertex_indices[2]];
+    }
+    release_vector_memory(old_to_new);
+
+    for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
+        const double mag = std::sqrt(
+            normal_accum[i].x * normal_accum[i].x +
+            normal_accum[i].y * normal_accum[i].y +
+            normal_accum[i].z * normal_accum[i].z);
+        if (mag > 0.0) {
+            mesh.vertices[i].normal = {
+                normal_accum[i].x / mag,
+                normal_accum[i].y / mag,
+                normal_accum[i].z / mag,
+            };
+        }
+    }
+    release_vector_memory(normal_accum);
+    return mesh;
+}
+
+inline void run_merge_surface_buffers_task(
+    SurfaceTaskGraphRuntime &runtime,
+    OpenedSurfaceMesh &out_mesh) {
+    out_mesh = merge_region_surface_buffers(runtime.region_buffers);
+}
+
+inline OpenedSurfaceMesh run_opened_surface_task_graph(
+    const std::vector<OccupiedSolidLeaf> &solid_leaves,
+    const std::vector<std::uint8_t> &opened_inside,
+    const std::vector<OctreeCell> &all_cells,
+    const LeafSpatialIndex &spatial_index,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution,
+    std::uint32_t max_depth,
+    std::uint32_t worker_count,
+    double table_cadence_seconds) {
+    if (worker_count == 0U) {
+        worker_count = 1U;
+    }
+
+    SurfaceTaskGraphRuntime runtime;
+    runtime.extraction.solid_leaves = &solid_leaves;
+    runtime.extraction.opened_inside = &opened_inside;
+    runtime.extraction.all_cells = &all_cells;
+    runtime.extraction.spatial_index = &spatial_index;
+    runtime.extraction.domain = &domain;
+    runtime.extraction.cell_to_leaf_index = nullptr;
+    runtime.extraction.base_resolution = base_resolution;
+    runtime.extraction.max_depth = max_depth;
+    runtime.extraction.fine_resolution = base_resolution * (1U << max_depth);
+    runtime.extraction.fine_dx =
+        (domain.max.x - domain.min.x) /
+        static_cast<double>(runtime.extraction.fine_resolution);
+    runtime.extraction.fine_dy =
+        (domain.max.y - domain.min.y) /
+        static_cast<double>(runtime.extraction.fine_resolution);
+    runtime.extraction.fine_dz =
+        (domain.max.z - domain.min.z) /
+        static_cast<double>(runtime.extraction.fine_resolution);
+
+    const std::vector<std::int64_t> cell_to_leaf_index =
+        build_opened_cell_to_leaf_index(all_cells, solid_leaves);
+    runtime.extraction.cell_to_leaf_index = &cell_to_leaf_index;
+
+    const std::vector<SurfaceRegion> regions =
+        build_surface_regions(solid_leaves, all_cells);
+    runtime.extraction.regions = &regions;
+    runtime.region_buffers.resize(regions.size());
+    runtime.pruned_tiny_artifacts.store(0U, std::memory_order_relaxed);
+    runtime.graph.pending_region_tasks.store(regions.size(), std::memory_order_relaxed);
+
+    if (regions.empty()) {
+        return {};
+    }
+
+    RefinementWorkQueue queue;
+    queue.initialize(worker_count);
+    for (std::size_t region_id = 0; region_id < regions.size(); ++region_id) {
+        queue.push(
+            {region_id, 0U, 0U, RefinementTaskKind::kRegionExtractSurface},
+            static_cast<std::uint32_t>(region_id % worker_count));
+    }
+    queue.capture_initial_queue_size();
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::uint32_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+            RefinementTask task;
+            while (queue.pop(worker_id, task)) {
+                switch (task.kind) {
+                    case RefinementTaskKind::kRegionExtractSurface: {
+                        const std::size_t region_id = task.cell_index;
+                        run_region_extract_surface_task(
+                            region_id,
+                            runtime.extraction,
+                            runtime.region_buffers[region_id]);
+                        runtime.pruned_tiny_artifacts.fetch_add(
+                            prune_tiny_opened_surface_artifacts(
+                                runtime.region_buffers[region_id]),
+                            std::memory_order_relaxed);
+                        if (runtime.graph.pending_region_tasks.fetch_sub(
+                                1U, std::memory_order_acq_rel) == 1U) {
+                            bool expected = false;
+                            if (runtime.graph.merge_enqueued.compare_exchange_strong(
+                                    expected,
+                                    true,
+                                    std::memory_order_acq_rel)) {
+                                queue.push(
+                                    {0U, 0U, 0U, RefinementTaskKind::kMergeSurfaceBuffers},
+                                    0U);
+                            }
+                        }
+                        break;
+                    }
+                    case RefinementTaskKind::kMergeSurfaceBuffers: {
+                        OpenedSurfaceMesh merged;
+                        run_merge_surface_buffers_task(runtime, merged);
+                        if (runtime.pruned_tiny_artifacts.load(
+                                std::memory_order_acquire) > 0U) {
+                            meshmerizer_log_detail::print_status(
+                                "Regularization",
+                                "prune_tiny_opened_surface_artifacts",
+                                "removed %zu tiny opened-surface artifact component(s)\n",
+                                runtime.pruned_tiny_artifacts.load(
+                                    std::memory_order_relaxed));
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(runtime.merged_mesh_mutex);
+                            runtime.merged_mesh = std::move(merged);
+                        }
+                        runtime.graph.merge_completed.store(true, std::memory_order_release);
+                        break;
+                    }
+                    default:
+                        break;
+                }
+                queue.task_done();
+                if (queue.try_claim_report(table_cadence_seconds)) {
+                    const RefinementWorkQueueStats stats = queue.stats();
+                    meshmerizer_log_detail::print_debug_status(
+                        "Meshing",
+                        "run_opened_surface_task_graph",
+                        "scheduler: queue=%zu inflight=%zu pushed=%zu popped=%zu\n",
+                        stats.queue_size,
+                        stats.in_flight_count,
+                        stats.push_count,
+                        stats.pop_count);
+                }
+                queue.try_shutdown_if_idle();
+            }
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+
+    return runtime.merged_mesh;
+}
 
 struct CornerVote {
     std::uint32_t inside = 0U;
@@ -1735,30 +3848,32 @@ inline bool resolve_opened_edge_ambiguities(
     const std::vector<OccupiedSolidLeaf> &solid_leaves,
     const std::vector<OctreeCell> &all_cells,
     const LeafSpatialIndex &spatial_index,
+    const std::vector<std::int64_t> &cell_to_leaf_index,
     std::vector<std::uint8_t> &opened_inside,
     const OpenedSurfaceMesh &mesh) {
     struct EdgeKey {
-        std::size_t a;
-        std::size_t b;
+        std::uint64_t base_key;
+        std::uint8_t axis;
 
         bool operator==(const EdgeKey &other) const {
-            return a == other.a && b == other.b;
+            return base_key == other.base_key && axis == other.axis;
         }
     };
     struct EdgeKeyHash {
         std::size_t operator()(const EdgeKey &key) const {
-            std::size_t h = key.a;
-            h ^= key.b + 0x9e3779b9ULL + (h << 6U) + (h >> 2U);
+            std::size_t h = static_cast<std::size_t>(key.base_key);
+            h ^= static_cast<std::size_t>(key.axis) + 0x9e3779b9ULL +
+                 (h << 6U) + (h >> 2U);
             return h;
         }
     };
+    constexpr std::uint64_t X_EDGE_DELTA = 1ULL << 42U;
+    constexpr std::uint64_t Y_EDGE_DELTA = 1ULL << 21U;
+    constexpr std::uint64_t Z_EDGE_DELTA = 1ULL;
 
     if (mesh.triangles.empty() || mesh.vertex_keys.size() != mesh.vertices.size()) {
         return false;
     }
-
-    const std::vector<std::int64_t> cell_to_leaf_index =
-        build_opened_cell_to_leaf_index(all_cells, solid_leaves);
 
     auto lookup_leaf = [&](std::int64_t qx,
                            std::int64_t qy,
@@ -1789,18 +3904,34 @@ inline bool resolve_opened_edge_ambiguities(
 
     std::unordered_map<EdgeKey, std::uint32_t, EdgeKeyHash> edge_counts;
     edge_counts.reserve(mesh.triangles.size() * 2U);
-    ProgressCounter edge_counter(
+    MESHMERIZER_PROGRESS_COUNTER(edge_counter,
         "Regularization", "resolve_opened_edge_ambiguities", "triangles", 1000);
     for (const MeshTriangle &triangle : mesh.triangles) {
-        edge_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(edge_counter);
         for (std::size_t i = 0; i < 3U; ++i) {
             const std::size_t v0 = triangle.vertex_indices[i];
             const std::size_t v1 = triangle.vertex_indices[(i + 1U) % 3U];
-            EdgeKey key{std::min(v0, v1), std::max(v0, v1)};
+            const std::uint64_t key0 = mesh.vertex_keys[v0];
+            const std::uint64_t key1 = mesh.vertex_keys[v1];
+            const std::uint64_t lower_key = std::min(key0, key1);
+            const std::uint64_t delta = std::max(key0, key1) - lower_key;
+
+            std::uint8_t axis = 0U;
+            if (delta == X_EDGE_DELTA) {
+                axis = 0U;
+            } else if (delta == Y_EDGE_DELTA) {
+                axis = 1U;
+            } else if (delta == Z_EDGE_DELTA) {
+                axis = 2U;
+            } else {
+                continue;
+            }
+
+            EdgeKey key{lower_key, axis};
             ++edge_counts[key];
         }
     }
-    edge_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(edge_counter);
 
     struct CandidateFill {
         std::size_t leaf_index;
@@ -1810,40 +3941,25 @@ inline bool resolve_opened_edge_ambiguities(
 
     std::vector<CandidateFill> fills;
     fills.reserve(16U);
-    ProgressCounter resolve_counter(
+    MESHMERIZER_PROGRESS_COUNTER(resolve_counter,
         "Regularization", "resolve_opened_edge_ambiguities", "edges", 100);
 
     for (const auto &entry : edge_counts) {
         if (entry.second <= 2U) {
             continue;
         }
-        resolve_counter.tick();
+        MESHMERIZER_PROGRESS_TICK(resolve_counter);
 
-        std::uint32_t ax, ay, az, bx, by, bz;
-        unpack_surface_corner_coords(mesh.vertex_keys[entry.first.a], ax, ay, az);
-        unpack_surface_corner_coords(mesh.vertex_keys[entry.first.b], bx, by, bz);
-
-        int axis = -1;
-        std::uint32_t gx = std::min(ax, bx);
-        std::uint32_t gy = std::min(ay, by);
-        std::uint32_t gz = std::min(az, bz);
-        if (ax != bx && ay == by && az == bz) {
-            axis = 0;
-        } else if (ax == bx && ay != by && az == bz) {
-            axis = 1;
-        } else if (ax == bx && ay == by && az != bz) {
-            axis = 2;
-        } else {
-            continue;
-        }
+        std::uint32_t gx, gy, gz;
+        unpack_surface_corner_coords(entry.first.base_key, gx, gy, gz);
 
         std::array<std::array<std::int64_t, 3>, 4> voxels;
-        if (axis == 0) {
+        if (entry.first.axis == 0U) {
             voxels = {{{static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy) - 1, static_cast<std::int64_t>(gz) - 1},
                        {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz) - 1},
                        {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy) - 1, static_cast<std::int64_t>(gz)},
                        {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz)}}};
-        } else if (axis == 1) {
+        } else if (entry.first.axis == 1U) {
             voxels = {{{static_cast<std::int64_t>(gx) - 1, static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz) - 1},
                        {static_cast<std::int64_t>(gx), static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz) - 1},
                        {static_cast<std::int64_t>(gx) - 1, static_cast<std::int64_t>(gy), static_cast<std::int64_t>(gz)},
@@ -1905,7 +4021,7 @@ inline bool resolve_opened_edge_ambiguities(
             fills.push_back(best);
         }
     }
-    resolve_counter.finish();
+    MESHMERIZER_PROGRESS_FINISH(resolve_counter);
 
     if (fills.empty()) {
         return false;
@@ -1947,253 +4063,19 @@ inline OpenedSurfaceMesh generate_opened_surface_mesh(
     const LeafSpatialIndex &spatial_index,
     const BoundingBox &domain,
     std::uint32_t base_resolution,
-    std::uint32_t max_depth) {
-    OpenedSurfaceMesh mesh;
-    std::unordered_map<std::uint64_t, std::size_t> vertex_lookup;
-    std::vector<Vector3d> normal_accum;
-    vertex_lookup.reserve(solid_leaves.size() * 8U);
-    ProgressCounter surface_counter(
-        "Meshing", "generate_opened_surface_mesh", "leaves", 1000);
-
-    const std::uint32_t fine_resolution =
-        base_resolution * (1U << max_depth);
-    const double fine_dx =
-        (domain.max.x - domain.min.x) / static_cast<double>(fine_resolution);
-    const double fine_dy =
-        (domain.max.y - domain.min.y) / static_cast<double>(fine_resolution);
-    const double fine_dz =
-        (domain.max.z - domain.min.z) / static_cast<double>(fine_resolution);
-
-    std::vector<std::int64_t> cell_to_leaf_index(all_cells.size(), -1);
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        cell_to_leaf_index[solid_leaves[leaf_index].cell_index] =
-            static_cast<std::int64_t>(leaf_index);
-    }
-
-    const auto vertex_index_for = [&](std::uint32_t ix, std::uint32_t iy,
-                                      std::uint32_t iz) {
-        const std::uint64_t key = pack_surface_corner_coords(ix, iy, iz);
-        auto it = vertex_lookup.find(key);
-        if (it != vertex_lookup.end()) {
-            return it->second;
-        }
-        const Vector3d position = {
-            domain.min.x + static_cast<double>(ix) * fine_dx,
-            domain.min.y + static_cast<double>(iy) * fine_dy,
-            domain.min.z + static_cast<double>(iz) * fine_dz,
-        };
-        const std::size_t index = mesh.vertices.size();
-        mesh.vertices.push_back({position, {0.0, 0.0, 0.0}});
-        mesh.vertex_keys.push_back(key);
-        normal_accum.push_back({0.0, 0.0, 0.0});
-        vertex_lookup[key] = index;
-        return index;
-    };
-
-    const auto emit_oriented_quad = [&](const std::array<Vector3d, 4> &positions,
-                                        const std::array<std::size_t, 4> &indices,
-                                        const Vector3d &outward) {
-        const Vector3d e1 = {
-            positions[1].x - positions[0].x,
-            positions[1].y - positions[0].y,
-            positions[1].z - positions[0].z,
-        };
-        const Vector3d e2 = {
-            positions[2].x - positions[0].x,
-            positions[2].y - positions[0].y,
-            positions[2].z - positions[0].z,
-        };
-        const Vector3d cross = {
-            e1.y * e2.z - e1.z * e2.y,
-            e1.z * e2.x - e1.x * e2.z,
-            e1.x * e2.y - e1.y * e2.x,
-        };
-        const double alignment =
-            cross.x * outward.x + cross.y * outward.y + cross.z * outward.z;
-
-        std::array<std::size_t, 4> oriented = indices;
-        if (alignment < 0.0) {
-            oriented = {indices[0], indices[3], indices[2], indices[1]};
-        }
-
-        mesh.triangles.push_back({
-            static_cast<std::uint32_t>(oriented[0]),
-            static_cast<std::uint32_t>(oriented[1]),
-            static_cast<std::uint32_t>(oriented[2]),
-        });
-        mesh.triangles.push_back({
-            static_cast<std::uint32_t>(oriented[0]),
-            static_cast<std::uint32_t>(oriented[2]),
-            static_cast<std::uint32_t>(oriented[3]),
-        });
-
-        for (std::size_t vertex_index : oriented) {
-            normal_accum[vertex_index].x += outward.x;
-            normal_accum[vertex_index].y += outward.y;
-            normal_accum[vertex_index].z += outward.z;
-        }
-    };
-
-    for (std::size_t leaf_index = 0; leaf_index < solid_leaves.size(); ++leaf_index) {
-        surface_counter.tick();
-        if (opened_inside[leaf_index] == 0U) {
-            continue;
-        }
-
-        std::uint32_t cell_x = 0U;
-        std::uint32_t cell_y = 0U;
-        std::uint32_t cell_z = 0U;
-        const OctreeCell &cell = all_cells[solid_leaves[leaf_index].cell_index];
-        morton_decode_3d(cell.morton_key, cell_x, cell_y, cell_z);
-        const std::uint32_t span = 1U << (max_depth - cell.depth);
-        const std::uint32_t ix0 = cell_x << (max_depth - cell.depth);
-        const std::uint32_t iy0 = cell_y << (max_depth - cell.depth);
-        const std::uint32_t iz0 = cell_z << (max_depth - cell.depth);
-
-        for (std::uint32_t u = 0; u < span; ++u) {
-            for (std::uint32_t v = 0; v < span; ++v) {
-                const auto neighbor_opened = [&](std::int64_t neighbor_cell_index) {
-                    if (neighbor_cell_index < 0) {
-                        return false;
-                    }
-                    const std::size_t neighbor_leaf = static_cast<std::size_t>(neighbor_cell_index);
-                    return opened_inside[neighbor_leaf] != 0U;
-                };
-                auto lookup_neighbor = [&](std::uint32_t qx, std::uint32_t qy,
-                                           std::uint32_t qz) {
-                    if (qx >= fine_resolution || qy >= fine_resolution || qz >= fine_resolution) {
-                        return false;
-                    }
-                    const std::size_t neighbor_cell_index =
-                        spatial_index.find_leaf_at(qx, qy, qz);
-                    if (neighbor_cell_index == SIZE_MAX ||
-                        neighbor_cell_index >= cell_to_leaf_index.size()) {
-                        return false;
-                    }
-                    const std::int64_t neighbor_leaf_index =
-                        cell_to_leaf_index[neighbor_cell_index];
-                    return neighbor_opened(neighbor_leaf_index);
-                };
-
-                if (ix0 == 0U || !lookup_neighbor(ix0 - 1U, iy0 + u, iz0 + v)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0, iy0 + u, iz0 + v),
-                        vertex_index_for(ix0, iy0 + u + 1U, iz0 + v),
-                        vertex_index_for(ix0, iy0 + u + 1U, iz0 + v + 1U),
-                        vertex_index_for(ix0, iy0 + u, iz0 + v + 1U),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {-1.0, 0.0, 0.0});
-                }
-                if (ix0 + span >= fine_resolution ||
-                    !lookup_neighbor(ix0 + span, iy0 + u, iz0 + v)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0 + span, iy0 + u, iz0 + v),
-                        vertex_index_for(ix0 + span, iy0 + u, iz0 + v + 1U),
-                        vertex_index_for(ix0 + span, iy0 + u + 1U, iz0 + v + 1U),
-                        vertex_index_for(ix0 + span, iy0 + u + 1U, iz0 + v),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {1.0, 0.0, 0.0});
-                }
-                if (iy0 == 0U || !lookup_neighbor(ix0 + u, iy0 - 1U, iz0 + v)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0 + u, iy0, iz0 + v),
-                        vertex_index_for(ix0 + u, iy0, iz0 + v + 1U),
-                        vertex_index_for(ix0 + u + 1U, iy0, iz0 + v + 1U),
-                        vertex_index_for(ix0 + u + 1U, iy0, iz0 + v),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {0.0, -1.0, 0.0});
-                }
-                if (iy0 + span >= fine_resolution ||
-                    !lookup_neighbor(ix0 + u, iy0 + span, iz0 + v)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0 + u, iy0 + span, iz0 + v),
-                        vertex_index_for(ix0 + u + 1U, iy0 + span, iz0 + v),
-                        vertex_index_for(ix0 + u + 1U, iy0 + span, iz0 + v + 1U),
-                        vertex_index_for(ix0 + u, iy0 + span, iz0 + v + 1U),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {0.0, 1.0, 0.0});
-                }
-                if (iz0 == 0U || !lookup_neighbor(ix0 + u, iy0 + v, iz0 - 1U)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0 + u, iy0 + v, iz0),
-                        vertex_index_for(ix0 + u + 1U, iy0 + v, iz0),
-                        vertex_index_for(ix0 + u + 1U, iy0 + v + 1U, iz0),
-                        vertex_index_for(ix0 + u, iy0 + v + 1U, iz0),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {0.0, 0.0, -1.0});
-                }
-                if (iz0 + span >= fine_resolution ||
-                    !lookup_neighbor(ix0 + u, iy0 + v, iz0 + span)) {
-                    const std::array<std::size_t, 4> ids = {
-                        vertex_index_for(ix0 + u, iy0 + v, iz0 + span),
-                        vertex_index_for(ix0 + u, iy0 + v + 1U, iz0 + span),
-                        vertex_index_for(ix0 + u + 1U, iy0 + v + 1U, iz0 + span),
-                        vertex_index_for(ix0 + u + 1U, iy0 + v, iz0 + span),
-                    };
-                    const std::array<Vector3d, 4> pos = {
-                        mesh.vertices[ids[0]].position,
-                        mesh.vertices[ids[1]].position,
-                        mesh.vertices[ids[2]].position,
-                        mesh.vertices[ids[3]].position,
-                    };
-                    emit_oriented_quad(pos, ids, {0.0, 0.0, 1.0});
-                }
-            }
-        }
-    }
-
-    surface_counter.finish();
-
-    ProgressCounter normal_counter(
-        "Meshing", "generate_opened_surface_mesh", "vertices", 1000);
-    for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
-        normal_counter.tick();
-        const double mag = std::sqrt(
-            normal_accum[i].x * normal_accum[i].x +
-            normal_accum[i].y * normal_accum[i].y +
-            normal_accum[i].z * normal_accum[i].z);
-        if (mag > 0.0) {
-            mesh.vertices[i].normal = {
-                normal_accum[i].x / mag,
-                normal_accum[i].y / mag,
-                normal_accum[i].z / mag,
-            };
-        }
-    }
-
-    normal_counter.finish();
-
-    return mesh;
+    std::uint32_t max_depth,
+    std::uint32_t worker_count = 1U,
+    double table_cadence_seconds = 10.0) {
+    return run_opened_surface_task_graph(
+        solid_leaves,
+        opened_inside,
+        all_cells,
+        spatial_index,
+        domain,
+        base_resolution,
+        max_depth,
+        worker_count,
+        table_cadence_seconds);
 }
 
 inline void apply_qef_positions_to_opened_surface_mesh(
@@ -2391,10 +4273,10 @@ inline bool opened_quad_has_four_distinct_vertices(
         return false;
     }
 
-    const std::int64_t vi0 = all_cells[c0].representative_vertex_index;
-    const std::int64_t vi1 = all_cells[c1].representative_vertex_index;
-    const std::int64_t vi2 = all_cells[c2].representative_vertex_index;
-    const std::int64_t vi3 = all_cells[c3].representative_vertex_index;
+    const std::int32_t vi0 = all_cells[c0].representative_vertex_index;
+    const std::int32_t vi1 = all_cells[c1].representative_vertex_index;
+    const std::int32_t vi2 = all_cells[c2].representative_vertex_index;
+    const std::int32_t vi3 = all_cells[c3].representative_vertex_index;
     if (vi0 < 0 || vi1 < 0 || vi2 < 0 || vi3 < 0) {
         return false;
     }

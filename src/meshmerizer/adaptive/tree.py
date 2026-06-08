@@ -18,37 +18,6 @@ if TYPE_CHECKING:
     import numpy
 
 
-def create_top_level_cells_with_contributors(
-    positions: list[tuple[float, float, float]],
-    smoothing_lengths: list[float],
-    domain_minimum: tuple[float, float, float],
-    domain_maximum: tuple[float, float, float],
-    base_resolution: int,
-) -> tuple[dict, ...]:
-    """Create top-level cells and query contributors in one pass.
-
-    Args:
-        positions: Particle positions with shape ``(N, 3)``.
-        smoothing_lengths: Per-particle smoothing lengths with shape ``(N,)``.
-        domain_minimum: Lower corner of the working domain.
-        domain_maximum: Upper corner of the working domain.
-        base_resolution: Number of top-level cells per axis.
-
-    Returns:
-        Native tuple containing the top-level cell dictionaries and aligned
-        contributor payload needed by later refinement stages.
-    """
-    # Delegate the combined construction/query step to the native helper so
-    # Python callers can reuse the documented historical bridge format.
-    return _adaptive.create_top_level_cells_with_contributors(
-        positions,
-        smoothing_lengths,
-        domain_minimum,
-        domain_maximum,
-        base_resolution,
-    )
-
-
 def create_top_level_cells(
     domain_minimum: tuple[float, float, float],
     domain_maximum: tuple[float, float, float],
@@ -168,9 +137,11 @@ def refine_octree(
     max_depth: int,
     domain: tuple[tuple[float, float, float], tuple[float, float, float]],
     base_resolution: int,
+    worker_count: int = 1,
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
+    table_cadence: float = 10.0,
 ) -> tuple[tuple[dict[str, object], ...], tuple[int, ...]]:
     """Refine the octree using breadth-first refinement.
 
@@ -182,6 +153,11 @@ def refine_octree(
         max_depth: Maximum permitted refinement depth.
         domain: Full working-domain bounds.
         base_resolution: Number of top-level cells per axis.
+        worker_count: Experimental worker count for the native closure engine.
+            Defaults to ``1`` and is primarily intended for testing and
+            diagnostics while the threaded path is still being hardened.
+        table_cadence: Strict time cadence in seconds for queue-status table
+            rows emitted by queue-driven refinement. Defaults to ``10.0``.
         minimum_usable_hermite_samples: Minimum usable Hermite sample count.
         max_qef_rms_residual_ratio: Maximum acceptable RMS QEF residual ratio.
         min_normal_alignment_threshold: Minimum acceptable normal alignment.
@@ -199,6 +175,8 @@ def refine_octree(
         max_depth,
         domain,
         base_resolution,
+        worker_count,
+        table_cadence,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
@@ -320,9 +298,11 @@ def run_octree_pipeline(
     base_resolution: int,
     isovalue: float,
     max_depth: int,
+    worker_count: int = 1,
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
+    table_cadence: float = 10.0,
 ) -> tuple["numpy.ndarray", "numpy.ndarray"]:
     """Run the octree pipeline in C++ and return QEF vertices.
 
@@ -334,6 +314,9 @@ def run_octree_pipeline(
         base_resolution: Number of top-level cells per axis.
         isovalue: Scalar field threshold.
         max_depth: Maximum permitted refinement depth.
+        worker_count: Number of closure workers to use during refinement.
+        table_cadence: Strict time cadence in seconds for queue-status table
+            rows emitted by queue-driven refinement. Defaults to ``10.0``.
         minimum_usable_hermite_samples: Minimum usable Hermite sample count.
         max_qef_rms_residual_ratio: Maximum acceptable RMS QEF residual ratio.
         min_normal_alignment_threshold: Minimum acceptable normal alignment.
@@ -351,6 +334,8 @@ def run_octree_pipeline(
         base_resolution,
         isovalue,
         max_depth,
+        table_cadence,
+        worker_count,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
@@ -365,9 +350,11 @@ def build_refined_tree(
     base_resolution: int,
     isovalue: float,
     max_depth: int,
+    worker_count: int = 1,
     minimum_usable_hermite_samples: int = 3,
     max_qef_rms_residual_ratio: float = 0.1,
     min_normal_alignment_threshold: float = 0.97,
+    table_cadence: float = 10.0,
 ) -> tuple[tuple[dict[str, object], ...], "numpy.ndarray"]:
     """Build and refine the adaptive tree in C++ and return resumable state.
 
@@ -379,6 +366,9 @@ def build_refined_tree(
         base_resolution: Number of top-level cells per axis.
         isovalue: Scalar field threshold used for split decisions.
         max_depth: Maximum permitted refinement depth.
+        worker_count: Number of worker threads for parallel refinement.
+        table_cadence: Strict time cadence in seconds for queue-status table
+            rows emitted by queue-driven refinement. Defaults to ``10.0``.
         minimum_usable_hermite_samples: Minimum usable Hermite sample count.
         max_qef_rms_residual_ratio: Maximum acceptable RMS QEF residual ratio.
         min_normal_alignment_threshold: Minimum acceptable normal alignment.
@@ -401,6 +391,8 @@ def build_refined_tree(
         base_resolution,
         isovalue,
         max_depth,
+        table_cadence,
+        worker_count,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
         min_normal_alignment_threshold,
@@ -408,13 +400,59 @@ def build_refined_tree(
     return cells, np.asarray(contributors, dtype=np.int64)
 
 
+def build_native_tree_handle(
+    positions: "numpy.ndarray",
+    smoothing_lengths: "numpy.ndarray",
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    base_resolution: int,
+    isovalue: float,
+    max_depth: int,
+    worker_count: int = 1,
+    minimum_usable_hermite_samples: int = 3,
+    max_qef_rms_residual_ratio: float = 0.1,
+    min_normal_alignment_threshold: float = 0.97,
+    table_cadence: float = 10.0,
+) -> object:
+    """Build and refine the adaptive tree and keep it resident in C++.
+
+    Returns an opaque native handle rather than materializing Python cell
+    dictionaries. This is the preferred staged-workflow path because it avoids
+    round-tripping the full octree across the Python boundary.
+    """
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
+    return _adaptive.build_native_tree_handle(
+        pos,
+        sml,
+        domain_minimum,
+        domain_maximum,
+        base_resolution,
+        isovalue,
+        max_depth,
+        table_cadence,
+        worker_count,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+    )
+
+
+def generate_mesh_from_tree_handle(
+    native_handle: object,
+) -> tuple["numpy.ndarray", "numpy.ndarray", "numpy.ndarray"]:
+    """Generate a dual-contour mesh from an opaque native tree handle."""
+    return _adaptive.generate_mesh_from_handle(native_handle)
+
+
 __all__ = [
+    "build_native_tree_handle",
     "build_refined_tree",
     "create_child_cells",
     "create_top_level_cells",
-    "create_top_level_cells_with_contributors",
     "filter_child_contributors",
     "generate_mesh",
+    "generate_mesh_from_tree_handle",
     "hermite_samples_for_cell",
     "refine_octree",
     "run_octree_pipeline",

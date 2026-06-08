@@ -74,6 +74,7 @@ def run_full_pipeline(
     base_resolution: int,
     isovalue: float,
     max_depth: int,
+    worker_count: int = 1,
     smoothing_iterations: int = 0,
     smoothing_strength: float = 0.5,
     max_edge_ratio: float = 1.5,
@@ -82,6 +83,7 @@ def run_full_pipeline(
     min_normal_alignment_threshold: float = 0.97,
     min_feature_thickness: float = 0.0,
     pre_thickening_radius: float = 0.0,
+    table_cadence: float = 10.0,
 ) -> dict:
     """Run the full particles-to-mesh pipeline in C++.
 
@@ -93,6 +95,9 @@ def run_full_pipeline(
         base_resolution: Number of top-level cells per axis.
         isovalue: Scalar field threshold for reconstruction.
         max_depth: Maximum octree refinement depth.
+        worker_count: Number of native closure workers.
+        table_cadence: Strict time cadence in seconds for queue-status table
+            rows emitted by queue-driven refinement. Defaults to ``10.0``.
         smoothing_iterations: Number of smoothing iterations.
         smoothing_strength: Laplacian smoothing strength in ``(0, 1]``.
         max_edge_ratio: Maximum permitted edge length relative to local cell
@@ -117,6 +122,8 @@ def run_full_pipeline(
         base_resolution,
         isovalue,
         max_depth,
+        worker_count,
+        table_cadence,
         smoothing_iterations,
         smoothing_strength,
         max_edge_ratio,

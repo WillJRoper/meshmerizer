@@ -5,7 +5,7 @@
  * This header defines the flat-array octree representation used throughout the
  * adaptive meshing pipeline. The design goals are deterministic child ordering,
  * cache-friendly storage of cells and contributor ranges, and reusable helper
- * routines for refinement, balancing, and diagnostics.
+ * routines for refinement, closure propagation support, and diagnostics.
  *
  * The flat representation is important: instead of storing child pointers and
  * nested ownership, cells are appended to one vector and reference child ranges
@@ -23,7 +23,6 @@
 #include <cstdio>
 #include <cstdint>
 #include <span>
-#include <queue>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -35,8 +34,8 @@
 #include "kernel_wendland_c2.hpp"
 #include "morton.hpp"
 #include "particle_grid.hpp"
-#include "progress_bar.hpp"
 #include "qef.hpp"
+#include "refinement_closure.hpp"
 #include "vector3d.hpp"
 
 /**
@@ -58,8 +57,12 @@ struct OctreeCell {
     std::uint64_t morton_key;
     /** Refinement depth measured from the top-level grid. */
     std::uint32_t depth;
-    /** Geometric extent of the cell in world/domain coordinates. */
-    BoundingBox bounds;
+    /** Representative mesh vertex index assigned during vertex solving. */
+    std::int32_t representative_vertex_index;
+    /** Index of the parent cell in ``all_cells``, or ``-1`` for roots. */
+    std::int32_t parent_index;
+    /** Bit mask encoding ``corner_values >= isovalue``. */
+    std::uint8_t corner_sign_mask;
     /** Whether the cell currently has no children in the flat array. */
     bool is_leaf;
     /** Whether the cell is considered active for direct contour extraction. */
@@ -68,18 +71,24 @@ struct OctreeCell {
     bool has_surface;
     /** Whether topology regularization marks the cell as a topology surface. */
     bool is_topo_surface;
+    /**
+     * @brief Local child index within the parent's eight-child block.
+     *
+     * Bit 0 = x half, bit 1 = y half, bit 2 = z half (matches
+     * ``create_child_cells`` and ``child_bounds_from_index``). Meaningful only
+     * when ``parent_index >= 0``; otherwise stored as 0.
+     */
+    std::uint8_t slot_in_parent;
+    /** Geometric extent of the cell in world/domain coordinates. */
+    BoundingBox bounds;
     /** Index of the first child in ``all_cells``, or ``-1`` for leaves. */
-    std::int64_t child_begin;
+    std::int32_t child_begin;
     /** Begin offset into the flat contributor array. */
-    std::int64_t contributor_begin;
+    std::int32_t contributor_begin;
     /** End offset into the flat contributor array. */
-    std::int64_t contributor_end;
-    /** Representative mesh vertex index assigned during vertex solving. */
-    std::int64_t representative_vertex_index;
+    std::int32_t contributor_end;
     /** Scalar field samples at the eight cell corners. */
     std::array<double, 8> corner_values;
-    /** Bit mask encoding ``corner_values >= isovalue``. */
-    std::uint8_t corner_sign_mask;
 };
 
 /**
@@ -239,22 +248,101 @@ inline std::vector<OctreeCell> create_top_level_cells(
                 cells.push_back({
                     morton_encode_3d(ix, iy, iz),
                     0U,
-                    {minimum, maximum},
+                    -1,
+                    -1,
+                    0U,
                     true,
                     false,
                     false,
                     false,
-                    -1,
+                    0U,
+                    {minimum, maximum},
                     -1,
                     -1,
                     -1,
                     {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-                    0U,
                 });
             }
         }
     }
     return cells;
+}
+
+inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>>
+build_top_level_cells_with_contributors(
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const BoundingBox &domain,
+    std::uint32_t base_resolution) {
+    TopLevelParticleGrid grid(domain, base_resolution);
+    grid.insert_particles(positions);
+    grid.compute_bin_max_h(smoothing_lengths);
+
+    std::vector<OctreeCell> top_cells =
+        create_top_level_cells(domain, base_resolution);
+    std::vector<OctreeCell> initial_cells;
+    initial_cells.reserve(top_cells.size());
+    std::vector<std::size_t> initial_contributors;
+    std::vector<std::vector<std::size_t>> top_cell_contributors(
+        top_cells.size());
+
+    const std::int64_t top_cell_count =
+        static_cast<std::int64_t>(top_cells.size());
+#pragma omp parallel for schedule(dynamic)
+    for (std::int64_t ci = 0; ci < top_cell_count; ++ci) {
+        if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
+                static_cast<std::size_t>(ci))) {
+            continue;
+        }
+        const OctreeCell &cell = top_cells[static_cast<std::size_t>(ci)];
+        std::vector<std::size_t> &cell_contributors =
+            top_cell_contributors[static_cast<std::size_t>(ci)];
+
+        std::uint32_t sx = 0, sy = 0, sz = 0;
+        std::uint32_t ex = 0, ey = 0, ez = 0;
+        grid.contributor_bin_span(
+            cell.bounds, smoothing_lengths, sx, sy, sz, ex, ey, ez);
+
+        for (std::uint32_t ix = sx; ix <= ex; ++ix) {
+            for (std::uint32_t iy = sy; iy <= ey; ++iy) {
+                for (std::uint32_t iz = sz; iz <= ez; ++iz) {
+                    const TopLevelBin &bin =
+                        grid.bins[grid.flatten_index(ix, iy, iz)];
+                    for (std::size_t pi : bin.particle_indices) {
+                        if (particle_support_overlaps_box(
+                                positions[pi],
+                                smoothing_lengths[pi],
+                                cell.bounds)) {
+                            cell_contributors.push_back(pi);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<std::size_t> contributor_offsets(top_cells.size() + 1U, 0U);
+    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+        contributor_offsets[ci + 1U] =
+            contributor_offsets[ci] + top_cell_contributors[ci].size();
+    }
+    initial_contributors.reserve(contributor_offsets.back());
+    for (std::size_t ci = 0; ci < top_cells.size(); ++ci) {
+        OctreeCell cell = top_cells[ci];
+        const std::size_t begin = contributor_offsets[ci];
+        const std::size_t end = contributor_offsets[ci + 1U];
+        cell.contributor_begin = static_cast<std::int32_t>(begin);
+        cell.contributor_end = static_cast<std::int32_t>(end);
+        initial_cells.push_back(cell);
+        const std::vector<std::size_t> &cell_contributors =
+            top_cell_contributors[ci];
+        initial_contributors.insert(
+            initial_contributors.end(),
+            cell_contributors.begin(),
+            cell_contributors.end());
+    }
+
+    return {std::move(initial_cells), std::move(initial_contributors)};
 }
 
 /**
@@ -313,17 +401,19 @@ inline std::vector<OctreeCell> create_child_cells(const OctreeCell &parent) {
         children.push_back({
             morton_encode_3d(child_x, child_y, child_z),
             parent.depth + 1U,
-            child_bounds_from_index(parent.bounds, child_index),
+            -1,
+            -1,
+            0U,
             true,
             false,
             false,
             false,
-            -1,
+            child_index,
+            child_bounds_from_index(parent.bounds, child_index),
             -1,
             -1,
             -1,
             {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-            0U,
         });
     }
     return children;
@@ -408,19 +498,23 @@ inline void split_octree_leaf(
     parent.has_surface = true;
     parent.is_topo_surface = false;
     parent.representative_vertex_index = -1;
-    parent.child_begin = static_cast<std::int64_t>(all_cells.size());
+    parent.child_begin = static_cast<std::int32_t>(all_cells.size());
 
+    const std::int32_t parent_storage_index =
+        static_cast<std::int32_t>(split_index);
     for (std::size_t i = 0; i < children.size(); ++i) {
-        const std::int64_t child_contrib_begin =
-            static_cast<std::int64_t>(all_contributors.size());
+        const std::int32_t child_contrib_begin =
+            static_cast<std::int32_t>(all_contributors.size());
         std::copy(child_contributors[i].begin(),
                   child_contributors[i].end(),
                   std::back_inserter(all_contributors));
-        const std::int64_t child_contrib_end =
-            static_cast<std::int64_t>(all_contributors.size());
+        const std::int32_t child_contrib_end =
+            static_cast<std::int32_t>(all_contributors.size());
 
         children[i].contributor_begin = child_contrib_begin;
         children[i].contributor_end = child_contrib_end;
+        children[i].parent_index = parent_storage_index;
+        // slot_in_parent already set by create_child_cells.
         all_cells.push_back(children[i]);
     }
 }
@@ -854,405 +948,127 @@ struct BalanceSpatialHash {
     }
 };
 
-/**
- * @brief Check if a leaf needs splitting using spatial hash neighbor lookup.
- *
- * For each of the 6 face directions, computes a probe point just inside
- * the neighboring region and looks up the leaf there via the spatial
- * hash.  If any neighbor leaf is more than 1 level deeper, the cell
- * needs splitting.
- *
- * Cost: O(6 * max_depth) hash probes per cell — much better than O(n).
- *
- * @param cell_index Index of the leaf to check.
- * @param all_cells All octree cells.
- * @param hash Prebuilt spatial hash of leaf cells.
- * @param max_depth Maximum octree depth.
- * @return True when this leaf needs to be split for balance.
- */
-inline bool needs_balance_split(
-    std::size_t cell_index,
+inline std::vector<std::size_t> collect_balance_violation_seed_cells(
     const std::vector<OctreeCell> &all_cells,
-    const BalanceSpatialHash &hash,
-    std::uint32_t max_depth) {
-    const OctreeCell &cell = all_cells[cell_index];
-
-    // The cell spans 'span' fine-grid cells per axis.
-    const std::uint32_t span = 1U << (max_depth - cell.depth);
-
-    // Quantize this cell's min corner.
-    std::uint32_t gx, gy, gz;
-    hash.quantize(cell.bounds.min, gx, gy, gz);
-
-    // For each face, probe one fine-grid cell into the neighbor region.
-    // The 6 face directions are: -X, +X, -Y, +Y, -Z, +Z.
-    // For the positive direction, the probe is at min + span.
-    // For the negative direction, the probe is at min - 1.
-    // We probe at the center of the face (offset by span/2 in the
-    // other two axes) to handle cases where the neighbor is larger.
-    // However, for detecting deeper neighbors (which are smaller),
-    // probing at the corner of the face is sufficient because any
-    // deeper neighbor along this face will be found.
-
-    // Face probe offsets: {dx, dy, dz} relative to cell min corner.
-    // +X face: probe at (gx + span, gy, gz)
-    // -X face: probe at (gx - 1, gy, gz)
-    // +Y face: probe at (gx, gy + span, gz)
-    // -Y face: probe at (gx, gy - 1, gz)
-    // +Z face: probe at (gx, gy, gz + span)
-    // -Z face: probe at (gx, gy, gz - 1)
-
-    struct Probe {
-        std::int64_t dx, dy, dz;
-    };
-    const Probe probes[6] = {
-        {static_cast<std::int64_t>(span), 0, 0},    // +X
-        {-1, 0, 0},                                   // -X
-        {0, static_cast<std::int64_t>(span), 0},    // +Y
-        {0, -1, 0},                                   // -Y
-        {0, 0, static_cast<std::int64_t>(span)},    // +Z
-        {0, 0, -1},                                   // -Z
-    };
-
-    for (const auto &p : probes) {
-        const std::int64_t px =
-            static_cast<std::int64_t>(gx) + p.dx;
-        const std::int64_t py =
-            static_cast<std::int64_t>(gy) + p.dy;
-        const std::int64_t pz =
-            static_cast<std::int64_t>(gz) + p.dz;
-
-        // Skip probes outside the domain.
-        if (px < 0 || py < 0 || pz < 0) continue;
-
-        const std::size_t neighbor_idx = hash.find_leaf_at(
-            static_cast<std::uint32_t>(px),
-            static_cast<std::uint32_t>(py),
-            static_cast<std::uint32_t>(pz));
-
-        if (neighbor_idx == SIZE_MAX) continue;
-
-        const OctreeCell &neighbor = all_cells[neighbor_idx];
-        const std::int32_t depth_diff =
-            static_cast<std::int32_t>(neighbor.depth) -
-            static_cast<std::int32_t>(cell.depth);
-        if (depth_diff > 1) {
-            return true;
-        }
-    }
-    return false;
-}
-
-inline void enqueue_balance_neighbors(
-    std::size_t cell_index,
-    const std::vector<OctreeCell> &all_cells,
-    const BalanceSpatialHash &hash,
+    const BoundingBox &domain,
     std::uint32_t max_depth,
-    std::vector<std::size_t> &queue,
-    std::vector<std::uint8_t> &enqueued) {
-    if (cell_index >= all_cells.size()) {
-        return;
-    }
+    std::uint32_t base_resolution) {
+    BalanceSpatialHash spatial_hash;
+    spatial_hash.build(all_cells, domain, max_depth, base_resolution);
+    std::vector<std::size_t> violating_cells;
+    violating_cells.reserve(all_cells.size() / 16U);
+    const std::uint32_t fine_max = base_resolution << max_depth;
 
-    auto enqueue_index = [&](std::size_t candidate) {
-        if (candidate >= all_cells.size()) {
+    auto check_neighbor = [&](std::size_t cell_index,
+                              std::uint32_t ix,
+                              std::uint32_t iy,
+                              std::uint32_t iz) {
+        const std::size_t neighbor_index = spatial_hash.find_leaf_at(ix, iy, iz);
+        if (neighbor_index == SIZE_MAX || neighbor_index >= all_cells.size() ||
+            neighbor_index == cell_index) {
             return;
         }
-        if (!all_cells[candidate].is_leaf) {
+        const OctreeCell &cell = all_cells[cell_index];
+        const OctreeCell &neighbor = all_cells[neighbor_index];
+        const std::uint32_t depth_diff =
+            cell.depth > neighbor.depth ? cell.depth - neighbor.depth
+                                        : neighbor.depth - cell.depth;
+        if (depth_diff <= 1U) {
             return;
         }
-        if (candidate >= enqueued.size()) {
-            enqueued.resize(all_cells.size(), 0U);
-        }
-        if (enqueued[candidate] != 0U) {
-            return;
-        }
-        enqueued[candidate] = 1U;
-        queue.push_back(candidate);
+        violating_cells.push_back(
+            cell.depth < neighbor.depth ? cell_index : neighbor_index);
     };
 
-    enqueue_index(cell_index);
-
-    const OctreeCell &cell = all_cells[cell_index];
-    if (!cell.is_leaf) {
-        return;
-    }
-
-    const std::uint32_t span = 1U << (max_depth - cell.depth);
-    std::uint32_t gx, gy, gz;
-    hash.quantize(cell.bounds.min, gx, gy, gz);
-
-    const std::uint32_t half = span > 1U ? span / 2U : 0U;
-    struct Probe {
-        std::int64_t dx, dy, dz;
-    };
-    const Probe probes[6] = {
-        {static_cast<std::int64_t>(span), static_cast<std::int64_t>(half), static_cast<std::int64_t>(half)},
-        {-1, static_cast<std::int64_t>(half), static_cast<std::int64_t>(half)},
-        {static_cast<std::int64_t>(half), static_cast<std::int64_t>(span), static_cast<std::int64_t>(half)},
-        {static_cast<std::int64_t>(half), -1, static_cast<std::int64_t>(half)},
-        {static_cast<std::int64_t>(half), static_cast<std::int64_t>(half), static_cast<std::int64_t>(span)},
-        {static_cast<std::int64_t>(half), static_cast<std::int64_t>(half), -1},
-    };
-
-    for (const Probe &probe : probes) {
-        const std::int64_t px = static_cast<std::int64_t>(gx) + probe.dx;
-        const std::int64_t py = static_cast<std::int64_t>(gy) + probe.dy;
-        const std::int64_t pz = static_cast<std::int64_t>(gz) + probe.dz;
-        if (px < 0 || py < 0 || pz < 0) {
+    for (std::size_t cell_index = 0; cell_index < all_cells.size(); ++cell_index) {
+        meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
+        const OctreeCell &cell = all_cells[cell_index];
+        if (!cell.is_leaf) {
             continue;
         }
 
-        const std::size_t neighbor_idx = hash.find_leaf_at(
-            static_cast<std::uint32_t>(px),
-            static_cast<std::uint32_t>(py),
-            static_cast<std::uint32_t>(pz));
-        if (neighbor_idx == SIZE_MAX) {
-            continue;
+        std::uint32_t min_x = 0U;
+        std::uint32_t min_y = 0U;
+        std::uint32_t min_z = 0U;
+        std::uint32_t max_x = 0U;
+        std::uint32_t max_y = 0U;
+        std::uint32_t max_z = 0U;
+        spatial_hash.quantize(cell.bounds.min, min_x, min_y, min_z);
+        spatial_hash.quantize(cell.bounds.max, max_x, max_y, max_z);
+        const std::uint32_t mid_x = min_x + (max_x - min_x) / 2U;
+        const std::uint32_t mid_y = min_y + (max_y - min_y) / 2U;
+        const std::uint32_t mid_z = min_z + (max_z - min_z) / 2U;
+
+        if (min_x > 0U) {
+            check_neighbor(cell_index, min_x - 1U, mid_y, mid_z);
         }
-        enqueue_index(neighbor_idx);
+        if (max_x < fine_max) {
+            check_neighbor(cell_index, max_x, mid_y, mid_z);
+        }
+        if (min_y > 0U) {
+            check_neighbor(cell_index, mid_x, min_y - 1U, mid_z);
+        }
+        if (max_y < fine_max) {
+            check_neighbor(cell_index, mid_x, max_y, mid_z);
+        }
+        if (min_z > 0U) {
+            check_neighbor(cell_index, mid_x, mid_y, min_z - 1U);
+        }
+        if (max_z < fine_max) {
+            check_neighbor(cell_index, mid_x, mid_y, max_z);
+        }
     }
+
+    std::sort(violating_cells.begin(), violating_cells.end());
+    violating_cells.erase(
+        std::unique(violating_cells.begin(), violating_cells.end()),
+        violating_cells.end());
+    return violating_cells;
 }
 
-/**
- * @brief Enforce the 2:1 octree balance rule on a refined octree.
- *
- * After the main breadth-first refinement, this function iteratively finds
- * pairs of adjacent leaf cells that violate the 2:1 balance rule (differing
- * by more than one refinement level) and splits the shallower leaf. The
- * process repeats until no violations remain.
- *
- * Each balance-forced split inherits contributors from the parent cell via
- * kernel-overlap filtering and samples corner values to support later surface
- * extraction.
- *
- * The algorithm uses a spatial hash of leaf min-corner positions for O(1)
- * neighbor lookups.  For each leaf, the 6 face-adjacent neighbors are
- * probed via the hash using a hierarchical search (finest to coarsest
- * alignment).  The hash is built once before the first round and updated
- * incrementally after each split (only new leaves are inserted).  Total
- * cost per iteration is O(n * max_depth) where n is the number of leaves.
- *
- * @param all_cells All octree cells (modified in place).
- * @param all_contributors Global flat contributor index array (modified in
- *     place).
- * @param positions Particle positions in world space.
- * @param smoothing_lengths Per-particle support radii.
- * @param isovalue The target surface level used to sample corner signs on
- *     newly created balance cells.
- * @param domain Full domain bounding box (for spatial hash construction).
- * @param base_resolution Number of top-level cells per axis.
- * @param max_depth Maximum depth; balance splits stop at this depth.
- */
-inline void balance_octree(
+inline void repair_balance_invariant_with_closure(
     std::vector<OctreeCell> &all_cells,
     std::vector<std::size_t> &all_contributors,
     const std::vector<Vector3d> &positions,
     const std::vector<double> &smoothing_lengths,
-    double isovalue,
-    const BoundingBox &domain,
-    std::uint32_t base_resolution,
-    std::uint32_t max_depth,
-    std::vector<std::uint8_t> *dirty_cells = nullptr) {
-    ProgressCounter balance_counter(
-        "Building", "balance_octree", "cells split", 10);
-
-    auto mark_dirty = [&](std::size_t cell_index) {
-        if (dirty_cells == nullptr) {
+    const RefinementClosureConfig &config) {
+    const std::size_t max_passes =
+        static_cast<std::size_t>(std::max(1U, config.max_depth)) + 2U;
+    for (std::size_t pass = 0; pass < max_passes; ++pass) {
+        meshmerizer_log_detail::print_status(
+            "Building",
+            "repair_balance_invariant_with_closure",
+            "checking 2:1 balance pass %zu (%zu cells)\n",
+            pass + 1U,
+            all_cells.size());
+        const std::vector<std::size_t> violating_cells =
+            collect_balance_violation_seed_cells(
+                all_cells, config.domain, config.max_depth,
+                config.base_resolution);
+        if (violating_cells.empty()) {
+            meshmerizer_log_detail::print_status(
+                "Building",
+                "repair_balance_invariant_with_closure",
+                "2:1 balance check passed\n");
             return;
         }
-        if (dirty_cells->size() <= cell_index) {
-            dirty_cells->resize(cell_index + 1U, 0U);
-        }
-        (*dirty_cells)[cell_index] = 1U;
-    };
-
-    // Build the spatial hash once; we will update it incrementally
-    // as cells are split rather than rebuilding from scratch each
-    // iteration.
-    BalanceSpatialHash hash;
-    hash.build(all_cells, domain, max_depth, base_resolution);
-
-    std::vector<std::size_t> queue;
-    queue.reserve(all_cells.size());
-    std::vector<std::uint8_t> enqueued(all_cells.size(), 0U);
-    for (std::size_t cell_idx = 0; cell_idx < all_cells.size(); ++cell_idx) {
-        if (!all_cells[cell_idx].is_leaf) {
-            continue;
-        }
-        if (all_cells[cell_idx].depth >= max_depth) {
-            continue;
-        }
-        queue.push_back(cell_idx);
-        enqueued[cell_idx] = 1U;
-    }
-
-    std::size_t processed_count = 0U;
-    std::size_t split_count = 0U;
-    while (!queue.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(
-            processed_count + split_count + 1U);
-        const std::size_t split_index = queue.back();
-        queue.pop_back();
-        if (split_index < enqueued.size()) {
-            enqueued[split_index] = 0U;
-        }
-        ++processed_count;
-
-        if (split_index >= all_cells.size()) {
-            continue;
-        }
-        if (!all_cells[split_index].is_leaf) {
-            continue;
-        }
-        if (all_cells[split_index].depth >= max_depth) {
-            continue;
-        }
-        if (!needs_balance_split(split_index, all_cells, hash, max_depth)) {
-            continue;
-        }
-
-        const OctreeCell parent_snapshot = all_cells[split_index];
-        const std::span<const std::size_t> parent_contributors =
-            contributor_span(
-                all_contributors,
-                parent_snapshot.contributor_begin < 0 ? 0U :
-                    static_cast<std::size_t>(parent_snapshot.contributor_begin),
-                parent_snapshot.contributor_end <= parent_snapshot.contributor_begin ? 0U :
-                    static_cast<std::size_t>(parent_snapshot.contributor_end));
-
-        const std::vector<OctreeCell> children =
-            create_child_cells(parent_snapshot);
-        const std::vector<std::vector<std::size_t>> child_contributors =
-            filter_child_contributors(
-                parent_contributors, positions, smoothing_lengths, children);
-
-        all_cells[split_index].is_leaf = false;
-        all_cells[split_index].child_begin =
-            static_cast<std::int64_t>(all_cells.size());
-        mark_dirty(split_index);
-
-        std::uint32_t pgx, pgy, pgz;
-        hash.quantize(parent_snapshot.bounds.min, pgx, pgy, pgz);
-        hash.map.erase(balance_pack_coords(pgx, pgy, pgz));
-
-        std::vector<std::size_t> affected_indices;
-        affected_indices.reserve(1U + children.size());
-        affected_indices.push_back(split_index);
-
-        for (std::size_t ci = 0; ci < children.size(); ++ci) {
-            OctreeCell child = children[ci];
-
-            const std::int64_t contrib_begin =
-                static_cast<std::int64_t>(all_contributors.size());
-            for (std::size_t pidx : child_contributors[ci]) {
-                all_contributors.push_back(pidx);
-            }
-            const std::int64_t contrib_end =
-                static_cast<std::int64_t>(all_contributors.size());
-
-            child.contributor_begin = contrib_begin;
-            child.contributor_end = contrib_end;
-            child.is_leaf = true;
-            child.is_active = false;
-            child.has_surface = false;
-            child.is_topo_surface = false;
-
-            if (!child_contributors[ci].empty()) {
-                child.corner_values = sample_cell_corners(
-                    child,
-                    std::span<const std::size_t>(child_contributors[ci]),
-                    positions,
-                    smoothing_lengths);
-                child.corner_sign_mask = compute_corner_sign_mask(
-                    child.corner_values, isovalue);
-                child.has_surface = cell_may_contain_isosurface(
-                    child.corner_values, isovalue);
-            }
-
-            const std::size_t new_idx = all_cells.size();
-            all_cells.push_back(child);
-            affected_indices.push_back(new_idx);
-            mark_dirty(new_idx);
-
-            std::uint32_t cgx, cgy, cgz;
-            hash.quantize(child.bounds.min, cgx, cgy, cgz);
-            hash.map[balance_pack_coords(cgx, cgy, cgz)] = new_idx;
-        }
-
-        if (enqueued.size() < all_cells.size()) {
-            enqueued.resize(all_cells.size(), 0U);
-        }
-        for (std::size_t affected_index : affected_indices) {
-            enqueue_balance_neighbors(
-                affected_index,
+        meshmerizer_log_detail::print_status(
+            "Building",
+            "repair_balance_invariant_with_closure",
+            "repairing %zu balance seed cells\n",
+            violating_cells.size());
+        if (!refine_cells_to_next_depth_with_closure(
                 all_cells,
-                hash,
-                max_depth,
-                queue,
-                enqueued);
+                all_contributors,
+                positions,
+                smoothing_lengths,
+                config,
+                violating_cells)) {
+            return;
         }
-
-        ++split_count;
-        balance_counter.tick();
     }
-
-    meshmerizer_log_detail::print_debug_status(
-        "Building",
-        "balance_octree",
-        "local closure processed=%zu split=%zu (total_cells=%zu)\n",
-        processed_count,
-        split_count,
-        all_cells.size());
-    balance_counter.finish();
 }
 
-/**
- * @brief Breadth-first octree refinement followed by 2:1 balance enforcement.
- *
- * Starting from top-level cells, this function iteratively refines cells that
- * may contain the isosurface by evaluating corner field values. The algorithm
- * proceeds breadth-first (one depth level at a time), which simplifies later
- * parallelization and keeps the working set predictable.
- *
- * The surface-driven refinement stops for a cell when:
- * - The cell does not straddle the isovalue at any corner, or
- * - The maximum depth is reached, or
- * - The cell has fewer than two contributors.
- *
- * After the BFS completes, a separate balancing post-pass (``balance_octree``)
- * enforces the 2:1 rule: no two adjacent leaves may differ by more than one
- * refinement level. Balance-forced splits inherit contributors from their
- * parent and sample their own corner values.
- *
- * @param initial_cells Top-level cells with attached contributors.
- * @param positions Particle positions in world space.
- * @param smoothing_lengths Per-particle support radii.
- * @param isovalue The target surface level.
- * @param max_depth Maximum refinement depth (prevents infinite refinement).
- * @return Tuple of (all_cells, all_contributors) where cells store indices
- *         into the contributors vector.
- */
-/**
- * @brief Overload that accepts pre-populated initial contributors.
- *
- * When initial cells are built in C++ (e.g., from the full pipeline),
- * the actual contributor particle indices are already known and stored
- * in @p initial_contributors.  Each cell's contributor_begin/end
- * index into this vector.  This avoids the legacy path that treats
- * contributor_begin..contributor_end as sequential particle indices.
- *
- * @param initial_cells Top-level cells with contributor ranges pointing
- *     into @p initial_contributors.
- * @param initial_contributors Pre-built flat contributor index array.
- * @param positions Particle positions.
- * @param smoothing_lengths Per-particle support radii.
- * @param isovalue Target surface level.
- * @param max_depth Maximum refinement depth.
- * @param domain Simulation domain bounding box.
- * @param base_resolution Top-level cells per axis.
- * @return Tuple of (all_cells, all_contributors).
- */
 inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>>
 refine_octree(
     std::vector<OctreeCell> initial_cells,
@@ -1263,208 +1079,47 @@ refine_octree(
     std::uint32_t max_depth,
     const BoundingBox &domain,
     std::uint32_t base_resolution,
+    std::uint32_t worker_count = 1U,
+    double table_cadence_seconds = 10.0,
     std::uint32_t minimum_usable_hermite_samples = 3U,
     double max_qef_rms_residual_ratio = 0.1,
-    double min_normal_alignment_threshold = 0.97) {
-    if (initial_cells.empty()) {
-        return {{}, {}};
-    }
-
-    std::vector<OctreeCell> all_cells;
-    // Start with the pre-built contributors; new contributors from
-    // child splits will be appended after this initial segment.
-    std::vector<std::size_t> all_contributors =
-        std::move(initial_contributors);
-    std::queue<std::size_t> leaf_queue;
-
-    // Initial cells already have valid contributor_begin/end
-    // pointing into all_contributors, so just copy them over.
-    for (std::size_t cell_index = 0;
-         cell_index < initial_cells.size(); ++cell_index) {
-        all_cells.push_back(initial_cells[cell_index]);
-        leaf_queue.push(all_cells.size() - 1);
-    }
-
-    ProgressCounter refine_counter(
-        "Building", "refine_octree", "cells", 100);
-
-    struct RefinementResult {
-        bool has_surface = false;
-        bool should_split = false;
-        std::array<double, 8> corner_values = {
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-        std::uint8_t corner_sign_mask = 0U;
-        std::vector<OctreeCell> children;
-        std::vector<std::vector<std::size_t>> child_contributors;
+    double min_normal_alignment_threshold = 0.97,
+    double surface_band_target_leaf_size = 0.0) {
+    const RefinementClosureConfig closure_config = {
+        isovalue,
+        max_depth,
+        domain,
+        base_resolution,
+        worker_count,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+        table_cadence_seconds,
+        "Building",
+        "refine_octree",
+        "refine_octree",
+        surface_band_target_leaf_size,
     };
 
-    while (!leaf_queue.empty()) {
-        meshmerizer_cancel_detail::poll_for_cancellation_serial(
-            all_cells.size() + leaf_queue.size());
-        const std::uint32_t batch_depth =
-            all_cells[leaf_queue.front()].depth;
-        std::vector<std::size_t> batch_indices;
-        while (!leaf_queue.empty() &&
-               all_cells[leaf_queue.front()].depth == batch_depth) {
-            batch_indices.push_back(leaf_queue.front());
-            leaf_queue.pop();
-        }
-
-        std::vector<RefinementResult> batch_results(batch_indices.size());
-
-#pragma omp parallel for schedule(dynamic)
-        for (std::size_t batch_i = 0; batch_i < batch_indices.size(); ++batch_i) {
-            if (meshmerizer_cancel_detail::poll_for_cancellation_in_parallel(
-                    batch_i)) {
-                continue;
-            }
-            const std::size_t current_index = batch_indices[batch_i];
-            const OctreeCell &current_cell = all_cells[current_index];
-            RefinementResult &result = batch_results[batch_i];
-
-            const std::int64_t contrib_begin = current_cell.contributor_begin;
-            const std::int64_t contrib_end = current_cell.contributor_end;
-            if (contrib_begin < 0 || contrib_end < 0 ||
-                contrib_begin >= contrib_end) {
-                continue;
-            }
-
-            const auto safe_begin = static_cast<std::size_t>(
-                std::min(contrib_begin,
-                         static_cast<std::int64_t>(all_contributors.size())));
-            const auto safe_end = static_cast<std::size_t>(
-                std::min(contrib_end,
-                         static_cast<std::int64_t>(all_contributors.size())));
-            const std::span<const std::size_t> contributors =
-                contributor_span(all_contributors, safe_begin, safe_end);
-
-            if (contributors.size() < 2) {
-                continue;
-            }
-
-            result.corner_values = sample_cell_corners(
-                current_cell, contributors, positions, smoothing_lengths);
-            result.corner_sign_mask = compute_corner_sign_mask(
-                result.corner_values, isovalue);
-
-            const bool corner_surface = cell_may_contain_isosurface(
-                result.corner_values, isovalue);
-            const bool inherited_surface_hint =
-                current_cell.has_surface && !corner_surface;
-            result.has_surface = corner_surface || inherited_surface_hint;
-            if (!result.has_surface) {
-                continue;
-            }
-
-            if (current_cell.depth >= max_depth) {
-                continue;
-            }
-
-            if (!corner_surface) {
-                result.should_split = true;
-                result.children = create_child_cells(current_cell);
-                result.child_contributors = filter_child_contributors(
-                    contributors, positions, smoothing_lengths,
-                    result.children);
-                continue;
-            }
-
-            const std::vector<HermiteSample> samples =
-                compute_cell_hermite_samples(
-                    current_cell.bounds, result.corner_values,
-                    result.corner_sign_mask, contributors,
-                    positions, smoothing_lengths, isovalue);
-            const QEFLeafDiagnostics qef_diagnostics =
-                analyze_qef_for_leaf(samples, current_cell.bounds);
-            const double dx = current_cell.bounds.max.x - current_cell.bounds.min.x;
-            const double dy = current_cell.bounds.max.y - current_cell.bounds.min.y;
-            const double dz = current_cell.bounds.max.z - current_cell.bounds.min.z;
-            const double cell_radius =
-                0.5 * std::sqrt(dx * dx + dy * dy + dz * dz);
-            const bool poor_qef_fit =
-                qef_diagnostics.usable_sample_count < minimum_usable_hermite_samples ||
-                qef_diagnostics.used_fallback ||
-                minimum_hermite_normal_alignment(samples) <
-                    min_normal_alignment_threshold ||
-                qef_diagnostics.rms_plane_residual >
-                    max_qef_rms_residual_ratio * cell_radius;
-            if (!poor_qef_fit) {
-                continue;
-            }
-
-            result.should_split = true;
-            result.children = create_child_cells(current_cell);
-            result.child_contributors = filter_child_contributors(
-                contributors, positions, smoothing_lengths, result.children);
-            for (OctreeCell &child : result.children) {
-                child.has_surface = child_inherits_surface_hint(
-                    child, samples, qef_diagnostics.vertex);
-            }
-        }
-
-        for (std::size_t batch_i = 0; batch_i < batch_indices.size(); ++batch_i) {
-            meshmerizer_cancel_detail::poll_for_cancellation_serial(batch_i);
-            refine_counter.tick();
-            OctreeCell &current_cell = all_cells[batch_indices[batch_i]];
-            const RefinementResult &result = batch_results[batch_i];
-
-            current_cell.corner_values = result.corner_values;
-            current_cell.corner_sign_mask = result.corner_sign_mask;
-
-            if (!result.has_surface) {
-                current_cell.is_leaf = true;
-                current_cell.is_active = false;
-                current_cell.has_surface = false;
-                current_cell.is_topo_surface = false;
-                current_cell.child_begin = -1;
-                continue;
-            }
-
-            if (!result.should_split) {
-                current_cell.is_leaf = true;
-                current_cell.is_active = true;
-                current_cell.has_surface = true;
-                current_cell.is_topo_surface = false;
-                current_cell.child_begin = -1;
-                continue;
-            }
-
-            current_cell.is_leaf = false;
-            current_cell.is_active = true;
-            current_cell.has_surface = true;
-            current_cell.is_topo_surface = false;
-
-            const std::int64_t child_begin_offset =
-                static_cast<std::int64_t>(all_cells.size());
-            current_cell.child_begin = child_begin_offset;
-
-            for (std::size_t i = 0; i < result.children.size(); ++i) {
-                const std::int64_t child_contrib_begin =
-                    static_cast<std::int64_t>(all_contributors.size());
-                std::copy(result.child_contributors[i].begin(),
-                          result.child_contributors[i].end(),
-                          std::back_inserter(all_contributors));
-                const std::int64_t child_contrib_end =
-                    static_cast<std::int64_t>(all_contributors.size());
-
-                OctreeCell child = result.children[i];
-                child.contributor_begin = child_contrib_begin;
-                child.contributor_end = child_contrib_end;
-
-                all_cells.push_back(child);
-                leaf_queue.push(all_cells.size() - 1);
-            }
-        }
-    }
-
-    refine_counter.finish();
-
-    // Enforce the 2:1 balance rule.
-    balance_octree(all_cells, all_contributors, positions,
-                   smoothing_lengths, isovalue, domain,
-                   base_resolution, max_depth);
-
-    return {all_cells, all_contributors};
+    auto refined = refine_with_closure(
+        std::move(initial_cells),
+        std::move(initial_contributors),
+        positions,
+        smoothing_lengths,
+        closure_config);
+#ifdef DEBUG_LOG
+    // Debug-only safety net: the closure queue is expected to enforce 2:1
+    // balance before it drains. If this does work, the scheduler missed a
+    // balance wake and the debug logs will expose it without reintroducing
+    // hidden production iteration.
+    repair_balance_invariant_with_closure(
+        refined.first,
+        refined.second,
+        positions,
+        smoothing_lengths,
+        closure_config);
+#endif
+    return refined;
 }
 
 inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octree(
@@ -1475,9 +1130,12 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
     std::uint32_t max_depth,
     const BoundingBox &domain,
     std::uint32_t base_resolution,
+    std::uint32_t worker_count = 1U,
+    double table_cadence_seconds = 10.0,
     std::uint32_t minimum_usable_hermite_samples = 3U,
     double max_qef_rms_residual_ratio = 0.1,
-    double min_normal_alignment_threshold = 0.97) {
+    double min_normal_alignment_threshold = 0.97,
+    double surface_band_target_leaf_size = 0.0) {
     if (initial_cells.empty()) {
         return {{}, {}};
     }
@@ -1488,18 +1146,18 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
          ++cell_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
         OctreeCell &cell = initial_cells[cell_index];
-        const std::int64_t contrib_begin = cell.contributor_begin;
-        const std::int64_t contrib_end = cell.contributor_end;
+        const std::int32_t contrib_begin = cell.contributor_begin;
+        const std::int32_t contrib_end = cell.contributor_end;
 
         if (contrib_begin >= 0 && contrib_end > contrib_begin) {
-            const std::int64_t original_size =
-                static_cast<std::int64_t>(initial_contributors.size());
+            const std::int32_t original_size =
+                static_cast<std::int32_t>(initial_contributors.size());
             cell.contributor_begin = original_size;
             for (std::int64_t i = contrib_begin; i < contrib_end; ++i) {
                 initial_contributors.push_back(static_cast<std::size_t>(i));
             }
             cell.contributor_end =
-                static_cast<std::int64_t>(initial_contributors.size());
+                static_cast<std::int32_t>(initial_contributors.size());
         } else {
             cell.contributor_begin = -1;
             cell.contributor_end = -1;
@@ -1509,10 +1167,11 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
     return refine_octree(
         std::move(initial_cells), std::move(initial_contributors),
         positions, smoothing_lengths, isovalue, max_depth,
-        domain, base_resolution,
+        domain, base_resolution, worker_count, table_cadence_seconds,
         minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio,
-        min_normal_alignment_threshold);
+        min_normal_alignment_threshold,
+        surface_band_target_leaf_size);
 }
 
 #endif  // MESHMERIZER_ADAPTIVE_CPP_OCTREE_CELL_HPP_

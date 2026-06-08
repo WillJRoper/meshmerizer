@@ -1,5 +1,6 @@
 """Tests for adaptive CLI helpers."""
 
+import warnings
 from argparse import Namespace
 from pathlib import Path
 
@@ -7,10 +8,12 @@ import numpy as np
 import pytest
 import trimesh
 
+from meshmerizer.cli import adaptive as adaptive_cli
 from meshmerizer.cli.adaptive import run_adaptive
 from meshmerizer.cli.args import build_parser
 from meshmerizer.cli.main import main
 from meshmerizer.cli.units import convert_print_length_to_native_units
+from meshmerizer.io import swift as swift_io
 from meshmerizer.logging import (
     _STATE,
     cli_logging_context,
@@ -59,6 +62,111 @@ def test_remove_islands_keeps_large_nonwatertight_main_component() -> None:
     assert cleaned.mesh.bounds[1][0] < 20.0
 
 
+def test_remove_islands_ignores_flat_degenerate_component() -> None:
+    """Flat zero-volume fluff should not trigger trimesh mass warnings."""
+    main = trimesh.creation.box(extents=(10.0, 10.0, 10.0))
+    flat = trimesh.Trimesh(
+        vertices=np.array(
+            [
+                [20.0, 0.0, 0.0],
+                [21.0, 0.0, 0.0],
+                [21.0, 1.0, 0.0],
+                [20.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        faces=np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64),
+        process=False,
+    )
+    combined = trimesh.util.concatenate([main, flat])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cleaned = remove_islands(
+            Mesh(mesh=combined.copy()), remove_islands_fraction=0.1
+        )
+
+    runtime_warnings = [
+        warning
+        for warning in caught
+        if issubclass(warning.category, RuntimeWarning)
+    ]
+    assert runtime_warnings == []
+
+    components = cleaned.mesh.split(only_watertight=False)
+    assert len(components) == 1
+    assert np.allclose(components[0].extents, main.extents)
+
+
+def test_remove_islands_avoids_watertight_mass_property_warnings() -> None:
+    """Watertight-marked zero-volume fluff should not hit trimesh volume."""
+    main = trimesh.creation.box(extents=(10.0, 10.0, 10.0))
+    flat = trimesh.Trimesh(
+        vertices=np.array(
+            [
+                [20.0, 0.0, 0.0],
+                [21.0, 0.0, 0.0],
+                [21.0, 1.0, 0.0],
+                [20.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        faces=np.array(
+            [[0, 1, 2], [0, 2, 3], [2, 1, 0], [3, 2, 0]], dtype=np.int64
+        ),
+        process=False,
+    )
+    combined = trimesh.util.concatenate([main, flat])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cleaned = remove_islands(
+            Mesh(mesh=combined.copy()), remove_islands_fraction=0.1
+        )
+
+    runtime_warnings = [
+        warning
+        for warning in caught
+        if issubclass(warning.category, RuntimeWarning)
+    ]
+    assert runtime_warnings == []
+
+    components = cleaned.mesh.split(only_watertight=False)
+    assert len(components) == 1
+    assert np.allclose(components[0].extents, main.extents)
+
+
+def test_postprocess_mesh_repairs_before_island_filtering(tmp_path) -> None:
+    """CLI postprocessing should repair invalid topology before filtering."""
+    from meshmerizer.cli.adaptive import _postprocess_mesh
+
+    box = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    bad = trimesh.Trimesh(
+        vertices=box.vertices.copy(),
+        faces=np.vstack([box.faces.copy(), box.faces[[0]][:, ::-1]]),
+        process=False,
+    )
+    mesh = Mesh(mesh=bad)
+
+    args = Namespace(
+        remove_islands_fraction=None,
+        simplify_factor=1.0,
+        target_size=None,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        repaired = _postprocess_mesh(mesh, args)
+        _ = repaired.mesh.is_watertight
+
+    runtime_warnings = [
+        warning
+        for warning in caught
+        if issubclass(warning.category, RuntimeWarning)
+    ]
+    assert runtime_warnings == []
+
+
 def test_run_adaptive_passes_pre_thickening_radius(
     monkeypatch, tmp_path
 ) -> None:
@@ -102,6 +210,7 @@ def test_run_adaptive_passes_pre_thickening_radius(
 
     args = Namespace(
         nthreads=None,
+        table_cadence=10.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -176,6 +285,7 @@ def test_run_adaptive_converts_pre_thickening_in_print_units(
 
     args = Namespace(
         nthreads=None,
+        table_cadence=10.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -252,6 +362,7 @@ def test_run_adaptive_converts_regularization_lengths_for_loaded_octree(
 
     args = Namespace(
         nthreads=None,
+        table_cadence=10.0,
         load_octree=tmp_path / "tree.hdf5",
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -305,6 +416,121 @@ def test_build_parser_supports_top_level_help() -> None:
     assert excinfo.value.code == 0
 
 
+def test_build_parser_accepts_table_cadence() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(["snapshot.hdf5", "--table-cadence", "7.5"])
+
+    assert args.table_cadence == pytest.approx(7.5)
+
+
+def test_build_parser_accepts_threshold_filter_arguments() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "snapshot.hdf5",
+            "--threshold-key",
+            "/PartType0/Densities",
+            "--low-thresh",
+            "1.5",
+            "--up-thresh",
+            "3.5",
+        ]
+    )
+
+    assert args.threshold_key == "/PartType0/Densities"
+    assert args.low_thresh == pytest.approx(1.5)
+    assert args.up_thresh == pytest.approx(3.5)
+
+
+def test_apply_particle_threshold_filter_keeps_bandpass_values(
+    tmp_path,
+) -> None:
+    h5py = pytest.importorskip("h5py")
+    snapshot = tmp_path / "snapshot.hdf5"
+    with h5py.File(snapshot, "w") as handle:
+        handle.create_dataset(
+            "/PartType0/Densities",
+            data=np.array([0.5, 1.5, 2.5, 3.5], dtype=np.float64),
+        )
+
+    coords = np.arange(12, dtype=np.float64).reshape(4, 3)
+    smoothing_lengths = np.array([10.0, 20.0, 30.0, 40.0])
+
+    filtered_coords, filtered_h = swift_io.apply_particle_threshold_filter(
+        snapshot,
+        coords,
+        smoothing_lengths,
+        threshold_key="/PartType0/Densities",
+        low_thresh=1.0,
+        up_thresh=3.0,
+    )
+
+    assert np.array_equal(filtered_coords, coords[[1, 2]])
+    assert np.array_equal(filtered_h, smoothing_lengths[[1, 2]])
+
+
+def test_apply_particle_threshold_filter_supports_one_sided_bounds(
+    tmp_path,
+) -> None:
+    h5py = pytest.importorskip("h5py")
+    snapshot = tmp_path / "snapshot.hdf5"
+    with h5py.File(snapshot, "w") as handle:
+        handle.create_dataset(
+            "/PartType0/Densities",
+            data=np.array([0.5, 1.5, 2.5, 3.5], dtype=np.float64),
+        )
+
+    coords = np.arange(12, dtype=np.float64).reshape(4, 3)
+
+    low_coords, low_h = swift_io.apply_particle_threshold_filter(
+        snapshot,
+        coords,
+        None,
+        threshold_key="/PartType0/Densities",
+        low_thresh=2.0,
+        up_thresh=None,
+    )
+    up_coords, up_h = swift_io.apply_particle_threshold_filter(
+        snapshot,
+        coords,
+        None,
+        threshold_key="/PartType0/Densities",
+        low_thresh=None,
+        up_thresh=1.5,
+    )
+
+    assert np.array_equal(low_coords, coords[[2, 3]])
+    assert low_h is None
+    assert np.array_equal(up_coords, coords[[0, 1]])
+    assert up_h is None
+
+
+def test_apply_particle_threshold_filter_rejects_invalid_arguments() -> None:
+    coords = np.zeros((2, 3), dtype=np.float64)
+
+    with pytest.raises(ValueError, match="threshold-key"):
+        swift_io.apply_particle_threshold_filter(
+            Path("snapshot.hdf5"),
+            coords,
+            None,
+            threshold_key=None,
+            low_thresh=1.0,
+            up_thresh=None,
+        )
+
+    with pytest.raises(ValueError, match="low-thresh"):
+        swift_io.apply_particle_threshold_filter(
+            Path("snapshot.hdf5"),
+            coords,
+            None,
+            threshold_key="/PartType0/Densities",
+            low_thresh=2.0,
+            up_thresh=1.0,
+        )
+
+
 def test_main_without_arguments_prints_usage(capsys) -> None:
     with pytest.raises(SystemExit) as excinfo:
         main([])
@@ -334,12 +560,13 @@ def test_run_adaptive_allows_missing_filename_with_loaded_octree(
         },
     )
     monkeypatch.setattr(
-        "meshmerizer.cli.adaptive._reconstruct_mesh",
+        "meshmerizer.cli.adaptive.generate_mesh",
         lambda *args, **kwargs: (
             np.array(
                 [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
                 dtype=np.float64,
             ),
+            np.zeros((3, 3), dtype=np.float64),
             np.array([[0, 1, 2]], dtype=np.uint32),
         ),
     )
@@ -350,6 +577,7 @@ def test_run_adaptive_allows_missing_filename_with_loaded_octree(
 
     args = Namespace(
         nthreads=None,
+        table_cadence=10.0,
         load_octree=tmp_path / "tree.hdf5",
         save_octree=None,
         filename=None,
@@ -381,9 +609,91 @@ def test_run_adaptive_allows_missing_filename_with_loaded_octree(
     run_adaptive(args)
 
 
+def test_run_adaptive_loaded_octree_reuses_tree_for_direct_meshing(
+    monkeypatch, tmp_path
+) -> None:
+    captured = {}
+
+    monkeypatch.setattr(
+        "meshmerizer.cli.adaptive.import_octree",
+        lambda path: {
+            "positions": np.array(
+                [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]],
+                dtype=np.float64,
+            ),
+            "smoothing_lengths": np.full(3, 0.1, dtype=np.float64),
+            "domain_minimum": (0.0, 0.0, 0.0),
+            "domain_maximum": (2.0, 1.0, 1.0),
+            "cells": [{"is_leaf": True}],
+            "contributors": np.array([0, 1, 2], dtype=np.int64),
+            "isovalue": 0.01,
+            "max_depth": 2,
+            "base_resolution": 2,
+        },
+    )
+    monkeypatch.setattr(
+        "meshmerizer.cli.adaptive.generate_mesh",
+        lambda *args, **kwargs: (
+            captured.setdefault("generate_mesh_called", True),
+            np.array(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=np.float64,
+            ),
+            np.zeros((3, 3), dtype=np.float64),
+            np.array([[0, 1, 2]], dtype=np.uint32),
+        )[1:],
+    )
+    monkeypatch.setattr(
+        "meshmerizer.cli.adaptive._reconstruct_mesh",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("_reconstruct_mesh should not be called")
+        ),
+    )
+    monkeypatch.setattr(
+        "meshmerizer.mesh.core.trimesh.Trimesh.export",
+        lambda self, *args, **kwargs: None,
+    )
+
+    args = Namespace(
+        nthreads=None,
+        table_cadence=10.0,
+        load_octree=tmp_path / "tree.hdf5",
+        save_octree=None,
+        filename=None,
+        output=tmp_path / "out.stl",
+        min_feature_thickness=0.0,
+        pre_thickening_radius=0.0,
+        simplify_factor=1.0,
+        target_size=None,
+        max_depth=2,
+        base_resolution=2,
+        isovalue=None,
+        surface_percentile=5.0,
+        fof=False,
+        linking_factor=0.2,
+        smoothing_iterations=0,
+        smoothing_strength=0.5,
+        max_edge_ratio=0.0,
+        min_usable_hermite_samples=3,
+        max_qef_rms_residual_ratio=0.1,
+        min_normal_alignment_threshold=0.97,
+        remove_islands_fraction=None,
+        visualise_verts=None,
+        min_fof_cluster_size=None,
+        center=None,
+        extent=None,
+        silent=False,
+    )
+
+    run_adaptive(args)
+
+    assert captured["generate_mesh_called"] is True
+
+
 def test_run_adaptive_errors_when_no_input_source_is_given() -> None:
     args = Namespace(
         nthreads=None,
+        table_cadence=10.0,
         load_octree=None,
         save_octree=None,
         filename=None,
@@ -490,6 +800,7 @@ def test_run_adaptive_removes_temporary_output_on_interrupt(
 
     args = Namespace(
         nthreads=None,
+        table_cadence=10.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -580,6 +891,7 @@ def test_run_adaptive_applies_simplify_factor(monkeypatch, tmp_path) -> None:
 
     args = Namespace(
         nthreads=None,
+        table_cadence=10.0,
         load_octree=None,
         save_octree=None,
         filename=Path("snapshot.hdf5"),
@@ -630,3 +942,128 @@ def test_warning_summary_is_deferred_until_end(monkeypatch) -> None:
 def test_progress_bar_respects_silent_mode() -> None:
     with cli_logging_context(silent=True):
         assert _STATE.silent is True
+
+
+def test_reconstruct_mesh_runs_fof_groups_in_parallel_and_merges_faces(
+    monkeypatch,
+) -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.0, 0.1, 0.0],
+            [1.0, 1.0, 1.0],
+            [1.1, 1.0, 1.0],
+            [1.0, 1.1, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    smoothing_lengths = np.full(6, 0.1, dtype=np.float64)
+    labels = np.array([4, 4, 4, 9, 9, 9], dtype=np.int64)
+    seen_groups = []
+
+    def fake_run_full_pipeline(
+        group_pos,
+        group_sml,
+        domain_min,
+        domain_max,
+        base_resolution,
+        isovalue,
+        max_depth,
+        **kwargs,
+    ):
+        seen_groups.append(group_pos.copy())
+        if np.allclose(group_pos[:, 0], [0.0, 0.1, 0.0]):
+            return {
+                "vertices": np.array(
+                    [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.0]],
+                    dtype=np.float64,
+                ),
+                "faces": np.array([[0, 1, 2]], dtype=np.uint32),
+            }
+        return {
+            "vertices": np.array(
+                [[1.0, 1.0, 1.0], [1.2, 1.0, 1.0], [1.0, 1.2, 1.0]],
+                dtype=np.float64,
+            ),
+            "faces": np.array([[0, 1, 2]], dtype=np.uint32),
+        }
+
+    monkeypatch.setattr(
+        "meshmerizer.cli.adaptive.run_full_pipeline",
+        fake_run_full_pipeline,
+    )
+
+    vertices, faces = adaptive_cli._reconstruct_mesh(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (2.0, 2.0, 2.0),
+        4,
+        0.01,
+        2,
+        worker_count=2,
+        group_labels=labels,
+    )
+
+    assert len(seen_groups) == 2
+    assert vertices.shape == (6, 3)
+    np.testing.assert_array_equal(
+        faces,
+        np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64),
+    )
+
+
+def test_reconstruct_mesh_skips_undersized_fof_groups(monkeypatch) -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.0, 0.1, 0.0],
+            [1.0, 1.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    smoothing_lengths = np.full(4, 0.1, dtype=np.float64)
+    labels = np.array([1, 1, 1, 2], dtype=np.int64)
+    call_sizes = []
+
+    def fake_run_full_pipeline(
+        group_pos,
+        group_sml,
+        domain_min,
+        domain_max,
+        base_resolution,
+        isovalue,
+        max_depth,
+        **kwargs,
+    ):
+        call_sizes.append(group_pos.shape[0])
+        return {
+            "vertices": np.array(
+                [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.0]],
+                dtype=np.float64,
+            ),
+            "faces": np.array([[0, 1, 2]], dtype=np.uint32),
+        }
+
+    monkeypatch.setattr(
+        "meshmerizer.cli.adaptive.run_full_pipeline",
+        fake_run_full_pipeline,
+    )
+
+    vertices, faces = adaptive_cli._reconstruct_mesh(
+        positions,
+        smoothing_lengths,
+        (0.0, 0.0, 0.0),
+        (2.0, 2.0, 2.0),
+        4,
+        0.01,
+        2,
+        worker_count=2,
+        group_labels=labels,
+    )
+
+    assert call_sizes == [3]
+    assert vertices.shape == (3, 3)
+    np.testing.assert_array_equal(faces, np.array([[0, 1, 2]], dtype=np.int64))

@@ -13,7 +13,7 @@ import trimesh.remesh as remesh
 import trimesh.smoothing as smoothing
 from trimesh import repair as trimesh_repair
 
-from meshmerizer.logging_utils import log_status
+from meshmerizer.logging import log_status
 
 
 class Mesh:
@@ -177,10 +177,11 @@ class Mesh:
                 iterations=smoothing_iters,
             )
 
-        # Re-run cleanup after smoothing because smoothing can invalidate
-        # cached topology state and introduce small local defects.
-        self.mesh.process()
-        _repair_local_broken_faces(self.mesh)
+            # Re-run cleanup after smoothing because smoothing can invalidate
+            # cached topology state and introduce small local defects.
+            self.mesh.process()
+            _repair_local_broken_faces(self.mesh)
+
         self.mesh.fix_normals()
         if not self.mesh.is_watertight:
             log_status("Cleaning", "⚠️ Mesh still not watertight after repair.")
