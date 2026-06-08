@@ -400,12 +400,59 @@ def build_refined_tree(
     return cells, np.asarray(contributors, dtype=np.int64)
 
 
+def build_native_tree_handle(
+    positions: "numpy.ndarray",
+    smoothing_lengths: "numpy.ndarray",
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    base_resolution: int,
+    isovalue: float,
+    max_depth: int,
+    worker_count: int = 1,
+    minimum_usable_hermite_samples: int = 3,
+    max_qef_rms_residual_ratio: float = 0.1,
+    min_normal_alignment_threshold: float = 0.97,
+    table_cadence: float = 10.0,
+) -> object:
+    """Build and refine the adaptive tree and keep it resident in C++.
+
+    Returns an opaque native handle rather than materializing Python cell
+    dictionaries. This is the preferred staged-workflow path because it avoids
+    round-tripping the full octree across the Python boundary.
+    """
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
+    return _adaptive.build_native_tree_handle(
+        pos,
+        sml,
+        domain_minimum,
+        domain_maximum,
+        base_resolution,
+        isovalue,
+        max_depth,
+        table_cadence,
+        worker_count,
+        minimum_usable_hermite_samples,
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold,
+    )
+
+
+def generate_mesh_from_tree_handle(
+    native_handle: object,
+) -> tuple["numpy.ndarray", "numpy.ndarray", "numpy.ndarray"]:
+    """Generate a dual-contour mesh from an opaque native tree handle."""
+    return _adaptive.generate_mesh_from_handle(native_handle)
+
+
 __all__ = [
+    "build_native_tree_handle",
     "build_refined_tree",
     "create_child_cells",
     "create_top_level_cells",
     "filter_child_contributors",
     "generate_mesh",
+    "generate_mesh_from_tree_handle",
     "hermite_samples_for_cell",
     "refine_octree",
     "run_octree_pipeline",

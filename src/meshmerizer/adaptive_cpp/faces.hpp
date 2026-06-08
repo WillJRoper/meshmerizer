@@ -652,13 +652,13 @@ inline void emit_quad(
     }
 
     // Get representative vertex indices for all four cells.
-    const std::int64_t vi0 =
+    const std::int32_t vi0 =
         all_cells[c0].representative_vertex_index;
-    const std::int64_t vi1 =
+    const std::int32_t vi1 =
         all_cells[c1].representative_vertex_index;
-    const std::int64_t vi2 =
+    const std::int32_t vi2 =
         all_cells[c2].representative_vertex_index;
-    const std::int64_t vi3 =
+    const std::int32_t vi3 =
         all_cells[c3].representative_vertex_index;
 
     // All four cells must have representative vertices (be active).

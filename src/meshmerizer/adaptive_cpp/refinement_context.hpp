@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "refinement_arena.hpp"
@@ -41,8 +43,8 @@ struct RefinementChildBlock {
 };
 
 struct RefinementContributorRange {
-    std::int64_t begin = -1;
-    std::int64_t end = -1;
+    std::int32_t begin = -1;
+    std::int32_t end = -1;
 };
 
 class RefinementContext {
@@ -135,6 +137,22 @@ public:
 
     /** Mark a processing cell as idle. */
     void mark_idle(std::size_t cell_index);
+
+    /**
+     * @brief Transition a cell from kProcessing to kIdle only if it hasn't
+     *        already been re-queued by a concurrent required_depth raise.
+     *
+     * Uses a CAS so that a lost raise (see mark_queued behaviour when state
+     * is kProcessing) is not silently ignored: if another worker already
+     * moved this cell to kQueued the CAS fails and returns false, indicating
+     * the caller should skip the idle transition and proceed without
+     * scheduling further work.
+     *
+     * @return true  when the CAS succeeded and the cell is now kIdle.
+     * @return false when the state was already kQueued (or another valid
+     *               non-kProcessing state); no transition was performed.
+     */
+    bool try_mark_idle(std::size_t cell_index);
 
     /** Mark a cell as retired. */
     void mark_retired(std::size_t cell_index);
@@ -255,8 +273,14 @@ private:
     ChunkedArena<std::atomic<std::uint32_t>> required_depth_;
     ChunkedArena<std::atomic<std::uint8_t>> task_state_;
     ChunkedArena<std::atomic<std::uint32_t>> generation_;
-    ChunkedArena<RefinementChildBlock> child_blocks_;
-    ChunkedArena<RefinementContributorRange> contributor_ranges_;
+    // Sparse child-block storage: only for internal (split) cells.
+    // keyed by parent cell_index. Protected by a mutex since concurrent
+    // splits by different workers may insert entries simultaneously.
+    mutable std::mutex child_blocks_mutex_;
+    std::unordered_map<std::size_t, RefinementChildBlock> child_blocks_;
+    // Contributor ranges are read directly from OctreeCell struct fields
+    // (contributor_begin / contributor_end), which are set during cell
+    // creation. No separate side-car arena is needed.
     // Incremental thickening side-cars (grown in lockstep with cell_arena_).
     ChunkedArena<std::atomic<std::uint8_t>> cell_classification_;
     // Outside distance stored as raw bits of a float (bit_cast equivalent).

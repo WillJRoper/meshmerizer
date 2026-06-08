@@ -82,4 +82,80 @@ def classify_occupied_solid(
     )
 
 
-__all__ = ["classify_occupied_solid"]
+def classify_occupied_solid_from_tree(
+    cells: list,
+    contributors: np.ndarray,
+    positions: np.ndarray,
+    smoothing_lengths: np.ndarray,
+    domain_minimum: tuple[float, float, float],
+    domain_maximum: tuple[float, float, float],
+    base_resolution: int,
+    isovalue: float,
+    max_depth: int,
+    erosion_radius: float = 0.0,
+    pre_thickening_radius: float = 0.0,
+    worker_count: int = 1,
+) -> dict:
+    """Classify the adaptive occupied solid from an already-built tree.
+
+    Skips particle re-insertion by reusing the existing tree cells and
+    contributor lists produced by ``build_refined_tree``.
+
+    Args:
+        cells: Octree cell list from ``build_refined_tree``.
+        contributors: Contributor index array from ``build_refined_tree``.
+        positions: Particle positions with shape ``(N, 3)``.
+        smoothing_lengths: Per-particle smoothing lengths with shape ``(N,)``.
+        domain_minimum: Lower corner of the working domain.
+        domain_maximum: Upper corner of the working domain.
+        base_resolution: Number of top-level cells per axis.
+        isovalue: Scalar field threshold.
+        max_depth: Maximum octree refinement depth.
+        erosion_radius: Erosion radius used by the opening operator.
+        pre_thickening_radius: Optional outward thickening radius applied
+            before erosion.
+        worker_count: Number of native closure workers to use during topology
+            refinement.
+
+    Returns:
+        Native result dictionary with the same structure as
+        ``classify_occupied_solid``.
+    """
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    sml = np.ascontiguousarray(smoothing_lengths, dtype=np.float64)
+    return _adaptive.classify_occupied_solid_from_tree(
+        cells,
+        contributors,
+        pos,
+        sml,
+        isovalue,
+        tuple(domain_minimum),
+        tuple(domain_maximum),
+        int(max_depth),
+        int(base_resolution),
+        float(erosion_radius),
+        float(pre_thickening_radius),
+        int(worker_count),
+    )
+
+
+def classify_occupied_solid_from_handle(
+    native_handle: object,
+    erosion_radius: float = 0.0,
+    pre_thickening_radius: float = 0.0,
+    worker_count: int = 1,
+) -> dict:
+    """Classify the occupied solid using an opaque native tree handle."""
+    return _adaptive.classify_occupied_solid_from_handle(
+        native_handle,
+        float(erosion_radius),
+        float(pre_thickening_radius),
+        int(worker_count),
+    )
+
+
+__all__ = [
+    "classify_occupied_solid",
+    "classify_occupied_solid_from_handle",
+    "classify_occupied_solid_from_tree",
+]

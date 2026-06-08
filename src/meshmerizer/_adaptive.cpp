@@ -30,11 +30,11 @@
 #define PY_ARRAY_UNIQUE_SYMBOL meshmerizer_ARRAY_API
 #include <numpy/arrayobject.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <vector>
-#include <algorithm>
 #include <thread>
+#include <vector>
 
 #include "adaptive_cpp/bounding_box.hpp"
 #include "adaptive_cpp/hermite.hpp"
@@ -417,14 +417,14 @@ static bool parse_contributor_indices(PyObject *object,
  */
 static bool append_inline_contributors(PyObject *contributor_object,
                                        std::vector<std::size_t> &output,
-                                       std::int64_t &begin,
-                                       std::int64_t &end) {
+                                       std::int32_t &begin,
+                                       std::int32_t &end) {
     PyObject *fast = PySequence_Fast(contributor_object, "contributors");
     if (fast == NULL) {
         return false;
     }
     const Py_ssize_t count = PySequence_Fast_GET_SIZE(fast);
-    begin = static_cast<std::int64_t>(output.size());
+    begin = static_cast<std::int32_t>(output.size());
     for (Py_ssize_t index = 0; index < count; ++index) {
         const long value = PyLong_AsLong(PySequence_Fast_GET_ITEM(fast, index));
         if (value == -1 && PyErr_Occurred()) {
@@ -433,7 +433,7 @@ static bool append_inline_contributors(PyObject *contributor_object,
         }
         output.push_back(static_cast<std::size_t>(value));
     }
-    end = static_cast<std::int64_t>(output.size());
+    end = static_cast<std::int32_t>(output.size());
     Py_DECREF(fast);
     return true;
 }
@@ -1326,17 +1326,19 @@ static PyObject *create_child_cells_py(PyObject *self, PyObject *args) {
     const OctreeCell parent = {
         static_cast<std::uint64_t>(parent_key),
         static_cast<std::uint32_t>(parent_depth),
-        parent_bounds,
-        false,
-        false,
-        false,
-        false,
         -1,
+        -1,
+        0U,
+        false,
+        false,
+        false,
+        false,
+        0U,
+        parent_bounds,
         -1,
         -1,
         -1,
         {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-        0U,
     };
     const std::vector<OctreeCell> children = create_child_cells(parent);
 
@@ -1405,17 +1407,19 @@ static PyObject *filter_child_contributors_py(PyObject *self, PyObject *args) {
     const OctreeCell parent = {
         0ULL,
         0U,
-        parent_bounds,
-        false,
-        false,
-        false,
-        false,
         -1,
+        -1,
+        0U,
+        false,
+        false,
+        false,
+        false,
+        0U,
+        parent_bounds,
         -1,
         -1,
         -1,
         {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-        0U,
     };
     const std::vector<OctreeCell> children = create_child_cells(parent);
     const std::vector<std::vector<std::size_t>> child_contributors =
@@ -1528,6 +1532,188 @@ static void release_binding_vector_memory(std::vector<T> &values) {
     std::vector<T>().swap(values);
 }
 
+static void classify_occupied_solid_on_tree(
+    const std::vector<OctreeCell> &all_cells,
+    const std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const BoundingBox &domain,
+    unsigned int base_resolution,
+    double isovalue,
+    unsigned int max_depth,
+    unsigned int worker_count,
+    double erosion_radius,
+    double pre_thickening_radius,
+    std::vector<OccupiedSolidLeaf> &solid_leaves,
+    std::vector<double> &clearance,
+    std::vector<double> &thickening_distance,
+    std::vector<std::uint8_t> &thickened_inside,
+    std::vector<std::uint8_t> &eroded_inside,
+    std::vector<double> &dilation_distance,
+    std::vector<std::uint8_t> &opened_inside,
+    std::vector<OpenedBoundarySample> &opened_boundary_samples,
+    OpenedSurfaceMesh &opened_surface_mesh,
+    std::size_t &inside_count,
+    std::size_t &boundary_inside_count,
+    std::size_t &boundary_outside_count,
+    std::size_t &eroded_inside_count,
+    std::size_t &thickened_inside_count,
+    std::size_t &opened_inside_count) {
+    LeafSpatialIndex spatial_index;
+    spatial_index.build(
+        all_cells, domain, static_cast<std::uint32_t>(max_depth),
+        static_cast<std::uint32_t>(base_resolution));
+    OccupiedSolidClassificationCache classification_cache;
+    update_occupied_solid_classification_cache(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        spatial_index,
+        isovalue,
+        static_cast<std::uint32_t>(max_depth),
+        classification_cache);
+
+    std::vector<std::uint8_t> inside_mask;
+    solid_leaves = build_occupied_solid_leaves_from_cache(
+        all_cells, classification_cache, nullptr, &inside_mask);
+    std::vector<std::uint8_t> inside_mask_by_cell =
+        build_inside_mask_from_classification_cache(all_cells, classification_cache);
+
+    std::vector<double> thickening_distance_by_cell(
+        all_cells.size(), std::numeric_limits<double>::infinity());
+    thickening_distance.assign(
+        solid_leaves.size(), std::numeric_limits<double>::infinity());
+    thickened_inside = inside_mask;
+    if (pre_thickening_radius > 0.0) {
+        thickening_distance_by_cell =
+            compute_outside_distance_from_classification_cache(
+                all_cells,
+                classification_cache,
+                static_cast<std::uint32_t>(worker_count),
+                pre_thickening_radius);
+        thickening_distance = project_leaf_scalars_from_cell_state(
+            solid_leaves,
+            thickening_distance_by_cell,
+            std::numeric_limits<double>::infinity());
+        inside_mask_by_cell = dilate_inside_cell_mask(
+            all_cells,
+            inside_mask_by_cell,
+            thickening_distance_by_cell,
+            pre_thickening_radius);
+        thickened_inside = build_leaf_mask_from_cell_mask(
+            solid_leaves, inside_mask_by_cell);
+    }
+
+    std::vector<double> clearance_by_cell(
+        all_cells.size(), std::numeric_limits<double>::infinity());
+    clearance.assign(solid_leaves.size(), std::numeric_limits<double>::infinity());
+    if (erosion_radius > 0.0) {
+        clearance_by_cell = compute_inside_clearance_from_cell_mask(
+            all_cells,
+            classification_cache,
+            inside_mask_by_cell,
+            static_cast<std::uint32_t>(worker_count),
+            erosion_radius);
+        clearance = project_leaf_scalars_from_cell_state(
+            solid_leaves,
+            clearance_by_cell,
+            std::numeric_limits<double>::infinity());
+    }
+
+    std::vector<std::uint8_t> eroded_inside_by_cell = inside_mask_by_cell;
+    if (erosion_radius > 0.0) {
+        eroded_inside_by_cell = erode_occupied_solid_cells(
+            all_cells,
+            inside_mask_by_cell,
+            clearance_by_cell,
+            erosion_radius);
+    }
+    eroded_inside = build_leaf_mask_from_cell_mask(
+        solid_leaves, eroded_inside_by_cell);
+
+    std::vector<double> dilation_distance_by_cell(
+        all_cells.size(), std::numeric_limits<double>::infinity());
+    dilation_distance.assign(
+        solid_leaves.size(), std::numeric_limits<double>::infinity());
+    std::vector<std::uint8_t> opened_inside_by_cell = eroded_inside_by_cell;
+    if (erosion_radius > 0.0) {
+        dilation_distance_by_cell = compute_distance_to_eroded_solid_from_cell_mask(
+            all_cells,
+            classification_cache,
+            eroded_inside_by_cell,
+            static_cast<std::uint32_t>(worker_count),
+            erosion_radius);
+        dilation_distance = project_leaf_scalars_from_cell_state(
+            solid_leaves,
+            dilation_distance_by_cell,
+            std::numeric_limits<double>::infinity());
+        opened_inside_by_cell = dilate_eroded_solid_cells(
+            all_cells,
+            eroded_inside_by_cell,
+            dilation_distance_by_cell,
+            erosion_radius);
+    }
+    opened_inside = build_leaf_mask_from_cell_mask(
+        solid_leaves, opened_inside_by_cell);
+    opened_boundary_samples = generate_opened_boundary_samples(
+        solid_leaves, opened_inside, all_cells);
+    opened_surface_mesh = generate_opened_surface_mesh(
+        solid_leaves,
+        opened_inside,
+        all_cells,
+        spatial_index,
+        domain,
+        static_cast<std::uint32_t>(base_resolution),
+        static_cast<std::uint32_t>(max_depth));
+
+    inside_count = 0U;
+    boundary_inside_count = 0U;
+    boundary_outside_count = 0U;
+    eroded_inside_count = 0U;
+    thickened_inside_count = 0U;
+    opened_inside_count = 0U;
+    for (std::size_t i = 0; i < solid_leaves.size(); ++i) {
+        const OccupiedSolidLeaf &leaf = solid_leaves[i];
+        if (leaf.occupancy == OccupancyState::kInside ||
+            leaf.occupancy == OccupancyState::kBoundaryInside) {
+            ++inside_count;
+        }
+        if (leaf.occupancy == OccupancyState::kBoundaryInside) {
+            ++boundary_inside_count;
+        }
+        if (leaf.occupancy == OccupancyState::kBoundaryOutside) {
+            ++boundary_outside_count;
+        }
+        if (eroded_inside[i] != 0U) {
+            ++eroded_inside_count;
+        }
+        if (thickened_inside[i] != 0U) {
+            ++thickened_inside_count;
+        }
+        if (opened_inside[i] != 0U) {
+            ++opened_inside_count;
+        }
+    }
+}
+
+static PyObject *build_classify_occupied_solid_result(
+    std::vector<OccupiedSolidLeaf> &solid_leaves,
+    std::vector<double> &clearance,
+    std::vector<double> &thickening_distance,
+    std::vector<std::uint8_t> &thickened_inside,
+    std::vector<std::uint8_t> &eroded_inside,
+    std::vector<double> &dilation_distance,
+    std::vector<std::uint8_t> &opened_inside,
+    std::vector<OpenedBoundarySample> &opened_boundary_samples,
+    OpenedSurfaceMesh &opened_surface_mesh,
+    std::size_t inside_count,
+    std::size_t boundary_inside_count,
+    std::size_t boundary_outside_count,
+    std::size_t eroded_inside_count,
+    std::size_t thickened_inside_count,
+    std::size_t opened_inside_count);
+
 static int dict_set_owned_item(
     PyObject *dict,
     const char *key,
@@ -1596,6 +1782,343 @@ static PyObject *vector_to_numpy_2d(
         return NULL;
     }
     return array;
+}
+
+struct NativeTreeState {
+    std::vector<OctreeCell> cells;
+    std::vector<std::size_t> contributors;
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    BoundingBox domain{};
+    unsigned int base_resolution = 0U;
+    unsigned int max_depth = 0U;
+    double isovalue = 0.0;
+    unsigned int minimum_usable_hermite_samples = 3U;
+    double max_qef_rms_residual_ratio = 0.1;
+    double min_normal_alignment_threshold = 0.97;
+};
+
+static void delete_native_tree_state_capsule(PyObject *capsule) {
+    void *pointer = PyCapsule_GetPointer(capsule, "meshmerizer.tree_state");
+    if (pointer != NULL) {
+        delete static_cast<NativeTreeState *>(pointer);
+    }
+}
+
+static NativeTreeState *get_native_tree_state(PyObject *capsule) {
+    return static_cast<NativeTreeState *>(
+        PyCapsule_GetPointer(capsule, "meshmerizer.tree_state"));
+}
+
+static PyObject *build_native_tree_state_capsule(NativeTreeState *state) {
+    PyObject *capsule = PyCapsule_New(
+        state,
+        "meshmerizer.tree_state",
+        &delete_native_tree_state_capsule);
+    if (capsule == NULL) {
+        delete state;
+    }
+    return capsule;
+}
+
+static PyObject *build_classify_occupied_solid_result(
+    std::vector<OccupiedSolidLeaf> &solid_leaves,
+    std::vector<double> &clearance,
+    std::vector<double> &thickening_distance,
+    std::vector<std::uint8_t> &thickened_inside,
+    std::vector<std::uint8_t> &eroded_inside,
+    std::vector<double> &dilation_distance,
+    std::vector<std::uint8_t> &opened_inside,
+    std::vector<OpenedBoundarySample> &opened_boundary_samples,
+    OpenedSurfaceMesh &opened_surface_mesh,
+    std::size_t inside_count,
+    std::size_t boundary_inside_count,
+    std::size_t boundary_outside_count,
+    std::size_t eroded_inside_count,
+    std::size_t thickened_inside_count,
+    std::size_t opened_inside_count) {
+    const npy_intp dims[1] = {static_cast<npy_intp>(solid_leaves.size())};
+    const npy_intp sample_dims[2] = {
+        static_cast<npy_intp>(opened_boundary_samples.size()), 3};
+    const npy_intp mesh_vertex_dims[2] = {
+        static_cast<npy_intp>(opened_surface_mesh.vertices.size()), 3};
+    const npy_intp mesh_face_dims[2] = {
+        static_cast<npy_intp>(opened_surface_mesh.triangles.size()), 3};
+
+    PyObject *result = PyDict_New();
+    if (result == NULL) {
+        return NULL;
+    }
+
+    auto fail_result = [&result]() -> PyObject * {
+        Py_DECREF(result);
+        return NULL;
+    };
+
+    PyObject *occupancy_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
+    PyObject *depth_array = PyArray_SimpleNew(1, dims, NPY_UINT32);
+    PyObject *center_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *size_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    if (!occupancy_array || !depth_array || !center_array || !size_array) {
+        Py_XDECREF(occupancy_array);
+        Py_XDECREF(depth_array);
+        Py_XDECREF(center_array);
+        Py_XDECREF(size_array);
+        return fail_result();
+    }
+
+    auto *occupancy_data = static_cast<std::uint8_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(occupancy_array)));
+    auto *depth_data = static_cast<std::uint32_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(depth_array)));
+    auto *center_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(center_array)));
+    auto *size_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(size_array)));
+    for (std::size_t i = 0; i < solid_leaves.size(); ++i) {
+        occupancy_data[i] = static_cast<std::uint8_t>(solid_leaves[i].occupancy);
+        depth_data[i] = solid_leaves[i].depth;
+        center_data[i] = solid_leaves[i].center_value;
+        size_data[i] = solid_leaves[i].cell_size;
+    }
+    release_binding_vector_memory(solid_leaves);
+    if (dict_set_owned_item(result, "occupancy", occupancy_array) < 0 ||
+        dict_set_owned_item(result, "depths", depth_array) < 0 ||
+        dict_set_owned_item(result, "center_values", center_array) < 0 ||
+        dict_set_owned_item(result, "cell_sizes", size_array) < 0) {
+        return fail_result();
+    }
+
+    PyObject *clearance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *thickening_distance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *thickened_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
+    PyObject *eroded_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
+    PyObject *dilation_distance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    PyObject *opened_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
+    if (!clearance_array || !thickening_distance_array || !thickened_inside_array ||
+        !eroded_inside_array || !dilation_distance_array || !opened_inside_array) {
+        Py_XDECREF(clearance_array);
+        Py_XDECREF(thickening_distance_array);
+        Py_XDECREF(thickened_inside_array);
+        Py_XDECREF(eroded_inside_array);
+        Py_XDECREF(dilation_distance_array);
+        Py_XDECREF(opened_inside_array);
+        return fail_result();
+    }
+
+    auto *clearance_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(clearance_array)));
+    auto *thickening_distance_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(thickening_distance_array)));
+    auto *thickened_inside_data = static_cast<std::uint8_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(thickened_inside_array)));
+    auto *eroded_inside_data = static_cast<std::uint8_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(eroded_inside_array)));
+    auto *dilation_distance_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(dilation_distance_array)));
+    auto *opened_inside_data = static_cast<std::uint8_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(opened_inside_array)));
+    for (std::size_t i = 0; i < clearance.size(); ++i) {
+        clearance_data[i] = clearance[i];
+        thickening_distance_data[i] = thickening_distance[i];
+        thickened_inside_data[i] = thickened_inside[i];
+        eroded_inside_data[i] = eroded_inside[i];
+        dilation_distance_data[i] = dilation_distance[i];
+        opened_inside_data[i] = opened_inside[i];
+    }
+    release_binding_vector_memory(clearance);
+    release_binding_vector_memory(thickening_distance);
+    release_binding_vector_memory(thickened_inside);
+    release_binding_vector_memory(eroded_inside);
+    release_binding_vector_memory(dilation_distance);
+    release_binding_vector_memory(opened_inside);
+    if (dict_set_owned_item(result, "clearance", clearance_array) < 0 ||
+        dict_set_owned_item(result, "thickening_distance", thickening_distance_array) < 0 ||
+        dict_set_owned_item(result, "thickened_inside", thickened_inside_array) < 0 ||
+        dict_set_owned_item(result, "eroded_inside", eroded_inside_array) < 0 ||
+        dict_set_owned_item(result, "dilation_distance", dilation_distance_array) < 0 ||
+        dict_set_owned_item(result, "opened_inside", opened_inside_array) < 0) {
+        return fail_result();
+    }
+
+    PyObject *sample_positions_array =
+        PyArray_SimpleNew(2, sample_dims, NPY_DOUBLE);
+    PyObject *sample_normals_array =
+        PyArray_SimpleNew(2, sample_dims, NPY_DOUBLE);
+    if (!sample_positions_array || !sample_normals_array) {
+        Py_XDECREF(sample_positions_array);
+        Py_XDECREF(sample_normals_array);
+        return fail_result();
+    }
+
+    auto *sample_positions_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(sample_positions_array)));
+    auto *sample_normals_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(sample_normals_array)));
+    for (std::size_t i = 0; i < opened_boundary_samples.size(); ++i) {
+        sample_positions_data[i * 3] = opened_boundary_samples[i].position.x;
+        sample_positions_data[i * 3 + 1] = opened_boundary_samples[i].position.y;
+        sample_positions_data[i * 3 + 2] = opened_boundary_samples[i].position.z;
+        sample_normals_data[i * 3] = opened_boundary_samples[i].outward_normal.x;
+        sample_normals_data[i * 3 + 1] = opened_boundary_samples[i].outward_normal.y;
+        sample_normals_data[i * 3 + 2] = opened_boundary_samples[i].outward_normal.z;
+    }
+    release_binding_vector_memory(opened_boundary_samples);
+    if (dict_set_owned_item(result, "opened_boundary_positions", sample_positions_array) < 0 ||
+        dict_set_owned_item(result, "opened_boundary_normals", sample_normals_array) < 0) {
+        return fail_result();
+    }
+
+    PyObject *mesh_vertex_array =
+        PyArray_SimpleNew(2, mesh_vertex_dims, NPY_DOUBLE);
+    PyObject *mesh_face_array =
+        PyArray_SimpleNew(2, mesh_face_dims, NPY_UINT32);
+    if (!mesh_vertex_array || !mesh_face_array) {
+        Py_XDECREF(mesh_vertex_array);
+        Py_XDECREF(mesh_face_array);
+        return fail_result();
+    }
+
+    auto *mesh_vertex_data = static_cast<double *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(mesh_vertex_array)));
+    auto *mesh_face_data = static_cast<std::uint32_t *>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject *>(mesh_face_array)));
+    for (std::size_t i = 0; i < opened_surface_mesh.vertices.size(); ++i) {
+        mesh_vertex_data[i * 3] = opened_surface_mesh.vertices[i].position.x;
+        mesh_vertex_data[i * 3 + 1] = opened_surface_mesh.vertices[i].position.y;
+        mesh_vertex_data[i * 3 + 2] = opened_surface_mesh.vertices[i].position.z;
+    }
+    release_binding_vector_memory(opened_surface_mesh.vertex_keys);
+    release_binding_vector_memory(opened_surface_mesh.vertices);
+    for (std::size_t i = 0; i < opened_surface_mesh.triangles.size(); ++i) {
+        mesh_face_data[i * 3] = opened_surface_mesh.triangles[i].vertex_indices[0];
+        mesh_face_data[i * 3 + 1] = opened_surface_mesh.triangles[i].vertex_indices[1];
+        mesh_face_data[i * 3 + 2] = opened_surface_mesh.triangles[i].vertex_indices[2];
+    }
+    release_binding_vector_memory(opened_surface_mesh.triangles);
+    if (dict_set_owned_item(result, "opened_surface_vertices", mesh_vertex_array) < 0 ||
+        dict_set_owned_item(result, "opened_surface_faces", mesh_face_array) < 0) {
+        return fail_result();
+    }
+
+    if (dict_set_owned_item(
+            result, "n_leaves", PyLong_FromSsize_t(static_cast<Py_ssize_t>(dims[0]))) < 0 ||
+        dict_set_owned_item(
+            result, "n_inside", PyLong_FromSsize_t(static_cast<Py_ssize_t>(inside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_boundary_inside",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(boundary_inside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_boundary_outside",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(boundary_outside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_thickened_inside",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(thickened_inside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_eroded_inside",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(eroded_inside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_opened_inside",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(opened_inside_count))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_opened_boundary_samples",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(sample_dims[0]))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_opened_surface_vertices",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(mesh_vertex_dims[0]))) < 0 ||
+        dict_set_owned_item(
+            result,
+            "n_opened_surface_faces",
+            PyLong_FromSsize_t(static_cast<Py_ssize_t>(mesh_face_dims[0]))) < 0) {
+        return fail_result();
+    }
+
+    return result;
+}
+
+static void run_classify_occupied_solid_on_existing_tree(
+    std::vector<OctreeCell> &all_cells,
+    std::vector<std::size_t> &all_contributors,
+    const std::vector<Vector3d> &positions,
+    const std::vector<double> &smoothing_lengths,
+    const BoundingBox &domain,
+    unsigned int base_resolution,
+    double isovalue,
+    unsigned int max_depth,
+    unsigned int worker_count,
+    unsigned int minimum_usable_hermite_samples,
+    double max_qef_rms_residual_ratio,
+    double min_normal_alignment_threshold,
+    double max_surface_leaf_size,
+    double erosion_radius,
+    double pre_thickening_radius,
+    std::vector<OccupiedSolidLeaf> &solid_leaves,
+    std::vector<double> &clearance,
+    std::vector<double> &thickening_distance,
+    std::vector<std::uint8_t> &thickened_inside,
+    std::vector<std::uint8_t> &eroded_inside,
+    std::vector<double> &dilation_distance,
+    std::vector<std::uint8_t> &opened_inside,
+    std::vector<OpenedBoundarySample> &opened_boundary_samples,
+    OpenedSurfaceMesh &opened_surface_mesh,
+    std::size_t &inside_count,
+    std::size_t &boundary_inside_count,
+    std::size_t &boundary_outside_count,
+    std::size_t &eroded_inside_count,
+    std::size_t &thickened_inside_count,
+    std::size_t &opened_inside_count) {
+    const double effective_surface_leaf_size = std::max(
+        max_surface_leaf_size,
+        std::max(pre_thickening_radius * 0.5, 0.0));
+    refine_surface_band_cells(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        isovalue,
+        static_cast<std::uint32_t>(max_depth),
+        domain,
+        static_cast<std::uint32_t>(base_resolution),
+        static_cast<std::uint32_t>(worker_count),
+        effective_surface_leaf_size,
+        0.0,
+        static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+        max_qef_rms_residual_ratio,
+        min_normal_alignment_threshold);
+    classify_occupied_solid_on_tree(
+        all_cells,
+        all_contributors,
+        positions,
+        smoothing_lengths,
+        domain,
+        base_resolution,
+        isovalue,
+        max_depth,
+        worker_count,
+        erosion_radius,
+        pre_thickening_radius,
+        solid_leaves,
+        clearance,
+        thickening_distance,
+        thickened_inside,
+        eroded_inside,
+        dilation_distance,
+        opened_inside,
+        opened_boundary_samples,
+        opened_surface_mesh,
+        inside_count,
+        boundary_inside_count,
+        boundary_outside_count,
+        eroded_inside_count,
+        thickened_inside_count,
+        opened_inside_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -1968,6 +2491,110 @@ static PyObject *build_refined_tree_py(PyObject * /* self */, PyObject *args) {
     return Py_BuildValue("(NN)", cells_list, contributors_array);
 }
 
+static PyObject *build_native_tree_handle_py(
+        PyObject * /* self */, PyObject *args) {
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    PyObject *domain_min_object = NULL;
+    PyObject *domain_max_object = NULL;
+    unsigned int base_resolution = 0U;
+    double isovalue = 0.0;
+    unsigned int max_depth = 0U;
+    double table_cadence = 10.0;
+    unsigned int worker_count = 1U;
+    unsigned int minimum_usable_hermite_samples = 3U;
+    double max_qef_rms_residual_ratio = 0.1;
+    double min_normal_alignment_threshold = 0.97;
+
+    if (!PyArg_ParseTuple(args, "OOOOIdI|dIIdd",
+                          &positions_object,
+                          &smoothing_object,
+                          &domain_min_object,
+                          &domain_max_object,
+                          &base_resolution,
+                          &isovalue,
+                          &max_depth,
+                          &table_cadence,
+                          &worker_count,
+                          &minimum_usable_hermite_samples,
+                          &max_qef_rms_residual_ratio,
+                          &min_normal_alignment_threshold)) {
+        return NULL;
+    }
+
+    auto *state = new NativeTreeState();
+    if (!parse_positions(positions_object, state->positions) ||
+        !parse_doubles(smoothing_object, state->smoothing_lengths)) {
+        delete state;
+        return NULL;
+    }
+    if (state->positions.size() != state->smoothing_lengths.size()) {
+        delete state;
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing lengths must match in size");
+        return NULL;
+    }
+    if (!parse_vector3d(domain_min_object, state->domain.min) ||
+        !parse_vector3d(domain_max_object, state->domain.max)) {
+        delete state;
+        return NULL;
+    }
+
+    state->base_resolution = base_resolution;
+    state->max_depth = max_depth;
+    state->isovalue = isovalue;
+    state->minimum_usable_hermite_samples = minimum_usable_hermite_samples;
+    state->max_qef_rms_residual_ratio = max_qef_rms_residual_ratio;
+    state->min_normal_alignment_threshold = min_normal_alignment_threshold;
+
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyThreadState *_save = PyEval_SaveThread();
+    try {
+        std::vector<OctreeCell> initial_cells;
+        std::vector<std::size_t> initial_contributors;
+        build_initial_cells_with_contributors(
+            state->domain,
+            state->positions,
+            state->smoothing_lengths,
+            static_cast<std::uint32_t>(state->base_resolution),
+            "Building",
+            "build_native_tree_handle_py",
+            initial_cells,
+            initial_contributors);
+
+        std::tie(state->cells, state->contributors) = refine_octree(
+            std::move(initial_cells),
+            std::move(initial_contributors),
+            state->positions,
+            state->smoothing_lengths,
+            state->isovalue,
+            state->max_depth,
+            state->domain,
+            static_cast<std::uint32_t>(state->base_resolution),
+            static_cast<std::uint32_t>(worker_count),
+            table_cadence,
+            static_cast<std::uint32_t>(state->minimum_usable_hermite_samples),
+            state->max_qef_rms_residual_ratio,
+            state->min_normal_alignment_threshold);
+    } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
+        PyEval_RestoreThread(_save);
+        delete state;
+        return raise_cancelled_exception();
+    } catch (const std::exception &exc) {
+        PyEval_RestoreThread(_save);
+        delete state;
+        return raise_cpp_exception(exc);
+    } catch (...) {
+        PyEval_RestoreThread(_save);
+        delete state;
+        return raise_unknown_cpp_exception();
+    }
+    PyEval_RestoreThread(_save);
+    meshmerizer_cancel_detail::reset_cancel_state();
+
+    return build_native_tree_state_capsule(state);
+}
+
 /**
  * @brief Extract a blocky opened-surface mesh from an editable opened mask.
  *
@@ -2208,6 +2835,48 @@ static PyObject *generate_mesh_py(PyObject *self, PyObject *args) {
         isovalue, domain, max_depth, base_resolution);
 
     // Return (positions_Nx3, normals_Nx3, triangles_Mx3) as NumPy arrays.
+    return build_mesh_numpy_result(vertices, triangles);
+}
+
+static PyObject *generate_mesh_from_handle_py(
+        PyObject * /* self */, PyObject *args) {
+    PyObject *handle_object = NULL;
+    if (!PyArg_ParseTuple(args, "O", &handle_object)) {
+        return NULL;
+    }
+
+    NativeTreeState *state = get_native_tree_state(handle_object);
+    if (state == NULL) {
+        return NULL;
+    }
+
+    std::vector<MeshVertex> vertices;
+    std::vector<MeshTriangle> triangles;
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyThreadState *_save = PyEval_SaveThread();
+    try {
+        std::tie(vertices, triangles) = generate_mesh(
+            state->cells,
+            state->contributors,
+            state->positions,
+            state->smoothing_lengths,
+            state->isovalue,
+            state->domain,
+            state->max_depth,
+            state->base_resolution);
+    } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
+        PyEval_RestoreThread(_save);
+        return raise_cancelled_exception();
+    } catch (const std::exception &exc) {
+        PyEval_RestoreThread(_save);
+        return raise_cpp_exception(exc);
+    } catch (...) {
+        PyEval_RestoreThread(_save);
+        return raise_unknown_cpp_exception();
+    }
+    PyEval_RestoreThread(_save);
+    meshmerizer_cancel_detail::reset_cancel_state();
+
     return build_mesh_numpy_result(vertices, triangles);
 }
 
@@ -2588,142 +3257,37 @@ static PyObject *classify_occupied_solid_py(
             max_qef_rms_residual_ratio,
             min_normal_alignment_threshold);
 
-        refine_surface_band_cells(
+        run_classify_occupied_solid_on_existing_tree(
             all_cells,
             all_contributors,
             positions,
             smoothing_lengths,
-            isovalue,
-            static_cast<std::uint32_t>(max_depth),
             domain,
-            static_cast<std::uint32_t>(base_resolution),
-            static_cast<std::uint32_t>(worker_count),
-            max_surface_leaf_size,
-            0.0,
-            static_cast<std::uint32_t>(minimum_usable_hermite_samples),
+            base_resolution,
+            isovalue,
+            max_depth,
+            worker_count,
+            minimum_usable_hermite_samples,
             max_qef_rms_residual_ratio,
-            min_normal_alignment_threshold);
-
-        LeafSpatialIndex spatial_index;
-        spatial_index.build(
-            all_cells, domain, static_cast<std::uint32_t>(max_depth),
-            static_cast<std::uint32_t>(base_resolution));
-        OccupiedSolidClassificationCache classification_cache;
-        update_occupied_solid_classification_cache(
-            all_cells, all_contributors, positions, smoothing_lengths,
-            spatial_index, isovalue, static_cast<std::uint32_t>(max_depth),
-            classification_cache);
-        std::vector<std::uint8_t> inside_mask;
-        solid_leaves = build_occupied_solid_leaves_from_cache(
-            all_cells, classification_cache, nullptr, &inside_mask);
-        std::vector<std::uint8_t> inside_mask_by_cell =
-            build_inside_mask_from_classification_cache(
-                all_cells, classification_cache);
-        std::vector<double> thickening_distance_by_cell(
-            all_cells.size(), std::numeric_limits<double>::infinity());
-        thickening_distance.assign(
-            solid_leaves.size(), std::numeric_limits<double>::infinity());
-        thickened_inside = inside_mask;
-        if (pre_thickening_radius > 0.0) {
-            thickening_distance_by_cell =
-                compute_outside_distance_from_classification_cache(
-                    all_cells,
-                    classification_cache,
-                    static_cast<std::uint32_t>(worker_count),
-                    pre_thickening_radius);
-            thickening_distance = project_leaf_scalars_from_cell_state(
-                solid_leaves,
-                thickening_distance_by_cell,
-                std::numeric_limits<double>::infinity());
-            inside_mask_by_cell = dilate_inside_cell_mask(
-                all_cells,
-                inside_mask_by_cell,
-                thickening_distance_by_cell,
-                pre_thickening_radius);
-            thickened_inside = build_leaf_mask_from_cell_mask(
-                solid_leaves, inside_mask_by_cell);
-            inside_mask = thickened_inside;
-        }
-        std::vector<double> clearance_by_cell(
-            all_cells.size(), std::numeric_limits<double>::infinity());
-        clearance.assign(
-            solid_leaves.size(), std::numeric_limits<double>::infinity());
-        if (erosion_radius > 0.0) {
-            clearance_by_cell = compute_inside_clearance_from_cell_mask(
-                all_cells,
-                classification_cache,
-                inside_mask_by_cell,
-                static_cast<std::uint32_t>(worker_count),
-                erosion_radius);
-            clearance = project_leaf_scalars_from_cell_state(
-                solid_leaves,
-                clearance_by_cell,
-                std::numeric_limits<double>::infinity());
-        }
-        std::vector<std::uint8_t> eroded_inside_by_cell = inside_mask_by_cell;
-        if (erosion_radius > 0.0) {
-            eroded_inside_by_cell = erode_occupied_solid_cells(
-                all_cells,
-                inside_mask_by_cell,
-                clearance_by_cell,
-                erosion_radius);
-        }
-        eroded_inside = build_leaf_mask_from_cell_mask(
-            solid_leaves, eroded_inside_by_cell);
-        std::vector<double> dilation_distance_by_cell(
-            all_cells.size(), std::numeric_limits<double>::infinity());
-        dilation_distance.assign(
-            solid_leaves.size(), std::numeric_limits<double>::infinity());
-        std::vector<std::uint8_t> opened_inside_by_cell = eroded_inside_by_cell;
-        if (erosion_radius > 0.0) {
-            dilation_distance_by_cell =
-                compute_distance_to_eroded_solid_from_cell_mask(
-                    all_cells,
-                    classification_cache,
-                    eroded_inside_by_cell,
-                    static_cast<std::uint32_t>(worker_count),
-                    erosion_radius);
-            dilation_distance = project_leaf_scalars_from_cell_state(
-                solid_leaves,
-                dilation_distance_by_cell,
-                std::numeric_limits<double>::infinity());
-            opened_inside_by_cell = dilate_eroded_solid_cells(
-                all_cells,
-                eroded_inside_by_cell,
-                dilation_distance_by_cell,
-                erosion_radius);
-        }
-        opened_inside = build_leaf_mask_from_cell_mask(
-            solid_leaves, opened_inside_by_cell);
-        opened_boundary_samples = generate_opened_boundary_samples(
-            solid_leaves, opened_inside, all_cells);
-        opened_surface_mesh = generate_opened_surface_mesh(
-            solid_leaves, opened_inside, all_cells, spatial_index,
-            domain, static_cast<std::uint32_t>(base_resolution),
-            static_cast<std::uint32_t>(max_depth));
-
-        for (std::size_t i = 0; i < solid_leaves.size(); ++i) {
-            const OccupiedSolidLeaf &leaf = solid_leaves[i];
-            if (leaf.occupancy == OccupancyState::kInside ||
-                leaf.occupancy == OccupancyState::kBoundaryInside) {
-                ++inside_count;
-            }
-            if (leaf.occupancy == OccupancyState::kBoundaryInside) {
-                ++boundary_inside_count;
-            }
-            if (leaf.occupancy == OccupancyState::kBoundaryOutside) {
-                ++boundary_outside_count;
-            }
-            if (eroded_inside[i] != 0U) {
-                ++eroded_inside_count;
-            }
-            if (thickened_inside[i] != 0U) {
-                ++thickened_inside_count;
-            }
-            if (opened_inside[i] != 0U) {
-                ++opened_inside_count;
-            }
-        }
+            min_normal_alignment_threshold,
+            max_surface_leaf_size,
+            erosion_radius,
+            pre_thickening_radius,
+            solid_leaves,
+            clearance,
+            thickening_distance,
+            thickened_inside,
+            eroded_inside,
+            dilation_distance,
+            opened_inside,
+            opened_boundary_samples,
+            opened_surface_mesh,
+            inside_count,
+            boundary_inside_count,
+            boundary_outside_count,
+            eroded_inside_count,
+            thickened_inside_count,
+            opened_inside_count);
     } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
         PyEval_RestoreThread(_save);
         return raise_cancelled_exception();
@@ -2737,210 +3301,274 @@ static PyObject *classify_occupied_solid_py(
     PyEval_RestoreThread(_save);
     meshmerizer_cancel_detail::reset_cancel_state();
 
-    const npy_intp dims[1] = {static_cast<npy_intp>(solid_leaves.size())};
-    const npy_intp sample_dims[2] = {
-        static_cast<npy_intp>(opened_boundary_samples.size()), 3};
-    const npy_intp mesh_vertex_dims[2] = {
-        static_cast<npy_intp>(opened_surface_mesh.vertices.size()), 3};
-    const npy_intp mesh_face_dims[2] = {
-        static_cast<npy_intp>(opened_surface_mesh.triangles.size()), 3};
+    return build_classify_occupied_solid_result(
+        solid_leaves,
+        clearance,
+        thickening_distance,
+        thickened_inside,
+        eroded_inside,
+        dilation_distance,
+        opened_inside,
+        opened_boundary_samples,
+        opened_surface_mesh,
+        inside_count,
+        boundary_inside_count,
+        boundary_outside_count,
+        eroded_inside_count,
+        thickened_inside_count,
+        opened_inside_count);
+}
 
-    PyObject *result = PyDict_New();
-    if (result == NULL) {
+static PyObject *classify_occupied_solid_from_tree_py(
+        PyObject *self, PyObject *args) {
+    PyObject *cells_object = NULL;
+    PyObject *contributors_object = NULL;
+    PyObject *positions_object = NULL;
+    PyObject *smoothing_object = NULL;
+    double isovalue = 0.0;
+    PyObject *domain_min_object = NULL;
+    PyObject *domain_max_object = NULL;
+    PyObject *max_depth_object = NULL;
+    PyObject *base_resolution_object = NULL;
+    PyObject *erosion_radius_object = NULL;
+    PyObject *pre_thickening_radius_object = NULL;
+    PyObject *worker_count_object = NULL;
+    unsigned int max_depth = 0U;
+    unsigned int base_resolution = 0U;
+    double erosion_radius = 0.0;
+    double pre_thickening_radius = 0.0;
+    unsigned int worker_count = 1U;
+    BoundingBox domain{};
+    std::vector<Vector3d> positions;
+    std::vector<double> smoothing_lengths;
+    std::vector<std::size_t> all_contributors;
+    std::vector<OctreeCell> all_cells;
+    (void)self;
+
+    if (!PyArg_ParseTuple(args, "OOOOdOOOOOOO",
+                          &cells_object,
+                          &contributors_object,
+                          &positions_object,
+                          &smoothing_object,
+                          &isovalue,
+                          &domain_min_object,
+                          &domain_max_object,
+                          &max_depth_object,
+                          &base_resolution_object,
+                          &erosion_radius_object,
+                          &pre_thickening_radius_object,
+                          &worker_count_object)) {
         return NULL;
     }
 
-    auto fail_result = [&result]() -> PyObject * {
-        Py_DECREF(result);
+    max_depth = static_cast<unsigned int>(PyLong_AsUnsignedLong(max_depth_object));
+    base_resolution = static_cast<unsigned int>(
+        PyLong_AsUnsignedLong(base_resolution_object));
+    erosion_radius = PyFloat_AsDouble(erosion_radius_object);
+    pre_thickening_radius = PyFloat_AsDouble(pre_thickening_radius_object);
+    worker_count = static_cast<unsigned int>(
+        PyLong_AsUnsignedLong(worker_count_object));
+    if (PyErr_Occurred()) {
         return NULL;
-    };
-
-    PyObject *occupancy_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
-    PyObject *depth_array = PyArray_SimpleNew(1, dims, NPY_UINT32);
-    PyObject *center_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
-    PyObject *size_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
-    if (!occupancy_array || !depth_array || !center_array || !size_array) {
-        Py_XDECREF(occupancy_array);
-        Py_XDECREF(depth_array);
-        Py_XDECREF(center_array);
-        Py_XDECREF(size_array);
-        return fail_result();
     }
 
-    auto *occupancy_data = static_cast<std::uint8_t *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(occupancy_array)));
-    auto *depth_data = static_cast<std::uint32_t *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(depth_array)));
-    auto *center_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(center_array)));
-    auto *size_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(size_array)));
-    for (std::size_t i = 0; i < solid_leaves.size(); ++i) {
-        occupancy_data[i] = static_cast<std::uint8_t>(solid_leaves[i].occupancy);
-        depth_data[i] = solid_leaves[i].depth;
-        center_data[i] = solid_leaves[i].center_value;
-        size_data[i] = solid_leaves[i].cell_size;
+    if (!parse_positions(positions_object, positions) ||
+        !parse_doubles(smoothing_object, smoothing_lengths)) {
+        return NULL;
     }
-    release_binding_vector_memory(solid_leaves);
-    if (dict_set_owned_item(result, "occupancy", occupancy_array) < 0 ||
-        dict_set_owned_item(result, "depths", depth_array) < 0 ||
-        dict_set_owned_item(result, "center_values", center_array) < 0 ||
-        dict_set_owned_item(result, "cell_sizes", size_array) < 0) {
-        return fail_result();
+    if (positions.size() != smoothing_lengths.size()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and smoothing lengths must match");
+        return NULL;
+    }
+    if (!parse_vector3d(domain_min_object, domain.min) ||
+        !parse_vector3d(domain_max_object, domain.max)) {
+        return NULL;
+    }
+    if (!parse_contributor_indices(contributors_object, all_contributors) ||
+        !parse_octree_cell_sequence(cells_object, all_contributors, all_cells)) {
+        return NULL;
     }
 
-    PyObject *clearance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
-    PyObject *thickening_distance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
-    PyObject *thickened_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
-    PyObject *eroded_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
-    PyObject *dilation_distance_array = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
-    PyObject *opened_inside_array = PyArray_SimpleNew(1, dims, NPY_UINT8);
-    if (!clearance_array || !thickening_distance_array || !thickened_inside_array ||
-        !eroded_inside_array || !dilation_distance_array || !opened_inside_array) {
-        Py_XDECREF(clearance_array);
-        Py_XDECREF(thickening_distance_array);
-        Py_XDECREF(thickened_inside_array);
-        Py_XDECREF(eroded_inside_array);
-        Py_XDECREF(dilation_distance_array);
-        Py_XDECREF(opened_inside_array);
-        return fail_result();
+    std::vector<OccupiedSolidLeaf> solid_leaves;
+    std::vector<double> clearance;
+    std::vector<double> thickening_distance;
+    std::vector<std::uint8_t> thickened_inside;
+    std::vector<std::uint8_t> eroded_inside;
+    std::vector<double> dilation_distance;
+    std::vector<std::uint8_t> opened_inside;
+    std::vector<OpenedBoundarySample> opened_boundary_samples;
+    OpenedSurfaceMesh opened_surface_mesh;
+    std::size_t inside_count = 0U;
+    std::size_t boundary_inside_count = 0U;
+    std::size_t boundary_outside_count = 0U;
+    std::size_t eroded_inside_count = 0U;
+    std::size_t thickened_inside_count = 0U;
+    std::size_t opened_inside_count = 0U;
+
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyThreadState *_save = PyEval_SaveThread();
+    try {
+        run_classify_occupied_solid_on_existing_tree(
+            all_cells,
+            all_contributors,
+            positions,
+            smoothing_lengths,
+            domain,
+            base_resolution,
+            isovalue,
+            max_depth,
+            worker_count,
+            3U,
+            0.1,
+            0.97,
+            erosion_radius,
+            erosion_radius,
+            pre_thickening_radius,
+            solid_leaves,
+            clearance,
+            thickening_distance,
+            thickened_inside,
+            eroded_inside,
+            dilation_distance,
+            opened_inside,
+            opened_boundary_samples,
+            opened_surface_mesh,
+            inside_count,
+            boundary_inside_count,
+            boundary_outside_count,
+            eroded_inside_count,
+            thickened_inside_count,
+            opened_inside_count);
+    } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
+        PyEval_RestoreThread(_save);
+        return raise_cancelled_exception();
+    } catch (const std::exception &exc) {
+        PyEval_RestoreThread(_save);
+        return raise_cpp_exception(exc);
+    } catch (...) {
+        PyEval_RestoreThread(_save);
+        return raise_unknown_cpp_exception();
+    }
+    PyEval_RestoreThread(_save);
+    meshmerizer_cancel_detail::reset_cancel_state();
+
+    return build_classify_occupied_solid_result(
+        solid_leaves,
+        clearance,
+        thickening_distance,
+        thickened_inside,
+        eroded_inside,
+        dilation_distance,
+        opened_inside,
+        opened_boundary_samples,
+        opened_surface_mesh,
+        inside_count,
+        boundary_inside_count,
+        boundary_outside_count,
+        eroded_inside_count,
+        thickened_inside_count,
+        opened_inside_count);
+}
+
+static PyObject *classify_occupied_solid_from_handle_py(
+        PyObject * /* self */, PyObject *args) {
+    PyObject *handle_object = NULL;
+    double erosion_radius = 0.0;
+    double pre_thickening_radius = 0.0;
+    unsigned int worker_count = 1U;
+    if (!PyArg_ParseTuple(args, "Odd|I",
+                          &handle_object,
+                          &erosion_radius,
+                          &pre_thickening_radius,
+                          &worker_count)) {
+        return NULL;
     }
 
-    auto *clearance_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(clearance_array)));
-    auto *thickening_distance_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(thickening_distance_array)));
-    auto *thickened_inside_data = static_cast<std::uint8_t *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(thickened_inside_array)));
-    auto *eroded_inside_data = static_cast<std::uint8_t *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(eroded_inside_array)));
-    auto *dilation_distance_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(dilation_distance_array)));
-    auto *opened_inside_data = static_cast<std::uint8_t *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(opened_inside_array)));
-    for (std::size_t i = 0; i < clearance.size(); ++i) {
-        clearance_data[i] = clearance[i];
-        thickening_distance_data[i] = thickening_distance[i];
-        thickened_inside_data[i] = thickened_inside[i];
-        eroded_inside_data[i] = eroded_inside[i];
-        dilation_distance_data[i] = dilation_distance[i];
-        opened_inside_data[i] = opened_inside[i];
-    }
-    release_binding_vector_memory(clearance);
-    release_binding_vector_memory(thickening_distance);
-    release_binding_vector_memory(thickened_inside);
-    release_binding_vector_memory(eroded_inside);
-    release_binding_vector_memory(dilation_distance);
-    release_binding_vector_memory(opened_inside);
-    if (dict_set_owned_item(result, "clearance", clearance_array) < 0 ||
-        dict_set_owned_item(result, "thickening_distance", thickening_distance_array) < 0 ||
-        dict_set_owned_item(result, "thickened_inside", thickened_inside_array) < 0 ||
-        dict_set_owned_item(result, "eroded_inside", eroded_inside_array) < 0 ||
-        dict_set_owned_item(result, "dilation_distance", dilation_distance_array) < 0 ||
-        dict_set_owned_item(result, "opened_inside", opened_inside_array) < 0) {
-        return fail_result();
+    NativeTreeState *state = get_native_tree_state(handle_object);
+    if (state == NULL) {
+        return NULL;
     }
 
-    PyObject *sample_positions_array =
-        PyArray_SimpleNew(2, sample_dims, NPY_DOUBLE);
-    PyObject *sample_normals_array =
-        PyArray_SimpleNew(2, sample_dims, NPY_DOUBLE);
-    if (!sample_positions_array || !sample_normals_array) {
-        Py_XDECREF(sample_positions_array);
-        Py_XDECREF(sample_normals_array);
-        return fail_result();
-    }
+    std::vector<OccupiedSolidLeaf> solid_leaves;
+    std::vector<double> clearance;
+    std::vector<double> thickening_distance;
+    std::vector<std::uint8_t> thickened_inside;
+    std::vector<std::uint8_t> eroded_inside;
+    std::vector<double> dilation_distance;
+    std::vector<std::uint8_t> opened_inside;
+    std::vector<OpenedBoundarySample> opened_boundary_samples;
+    OpenedSurfaceMesh opened_surface_mesh;
+    std::size_t inside_count = 0U;
+    std::size_t boundary_inside_count = 0U;
+    std::size_t boundary_outside_count = 0U;
+    std::size_t eroded_inside_count = 0U;
+    std::size_t thickened_inside_count = 0U;
+    std::size_t opened_inside_count = 0U;
 
-    auto *sample_positions_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(sample_positions_array)));
-    auto *sample_normals_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(sample_normals_array)));
-    for (std::size_t i = 0; i < opened_boundary_samples.size(); ++i) {
-        sample_positions_data[i * 3] = opened_boundary_samples[i].position.x;
-        sample_positions_data[i * 3 + 1] = opened_boundary_samples[i].position.y;
-        sample_positions_data[i * 3 + 2] = opened_boundary_samples[i].position.z;
-        sample_normals_data[i * 3] = opened_boundary_samples[i].outward_normal.x;
-        sample_normals_data[i * 3 + 1] = opened_boundary_samples[i].outward_normal.y;
-        sample_normals_data[i * 3 + 2] = opened_boundary_samples[i].outward_normal.z;
+    meshmerizer_cancel_detail::reset_cancel_state();
+    PyThreadState *_save = PyEval_SaveThread();
+    try {
+        run_classify_occupied_solid_on_existing_tree(
+            state->cells,
+            state->contributors,
+            state->positions,
+            state->smoothing_lengths,
+            state->domain,
+            state->base_resolution,
+            state->isovalue,
+            state->max_depth,
+            worker_count,
+            state->minimum_usable_hermite_samples,
+            state->max_qef_rms_residual_ratio,
+            state->min_normal_alignment_threshold,
+            erosion_radius,
+            erosion_radius,
+            pre_thickening_radius,
+            solid_leaves,
+            clearance,
+            thickening_distance,
+            thickened_inside,
+            eroded_inside,
+            dilation_distance,
+            opened_inside,
+            opened_boundary_samples,
+            opened_surface_mesh,
+            inside_count,
+            boundary_inside_count,
+            boundary_outside_count,
+            eroded_inside_count,
+            thickened_inside_count,
+            opened_inside_count);
+    } catch (const meshmerizer_cancel_detail::OperationCancelled &) {
+        PyEval_RestoreThread(_save);
+        return raise_cancelled_exception();
+    } catch (const std::exception &exc) {
+        PyEval_RestoreThread(_save);
+        return raise_cpp_exception(exc);
+    } catch (...) {
+        PyEval_RestoreThread(_save);
+        return raise_unknown_cpp_exception();
     }
-    release_binding_vector_memory(opened_boundary_samples);
-    if (dict_set_owned_item(result, "opened_boundary_positions", sample_positions_array) < 0 ||
-        dict_set_owned_item(result, "opened_boundary_normals", sample_normals_array) < 0) {
-        return fail_result();
-    }
+    PyEval_RestoreThread(_save);
+    meshmerizer_cancel_detail::reset_cancel_state();
 
-    PyObject *mesh_vertex_array =
-        PyArray_SimpleNew(2, mesh_vertex_dims, NPY_DOUBLE);
-    PyObject *mesh_face_array =
-        PyArray_SimpleNew(2, mesh_face_dims, NPY_UINT32);
-    if (!mesh_vertex_array || !mesh_face_array) {
-        Py_XDECREF(mesh_vertex_array);
-        Py_XDECREF(mesh_face_array);
-        return fail_result();
-    }
-
-    auto *mesh_vertex_data = static_cast<double *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(mesh_vertex_array)));
-    auto *mesh_face_data = static_cast<std::uint32_t *>(
-        PyArray_DATA(reinterpret_cast<PyArrayObject *>(mesh_face_array)));
-    for (std::size_t i = 0; i < opened_surface_mesh.vertices.size(); ++i) {
-        mesh_vertex_data[i * 3] = opened_surface_mesh.vertices[i].position.x;
-        mesh_vertex_data[i * 3 + 1] = opened_surface_mesh.vertices[i].position.y;
-        mesh_vertex_data[i * 3 + 2] = opened_surface_mesh.vertices[i].position.z;
-    }
-    release_binding_vector_memory(opened_surface_mesh.vertex_keys);
-    release_binding_vector_memory(opened_surface_mesh.vertices);
-    for (std::size_t i = 0; i < opened_surface_mesh.triangles.size(); ++i) {
-        mesh_face_data[i * 3] = opened_surface_mesh.triangles[i].vertex_indices[0];
-        mesh_face_data[i * 3 + 1] = opened_surface_mesh.triangles[i].vertex_indices[1];
-        mesh_face_data[i * 3 + 2] = opened_surface_mesh.triangles[i].vertex_indices[2];
-    }
-    release_binding_vector_memory(opened_surface_mesh.triangles);
-    if (dict_set_owned_item(result, "opened_surface_vertices", mesh_vertex_array) < 0 ||
-        dict_set_owned_item(result, "opened_surface_faces", mesh_face_array) < 0) {
-        return fail_result();
-    }
-
-    if (dict_set_owned_item(
-            result, "n_leaves", PyLong_FromSsize_t(static_cast<Py_ssize_t>(dims[0]))) < 0 ||
-        dict_set_owned_item(
-            result, "n_inside", PyLong_FromSsize_t(static_cast<Py_ssize_t>(inside_count))) < 0 ||
-        dict_set_owned_item(
-            result,
-            "n_boundary_inside",
-            PyLong_FromSsize_t(static_cast<Py_ssize_t>(boundary_inside_count))) < 0 ||
-        dict_set_owned_item(
-            result,
-            "n_boundary_outside",
-            PyLong_FromSsize_t(static_cast<Py_ssize_t>(boundary_outside_count))) < 0 ||
-        dict_set_owned_item(
-            result,
-            "n_thickened_inside",
-            PyLong_FromSsize_t(static_cast<Py_ssize_t>(thickened_inside_count))) < 0 ||
-        dict_set_owned_item(
-            result,
-            "n_eroded_inside",
-            PyLong_FromSsize_t(static_cast<Py_ssize_t>(eroded_inside_count))) < 0 ||
-        dict_set_owned_item(
-            result,
-            "n_opened_inside",
-            PyLong_FromSsize_t(static_cast<Py_ssize_t>(opened_inside_count))) < 0 ||
-        dict_set_owned_item(
-            result,
-            "n_opened_boundary_samples",
-            PyLong_FromSsize_t(static_cast<Py_ssize_t>(sample_dims[0]))) < 0 ||
-        dict_set_owned_item(
-            result,
-            "n_opened_surface_vertices",
-            PyLong_FromSsize_t(static_cast<Py_ssize_t>(mesh_vertex_dims[0]))) < 0 ||
-        dict_set_owned_item(
-            result,
-            "n_opened_surface_faces",
-            PyLong_FromSsize_t(static_cast<Py_ssize_t>(mesh_face_dims[0]))) < 0) {
-        return fail_result();
-    }
-
-    return result;
+    return build_classify_occupied_solid_result(
+        solid_leaves,
+        clearance,
+        thickening_distance,
+        thickened_inside,
+        eroded_inside,
+        dilation_distance,
+        opened_inside,
+        opened_boundary_samples,
+        opened_surface_mesh,
+        inside_count,
+        boundary_inside_count,
+        boundary_outside_count,
+        eroded_inside_count,
+        thickened_inside_count,
+        opened_inside_count);
 }
 
 /**
@@ -3433,6 +4061,14 @@ static PyMethodDef adaptive_methods[] = {
             "(cells, contributors) for resumable Python workflows."),
     },
     {
+        "build_native_tree_handle",
+        build_native_tree_handle_py,
+        METH_VARARGS,
+        PyDoc_STR(
+            "Build and refine the adaptive octree in C++ and return an "
+            "opaque native tree handle for staged workflows."),
+    },
+    {
         "create_top_level_cells",
         create_top_level_cells_py,
         METH_VARARGS,
@@ -3473,6 +4109,13 @@ static PyMethodDef adaptive_methods[] = {
         generate_mesh_py,
         METH_VARARGS,
         PyDoc_STR("Generate a triangle mesh from a refined octree via dual contouring."),
+    },
+    {
+        "generate_mesh_from_handle",
+        generate_mesh_from_handle_py,
+        METH_VARARGS,
+        PyDoc_STR(
+            "Generate a triangle mesh from an opaque native tree handle."),
     },
     {
         "solve_vertices",
@@ -3541,6 +4184,20 @@ static PyMethodDef adaptive_methods[] = {
         METH_VARARGS,
         PyDoc_STR(
             "Classify the adaptive occupied solid for morphology scaffolding."),
+    },
+    {
+        "classify_occupied_solid_from_tree",
+        classify_occupied_solid_from_tree_py,
+        METH_VARARGS,
+        PyDoc_STR(
+            "Classify the adaptive occupied solid using an existing refined tree."),
+    },
+    {
+        "classify_occupied_solid_from_handle",
+        classify_occupied_solid_from_handle_py,
+        METH_VARARGS,
+        PyDoc_STR(
+            "Classify the adaptive occupied solid using an opaque native tree handle."),
     },
     {
         "run_full_pipeline",

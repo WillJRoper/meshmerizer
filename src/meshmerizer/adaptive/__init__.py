@@ -19,13 +19,19 @@ from .pipeline import (
     fof_cluster,
     run_full_pipeline,
 )
-from .topology import classify_occupied_solid
+from .topology import (
+    classify_occupied_solid,
+    classify_occupied_solid_from_handle,
+    classify_occupied_solid_from_tree,
+)
 from .tree import (
+    build_native_tree_handle,
     build_refined_tree,
     create_child_cells,
     create_top_level_cells,
     filter_child_contributors,
     generate_mesh,
+    generate_mesh_from_tree_handle,
     hermite_samples_for_cell,
     refine_octree,
     run_octree_pipeline,
@@ -37,9 +43,12 @@ __all__ = [
     "adaptive_status",
     "bounding_box_contains",
     "bounding_box_overlaps",
+    "build_native_tree_handle",
     "build_refined_tree",
     "cell_may_contain_isosurface",
     "classify_occupied_solid",
+    "classify_occupied_solid_from_handle",
+    "classify_occupied_solid_from_tree",
     "compute_isovalue_from_percentile",
     "corner_sign_mask",
     "create_child_cells",
@@ -47,6 +56,7 @@ __all__ = [
     "filter_child_contributors",
     "fof_cluster",
     "generate_mesh",
+    "generate_mesh_from_tree_handle",
     "hermite_samples_for_cell",
     "morton_decode_3d",
     "morton_encode_3d",

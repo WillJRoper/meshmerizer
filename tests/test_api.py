@@ -60,7 +60,7 @@ def test_build_tree_passes_nthreads(
     positions, smoothing_lengths = _simple_particles()
     captured = {}
 
-    def fake_build_refined_tree(
+    def fake_build_native_tree_handle(
         pos,
         sml,
         domain_min,
@@ -74,11 +74,11 @@ def test_build_tree_passes_nthreads(
         min_normal_alignment_threshold,
     ):
         captured["worker_count"] = worker_count
-        return (), np.array([], dtype=np.int64)
+        return object()
 
     monkeypatch.setattr(
-        "meshmerizer.api.build_refined_tree",
-        fake_build_refined_tree,
+        "meshmerizer.api.build_native_tree_handle",
+        fake_build_native_tree_handle,
     )
 
     tree = build_tree(
@@ -126,10 +126,11 @@ def test_regularize_passes_nthreads(
         base_resolution=2,
         max_depth=2,
         isovalue=0.01,
+        native_handle=object(),
     )
     captured = {}
 
-    def fake_classify_occupied_solid(*args, **kwargs):
+    def fake_classify_occupied_solid_from_handle(*args, **kwargs):
         captured["worker_count"] = kwargs["worker_count"]
         return {
             "occupancy": np.zeros(1, dtype=np.uint8),
@@ -149,8 +150,8 @@ def test_regularize_passes_nthreads(
         }
 
     monkeypatch.setattr(
-        "meshmerizer.api.classify_occupied_solid",
-        fake_classify_occupied_solid,
+        "meshmerizer.api.classify_occupied_solid_from_handle",
+        fake_classify_occupied_solid_from_handle,
     )
 
     topology = regularize(

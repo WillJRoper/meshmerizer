@@ -109,6 +109,7 @@ struct StableTreePreludeRuntime {
     double min_normal_alignment_threshold = 0.97;
     double finest_leaf_size = 0.0;
     double pre_thickening_radius = 0.0;
+    bool thickening_refined_in_initial_tree = false;
     OccupiedSolidCacheRebuildMode initial_rebuild_mode =
         OccupiedSolidCacheRebuildMode::kLegacyPass;
     OccupiedSolidCacheRebuildMode post_thickening_rebuild_mode =
@@ -239,6 +240,7 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
     double min_normal_alignment_threshold,
     double finest_leaf_size,
     double pre_thickening_radius,
+    bool thickening_refined_in_initial_tree,
     OccupiedSolidCacheRebuildMode initial_rebuild_mode,
     OccupiedSolidCacheRebuildMode post_thickening_rebuild_mode) {
     StableTreePreludeRuntime runtime;
@@ -257,6 +259,8 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
     runtime.min_normal_alignment_threshold = min_normal_alignment_threshold;
     runtime.finest_leaf_size = finest_leaf_size;
     runtime.pre_thickening_radius = pre_thickening_radius;
+    runtime.thickening_refined_in_initial_tree =
+        thickening_refined_in_initial_tree;
     runtime.initial_rebuild_mode = initial_rebuild_mode;
     runtime.post_thickening_rebuild_mode = post_thickening_rebuild_mode;
     runtime.result.dirty_cells.assign(all_cells.size(), 1U);
@@ -326,10 +330,14 @@ inline StableTreePreludeResult run_stable_tree_prelude_task_graph(
                                     StableTreePreludeNode::kInitialSolidClassification),
                                 elapsed_seconds_since(stage_start));
                             if (runtime.pre_thickening_radius > 0.0) {
+                                const StableTreePreludeNode next_node =
+                                    runtime.thickening_refined_in_initial_tree
+                                        ? StableTreePreludeNode::kComputeFinalThickeningDistance
+                                        : StableTreePreludeNode::kComputeThickeningSeedDistance;
                                 unlock_stable_tree_prelude_task(
                                     queue,
                                     runtime,
-                                    StableTreePreludeNode::kComputeThickeningSeedDistance,
+                                    next_node,
                                     worker_id);
                             }
                             break;
@@ -759,8 +767,8 @@ inline DCPipelineResult run_dc_pipeline(
         OctreeCell cell = top_cells[ci];
         const std::size_t begin = contributor_offsets[ci];
         const std::size_t end = contributor_offsets[ci + 1U];
-        cell.contributor_begin = static_cast<std::int64_t>(begin);
-        cell.contributor_end = static_cast<std::int64_t>(end);
+        cell.contributor_begin = static_cast<std::int32_t>(begin);
+        cell.contributor_end = static_cast<std::int32_t>(end);
         initial_cells.push_back(cell);
         const std::vector<std::size_t> &cell_contributors =
             top_cell_contributors[ci];
@@ -792,6 +800,7 @@ inline DCPipelineResult run_dc_pipeline(
     double effective_min_feature_thickness = min_feature_thickness;
     double opening_radius = 0.0;
     double max_surface_leaf_size = 0.0;
+    bool thickening_refined_in_initial_tree = false;
     if (min_feature_thickness > 0.0) {
         const double minimum_resolvable_thickness = 2.0 * finest_leaf_size;
         if (effective_min_feature_thickness < minimum_resolvable_thickness) {
@@ -810,6 +819,15 @@ inline DCPipelineResult run_dc_pipeline(
         }
         opening_radius = 0.5 * effective_min_feature_thickness;
         max_surface_leaf_size = opening_radius;
+    }
+    if (pre_thickening_radius > 0.0) {
+        const double thickening_leaf_size_target = std::max(
+            pre_thickening_radius * 0.5,
+            finest_leaf_size);
+        max_surface_leaf_size = std::max(
+            max_surface_leaf_size,
+            thickening_leaf_size_target);
+        thickening_refined_in_initial_tree = true;
     }
 
     const auto refine_start = std::chrono::steady_clock::now();
@@ -868,6 +886,7 @@ inline DCPipelineResult run_dc_pipeline(
                 min_normal_alignment_threshold,
                 finest_leaf_size,
                 pre_thickening_radius,
+                thickening_refined_in_initial_tree,
                 initial_occupied_solid_rebuild_mode,
                 post_thickening_rebuild_mode);
         LeafSpatialIndex &solid_spatial_index = stable_tree_prelude.solid_spatial_index;

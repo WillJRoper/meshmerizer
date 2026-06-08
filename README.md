@@ -40,6 +40,28 @@ For macOS with Homebrew `libomp`:
 WITH_OPENMP=/opt/homebrew/opt/libomp pip install -e .
 ```
 
+## Optional native CMake build
+
+This is an optional convenience path for native-only iteration. It builds the
+same `_adaptive` extension into `src/meshmerizer/` and does not replace the
+existing `pip install -e .` workflow.
+
+```bash
+cmake -S . -B build/cmake \
+  -DPython3_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')" \
+  -DMESHMERIZER_WITH_OPENMP=ON \
+  -DMESHMERIZER_OPENMP_ROOT=/opt/homebrew/opt/libomp
+cmake --build build/cmake -j
+```
+
+Without OpenMP:
+
+```bash
+cmake -S . -B build/cmake \
+  -DPython3_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')"
+cmake --build build/cmake -j
+```
+
 ## Quick smoke test
 
 ```bash

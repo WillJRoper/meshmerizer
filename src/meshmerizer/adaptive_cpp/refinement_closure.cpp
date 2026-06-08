@@ -31,22 +31,22 @@ inline bool closure_is_leaf(const OctreeCell &cell) {
     // const away on the underlying storage. ``atomic_ref`` itself is the
     // synchronization mechanism, so this is sound: we are not mutating the
     // cell, only acquire-loading the publication slot.
-    const std::int64_t observed =
-        std::atomic_ref<std::int64_t>(
-            const_cast<std::int64_t &>(cell.child_begin))
+    const std::int32_t observed =
+        std::atomic_ref<std::int32_t>(
+            const_cast<std::int32_t &>(cell.child_begin))
             .load(std::memory_order_acquire);
     return observed < 0;
 }
 
-inline std::int64_t closure_child_begin_acquire(const OctreeCell &cell) {
-    return std::atomic_ref<std::int64_t>(
-               const_cast<std::int64_t &>(cell.child_begin))
+inline std::int32_t closure_child_begin_acquire(const OctreeCell &cell) {
+    return std::atomic_ref<std::int32_t>(
+               const_cast<std::int32_t &>(cell.child_begin))
         .load(std::memory_order_acquire);
 }
 
 inline void closure_publish_child_begin(
-    OctreeCell &cell, std::int64_t value) {
-    std::atomic_ref<std::int64_t>(cell.child_begin)
+    OctreeCell &cell, std::int32_t value) {
+    std::atomic_ref<std::int32_t>(cell.child_begin)
         .store(value, std::memory_order_release);
 }
 
@@ -150,25 +150,19 @@ public:
         for (std::size_t offset = 0; offset < prepared_children.size(); ++offset) {
             PreparedChildPublication &prepared = prepared_children[offset];
             prepared.cell.contributor_begin =
-                static_cast<std::int64_t>(next_contributor_offset);
+                static_cast<std::int32_t>(next_contributor_offset);
             for (std::size_t contributor_index : prepared.contributors) {
                 context_.contributors()[next_contributor_offset++] =
                     contributor_index;
             }
             prepared.cell.contributor_end =
-                static_cast<std::int64_t>(next_contributor_offset);
-            const std::int64_t published_contributor_begin =
-                prepared.cell.contributor_begin;
-            const std::int64_t published_contributor_end =
-                prepared.cell.contributor_end;
+                static_cast<std::int32_t>(next_contributor_offset);
             const std::size_t new_index = publish_cell(
                 reservation,
                 offset,
                 std::move(prepared.cell));
-            context_.set_contributor_range(
-                new_index,
-                published_contributor_begin,
-                published_contributor_end);
+            // Contributor range was set on the cell struct in prepare_cell
+            // above. No separate side-car write is needed.
             context_.raise_required_depth_to(new_index, prepared.required_depth);
             published_indices.push_back(new_index);
         }
@@ -475,6 +469,7 @@ private:
         std::size_t distance_update_pop_count = 0U;
         std::size_t occupancy_update_pop_count = 0U;
         std::size_t refine_pop_count = 0U;
+        std::size_t in_flight_count = 0U;
 
         bool operator==(const EmittedSnapshot &other) const {
             return queue_size == other.queue_size &&
@@ -493,7 +488,8 @@ private:
                        other.distance_update_pop_count &&
                    occupancy_update_pop_count ==
                        other.occupancy_update_pop_count &&
-                   refine_pop_count == other.refine_pop_count;
+                    refine_pop_count == other.refine_pop_count &&
+                    in_flight_count == other.in_flight_count;
         }
 
         bool has_any_work() const {
@@ -511,9 +507,6 @@ public:
         std::lock_guard<std::mutex> lock(emit_mutex_);
         const EmittedSnapshot snapshot = build_snapshot();
         if (!snapshot.has_any_work()) {
-            return;
-        }
-        if (has_last_snapshot_ && snapshot == last_snapshot_) {
             return;
         }
         last_snapshot_ = emit_row(now, snapshot);
@@ -541,13 +534,15 @@ public:
 
     void emit_header() {
         meshmerizer_log_detail::print_indented_status(
-            "scheduler status table follows (progress=1%%, task graph=%s)\n",
+            "scheduler status table follows (task graph=%s)\n",
             config_.phase_name.c_str());
         meshmerizer_log_detail::print_indented_status(
-            "%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s"
+            "%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s"
             " %*s %*s\n",
             kTableElapsedWidth,
             "elapsed_s",
+            10,
+            "progress%",
             kTableCountWidth,
             "queue",
             kTableCountWidth,
@@ -594,6 +589,7 @@ public:
             run_stats_snapshot.distance_update_pop_count,
             run_stats_snapshot.occupancy_update_pop_count,
             run_stats_snapshot.refine_pop_count,
+            queue_stats.in_flight_count,
         };
     }
 
@@ -612,11 +608,15 @@ public:
 
         const double elapsed_seconds =
             std::chrono::duration<double>(now - start_time_).count();
+        const std::size_t progress_percent =
+            progress_percent_for(snapshot);
         meshmerizer_log_detail::print_indented_status(
-            "%*.1f %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu"
+            "%*.1f %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu %*zu"
             " %*zu %*zu\n",
             kTableElapsedWidth,
             elapsed_seconds,
+            10,
+            progress_percent,
             kTableCountWidth,
             snapshot.queue_size,
             kTableCountWidth,
@@ -642,6 +642,20 @@ public:
             kTableCountWidth,
             snapshot.total_cells);
         return snapshot;
+    }
+
+    std::size_t progress_percent_for(const EmittedSnapshot &snapshot) const {
+        const std::size_t completed =
+            snapshot.pop_count > snapshot.in_flight_count
+                ? snapshot.pop_count - snapshot.in_flight_count
+                : 0U;
+        const std::size_t total_known_work =
+            completed + snapshot.queue_size + snapshot.in_flight_count;
+        if (total_known_work == 0U) {
+            return 0U;
+        }
+        return static_cast<std::size_t>(
+            (100U * completed) / total_known_work);
     }
 
     std::size_t progress_bucket_for(const EmittedSnapshot &snapshot) const {
@@ -676,18 +690,18 @@ inline RefinementResult evaluate_refinement_for_leaf(
     std::vector<HermiteSample> &samples) {
     RefinementResult result;
 
-    const std::int64_t contrib_begin = current_cell.contributor_begin;
-    const std::int64_t contrib_end = current_cell.contributor_end;
+    const std::int32_t contrib_begin = current_cell.contributor_begin;
+    const std::int32_t contrib_end = current_cell.contributor_end;
     if (contrib_begin < 0 || contrib_end < 0 || contrib_begin >= contrib_end) {
         return result;
     }
 
     const auto safe_begin = static_cast<std::size_t>(
         std::min(contrib_begin,
-                 static_cast<std::int64_t>(all_contributors.size())));
+                 static_cast<std::int32_t>(all_contributors.size())));
     const auto safe_end = static_cast<std::size_t>(
         std::min(contrib_end,
-                 static_cast<std::int64_t>(all_contributors.size())));
+                 static_cast<std::int32_t>(all_contributors.size())));
     const std::span<const std::size_t> contributors =
         contributor_span(all_contributors, safe_begin, safe_end);
 
@@ -794,7 +808,7 @@ inline std::size_t closure_morton_descend_to_leaf(
         if (cell.depth >= max_depth) {
             return current;
         }
-        const std::int64_t child_begin = closure_child_begin_acquire(cell);
+        const std::int32_t child_begin = closure_child_begin_acquire(cell);
         if (child_begin < 0) {
             return current;
         }
@@ -1028,7 +1042,7 @@ inline void collect_internal_refinement_indices(
 inline void closure_assign_parent_index(
     std::vector<OctreeCell> &children, std::size_t parent_index) {
     for (OctreeCell &child : children) {
-        child.parent_index = static_cast<std::int64_t>(parent_index);
+        child.parent_index = static_cast<std::int32_t>(parent_index);
     }
 }
 
@@ -1143,6 +1157,26 @@ inline void enqueue_distance_update_neighbors(
     }
 }
 
+// After a split publishes children, raise each child's required_depth to
+// match the parent's live required_depth if it was raised concurrently
+// during the split.  Required_depth propagation is only upward, so without
+// this step a raise that arrives while the split is in flight is silently
+// lost for the subtree (children keep the stale snapshot value).
+inline void propagate_parent_required_depth_to_children(
+    std::size_t parent_index,
+    std::uint32_t snapshot_parent_required_depth,
+    const std::vector<std::size_t> &child_indices,
+    RefinementContext &context) {
+    const std::uint32_t live_required =
+        context.get_required_depth(parent_index);
+    if (live_required <= snapshot_parent_required_depth) {
+        return;
+    }
+    for (std::size_t child_index : child_indices) {
+        context.raise_required_depth_to(child_index, live_required);
+    }
+}
+
 inline PublishedChildren apply_balance_split(
     std::size_t split_index,
     ClosureWorkerState &worker,
@@ -1226,6 +1260,12 @@ inline PublishedChildren apply_balance_split(
     enqueue_classify_children(published, worker);
     enqueue_distance_update_neighbors(published, worker);
 
+    propagate_parent_required_depth_to_children(
+        split_index,
+        parent_required_depth,
+        published.child_indices,
+        context);
+
     return published;
 }
 
@@ -1295,6 +1335,12 @@ inline PublishedChildren apply_surface_split(
     enqueue_surface_band_children(published, worker, wake_tasks);
     enqueue_classify_children(published, worker);
     enqueue_distance_update_neighbors(published, worker);
+
+    propagate_parent_required_depth_to_children(
+        split_index,
+        parent_required_depth,
+        published.child_indices,
+        context);
 
     return published;
 }
@@ -1682,7 +1728,7 @@ inline void process_closure_task(
 
             cell_snapshot.contributor_begin = 0;
             cell_snapshot.contributor_end =
-                static_cast<std::int64_t>(contributor_snapshot.size());
+                static_cast<std::int32_t>(contributor_snapshot.size());
             ready_for_leaf_evaluation = true;
         }
 
@@ -1814,7 +1860,9 @@ inline void process_closure_task(
                         local_stack)) {
                     continue;
                 }
-                context.mark_idle(task.cell_index);
+                if (!context.try_mark_idle(task.cell_index)) {
+                    continue;
+                }
                 should_continue = true;
                 worker.profiler.tasks_retired_no_split.fetch_add(
                     1U, std::memory_order_relaxed);
@@ -1832,7 +1880,9 @@ inline void process_closure_task(
                         local_stack)) {
                     continue;
                 }
-                context.mark_idle(task.cell_index);
+                if (!context.try_mark_idle(task.cell_index)) {
+                    continue;
+                }
                 should_continue = true;
                 worker.profiler.tasks_retired_no_split.fetch_add(
                     1U, std::memory_order_relaxed);
@@ -2753,10 +2803,9 @@ bool refine_thickening_band_with_closure(
     if (config.thickening_band_target_leaf_size > 0.0) {
         RefinementContext context(all_cells, all_contributors);
         context.sync_cell_state_size();
-        context.initialize_thickening_state(
-            initial_inside_flags,
-            initial_center_values,
-            initial_occupancy_states);
+        // initialize_thickening_state is intentionally omitted:
+        // kClassify tasks re-evaluate SPH and populate topology arenas
+        // lazily. See the no-op implementation in refinement_context.cpp.
 
         RefinementWorkQueue queue;
         const std::uint32_t worker_count = std::max(1U, config.worker_count);

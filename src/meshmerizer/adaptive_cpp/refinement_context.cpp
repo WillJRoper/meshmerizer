@@ -41,12 +41,6 @@ RefinementContext::RefinementContext(
     cell_arena_.adopt(all_cells);
     contrib_arena_.adopt(all_contributors);
     sync_cell_state_size();
-    for (std::size_t i = 0; i < cell_arena_.size(); ++i) {
-        contributor_ranges_[i] = {
-            cell_arena_[i].contributor_begin,
-            cell_arena_[i].contributor_end,
-        };
-    }
 }
 
 void RefinementContext::sync_cell_state_size() {
@@ -61,12 +55,13 @@ void RefinementContext::sync_cell_state_size() {
     // RefinementChildBlock (child_count = 0).
     // cell_classification_ starts at 0 (== outside / unset default).
     // outside_distance_bits_ starts at 0 (== 0.0f, overwritten on first use).
+    // Only allocate the core scheduler side-cars and topology arenas.
+    // child_blocks_ is now a sparse map (no pre-allocation).
+    // contributor_ranges_ is read directly from OctreeCell struct fields.
     const std::size_t target = cell_arena_.size();
     required_depth_.reserve_to(target);
     task_state_.reserve_to(target);
     generation_.reserve_to(target);
-    child_blocks_.reserve_to(target);
-    contributor_ranges_.reserve_to(target);
     cell_classification_.reserve_to(target);
     outside_distance_bits_.reserve_to(target);
     center_value_bits_.reserve_to(target);
@@ -110,14 +105,16 @@ void RefinementContext::set_child_block(
     if (cell_index >= cell_arena_.size()) {
         throw std::out_of_range("refinement child block index out of range");
     }
-    RefinementChildBlock &child_block = child_blocks_[cell_index];
-    if (child_indices.size() > child_block.child_indices.size()) {
+    if (child_indices.size() > 8U) {
         throw std::out_of_range("refinement child block exceeded fixed capacity");
     }
-    child_block.child_count = static_cast<std::uint8_t>(child_indices.size());
+    RefinementChildBlock block;
+    block.child_count = static_cast<std::uint8_t>(child_indices.size());
     for (std::size_t index = 0; index < child_indices.size(); ++index) {
-        child_block.child_indices[index] = child_indices[index];
+        block.child_indices[index] = child_indices[index];
     }
+    std::lock_guard<std::mutex> guard(child_blocks_mutex_);
+    child_blocks_[cell_index] = block;
 }
 
 void RefinementContext::append_child_indices(
@@ -126,7 +123,12 @@ void RefinementContext::append_child_indices(
     if (cell_index >= cell_arena_.size()) {
         throw std::out_of_range("refinement child block index out of range");
     }
-    const RefinementChildBlock &child_block = child_blocks_[cell_index];
+    std::lock_guard<std::mutex> guard(child_blocks_mutex_);
+    const auto it = child_blocks_.find(cell_index);
+    if (it == child_blocks_.end()) {
+        return;
+    }
+    const RefinementChildBlock &child_block = it->second;
     for (std::size_t index = 0; index < child_block.child_count; ++index) {
         out_indices.push_back(child_block.child_indices[index]);
     }
@@ -138,7 +140,12 @@ std::size_t RefinementContext::child_index_at(
     if (cell_index >= cell_arena_.size()) {
         throw std::out_of_range("refinement child block index out of range");
     }
-    const RefinementChildBlock &child_block = child_blocks_[cell_index];
+    std::lock_guard<std::mutex> guard(child_blocks_mutex_);
+    const auto it = child_blocks_.find(cell_index);
+    if (it == child_blocks_.end()) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    const RefinementChildBlock &child_block = it->second;
     if (child_slot >= child_block.child_count) {
         return std::numeric_limits<std::size_t>::max();
     }
@@ -149,10 +156,13 @@ void RefinementContext::set_contributor_range(
     std::size_t cell_index,
     std::int64_t begin,
     std::int64_t end) {
-    if (cell_index >= cell_arena_.size()) {
-        throw std::out_of_range("refinement contributor range index out of range");
-    }
-    contributor_ranges_[cell_index] = {begin, end};
+    // Contributor ranges are now stored directly on the OctreeCell struct
+    // (contributor_begin / contributor_end fields), which are set during
+    // cell creation / publication. This function is kept for API compatibility
+    // but is a no-op — the cell's fields are already correct.
+    (void)cell_index;
+    (void)begin;
+    (void)end;
 }
 
 RefinementContributorRange RefinementContext::contributor_range(
@@ -160,7 +170,9 @@ RefinementContributorRange RefinementContext::contributor_range(
     if (cell_index >= cell_arena_.size()) {
         throw std::out_of_range("refinement contributor range index out of range");
     }
-    return contributor_ranges_[cell_index];
+    // Read directly from the OctreeCell struct.
+    const OctreeCell &cell = cell_arena_[cell_index];
+    return {cell.contributor_begin, cell.contributor_end};
 }
 
 std::span<const std::size_t> RefinementContext::contributor_span(
@@ -170,10 +182,10 @@ std::span<const std::size_t> RefinementContext::contributor_span(
         return {};
     }
     const std::size_t safe_begin =
-        static_cast<std::size_t>(std::max<std::int64_t>(0, range.begin));
+        static_cast<std::size_t>(std::max<std::int32_t>(0, range.begin));
     const std::size_t safe_end = static_cast<std::size_t>(std::min(
         range.end,
-        static_cast<std::int64_t>(contrib_arena_.size())));
+        static_cast<std::int32_t>(contrib_arena_.size())));
     if (safe_end <= safe_begin) {
         return {};
     }
@@ -197,10 +209,10 @@ void RefinementContext::copy_contributors_for_cell(
         return;
     }
     const std::size_t safe_begin =
-        static_cast<std::size_t>(std::max<std::int64_t>(0, range.begin));
+        static_cast<std::size_t>(std::max<std::int32_t>(0, range.begin));
     const std::size_t safe_end = static_cast<std::size_t>(std::min(
         range.end,
-        static_cast<std::int64_t>(contrib_arena_.size())));
+        static_cast<std::int32_t>(contrib_arena_.size())));
     if (safe_end <= safe_begin) {
         out_indices.clear();
         return;
@@ -286,6 +298,19 @@ void RefinementContext::mark_idle(std::size_t cell_index) {
         std::memory_order_release);
 }
 
+bool RefinementContext::try_mark_idle(std::size_t cell_index) {
+    if (cell_index >= cell_arena_.size()) {
+        throw std::out_of_range("refinement task state index out of range");
+    }
+    std::uint8_t expected =
+        task_state_value(RefinementTaskState::kProcessing);
+    return task_state_[cell_index].compare_exchange_strong(
+        expected,
+        task_state_value(RefinementTaskState::kIdle),
+        std::memory_order_acq_rel,
+        std::memory_order_acquire);
+}
+
 void RefinementContext::mark_retired(std::size_t cell_index) {
     if (cell_index >= cell_arena_.size()) {
         throw std::out_of_range("refinement task state index out of range");
@@ -326,8 +351,6 @@ std::size_t RefinementContext::reserve_cell_block(std::size_t count) {
     required_depth_.reserve_to(target);
     task_state_.reserve_to(target);
     generation_.reserve_to(target);
-    child_blocks_.reserve_to(target);
-    contributor_ranges_.reserve_to(target);
     cell_classification_.reserve_to(target);
     outside_distance_bits_.reserve_to(target);
     center_value_bits_.reserve_to(target);
@@ -337,14 +360,14 @@ std::size_t RefinementContext::reserve_cell_block(std::size_t count) {
     // ``std::atomic<T>`` arrays here: newly appended children must always
     // start from a known kIdle / zero-depth / zero-generation state before
     // any worker can attempt to queue them.
+    // child_blocks_ is sparse (only populated for split cells via
+    // set_child_block). contributor_ranges_ is read from OctreeCell fields.
     for (std::size_t i = begin; i < target; ++i) {
         required_depth_[i].store(0U, std::memory_order_relaxed);
         task_state_[i].store(
             task_state_value(RefinementTaskState::kIdle),
             std::memory_order_relaxed);
         generation_[i].store(0U, std::memory_order_relaxed);
-        child_blocks_[i] = RefinementChildBlock{};
-        contributor_ranges_[i] = RefinementContributorRange{};
         cell_classification_[i].store(0U, std::memory_order_relaxed);
         outside_distance_bits_[i].store(0U, std::memory_order_relaxed);
         center_value_bits_[i].store(0U, std::memory_order_relaxed);
@@ -398,9 +421,8 @@ void RefinementContext::materialize_into(
         // plain bool, so we set it here once at run end where there is no
         // concurrency.
         cell.is_leaf = (cell.child_begin < 0);
-        const RefinementContributorRange range = contributor_ranges_[i];
-        cell.contributor_begin = range.begin;
-        cell.contributor_end = range.end;
+        // Contributor ranges are already on the cell struct (set during
+        // creation / publication). No side-car copy needed.
         out_cells.push_back(std::move(cell));
     }
     const std::size_t contrib_count = contrib_arena_.size();
@@ -440,28 +462,21 @@ void RefinementContext::materialize_thickening_state(
 }
 
 void RefinementContext::initialize_thickening_state(
-    const std::vector<std::uint8_t> *initial_cell_classification,
-    const std::vector<double> *initial_center_values,
-    const std::vector<std::uint8_t> *initial_occupancy_states) {
-    const std::size_t cell_count = cell_arena_.size();
-    for (std::size_t i = 0; i < cell_count; ++i) {
-        if (initial_cell_classification != nullptr &&
-            i < initial_cell_classification->size()) {
-            cell_classification_[i].store(
-                (*initial_cell_classification)[i], std::memory_order_relaxed);
-        }
-        if (initial_center_values != nullptr && i < initial_center_values->size()) {
-            std::uint64_t bits = 0U;
-            const double value = (*initial_center_values)[i];
-            std::memcpy(&bits, &value, sizeof(bits));
-            center_value_bits_[i].store(bits, std::memory_order_relaxed);
-        }
-        if (initial_occupancy_states != nullptr &&
-            i < initial_occupancy_states->size()) {
-            occupancy_state_bits_[i].store(
-                (*initial_occupancy_states)[i], std::memory_order_relaxed);
-        }
-    }
+    const std::vector<std::uint8_t> * /*initial_cell_classification*/,
+    const std::vector<double> * /*initial_center_values*/,
+    const std::vector<std::uint8_t> * /*initial_occupancy_states*/) {
+    // This function is intentionally a no-op.
+    //
+    // The incremental topology task chain (kClassify → kDistanceUpdate → kRefine)
+    // re-evaluates SPH and sets classification/center/occupancy on each cell
+    // as it processes them. The kClassify handler fully initialises all three
+    // side-cars, so pre-populating them here would only add an O(N) copy that
+    // is immediately overwritten. The kDistanceUpdate handler treats unset
+    // (zero) classification as "outside", which is the correct conservative
+    // default for any cell not yet reached by the task graph.
+    //
+    // Pre-allocating the topology arenas (in sync_cell_state_size) is still
+    // necessary so that task handlers can index into them without resizing.
 }
 
 void RefinementContext::propagate_required_depth_upward(
@@ -474,7 +489,7 @@ void RefinementContext::propagate_required_depth_upward(
     std::size_t current = cell_index;
     while (true) {
         const OctreeCell &cell = cell_arena_[current];
-        std::int64_t parent_idx = cell.parent_index;
+        std::int32_t parent_idx = cell.parent_index;
         if (parent_idx < 0) {
             // Reached the root.
             break;

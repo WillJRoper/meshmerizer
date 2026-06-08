@@ -57,8 +57,12 @@ struct OctreeCell {
     std::uint64_t morton_key;
     /** Refinement depth measured from the top-level grid. */
     std::uint32_t depth;
-    /** Geometric extent of the cell in world/domain coordinates. */
-    BoundingBox bounds;
+    /** Representative mesh vertex index assigned during vertex solving. */
+    std::int32_t representative_vertex_index;
+    /** Index of the parent cell in ``all_cells``, or ``-1`` for roots. */
+    std::int32_t parent_index;
+    /** Bit mask encoding ``corner_values >= isovalue``. */
+    std::uint8_t corner_sign_mask;
     /** Whether the cell currently has no children in the flat array. */
     bool is_leaf;
     /** Whether the cell is considered active for direct contour extraction. */
@@ -67,27 +71,6 @@ struct OctreeCell {
     bool has_surface;
     /** Whether topology regularization marks the cell as a topology surface. */
     bool is_topo_surface;
-    /** Index of the first child in ``all_cells``, or ``-1`` for leaves. */
-    std::int64_t child_begin;
-    /** Begin offset into the flat contributor array. */
-    std::int64_t contributor_begin;
-    /** End offset into the flat contributor array. */
-    std::int64_t contributor_end;
-    /** Representative mesh vertex index assigned during vertex solving. */
-    std::int64_t representative_vertex_index;
-    /** Scalar field samples at the eight cell corners. */
-    std::array<double, 8> corner_values;
-    /** Bit mask encoding ``corner_values >= isovalue``. */
-    std::uint8_t corner_sign_mask;
-    /**
-     * @brief Index of the parent cell in ``all_cells``, or ``-1`` for roots.
-     *
-     * Populated by the closure pipeline when it splits a parent and appends
-     * the child block to the flat array. Cells constructed outside that path
-     * (e.g. Python ``create_child_cells`` binding, top-level cells) carry
-     * ``-1`` and rely on the morton-ascend fallback rather than this field.
-     */
-    std::int64_t parent_index;
     /**
      * @brief Local child index within the parent's eight-child block.
      *
@@ -96,6 +79,16 @@ struct OctreeCell {
      * when ``parent_index >= 0``; otherwise stored as 0.
      */
     std::uint8_t slot_in_parent;
+    /** Geometric extent of the cell in world/domain coordinates. */
+    BoundingBox bounds;
+    /** Index of the first child in ``all_cells``, or ``-1`` for leaves. */
+    std::int32_t child_begin;
+    /** Begin offset into the flat contributor array. */
+    std::int32_t contributor_begin;
+    /** End offset into the flat contributor array. */
+    std::int32_t contributor_end;
+    /** Scalar field samples at the eight cell corners. */
+    std::array<double, 8> corner_values;
 };
 
 /**
@@ -255,19 +248,19 @@ inline std::vector<OctreeCell> create_top_level_cells(
                 cells.push_back({
                     morton_encode_3d(ix, iy, iz),
                     0U,
-                    {minimum, maximum},
+                    -1,
+                    -1,
+                    0U,
                     true,
                     false,
                     false,
                     false,
-                    -1,
+                    0U,
+                    {minimum, maximum},
                     -1,
                     -1,
                     -1,
                     {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-                    0U,
-                    -1,
-                    0U,
                 });
             }
         }
@@ -338,8 +331,8 @@ build_top_level_cells_with_contributors(
         OctreeCell cell = top_cells[ci];
         const std::size_t begin = contributor_offsets[ci];
         const std::size_t end = contributor_offsets[ci + 1U];
-        cell.contributor_begin = static_cast<std::int64_t>(begin);
-        cell.contributor_end = static_cast<std::int64_t>(end);
+        cell.contributor_begin = static_cast<std::int32_t>(begin);
+        cell.contributor_end = static_cast<std::int32_t>(end);
         initial_cells.push_back(cell);
         const std::vector<std::size_t> &cell_contributors =
             top_cell_contributors[ci];
@@ -408,19 +401,19 @@ inline std::vector<OctreeCell> create_child_cells(const OctreeCell &parent) {
         children.push_back({
             morton_encode_3d(child_x, child_y, child_z),
             parent.depth + 1U,
-            child_bounds_from_index(parent.bounds, child_index),
+            -1,
+            -1,
+            0U,
             true,
             false,
             false,
             false,
-            -1,
+            child_index,
+            child_bounds_from_index(parent.bounds, child_index),
             -1,
             -1,
             -1,
             {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-            0U,
-            -1,
-            child_index,
         });
     }
     return children;
@@ -505,18 +498,18 @@ inline void split_octree_leaf(
     parent.has_surface = true;
     parent.is_topo_surface = false;
     parent.representative_vertex_index = -1;
-    parent.child_begin = static_cast<std::int64_t>(all_cells.size());
+    parent.child_begin = static_cast<std::int32_t>(all_cells.size());
 
-    const std::int64_t parent_storage_index =
-        static_cast<std::int64_t>(split_index);
+    const std::int32_t parent_storage_index =
+        static_cast<std::int32_t>(split_index);
     for (std::size_t i = 0; i < children.size(); ++i) {
-        const std::int64_t child_contrib_begin =
-            static_cast<std::int64_t>(all_contributors.size());
+        const std::int32_t child_contrib_begin =
+            static_cast<std::int32_t>(all_contributors.size());
         std::copy(child_contributors[i].begin(),
                   child_contributors[i].end(),
                   std::back_inserter(all_contributors));
-        const std::int64_t child_contrib_end =
-            static_cast<std::int64_t>(all_contributors.size());
+        const std::int32_t child_contrib_end =
+            static_cast<std::int32_t>(all_contributors.size());
 
         children[i].contributor_begin = child_contrib_begin;
         children[i].contributor_end = child_contrib_end;
@@ -1153,18 +1146,18 @@ inline std::pair<std::vector<OctreeCell>, std::vector<std::size_t>> refine_octre
          ++cell_index) {
         meshmerizer_cancel_detail::poll_for_cancellation_serial(cell_index);
         OctreeCell &cell = initial_cells[cell_index];
-        const std::int64_t contrib_begin = cell.contributor_begin;
-        const std::int64_t contrib_end = cell.contributor_end;
+        const std::int32_t contrib_begin = cell.contributor_begin;
+        const std::int32_t contrib_end = cell.contributor_end;
 
         if (contrib_begin >= 0 && contrib_end > contrib_begin) {
-            const std::int64_t original_size =
-                static_cast<std::int64_t>(initial_contributors.size());
+            const std::int32_t original_size =
+                static_cast<std::int32_t>(initial_contributors.size());
             cell.contributor_begin = original_size;
             for (std::int64_t i = contrib_begin; i < contrib_end; ++i) {
                 initial_contributors.push_back(static_cast<std::size_t>(i));
             }
             cell.contributor_end =
-                static_cast<std::int64_t>(initial_contributors.size());
+                static_cast<std::int32_t>(initial_contributors.size());
         } else {
             cell.contributor_begin = -1;
             cell.contributor_end = -1;

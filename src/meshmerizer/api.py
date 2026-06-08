@@ -16,10 +16,12 @@ from typing import Optional, Sequence
 import numpy as np
 
 from meshmerizer.adaptive import (
-    build_refined_tree,
-    classify_occupied_solid,
+    build_native_tree_handle,
+    classify_occupied_solid_from_handle,
+    classify_occupied_solid_from_tree,
     compute_isovalue_from_percentile,
     fof_cluster,
+    generate_mesh_from_tree_handle,
     run_full_pipeline,
 )
 from meshmerizer.adaptive import (
@@ -144,7 +146,7 @@ def build_tree(
         ``TreeState`` containing the refined tree and validated inputs.
     """
     pos, sml = _validate_particle_arrays(positions, smoothing_lengths)
-    cells, contributors = build_refined_tree(
+    native_handle = build_native_tree_handle(
         pos,
         sml,
         tuple(domain_min),
@@ -158,8 +160,8 @@ def build_tree(
         min_normal_alignment_threshold,
     )
     return TreeState(
-        cells=cells,
-        contributors=contributors,
+        cells=(),
+        contributors=np.empty(0, dtype=np.int64),
         positions=pos,
         smoothing_lengths=sml,
         domain_min=tuple(domain_min),
@@ -170,6 +172,7 @@ def build_tree(
         minimum_usable_hermite_samples=minimum_usable_hermite_samples,
         max_qef_rms_residual_ratio=max_qef_rms_residual_ratio,
         min_normal_alignment_threshold=min_normal_alignment_threshold,
+        native_handle=native_handle,
     )
 
 
@@ -194,22 +197,28 @@ def regularize(
         ``TopologyState`` representing the regularized opened solid.
     """
     erosion_radius = 0.5 * float(min_feature_thickness)
-    result = classify_occupied_solid(
-        tree.positions,
-        tree.smoothing_lengths,
-        tree.domain_min,
-        tree.domain_max,
-        tree.base_resolution,
-        tree.isovalue,
-        tree.max_depth,
-        tree.minimum_usable_hermite_samples,
-        tree.max_qef_rms_residual_ratio,
-        tree.min_normal_alignment_threshold,
-        max_surface_leaf_size=erosion_radius,
-        erosion_radius=erosion_radius,
-        pre_thickening_radius=pre_thickening_radius,
-        worker_count=nthreads,
-    )
+    if tree.native_handle is not None:
+        result = classify_occupied_solid_from_handle(
+            tree.native_handle,
+            erosion_radius=erosion_radius,
+            pre_thickening_radius=pre_thickening_radius,
+            worker_count=nthreads,
+        )
+    else:
+        result = classify_occupied_solid_from_tree(
+            tree.cells,
+            tree.contributors,
+            tree.positions,
+            tree.smoothing_lengths,
+            tree.domain_min,
+            tree.domain_max,
+            tree.base_resolution,
+            tree.isovalue,
+            tree.max_depth,
+            erosion_radius=erosion_radius,
+            pre_thickening_radius=pre_thickening_radius,
+            worker_count=nthreads,
+        )
     return TopologyState(
         tree=tree,
         occupancy=result["occupancy"],
@@ -262,30 +271,54 @@ def _extract_mesh_from_tree(
     """
     # Use the lighter direct mesh-generation path when the caller already has a
     # refined tree and does not request regularization.
-    if (
-        tree.cells
-        and tree.contributors.size > 0
-        and min_feature_thickness <= 0.0
-        and pre_thickening_radius <= 0.0
-    ):
-        vertices, _, faces = generate_native_mesh(
-            tree.cells,
-            tree.contributors,
-            tree.positions,
-            tree.smoothing_lengths,
-            tree.isovalue,
-            tree.domain_min,
-            tree.domain_max,
-            tree.max_depth,
-            tree.base_resolution,
-        )
-        # Wrap the direct native arrays immediately so the rest of the function
-        # can treat both branches uniformly.
-        mesh_result = MeshResult(
-            mesh=Mesh(vertices=vertices, faces=faces.astype(np.uint32)),
-            isovalue=tree.isovalue,
-            n_qef_vertices=int(vertices.shape[0]),
-        )
+    if min_feature_thickness <= 0.0 and pre_thickening_radius <= 0.0:
+        if tree.native_handle is not None:
+            vertices, _, faces = generate_mesh_from_tree_handle(
+                tree.native_handle
+            )
+        elif tree.cells and tree.contributors.size > 0:
+            vertices, _, faces = generate_native_mesh(
+                tree.cells,
+                tree.contributors,
+                tree.positions,
+                tree.smoothing_lengths,
+                tree.isovalue,
+                tree.domain_min,
+                tree.domain_max,
+                tree.max_depth,
+                tree.base_resolution,
+            )
+        else:
+            vertices = faces = None
+
+        if vertices is not None and faces is not None:
+            # Wrap the direct native arrays immediately so the rest of the
+            # function can treat both branches uniformly.
+            mesh_result = MeshResult(
+                mesh=Mesh(vertices=vertices, faces=faces.astype(np.uint32)),
+                isovalue=tree.isovalue,
+                n_qef_vertices=int(vertices.shape[0]),
+            )
+        else:
+            result = run_full_pipeline(
+                tree.positions,
+                tree.smoothing_lengths,
+                tree.domain_min,
+                tree.domain_max,
+                tree.base_resolution,
+                tree.isovalue,
+                tree.max_depth,
+                worker_count=nthreads,
+                smoothing_iterations=smoothing_iterations,
+                smoothing_strength=smoothing_strength,
+                max_edge_ratio=max_edge_ratio,
+                minimum_usable_hermite_samples=tree.minimum_usable_hermite_samples,
+                max_qef_rms_residual_ratio=tree.max_qef_rms_residual_ratio,
+                min_normal_alignment_threshold=tree.min_normal_alignment_threshold,
+                min_feature_thickness=min_feature_thickness,
+                pre_thickening_radius=pre_thickening_radius,
+            )
+            mesh_result = _mesh_result_from_pipeline_dict(result)
     else:
         # Fall back to the whole-pipeline entry point when regularization
         # or smoothing requests mean the direct shortcut is insufficient.

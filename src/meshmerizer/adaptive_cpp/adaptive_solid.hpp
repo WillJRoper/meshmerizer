@@ -3299,7 +3299,7 @@ inline bool surface_region_contains_cell(
         if (current == root_cell_index) {
             return true;
         }
-        const std::int64_t parent = all_cells[current].parent_index;
+        const std::int32_t parent = all_cells[current].parent_index;
         if (parent < 0) {
             return false;
         }
@@ -4273,10 +4273,10 @@ inline bool opened_quad_has_four_distinct_vertices(
         return false;
     }
 
-    const std::int64_t vi0 = all_cells[c0].representative_vertex_index;
-    const std::int64_t vi1 = all_cells[c1].representative_vertex_index;
-    const std::int64_t vi2 = all_cells[c2].representative_vertex_index;
-    const std::int64_t vi3 = all_cells[c3].representative_vertex_index;
+    const std::int32_t vi0 = all_cells[c0].representative_vertex_index;
+    const std::int32_t vi1 = all_cells[c1].representative_vertex_index;
+    const std::int32_t vi2 = all_cells[c2].representative_vertex_index;
+    const std::int32_t vi3 = all_cells[c3].representative_vertex_index;
     if (vi0 < 0 || vi1 < 0 || vi2 < 0 || vi3 < 0) {
         return false;
     }

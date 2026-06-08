@@ -39,6 +39,8 @@ class TreeState:
             fraction of the local cell radius.
         min_normal_alignment_threshold: Minimum alignment required between
             usable Hermite normals and their mean direction.
+        native_handle: Optional opaque C++ tree handle used by the staged API
+            to keep octree state resident in native memory across phases.
     """
 
     cells: tuple[dict[str, object], ...]
@@ -53,6 +55,7 @@ class TreeState:
     minimum_usable_hermite_samples: int = 3
     max_qef_rms_residual_ratio: float = 0.1
     min_normal_alignment_threshold: float = 0.97
+    native_handle: object | None = None
 
 
 @dataclass
